@@ -607,6 +607,9 @@ enum Cookies {
 /// sealed by the first write a keyring takes. Either way no plaintext is left behind: the sealed
 /// file is renamed over it, so the plain one is never there beside it.
 fn read_jar(store: &Store) -> (cookie_store::CookieStore, Cookies) {
+    if store.is_memory() {
+        return (cookie_store::CookieStore::default(), Cookies::Read);
+    }
     let path = store.cookie_path();
     let parse = |json: &[u8]| cookie_store::serde::json::load(json).ok();
     let Ok(bytes) = std::fs::read(path) else {
@@ -857,6 +860,11 @@ impl Client {
     /// the sign-in lock, for a session that had not changed. Only a write that went through is
     /// remembered, so one that failed is made again next time.
     fn persist(&self) -> Result<()> {
+        if self.store.is_memory()
+            || (self.store.is_passwordless() && !matches!(self.sign, state::SignIn::Idle))
+        {
+            return Ok(());
+        }
         let session = serde_json::to_vec(&self.session)
             .map_err(|e| Error::Protocol(format!("couldn't save the session: {e}")))?;
         let cookies = {
@@ -1972,7 +1980,11 @@ impl Client {
         // itself, so that is when it is kept.
         if let Some((apple_id, password)) = self.sign.finish() {
             self.session.apple_id = Some(apple_id);
-            self.session.password = Some(password);
+            self.session.password = if self.store.is_passwordless() {
+                None
+            } else {
+                Some(password)
+            };
         }
         if let Some(ws) = data.get("webservices") {
             self.session.webservices = Some(ws.clone());

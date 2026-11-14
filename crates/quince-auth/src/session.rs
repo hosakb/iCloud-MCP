@@ -221,6 +221,8 @@ impl Session {
 /// Normally the OS keyring (gnome-keyring / kwallet over the Secret Service API). Tests use
 /// a file instead, so a test run never touches the user's real keyring.
 enum Backend {
+    /// No secret persistence and no legacy-store access. Cooldowns stay process-local.
+    Memory(std::sync::Mutex<Cooldown>),
     /// The keyring entry's name: one per state directory.
     Keyring(String),
     File(PathBuf),
@@ -232,6 +234,8 @@ pub struct Store {
     /// Present while a sign-out has not yet reached the keyring (see [`Store::clear`]).
     sign_out_path: PathBuf,
     backend: Backend,
+    passwordless: bool,
+    service: Option<&'static str>,
 }
 
 /// How long to wait before trying to sign in again, kept where the keyring cannot lose it.
@@ -307,6 +311,11 @@ trait Secrets {
 
 /// The system keyring, under one service name.
 struct SystemKeyring(&'static str);
+
+/// The headless consumer must never launch an OS unlock dialog.
+pub fn may_unlock(service: &str) -> bool {
+    service != "skykeep-mcp"
+}
 
 /// Where the session is kept now.
 fn current() -> Result<SystemKeyring, String> {
@@ -462,7 +471,11 @@ mod secret_service {
             match items.as_slice() {
                 [] => Ok(None),
                 [item] => {
-                    item.ensure_unlocked()?;
+                    if super::may_unlock(service) {
+                        item.ensure_unlocked()?;
+                    } else if item.is_locked()? {
+                        return Err(dbus_secret_service::Error::Locked);
+                    }
                     f(item).map(Some)
                 }
                 _ => Err(dbus_secret_service::Error::NoResult),
@@ -496,7 +509,11 @@ mod secret_service {
                 return Ok(());
             }
             let collection = ss.get_default_collection()?;
-            collection.ensure_unlocked()?;
+            if super::may_unlock(service) {
+                collection.ensure_unlocked()?;
+            } else if collection.is_locked()? {
+                return Err(dbus_secret_service::Error::Locked);
+            }
             let mut attrs = attributes(service, user);
             attrs.insert("application", "rust-keyring");
             collection.create_item(
@@ -808,6 +825,62 @@ pub(crate) fn write_whole(path: &Path, bytes: &[u8], private: bool) -> std::io::
 const SIGN_OUT_PENDING: &str = "sign-out-pending";
 
 impl Store {
+    /// Keep durable session tokens, never an account password.
+    pub fn is_passwordless(&self) -> bool {
+        self.passwordless
+    }
+
+    pub fn without_passwords(mut self) -> Self {
+        self.passwordless = true;
+        self
+    }
+
+    /// Separate MCP namespace. Never imports or erases desktop keyring entries.
+    /// The caller must validate and exclusively lock the private state directory first.
+    pub fn isolated_keyring(state_dir: &Path) -> std::io::Result<Self> {
+        let state_dir = state_dir.canonicalize()?;
+        let mut store = Self::keyring(&state_dir)?.without_passwords();
+        store.service = Some("skykeep-mcp");
+        // Always path-specific, even when the folder has a desktop application name.
+        use sha2::{Digest, Sha256};
+        store.backend = Backend::Keyring(format!(
+            "session:{:x}",
+            Sha256::digest(state_dir.as_os_str().as_encoded_bytes())
+        ));
+        Ok(store)
+    }
+
+    fn current(&self) -> Result<SystemKeyring, String> {
+        match self.service {
+            Some(service) => Ok(SystemKeyring(service)),
+            None => current(),
+        }
+    }
+
+    fn previous(&self) -> Result<Vec<SystemKeyring>, String> {
+        if self.service.is_some() {
+            Ok(Vec::new())
+        } else {
+            previous()
+        }
+    }
+
+    /// A session owned by the running process only. Never reads or migrates a saved login.
+    pub fn memory() -> Self {
+        Self {
+            cookie_path: PathBuf::new(),
+            cooldown_path: PathBuf::new(),
+            sign_out_path: PathBuf::new(),
+            backend: Backend::Memory(std::sync::Mutex::new(Cooldown::default())),
+            passwordless: true,
+            service: None,
+        }
+    }
+
+    pub fn is_memory(&self) -> bool {
+        matches!(self.backend, Backend::Memory(_))
+    }
+
     /// Production: secrets in the OS keyring.
     pub fn keyring(state_dir: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(state_dir)?;
@@ -816,6 +889,8 @@ impl Store {
             cooldown_path: state_dir.join("cooldown.json"),
             sign_out_path: state_dir.join(SIGN_OUT_PENDING),
             backend: Backend::Keyring(entry_name(state_dir)),
+            passwordless: false,
+            service: None,
         })
     }
 
@@ -828,6 +903,8 @@ impl Store {
             cooldown_path: state_dir.join("cooldown.json"),
             sign_out_path: state_dir.join(SIGN_OUT_PENDING),
             backend: Backend::File(state_dir.join("session.json")),
+            passwordless: false,
+            service: None,
         })
     }
 
@@ -849,6 +926,12 @@ impl Store {
 
     /// What is owed, whoever owes it.
     pub fn load_cooldown(&self) -> Cooldown {
+        if let Backend::Memory(held) = &self.backend {
+            return held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+        }
         std::fs::read_to_string(&self.cooldown_path)
             .ok()
             .and_then(|json| serde_json::from_str(&json).ok())
@@ -858,6 +941,12 @@ impl Store {
     /// Written on its own, next to the cookies rather than into the keyring, so a machine
     /// with no keyring still remembers to wait.
     pub fn save_cooldown(&self, cooldown: &Cooldown) -> std::io::Result<()> {
+        if let Backend::Memory(held) = &self.backend {
+            *held
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = cooldown.clone();
+            return Ok(());
+        }
         let json = serde_json::to_string(cooldown).unwrap_or_else(|_| "{}".into());
         write_whole(&self.cooldown_path, json.as_bytes(), false)
     }
@@ -866,6 +955,7 @@ impl Store {
         match &self.backend {
             Backend::Keyring(name) => name.as_str(),
             Backend::File(_) => KEYRING_ENTRY,
+            Backend::Memory(_) => "skykeep-mcp-memory",
         }
     }
 
@@ -882,10 +972,11 @@ impl Store {
         let name = self.key_name();
         match &self.backend {
             Backend::Keyring(_) => {
-                let now = current().map_err(crate::Error::Keyring)?;
+                let now = self.current().map_err(crate::Error::Keyring)?;
                 f(&now, &name)
             }
             Backend::File(path) => f(&KeyFile(path.with_file_name("cookie-key")), &name),
+            Backend::Memory(_) => Err("Secret persistence is disabled".into()),
         }
         .map_err(crate::Error::Keyring)
     }
@@ -914,13 +1005,14 @@ impl Store {
         let name = format!("{}{ACCOUNT_SECRET}{id}", self.name());
         match &self.backend {
             Backend::Keyring(_) => {
-                let now = current().map_err(crate::Error::Keyring)?;
+                let now = self.current().map_err(crate::Error::Keyring)?;
                 f(&now, &name)
             }
             Backend::File(path) => f(
                 &KeyFile(path.with_file_name(format!("account-{id}"))),
                 &name,
             ),
+            Backend::Memory(_) => Err("Secret persistence is disabled".into()),
         }
         .map_err(crate::Error::Keyring)
     }
@@ -961,6 +1053,9 @@ impl Store {
     /// are erased now if it answers, and either way the answer is nothing stored. Otherwise a
     /// keyring locked at sign-out would sign the person back in on the next launch.
     pub fn try_load(&self) -> Result<Session, crate::Error> {
+        if self.is_memory() {
+            return Ok(Session::default());
+        }
         if self.sign_out_pending() {
             if let Err(e) = self.finish_sign_out() {
                 quiet!("quince: keyring: sign-out still waiting on it: {e:?}");
@@ -968,8 +1063,9 @@ impl Store {
             return Ok(Session::default());
         }
         let json = match &self.backend {
-            Backend::Keyring(_) => match current().and_then(|now| {
-                let before = previous()?;
+            Backend::Memory(_) => return Ok(Session::default()),
+            Backend::Keyring(_) => match self.current().and_then(|now| {
+                let before = self.previous()?;
                 let before: Vec<&dyn Secrets> = before.iter().map(|k| k as &dyn Secrets).collect();
                 read_moving(&now, &before, self.name(), part_size())
             }) {
@@ -985,24 +1081,35 @@ impl Store {
                 Err(e) => return Err(crate::Error::Keyring(e.to_string())),
             },
         };
-        Ok(serde_json::from_str(&json).unwrap_or_default())
+        let mut session: Session = serde_json::from_str(&json).unwrap_or_default();
+        if self.passwordless {
+            session.password = None;
+        }
+        Ok(session)
     }
 
     pub fn save(&self, session: &Session) -> Result<(), crate::Error> {
+        if self.is_memory() {
+            return Ok(());
+        }
         // A sign-out still owed is finished first: the new session is written over a keyring
         // with nothing of the old one left in it, and no later read refuses the new one.
         if self.sign_out_pending() {
             self.finish_sign_out()?;
         }
-        let json = serde_json::to_string(session)?;
+        let mut saved = session.clone();
+        if self.passwordless {
+            saved.password = None;
+        }
+        let json = serde_json::to_string(&saved)?;
         match &self.backend {
             Backend::Keyring(_) => {
-                let now = current().map_err(crate::Error::Keyring)?;
+                let now = self.current().map_err(crate::Error::Keyring)?;
                 write_secret(&now, self.name(), &json, part_size())
                     .map_err(crate::Error::Keyring)?;
                 // Anything still under an earlier name is older than this: gone, so a later
                 // sign-out cannot bring it back.
-                for before in previous().unwrap_or_default() {
+                for before in self.previous().unwrap_or_default() {
                     let _ = delete_secret(&before, self.name());
                 }
 
@@ -1023,6 +1130,7 @@ impl Store {
                 Ok(())
             }
             Backend::File(path) => Ok(std::fs::write(path, json)?),
+            Backend::Memory(_) => Ok(()),
         }
     }
 
@@ -1035,6 +1143,9 @@ impl Store {
     /// not answer, the next time it is asked for anything; until then nothing in it is read.
     /// An error only when the keyring refused and the sign-out could not be written down.
     pub fn clear(&self) -> Result<(), crate::Error> {
+        if self.is_memory() {
+            return Ok(());
+        }
         let marked = write_whole(&self.sign_out_path, b"", false);
         let cookies = match std::fs::remove_file(&self.cookie_path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
@@ -1057,13 +1168,16 @@ impl Store {
     /// is resumed (see [`Self::try_load`]).
     #[must_use]
     pub fn sign_out_pending(&self) -> bool {
-        self.sign_out_path.exists()
+        !self.is_memory() && self.sign_out_path.exists()
     }
 
     /// Erase every keyring entry the session left, and once all are gone, the note that a
     /// sign-out was owed. Every entry is tried even when one is refused; the first refusal is
     /// the answer, and the note stays for the next try.
     pub fn finish_sign_out(&self) -> Result<(), crate::Error> {
+        if self.is_memory() {
+            return Ok(());
+        }
         let mut refused: Option<crate::Error> = None;
         let mut note = |r: Result<(), crate::Error>| {
             if let Err(e) = r {
@@ -1071,14 +1185,15 @@ impl Store {
             }
         };
         match &self.backend {
+            Backend::Memory(_) => return Ok(()),
             Backend::Keyring(_) => {
                 note(
-                    current()
+                    self.current()
                         .and_then(|now| delete_secret(&now, self.name()))
                         .map_err(crate::Error::Keyring),
                 );
                 // And under every earlier name, or the next read would move it back.
-                match previous() {
+                match self.previous() {
                     Ok(before) => {
                         for k in before {
                             note(delete_secret(&k, self.name()).map_err(crate::Error::Keyring));
