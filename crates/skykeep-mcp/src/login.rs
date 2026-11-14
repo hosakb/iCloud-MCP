@@ -2,6 +2,11 @@
 use quince_auth::{Client, Error};
 use zeroize::Zeroizing;
 
+enum CodeRoute {
+    TrustedDevice,
+    Sms(u64),
+}
+
 pub fn auth_error(error: Error) -> &'static str {
     match error {
         Error::BadCredentials => "credentials_rejected",
@@ -32,33 +37,66 @@ where
         .map_err(auth_error)?;
     if outcome == quince_auth::SignInOutcome::NeedsTwoFactor {
         let options = client.two_factor_options().await.map_err(auth_error)?;
-        let label = format!(
-            "Code route: 0 for trusted device; phone IDs {:?} (hidden): ",
-            options.phones.iter().map(|p| p.id).collect::<Vec<_>>()
-        );
-        let route = prompt(&label)?;
-        let route: u64 = route.parse().map_err(|_| "invalid_code_route")?;
-        if route == 0 {
-            if options.trusted_device_count == 0 {
-                return Err("trusted_device_unavailable");
-            }
-            client.request_code().await.map_err(auth_error)?;
-        } else {
-            if !options.phones.iter().any(|p| p.id == route) {
-                return Err("invalid_code_route");
-            }
-            client.send_sms(route).await.map_err(auth_error)?;
+        let devices = options.trusted_device_count > 0;
+        let phones: Vec<_> = options.phones.iter().map(|p| p.id).collect();
+        if !devices && phones.is_empty() {
+            return Err("no_available_code_routes");
         }
+        let label = format!(
+            "{}Code route: {}{}phone IDs {:?} (hidden, Ctrl-C cancels): ",
+            if devices {
+                ""
+            } else {
+                "Trusted device unavailable. "
+            },
+            if devices {
+                "0 for trusted device; "
+            } else {
+                ""
+            },
+            if phones.contains(&0) {
+                "sms:0 for SMS phone ID 0; "
+            } else {
+                ""
+            },
+            phones
+        );
+        // A mistyped or unavailable route must not discard the completed credential step.
+        // Prompt errors still propagate immediately, including cancellation and timeout.
+        let mut retry = false;
+        let route = loop {
+            let answer = prompt(&if retry {
+                format!("Invalid or unavailable code route. {label}")
+            } else {
+                label.clone()
+            })?;
+            if answer.as_str() == "sms:0" && phones.contains(&0) {
+                break CodeRoute::Sms(0);
+            }
+            if let Ok(id) = answer.parse::<u64>() {
+                if id == 0 && devices {
+                    break CodeRoute::TrustedDevice;
+                }
+                if id != 0 && phones.contains(&id) {
+                    break CodeRoute::Sms(id);
+                }
+            }
+            retry = true;
+        };
+        match route {
+            CodeRoute::TrustedDevice => client.request_code().await,
+            CodeRoute::Sms(id) => client.send_sms(id).await,
+        }
+        .map_err(auth_error)?;
         for attempt in 0..3 {
             let code = prompt(if attempt == 0 {
                 "Apple verification code (hidden): "
             } else {
                 "Code incorrect or expired. New code (hidden): "
             })?;
-            let result = if route == 0 {
-                client.submit_two_factor(&code).await
-            } else {
-                client.submit_sms_code(route, &code).await
+            let result = match route {
+                CodeRoute::TrustedDevice => client.submit_two_factor(&code).await,
+                CodeRoute::Sms(id) => client.submit_sms_code(id, &code).await,
             };
             match result {
                 Ok(()) => break,

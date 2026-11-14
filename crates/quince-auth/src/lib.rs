@@ -388,7 +388,8 @@ fn trusted_phones(v: &Value) -> Vec<TrustedPhone> {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TwoFactorOptions {
-    /// Devices Apple pushed the code to. Zero means nothing will arrive on its own.
+    /// Trusted-device eligibility reported by this response, not confirmed code delivery.
+    /// Zero means this response advertises no eligible trusted-device route.
     pub trusted_device_count: u64,
     pub phones: Vec<TrustedPhone>,
     /// Apple refuses further sends for a while.
@@ -1412,10 +1413,10 @@ impl Client {
         }
     }
 
-    /// Where Apple can send a code, and whether it already pushed one.
+    /// Where Apple says it can send a code.
     ///
-    /// Worth reading whenever a code doesn't arrive: a `trusted_device_count` of zero means
-    /// no push was ever sent and SMS is the only route.
+    /// A zero count does not establish whether an earlier push was sent or received.
+    /// It means this response gives no eligible trusted-device route.
     pub async fn two_factor_options(&mut self) -> Result<TwoFactorOptions> {
         let mut headers = self.auth_headers();
         headers.insert("accept", HeaderValue::from_static("application/json"));
@@ -1442,15 +1443,22 @@ impl Client {
         }
         let v = auth_options_of(&text);
         let places = two_factor_places(&v);
+        // Field names alone are not availability evidence: a malformed count or boolean
+        // used to be accepted as an explicit zero. Keep the numeric and boolean schemas,
+        // without guessing at unsupported representations.
         let says_where = places.iter().any(|p| {
-            [
-                "trustedDeviceCount",
-                "hasTrustedDevices",
-                "trustedPhoneNumbers",
-                "trustedPhoneNumber",
-            ]
-            .iter()
-            .any(|k| p.get(*k).is_some())
+            p.get("trustedDeviceCount")
+                .and_then(Value::as_u64)
+                .is_some()
+                || p.get("hasTrustedDevices")
+                    .and_then(Value::as_bool)
+                    .is_some()
+                || p.get("trustedPhoneNumbers")
+                    .and_then(Value::as_array)
+                    .is_some()
+                || p.get("trustedPhoneNumber")
+                    .and_then(Value::as_object)
+                    .is_some()
         });
         // A security-key account names no devices and no numbers: its answer is the key
         // challenge. Said as such, so the screen can tell the person, rather than refused as an
