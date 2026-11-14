@@ -37,22 +37,22 @@ where
         .map_err(auth_error)?;
     if outcome == quince_auth::SignInOutcome::NeedsTwoFactor {
         let options = client.two_factor_options().await.map_err(auth_error)?;
+        // Apple's reported count is not a reliable gate: a code has arrived on a trusted device
+        // while this answer reported zero. Like the desktop app's code screen, the trusted-device
+        // route is always offered; a zero count only adds a note.
         let devices = options.trusted_device_count > 0;
         let phones: Vec<_> = options.phones.iter().map(|p| p.id).collect();
-        if !devices && phones.is_empty() {
-            return Err("no_available_code_routes");
+        // A security-key-only answer offers no code at all (the desktop app shows its
+        // security-key screen instead); Skykeep cannot answer the key challenge.
+        if options.security_key && !devices && phones.is_empty() {
+            return Err("security_key_sign_in_unsupported");
         }
         let label = format!(
-            "{}Code route: {}{}phone IDs {:?} (hidden, Ctrl-C cancels): ",
+            "{}Code route: 0 for trusted device; {}phone IDs {:?} (hidden, Ctrl-C cancels): ",
             if devices {
                 ""
             } else {
-                "Trusted device unavailable. "
-            },
-            if devices {
-                "0 for trusted device; "
-            } else {
-                ""
+                "Apple reported no trusted devices, but a code may still arrive on them. "
             },
             if phones.contains(&0) {
                 "sms:0 for SMS phone ID 0; "
@@ -74,7 +74,7 @@ where
                 break CodeRoute::Sms(0);
             }
             if let Ok(id) = answer.parse::<u64>() {
-                if id == 0 && devices {
+                if id == 0 {
                     break CodeRoute::TrustedDevice;
                 }
                 if id != 0 && phones.contains(&id) {

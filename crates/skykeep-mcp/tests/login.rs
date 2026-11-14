@@ -254,6 +254,24 @@ async fn route_case(
             .count(),
         usize::from(expected.is_ok() && expected_sms.is_none())
     );
+    if expected.is_ok() && expected_sms.is_none() {
+        // Apple waits to be asked (PUT) before pushing a code to trusted devices; the
+        // verification POST must follow that request.
+        let put = requests.iter().position(|r| {
+            r.method == "PUT" && r.url.path().ends_with("/verify/trusteddevice/securitycode")
+        });
+        let post = requests.iter().position(|r| {
+            r.method == "POST" && r.url.path().ends_with("/verify/trusteddevice/securitycode")
+        });
+        assert!(
+            put.is_some() && put < post,
+            "PUT {put:?} before POST {post:?}"
+        );
+        let body = requests[post.unwrap()]
+            .body_json::<serde_json::Value>()
+            .unwrap();
+        assert_eq!(body["securityCode"]["code"], "123456");
+    }
     labels
 }
 
@@ -265,12 +283,13 @@ fn sms_only_options() -> serde_json::Value {
     }}})
 }
 
+const ZERO_DEVICE_NOTE: &str = "Apple reported no trusted devices";
+
 #[tokio::test]
-async fn unavailable_and_malformed_routes_retry_sms_without_new_credentials() {
+async fn malformed_routes_retry_sms_without_new_credentials() {
     let labels = route_case(
         sms_only_options(),
         &[
-            Ok("0"),
             Ok(""),
             Ok("   "),
             Ok("not-a-route"),
@@ -284,11 +303,45 @@ async fn unavailable_and_malformed_routes_retry_sms_without_new_credentials() {
     )
     .await;
     for label in &labels[2..labels.len() - 1] {
-        assert!(!label.contains("0 for trusted device"), "{label}");
+        assert!(label.contains("0 for trusted device"), "{label}");
         assert!(label.contains("[7]"), "{label}");
     }
-    assert!(labels[2].contains("Trusted device unavailable"));
+    assert!(labels[2].contains(ZERO_DEVICE_NOTE), "{}", labels[2]);
     assert!(labels[3].contains("Invalid or unavailable code route"));
+}
+
+// Apple's count is not a reliable gate: a live account reported zero trusted devices while a
+// code still arrived on its trusted device. The original app always offers that route.
+#[tokio::test]
+async fn trusted_device_route_works_when_apple_reports_zero_devices() {
+    let labels = route_case(sms_only_options(), &[Ok("0"), Ok("123456")], Ok(()), None).await;
+    assert!(labels[2].contains("0 for trusted device"), "{}", labels[2]);
+    assert!(labels[2].contains(ZERO_DEVICE_NOTE), "{}", labels[2]);
+}
+
+#[tokio::test]
+async fn trusted_device_route_works_with_zero_devices_and_no_phones() {
+    let labels = route_case(
+        json!({"trustedDeviceCount": 0, "trustedPhoneNumbers": []}),
+        &[Ok("0"), Ok("123456")],
+        Ok(()),
+        None,
+    )
+    .await;
+    assert!(labels[2].contains("0 for trusted device"), "{}", labels[2]);
+    assert!(labels[2].contains(ZERO_DEVICE_NOTE), "{}", labels[2]);
+}
+
+#[tokio::test]
+async fn reported_trusted_devices_omit_zero_device_note() {
+    let labels = route_case(
+        json!({"trustedDeviceCount": 1, "trustedPhoneNumbers": []}),
+        &[Ok("0"), Ok("123456")],
+        Ok(()),
+        None,
+    )
+    .await;
+    assert!(!labels[2].contains(ZERO_DEVICE_NOTE), "{}", labels[2]);
 }
 
 #[tokio::test]
@@ -304,12 +357,14 @@ async fn malformed_route_can_retry_an_existing_sms_route() {
     assert!(labels[2].contains("0 for trusted device"));
 }
 
+// A security-key-only answer offers no code at all; the original app shows its security-key
+// screen instead of a code prompt. Keep refusing before any route prompt.
 #[tokio::test]
-async fn no_eligible_code_routes_fail_before_route_prompt() {
+async fn security_key_only_answer_fails_before_route_prompt() {
     route_case(
-        json!({"trustedDeviceCount": 0, "trustedPhoneNumbers": []}),
+        json!({"fsaChallenge": {"challenge": "Y2hhbGxlbmdl", "keyHandles": ["aGFuZGxl"], "rpId": "apple.com"}}),
         &[],
-        Err("no_available_code_routes"),
+        Err("security_key_sign_in_unsupported"),
         None,
     )
     .await;
@@ -318,7 +373,13 @@ async fn no_eligible_code_routes_fail_before_route_prompt() {
 #[tokio::test]
 async fn route_retry_preserves_cancellation_and_timeout() {
     for error in ["input_cancelled", "input_timeout"] {
-        route_case(sms_only_options(), &[Ok("0"), Err(error)], Err(error), None).await;
+        route_case(
+            sms_only_options(),
+            &[Ok("99"), Err(error)],
+            Err(error),
+            None,
+        )
+        .await;
     }
 }
 
@@ -333,21 +394,23 @@ async fn sms_zero_is_selectable_with_and_without_trusted_devices() {
         )
         .await;
         assert!(labels[2].contains("sms:0"), "{}", labels[2]);
-        assert_eq!(labels[2].contains("0 for trusted device"), devices > 0);
+        assert!(labels[2].contains("0 for trusted device"), "{}", labels[2]);
     }
 }
 
 #[tokio::test]
 async fn trusted_zero_remains_distinct_from_sms_zero() {
-    let labels = route_case(
-        json!({"trustedDeviceCount": 1, "trustedPhoneNumbers": [{"id": 0}]}),
-        &[Ok("0"), Ok("123456")],
-        Ok(()),
-        None,
-    )
-    .await;
-    assert!(labels[2].contains("0 for trusted device"));
-    assert!(labels[2].contains("sms:0"));
+    for devices in [0, 1] {
+        let labels = route_case(
+            json!({"trustedDeviceCount": devices, "trustedPhoneNumbers": [{"id": 0}]}),
+            &[Ok("0"), Ok("123456")],
+            Ok(()),
+            None,
+        )
+        .await;
+        assert!(labels[2].contains("0 for trusted device"), "{}", labels[2]);
+        assert!(labels[2].contains("sms:0"), "{}", labels[2]);
+    }
 }
 
 #[tokio::test]

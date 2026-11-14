@@ -388,8 +388,9 @@ fn trusted_phones(v: &Value) -> Vec<TrustedPhone> {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TwoFactorOptions {
-    /// Trusted-device eligibility reported by this response, not confirmed code delivery.
-    /// Zero means this response advertises no eligible trusted-device route.
+    /// Trusted devices as Apple's answer reports them, not confirmed code delivery. Not a
+    /// reliable gate: a code has reached a trusted device while this read zero, so callers
+    /// should still offer the trusted-device route when it is zero.
     pub trusted_device_count: u64,
     pub phones: Vec<TrustedPhone>,
     /// Apple refuses further sends for a while.
@@ -1415,8 +1416,8 @@ impl Client {
 
     /// Where Apple says it can send a code.
     ///
-    /// A zero count does not establish whether an earlier push was sent or received.
-    /// It means this response gives no eligible trusted-device route.
+    /// The trusted-device count is Apple's report only: zero establishes neither that no push
+    /// was sent nor that the trusted-device route is unavailable.
     pub async fn two_factor_options(&mut self) -> Result<TwoFactorOptions> {
         let mut headers = self.auth_headers();
         headers.insert("accept", HeaderValue::from_static("application/json"));
