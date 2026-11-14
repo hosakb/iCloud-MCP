@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["probe", "crates/quince-mobile", "crates/quince-auth", "crates/quince-core", "crates/quince-icloud", "crates/quince-media", "crates/quince-vfs", "crates/quince-thumbs", "crates/quince-sync", "crates/uniffi-bindgen", "src-tauri"]
+default-members = ["crates/skykeep-mcp"]
+members = ["crates/skykeep-mcp", "probe", "crates/quince-mobile", "crates/quince-auth", "crates/quince-core", "crates/quince-icloud", "crates/quince-media", "crates/quince-vfs", "crates/quince-thumbs", "crates/quince-sync", "crates/uniffi-bindgen", "src-tauri"]
 
 [workspace.package]
 edition = "2021"
