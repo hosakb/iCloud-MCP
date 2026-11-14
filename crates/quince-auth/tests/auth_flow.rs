@@ -1315,6 +1315,59 @@ async fn a_failed_answer_is_never_nowhere_to_send() {
     }
 }
 
+/// Synthetic options using the numeric count and boolean bootstrap schemas already supported
+/// here. `direct.hasTrustedDevices` is also read by timlaing/pyicloud's
+/// `Hsa2BootContext.from_auth_options`; these are not captured Apple account responses.
+#[tokio::test]
+async fn trusted_device_availability_uses_typed_count_or_bootstrap_boolean() {
+    for (value, expected) in [
+        (json!({"trustedDeviceCount": 2}), Some(2)),
+        (
+            json!({"trustedDeviceCount": 0, "hasTrustedDevices": true}),
+            Some(0),
+        ),
+        (json!({"hasTrustedDevices": true}), Some(1)),
+        (json!({"hasTrustedDevices": false}), Some(0)),
+        (json!({"direct": {"hasTrustedDevices": true}}), Some(1)),
+        (json!({"direct": {"hasTrustedDevices": false}}), Some(0)),
+        (json!({"trustedPhoneNumbers": []}), Some(0)),
+        (json!({"trustedDeviceCount": "2"}), None),
+        (json!({"trustedDeviceCount": -1}), None),
+        (json!({"hasTrustedDevices": "true"}), None),
+        (json!({"trustedDeviceCount": null}), None),
+    ] {
+        for html in [false, true] {
+            let server = MockServer::start().await;
+            let response = if html {
+                ResponseTemplate::new(200).set_body_string(format!(
+                    "<script type=\"application/json\" class=\"boot_args\">{value}</script>"
+                ))
+            } else {
+                ResponseTemplate::new(200).set_body_json(&value)
+            };
+            Mock::given(method("GET"))
+                .and(path("/appleauth/auth"))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut client = client_for(&server, dir.path());
+            let result = client.two_factor_options().await;
+            match expected {
+                Some(count) => assert_eq!(
+                    result.unwrap().trusted_device_count,
+                    count,
+                    "{value}; html={html}"
+                ),
+                None => assert!(
+                    result.is_err(),
+                    "malformed availability is not an explicit zero: {value}; html={html}"
+                ),
+            }
+        }
+    }
+}
+
 /// The Hidden album's password check, with the password kept from a finished sign-in: the
 /// kept one is accepted on this computer, Apple never asked.
 #[tokio::test]

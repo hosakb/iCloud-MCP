@@ -144,6 +144,303 @@ async fn sms_route_uses_only_an_offered_phone_id() {
     }
 }
 
+// All options and inputs below are synthetic, never a captured account response.
+async fn route_case(
+    options: serde_json::Value,
+    answers: &[Result<&str, &'static str>],
+    expected: Result<(), &'static str>,
+    expected_sms: Option<u64>,
+) -> Vec<String> {
+    let server = MockServer::start().await;
+    mock_auth(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/appleauth/auth"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(options))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    for (verb, endpoint) in [
+        ("PUT", "/appleauth/auth/verify/phone"),
+        ("POST", "/appleauth/auth/verify/phone/securitycode"),
+    ] {
+        Mock::given(method(verb))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut client = Client::with(
+        dir.path(),
+        Endpoints::at(&server.uri()),
+        Store::file(dir.path()).unwrap().without_passwords(),
+    )
+    .unwrap();
+    let mut inputs = [Ok("fixture@example.invalid"), Ok("SYNTHETIC-PASSWORD")]
+        .into_iter()
+        .chain(answers.iter().copied());
+    let mut labels = Vec::new();
+    let result = authenticate(&mut client, &mut |label| {
+        labels.push(label.to_string());
+        inputs
+            .next()
+            .expect("unexpected extra prompt")
+            .map(|s| Zeroizing::new(s.to_string()))
+    })
+    .await;
+    assert_eq!(result, expected);
+    assert!(inputs.next().is_none(), "all route inputs consumed");
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|l| l.starts_with("Apple Account ("))
+            .count(),
+        1
+    );
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|l| l.starts_with("Apple Account password"))
+            .count(),
+        1
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/signin/init"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/signin/complete"))
+            .count(),
+        1
+    );
+    let phone_requests: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.path().contains("/verify/phone"))
+        .collect();
+    if expected.is_ok() {
+        assert_eq!(
+            phone_requests.len(),
+            if expected_sms.is_some() { 2 } else { 0 }
+        );
+        for request in phone_requests {
+            let body = request.body_json::<serde_json::Value>().unwrap();
+            assert_eq!(body["phoneNumber"]["id"], expected_sms.unwrap());
+            if request.url.path().ends_with("/securitycode") {
+                assert_eq!(request.method, "POST");
+                assert_eq!(body["securityCode"]["code"], "123456");
+            } else {
+                assert_eq!(request.method, "PUT");
+                assert_eq!(body["mode"], "sms");
+            }
+        }
+        assert_eq!(client.session().dsid.as_deref(), Some("1234567890"));
+        assert!(client.session().password.is_none());
+    } else {
+        assert!(phone_requests.is_empty());
+        assert!(!dir.path().join("session.json").exists());
+    }
+    // Only exclude trusted-device POST verification for SMS/error cases. sign_in already
+    // attempts a trusted-device PUT dispatch before fetching the available routes.
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.method == "POST" && r.url.path().contains("/verify/trusteddevice"))
+            .count(),
+        usize::from(expected.is_ok() && expected_sms.is_none())
+    );
+    if expected.is_ok() && expected_sms.is_none() {
+        // Apple waits to be asked (PUT) before pushing a code to trusted devices; the
+        // verification POST must follow that request.
+        let put = requests.iter().position(|r| {
+            r.method == "PUT" && r.url.path().ends_with("/verify/trusteddevice/securitycode")
+        });
+        let post = requests.iter().position(|r| {
+            r.method == "POST" && r.url.path().ends_with("/verify/trusteddevice/securitycode")
+        });
+        assert!(
+            put.is_some() && put < post,
+            "PUT {put:?} before POST {post:?}"
+        );
+        let body = requests[post.unwrap()]
+            .body_json::<serde_json::Value>()
+            .unwrap();
+        assert_eq!(body["securityCode"]["code"], "123456");
+    }
+    labels
+}
+
+fn sms_only_options() -> serde_json::Value {
+    json!({"direct": {"hasTrustedDevices": false, "twoSV": {
+        "bridgeInitiateData": {"phoneNumberVerification": {
+            "trustedPhoneNumbers": [{"id": 7, "pushMode": "sms"}]
+        }}
+    }}})
+}
+
+const ZERO_DEVICE_NOTE: &str = "Apple reported no trusted devices";
+
+#[tokio::test]
+async fn malformed_routes_retry_sms_without_new_credentials() {
+    let labels = route_case(
+        sms_only_options(),
+        &[
+            Ok(""),
+            Ok("   "),
+            Ok("not-a-route"),
+            Ok("18446744073709551616"),
+            Ok("99"),
+            Ok("7"),
+            Ok("123456"),
+        ],
+        Ok(()),
+        Some(7),
+    )
+    .await;
+    for label in &labels[2..labels.len() - 1] {
+        assert!(label.contains("0 for trusted device"), "{label}");
+        assert!(label.contains("[7]"), "{label}");
+    }
+    assert!(labels[2].contains(ZERO_DEVICE_NOTE), "{}", labels[2]);
+    assert!(labels[3].contains("Invalid or unavailable code route"));
+}
+
+// Apple's count is not a reliable gate: a live account reported zero trusted devices while a
+// code still arrived on its trusted device. The original app always offers that route.
+#[tokio::test]
+async fn trusted_device_route_works_when_apple_reports_zero_devices() {
+    let labels = route_case(sms_only_options(), &[Ok("0"), Ok("123456")], Ok(()), None).await;
+    assert!(labels[2].contains("0 for trusted device"), "{}", labels[2]);
+    assert!(labels[2].contains(ZERO_DEVICE_NOTE), "{}", labels[2]);
+}
+
+#[tokio::test]
+async fn trusted_device_route_works_with_zero_devices_and_no_phones() {
+    let labels = route_case(
+        json!({"trustedDeviceCount": 0, "trustedPhoneNumbers": []}),
+        &[Ok("0"), Ok("123456")],
+        Ok(()),
+        None,
+    )
+    .await;
+    assert!(labels[2].contains("0 for trusted device"), "{}", labels[2]);
+    assert!(labels[2].contains(ZERO_DEVICE_NOTE), "{}", labels[2]);
+}
+
+#[tokio::test]
+async fn reported_trusted_devices_omit_zero_device_note() {
+    let labels = route_case(
+        json!({"trustedDeviceCount": 1, "trustedPhoneNumbers": []}),
+        &[Ok("0"), Ok("123456")],
+        Ok(()),
+        None,
+    )
+    .await;
+    assert!(!labels[2].contains(ZERO_DEVICE_NOTE), "{}", labels[2]);
+}
+
+#[tokio::test]
+async fn malformed_route_can_retry_an_existing_sms_route() {
+    let labels = route_case(
+        json!({"trustedDeviceCount": 1,
+        "trustedPhoneNumbers": [{"id": 7}]}),
+        &[Ok("bad"), Ok("7"), Ok("123456")],
+        Ok(()),
+        Some(7),
+    )
+    .await;
+    assert!(labels[2].contains("0 for trusted device"));
+}
+
+// A security-key-only answer offers no code at all; the original app shows its security-key
+// screen instead of a code prompt. Keep refusing before any route prompt.
+#[tokio::test]
+async fn security_key_only_answer_fails_before_route_prompt() {
+    route_case(
+        json!({"fsaChallenge": {"challenge": "Y2hhbGxlbmdl", "keyHandles": ["aGFuZGxl"], "rpId": "apple.com"}}),
+        &[],
+        Err("security_key_sign_in_unsupported"),
+        None,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn route_retry_preserves_cancellation_and_timeout() {
+    for error in ["input_cancelled", "input_timeout"] {
+        route_case(
+            sms_only_options(),
+            &[Ok("99"), Err(error)],
+            Err(error),
+            None,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn sms_zero_is_selectable_with_and_without_trusted_devices() {
+    for devices in [0, 1] {
+        let labels = route_case(
+            json!({"trustedDeviceCount": devices, "trustedPhoneNumbers": [{"id": 0}]}),
+            &[Ok("bad"), Ok("sms:0"), Ok("123456")],
+            Ok(()),
+            Some(0),
+        )
+        .await;
+        assert!(labels[2].contains("sms:0"), "{}", labels[2]);
+        assert!(labels[2].contains("0 for trusted device"), "{}", labels[2]);
+    }
+}
+
+#[tokio::test]
+async fn trusted_zero_remains_distinct_from_sms_zero() {
+    for devices in [0, 1] {
+        let labels = route_case(
+            json!({"trustedDeviceCount": devices, "trustedPhoneNumbers": [{"id": 0}]}),
+            &[Ok("0"), Ok("123456")],
+            Ok(()),
+            None,
+        )
+        .await;
+        assert!(labels[2].contains("0 for trusted device"), "{}", labels[2]);
+        assert!(labels[2].contains("sms:0"), "{}", labels[2]);
+    }
+}
+
+#[tokio::test]
+async fn zero_phone_route_retries_preserve_cancellation_and_timeout() {
+    for devices in [0, 1] {
+        for error in ["input_cancelled", "input_timeout"] {
+            route_case(
+                json!({"trustedDeviceCount": devices, "trustedPhoneNumbers": [{"id": 0}]}),
+                &[Ok("99"), Err(error)],
+                Err(error),
+                None,
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn unadvertised_sms_zero_retries_an_offered_positive_phone_id() {
+    let labels = route_case(
+        sms_only_options(),
+        &[Ok("sms:0"), Ok("7"), Ok("123456")],
+        Ok(()),
+        Some(7),
+    )
+    .await;
+    assert!(!labels[2].contains("sms:0"));
+    assert!(labels[3].contains("Invalid or unavailable code route"));
+}
+
 #[tokio::test]
 async fn cancelled_login_cannot_save_partial_session() {
     let dir = tempfile::tempdir().unwrap();
