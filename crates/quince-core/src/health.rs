@@ -85,6 +85,15 @@ impl Library {
         Ok(())
     }
 
+    /// Make the next pass of this service a full one, as if none had run.
+    pub fn forget_full_sync(&self, service: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sync_state SET last_full_at = NULL WHERE service = ?1",
+            params![service],
+        )?;
+        Ok(())
+    }
+
     /// Every service the library has ever tried to refresh.
     pub fn sync_health(&self) -> Result<Vec<ServiceHealth>> {
         let mut stmt = self.conn.prepare(

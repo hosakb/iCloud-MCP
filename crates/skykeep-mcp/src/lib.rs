@@ -445,18 +445,22 @@ impl Server {
         let refused = library
             .outbox_refused()
             .map_err(|_| "library_unavailable")?;
+        // Upstream reasons can hold HTTP text; the terminal gets a bounded line with no
+        // control or text-direction characters that could rearrange what is shown.
+        let plain = |text: &str, limit: usize| -> String {
+            text.chars()
+                .filter(|c| {
+                    !c.is_control()
+                        && !matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+                })
+                .take(limit)
+                .collect()
+        };
         Ok(refused
             .iter()
             .map(|r| {
-                // Upstream reasons can hold HTTP text; the terminal gets a bounded line.
-                let reason: String = r
-                    .reason
-                    .chars()
-                    .filter(|c| !c.is_control())
-                    .take(160)
-                    .collect();
-                json!({"id":r.change.id,"service":r.change.service,"kind":r.change.kind,
-                    "record":r.change.record,"reason":reason,"refused_at":r.refused_at})
+                json!({"id":r.change.id,"service":plain(&r.change.service, 40),"kind":plain(&r.change.kind, 40),
+                    "record":plain(&r.change.record, 200),"reason":plain(&r.reason, 160),"refused_at":r.refused_at})
             })
             .collect())
     }
@@ -770,11 +774,12 @@ impl Server {
                 let _: Empty = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
                 let health = library.sync_health().map_err(|_| "library_unavailable")?;
                 let refused = library
-                    .outbox_refused()
+                    .outbox_refused_brief()
                     .map_err(|_| "library_unavailable")?;
                 let mut services = Vec::new();
                 for service in ["notes", "reminders"] {
                     let h = health.iter().find(|h| h.service == service);
+                    let mine: Vec<_> = refused.iter().filter(|r| r.service == service).collect();
                     let pending = library
                         .outbox_pending(service)
                         .map_err(|_| "library_unavailable")?
@@ -783,7 +788,10 @@ impl Server {
                     services.push(
                         json!({"service":service,"last_synced_at":h.and_then(|h| h.last_synced_at),
                         "last_error":h.is_some_and(|h| h.last_error.is_some()),"pending":pending,
-                        "refused":refused.iter().filter(|r| r.change.service == service).count()}),
+                        "refused":mine.len(),
+                        // Identifiers and reason codes only, newest last, so the user can be
+                        // told which approved write will not be sent and why.
+                        "refused_recent":mine[mine.len().saturating_sub(20)..].iter().map(|r| sync::refused_view(r)).collect::<Vec<_>>()}),
                     );
                 }
                 Ok(json!({"source":"local_cache","services":services,"remote_verified":false}))

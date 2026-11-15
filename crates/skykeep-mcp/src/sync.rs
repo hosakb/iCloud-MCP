@@ -62,12 +62,10 @@ fn send_context(
                 .note(&p.record)
                 .map_err(|_| "library_unavailable")?
                 .ok_or("not_found")?;
+            // `Note.runs` never serializes; the sender takes runs from the payload.
             if kind == "save" {
                 item.body = library
                     .note_body(&p.record)
-                    .map_err(|_| "library_unavailable")?;
-                item.runs = library
-                    .note_runs(&p.record)
                     .map_err(|_| "library_unavailable")?;
             }
             bounded_context(json!({"item":crate::bounded_json(&item)?}))
@@ -105,8 +103,10 @@ fn bounded_context(context: Value) -> Result<Value, &'static str> {
 
 /// Grant failures that belong to one queued write. Anything else (an unreadable library,
 /// a changed policy, account or directory) still stops the whole pass.
-const QUARANTINABLE: [&str; 9] = [
+const QUARANTINABLE: [&str; 11] = [
     "payload_too_large",
+    "preview_too_large",
+    "invalid_preview",
     "legacy_write_quarantined",
     "authorization_too_large",
     "invalid_authorization",
@@ -129,13 +129,48 @@ fn quarantine_unauthorized(library: &mut Library, dir: &Path) -> Result<(), &'st
             Err(reason) if QUARANTINABLE.contains(&reason) => library
                 .atomically(|library| -> quince_core::Result<()> {
                     library.outbox_refuse(p.id, &format!("mcp_quarantine:{reason}"))?;
-                    library.set_state(&format!("mcp.authorization.{}", p.id), "")
+                    library.set_state(&format!("mcp.authorization.{}", p.id), "")?;
+                    library.set_state(&reread_key(&p.service), "1")
                 })
                 .map_err(|_| "library_unavailable")?,
             Err(error) => return Err(error),
         }
     }
     Ok(())
+}
+
+/// Set when a write is quarantined: the cache still shows it as if on its way. The next
+/// pass that reaches the drain re-reads the service in full, which replays only waiting
+/// writes, and clears this once that pass succeeds. Kept until then, across failures.
+fn reread_key(service: &str) -> String {
+    format!("mcp.full_reread.{service}")
+}
+
+/// Skykeep's own refusal codes are shown; engine and Apple reasons can hold HTTP text.
+fn shown_reason(reason: &str) -> &str {
+    if reason.starts_with("mcp_quarantine:")
+        || reason == "mcp_policy_migration_quarantine"
+        || reason == "superseded_by_approved_deletion"
+    {
+        reason
+    } else {
+        "refused_by_sync_engine"
+    }
+}
+
+/// A refused write as MCP may show it: identifiers and a reason code, never the payload.
+pub(crate) fn refused_view(r: &quince_core::outbox::RefusedBrief) -> Value {
+    json!({"id":r.id,"service":r.service,"kind":r.kind,"record":r.record,"reason":shown_reason(&r.reason)})
+}
+
+fn refused_ids(dir: &Path) -> Result<Vec<i64>, &'static str> {
+    let library = Library::open(dir).map_err(|_| "library_unavailable")?;
+    Ok(library
+        .outbox_refused_brief()
+        .map_err(|_| "library_unavailable")?
+        .into_iter()
+        .map(|r| r.id)
+        .collect())
 }
 
 pub(crate) fn record_authorization(
@@ -221,6 +256,7 @@ fn refresh_gate(dir: &Path, approved: bool) -> Result<bool, &'static str> {
 }
 
 pub(crate) async fn run_authorized(dir: &Path, approved: bool) -> Result<Value, &'static str> {
+    let before = refused_ids(dir)?;
     refresh_gate(dir, approved)?;
     let store = Store::isolated_keyring(dir).map_err(|_| "secure_storage_unavailable")?;
     let session = store
@@ -230,30 +266,34 @@ pub(crate) async fn run_authorized(dir: &Path, approved: bool) -> Result<Value, 
         return Err("login_required");
     }
     let client = Client::with(dir, Endpoints::default(), store).map_err(|_| "login_required")?;
-    with_client_inner(dir, client, approved).await
+    with_client_inner(dir, client, approved, before).await
 }
 
 /// Test seam with synthetic endpoints. Production constructs its own Apple-only client.
 /// Caller holds the private directory's exclusive operation lock.
 pub async fn with_client(dir: &Path, client: Client) -> Result<Value, &'static str> {
-    with_client_inner(dir, client, false).await
+    let before = refused_ids(dir)?;
+    with_client_inner(dir, client, false, before).await
 }
 
+/// `before` holds the refused ids from before this sync's first gate, so the reply can
+/// name every write this sync refused or quarantined.
 async fn with_client_inner(
     dir: &Path,
     client: Client,
     approved: bool,
+    before: Vec<i64>,
 ) -> Result<Value, &'static str> {
     let configured = refresh_gate(dir, approved)?;
     if configured {
         tokio::time::timeout(
             std::time::Duration::from_secs(60),
-            sync_pass(dir, client, true),
+            sync_pass(dir, client, true, &before),
         )
         .await
         .map_err(|_| "sync_timeout_delivery_uncertain")?
     } else {
-        sync_pass(dir, client, false).await
+        sync_pass(dir, client, false, &before).await
     }
 }
 
@@ -261,6 +301,7 @@ async fn sync_pass(
     dir: &Path,
     mut client: Client,
     configured: bool,
+    before_refused: &[i64],
 ) -> Result<Value, &'static str> {
     if !client
         .resume()
@@ -300,13 +341,13 @@ async fn sync_pass(
                 let params = ctx.params.clone();
                 async move {
                     if configured {
-                        let library = data.lock().await;
-                        authorized(&library, dir, &p).map_err(|_| {
-                            quince_icloud::Error::Refused(
-                                "Skykeep write authorization is missing or stale; quarantined"
-                                    .into(),
-                            )
-                        })?;
+                        let mut library = data.lock().await;
+                        if let Err(reason) = authorized(&library, dir, &p) {
+                            let _ = library.set_state(&reread_key(service), "1");
+                            return Err(quince_icloud::Error::Refused(format!(
+                                "mcp_quarantine:{reason}"
+                            )));
+                        }
                     }
                     if service == "notes" {
                         quince_sync::notes::send(data, http, root, params, p).await
@@ -318,16 +359,51 @@ async fn sync_pass(
             .await;
             sent = report.sent;
         }
-        let after = if sent {
+        let reread = configured
+            && matches!(before.outcome, pass::Outcome::Ok)
+            && data
+                .lock()
+                .await
+                .state(&reread_key(service))
+                .map_err(|_| "library_unavailable")?
+                .as_deref()
+                == Some("1");
+        if reread {
+            data.lock()
+                .await
+                .forget_full_sync(service)
+                .map_err(|_| "library_unavailable")?;
+        }
+        let after = if sent || reread {
             pass::run(service, &ctx, &data, &lock).await
         } else {
             before
         };
+        if reread && matches!(after.outcome, pass::Outcome::Ok) {
+            data.lock()
+                .await
+                .set_state(&reread_key(service), "")
+                .map_err(|_| "library_unavailable")?;
+        }
         // Raw upstream error details can contain HTTP bodies. Expose only typed outcomes.
         services.push(json!({"service":service,"outcome":after.outcome,"sent":sent,"last_synced_at":after.last_synced_at}));
     }
     let library = data.lock().await;
+    let refused = library
+        .outbox_refused_brief()
+        .map_err(|_| "library_unavailable")?;
+    let waiting = library
+        .outbox_count()
+        .map_err(|_| "library_unavailable")?
+        .saturating_sub(refused.len());
+    // Bounded: admission stops at MAX_PENDING waiting writes, and each is refused at most once.
+    let refused_now: Vec<Value> = refused
+        .iter()
+        .filter(|r| !before_refused.contains(&r.id))
+        .take(MAX_PENDING)
+        .map(refused_view)
+        .collect();
     Ok(
-        json!({"services":services,"queued":library.outbox_count().map_err(|_| "library_unavailable")?,"remote_verified":false,"verification":"upstream sync and replay only; field-level read-back is not guaranteed"}),
+        json!({"services":services,"queued":waiting,"refused":refused.len(),"refused_this_sync":refused_now,"remote_verified":false,"verification":"upstream sync and replay only; field-level read-back is not guaranteed"}),
     )
 }

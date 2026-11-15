@@ -89,6 +89,25 @@ async fn family() -> (tempfile::TempDir, skykeep_mcp::Server, quince_core::Libra
             })
             .unwrap();
     }
+    library
+        .put_notes(&[quince_core::notes::Note {
+            guid: "note".into(),
+            title: "note".into(),
+            folder_guid: None,
+            snippet: None,
+            body: None,
+            locked: false,
+            pinned: false,
+            created_at: None,
+            modified_at: None,
+            runs: None,
+            editable: true,
+            etag: Some("n1".into()),
+        }])
+        .unwrap();
+    library
+        .set_note_text("note", "note\nbody", "note", Some("body"))
+        .unwrap();
     // A prior full sync, so the synthetic pass is incremental and keeps these items.
     for service in ["notes", "reminders"] {
         library.mark_synced(service, Some("prior")).unwrap();
@@ -478,4 +497,188 @@ async fn legacy_queue_larger_than_admission_cap_can_still_migrate() {
     server.set_policy("writes_only").unwrap();
     assert_eq!(library.outbox_pending("reminders").unwrap().len(), 0);
     assert_eq!(library.outbox_refused().unwrap().len(), 129);
+}
+
+/// Security review 03, N1: an item that grows past the 128 KiB serializer limit after
+/// approval must quarantine only its own write, not stop every later sync.
+#[tokio::test]
+async fn oversized_bound_items_are_quarantined_alone() {
+    let (dir, mut server, mut library) = family().await;
+    approved(
+        &mut server,
+        2,
+        json!({"action":"tick","guid":"other","done":true}),
+    )
+    .await;
+    approved(
+        &mut server,
+        3,
+        json!({"action":"tick","guid":"parent","done":true}),
+    )
+    .await;
+    let saved = write(
+        &mut server,
+        4,
+        "notes_write",
+        json!({"action":"save","guid":"note","body":"note\nbody edited","base_etag":"n1"}),
+    )
+    .await;
+    assert_eq!(saved["isError"], false, "{saved}");
+    let mut other = library.reminder("other").unwrap().unwrap();
+    other.notes = Some("y".repeat(140_000));
+    library.put_reminder_local(&other).unwrap();
+    library
+        .set_note_text(
+            "note",
+            &format!("note\n{}", "z".repeat(140_000)),
+            "note",
+            Some("z"),
+        )
+        .unwrap();
+    let remote = remote().await;
+    let result =
+        skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+            .await
+            .unwrap();
+    assert_eq!(
+        refused_reason(&library, "other").as_deref(),
+        Some("mcp_quarantine:preview_too_large"),
+        "{result}"
+    );
+    let note = library
+        .outbox_refused()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.change.service == "notes")
+        .unwrap();
+    assert_eq!(note.reason, "mcp_quarantine:preview_too_large");
+    let requests = remote.received_requests().await.unwrap();
+    assert!(
+        handed_to_sender(&requests, "parent"),
+        "the approved tick still reached the sender"
+    );
+    assert!(!handed_to_sender(&requests, "other"));
+}
+
+/// Security review 03, N2: the sync reply names what this sync quarantined and counts
+/// only waiting writes as queued; status says which write and why.
+#[tokio::test]
+async fn sync_reply_and_status_report_quarantined_writes() {
+    let (dir, mut server, mut library) = family().await;
+    approved(
+        &mut server,
+        2,
+        json!({"action":"edit","guid":"other","patch":{"title":"QUEUED-TITLE"}}),
+    )
+    .await;
+    let mut changed = library.reminder("other").unwrap().unwrap();
+    changed.priority = 5;
+    library.put_reminder_local(&changed).unwrap();
+    let remote = remote().await;
+    let result =
+        skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+            .await
+            .unwrap();
+    assert_eq!(result["queued"], 0, "{result}");
+    assert_eq!(result["refused"], 1, "{result}");
+    let quarantined = result["refused_this_sync"].as_array().unwrap();
+    assert_eq!(quarantined.len(), 1, "{result}");
+    assert_eq!(quarantined[0]["record"], "other");
+    assert_eq!(quarantined[0]["kind"], "edit");
+    assert_eq!(
+        quarantined[0]["reason"],
+        "mcp_quarantine:write_authorization_stale"
+    );
+    assert!(!result.to_string().contains("QUEUED-TITLE"));
+    use std::os::unix::fs::PermissionsExt;
+    for file in std::fs::read_dir(dir.path()).unwrap() {
+        let file = file.unwrap();
+        if file.file_type().unwrap().is_file() {
+            std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    let status = write(&mut server, 9, "sync_status", json!({})).await;
+    let status: Value =
+        serde_json::from_str(status["content"][0]["text"].as_str().unwrap()).unwrap();
+    let reminders = status["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["service"] == "reminders")
+        .unwrap()
+        .clone();
+    assert_eq!(reminders["refused"], 1, "{status}");
+    assert_eq!(
+        reminders["refused_recent"][0]["record"], "other",
+        "{status}"
+    );
+    assert_eq!(
+        reminders["refused_recent"][0]["reason"],
+        "mcp_quarantine:write_authorization_stale"
+    );
+    assert!(!status.to_string().contains("QUEUED-TITLE"));
+}
+
+/// Security review 03, N2: a quarantined edit must not stay in the cache as if it were
+/// on its way. After its drain the same sync re-reads the service from the start (no sync
+/// token), and a full pass replays only waiting writes, so the unsent title is gone. The
+/// empty synthetic remote makes that full pass drop the item entirely.
+#[tokio::test]
+async fn quarantined_edit_does_not_stay_in_the_cache() {
+    let (dir, mut server, mut library) = family().await;
+    approved(
+        &mut server,
+        2,
+        json!({"action":"edit","guid":"other","patch":{"title":"QUEUED-TITLE"}}),
+    )
+    .await;
+    assert_eq!(
+        library.reminder("other").unwrap().unwrap().title,
+        "QUEUED-TITLE"
+    );
+    let mut changed = library.reminder("other").unwrap().unwrap();
+    changed.priority = 5;
+    library.put_reminder_local(&changed).unwrap();
+    let remote = remote().await;
+    skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+        .await
+        .unwrap();
+    let requests = remote.received_requests().await.unwrap();
+    let reminder_reads: Vec<String> = requests
+        .iter()
+        .filter(|r| {
+            r.url.path().contains("com.apple.reminders") && r.url.path().ends_with("/changes/zone")
+        })
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    assert_eq!(reminder_reads.len(), 2, "{reminder_reads:?}");
+    assert!(
+        reminder_reads[0].contains("prior"),
+        "first read is the usual delta"
+    );
+    assert!(!reminder_reads[1].contains("prior"), "then a full re-read");
+    assert!(library
+        .reminder("other")
+        .unwrap()
+        .is_none_or(|r| r.title != "QUEUED-TITLE"));
+}
+
+/// Security review 03, N3: the terminal listing drops text-direction characters, and
+/// status shows engine reasons only as a code.
+#[tokio::test]
+async fn refused_reasons_are_plain_in_terminal_and_coded_in_status() {
+    let (_dir, mut server, mut library) = family().await;
+    let id = library
+        .outbox_append("reminders", "rec\u{202E}ord", "edit", "{}")
+        .unwrap();
+    library
+        .outbox_refuse(id, "HTTP 400 body\u{202E}\u{2066} SYNTHETIC-UPSTREAM-TEXT")
+        .unwrap();
+    let shown = server.quarantined().unwrap();
+    assert_eq!(shown[0]["record"], "record");
+    assert_eq!(shown[0]["reason"], "HTTP 400 body SYNTHETIC-UPSTREAM-TEXT");
+    let status = write(&mut server, 9, "sync_status", json!({})).await;
+    let text = status["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("refused_by_sync_engine"), "{text}");
+    assert!(!text.contains("SYNTHETIC-UPSTREAM-TEXT"));
 }

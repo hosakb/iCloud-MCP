@@ -134,7 +134,7 @@ grant. Tries can change during retry; operation bytes cannot. Changing policy
 quarantines even previously approved pending writes.
 
 A grant binds only the cached rows the native sender reads for that operation:
-the item itself, a note's body and runs for `save`, the subtasks for a reminder
+the item itself, a note's body for `save` (runs come from the payload), the subtasks for a reminder
 edit that moves lists, and the notes template for a note `create`. Lists, folders
 and other items are not bound, so refreshing them does not stale a grant. When an
 approved write changes the cached rows of another queued write (a subtask edit
@@ -148,8 +148,13 @@ Before session validation, sync checks read permission and the policy binding. I
 `reads_and_writes`, startup/timer refresh is refused without issuing a form;
 only an originating `sync` call can request one-shot refresh consent. The other
 modes permit background refresh. A queued write whose grant is missing, stale,
-oversized or whose item is gone is refused alone with the reason
-`mcp_quarantine:<code>` and is never sent; the rest of the queue continues.
+oversized (including a bound item that grew past the serializer limit) or whose
+item is gone is refused alone with the reason `mcp_quarantine:<code>` and is never
+sent; the rest of the queue continues. The cache still shows a quarantined write as
+if it were on its way, so after its drain the same sync re-reads that service in
+full. A full pass replays only waiting writes, which drops the quarantined change
+from the cache. If that pass fails, the next sync that reaches the drain tries
+again. Until it succeeds, reads can still show the unsent change.
 Native sends recheck exact payload, account, policy, directory and the bound cached
 rows after refresh, before entering the writer, and refuse that write if they
 changed. A sync has a 60-second async deadline. At most 128 waiting writes are
@@ -158,6 +163,14 @@ original durable record remains for retry. These safeguards can refuse delivery
 after a concurrent remote edit of the same item. Apple-side conflict/merge
 behavior remains native engine behavior; local acceptance is not field-level
 remote verification.
+
+The `sync` reply reports `queued` (waiting writes only), `refused` (all kept
+refused writes) and `refused_this_sync` with each write this sync refused or
+quarantined. `sync_status` reports per service the refused count and the 20 newest
+as `refused_recent`. Both show id, service, kind, record and a reason code, never
+payloads; engine and Apple reasons appear only as `refused_by_sync_engine`. A
+sync that fails after its local gate does not list its quarantines; `sync_status`
+does.
 
 Refused writes stay in the private directory and `sync_status` counts them. They
 do not count toward the 128 waiting writes. Up to 1024 refused writes are kept;

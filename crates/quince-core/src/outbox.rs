@@ -27,6 +27,16 @@ pub struct Pending {
     pub tries: i64,
 }
 
+/// A refused change without its payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedBrief {
+    pub id: i64,
+    pub service: String,
+    pub record: String,
+    pub kind: String,
+    pub reason: String,
+}
+
 /// A change Apple turned down for good, kept with its reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refused {
@@ -182,6 +192,24 @@ impl Library {
             |r| r.get(0),
         )?;
         Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    /// Every refused change in brief, oldest first: no payload, the reason cut short.
+    pub fn outbox_refused_brief(&self) -> Result<Vec<RefusedBrief>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, service, record, kind, substr(coalesce(error, ''), 1, 200) FROM outbox
+             WHERE refused_at IS NOT NULL ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(RefusedBrief {
+                id: r.get(0)?,
+                service: r.get(1)?,
+                record: r.get(2)?,
+                kind: r.get(3)?,
+                reason: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Apple has it: no longer waiting.
