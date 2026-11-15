@@ -76,6 +76,125 @@ What approval protects against: an agent that reaches this server only through M
 
 ## Limitations
 
+### Issue #7 staged implementation checkpoint
+
+This candidate implements policy-controlled reads, Notes and Reminders mutations,
+and bounded sync. Missing policy retains legacy behavior. It is not ready for
+real-account rollout while the Hermes boolean-content and rendered-preview gates
+below remain open. No mode has been activated on real state.
+
+The human-only command is `skykeep-mcp policy --state-dir DIR MODE`, where MODE is
+`reads_and_writes`, `writes_only`, or `yolo`. It requires a user-owned terminal,
+literal `confirm`, persists a fresh revision bound to the account and directory
+device/inode, and prints the saved record. It is never exposed as an MCP tool.
+Account changes or copied policies fail closed until the human explicitly migrates
+again. Existing terminal policy commands cannot override an activated new policy.
+No migration back to legacy is provided. No real state was migrated in development.
+
+| Mode | Content reads and refresh | Mutations, including deletion |
+| --- | --- | --- |
+| reads_and_writes | One-shot form approval | One-shot form approval |
+| writes_only | No prompt | One-shot form approval |
+| yolo | No prompt | No prompt |
+
+2025-11-25 clients advertising `elicitation: {}` or `form: {}` receive standard
+`elicitation/create` with a required boolean. Only `accept` with exactly
+`content: {"approve": true}` authorizes execution. Unsupported versions, URL-only,
+absent, malformed and unknown-only capabilities fail closed when consent is needed.
+Legacy terminal proposals continue to work only in legacy state.
+
+Consent is an in-memory continuation: the stdio loop resumes receiving messages
+while the human decides, without retaining the directory lock. One consent can be
+pending per connection; ping/status remain available. The originating RPC, complete
+arguments, account, policy revision and directory identity are retained privately;
+execution revalidates them under the operation lock. IDs use a UUID server namespace;
+only response envelopes can complete consent. Decline, cancel, malformed replies,
+policy changes, timeout (180 seconds), disconnect and replay cannot enqueue. No
+durable consent record is written. EOF drops the pending continuation. Cancellation
+after enqueue cannot roll back an already committed operation.
+
+The complete create/read-request JSON is sent without truncation, with markup and
+non-ASCII characters escaped as inert Unicode sequences. Existing-item mutations
+show the cached item, body/runs or reminder details, affected subtasks, containers,
+and prior queued operations. Execution checks that snapshot again under lock.
+In `reads_and_writes`, a first consent authorizes reading this preview; a second
+consent authorizes the mutation. A stale policy cannot authorize preview reads.
+Frames are limited to 64 KiB before parsing, arguments to 32 KiB before cloning,
+and escaped previews to 128 KiB before expansion. Parsed values also have depth
+and node limits. Oversized operations are rejected, never silently truncated. The owner
+must verify that the client exposes the entire preview before approving; source or
+SDK tests do not establish UI rendering. Forms request only approval, never secrets.
+
+Migration atomically marks existing pending writes refused with the reason
+`mcp_policy_migration_quarantine` and invalidates their grants. It also blocks old
+terminal proposals. It runs however large a legacy queue is. Every new enqueue
+records the exact native payload and policy revision in the same transaction.
+Coalescing requires previously authorized input and replaces the resulting payload
+grant. Tries can change during retry; operation bytes cannot. Changing policy
+quarantines even previously approved pending writes.
+
+A grant binds only the cached rows the native sender reads for that operation:
+the item itself, a note's body for `save` (runs come from the payload), the subtasks for a reminder
+edit that moves lists, and the notes template for a note `create`. Lists, folders
+and other items are not bound, so refreshing them does not stale a grant. When an
+approved write changes the cached rows of another queued write (a subtask edit
+under a parent's list move, or a parent move that rewrites its subtasks), that
+write is re-bound in the same transaction, but only if its grant was current just
+before. An approved deletion that removes an item, or its subtasks, refuses older
+writes to those items with `superseded_by_approved_deletion`. A changed payload
+on another record is never re-authorized.
+
+Before session validation, sync checks read permission and the policy binding. In
+`reads_and_writes`, startup/timer refresh is refused without issuing a form;
+only an originating `sync` call can request one-shot refresh consent. The other
+modes permit background refresh. A queued write whose grant is missing, stale,
+oversized (including a bound item that grew past the serializer limit) or whose
+item is gone is refused alone with the reason `mcp_quarantine:<code>` and is never
+sent; the rest of the queue continues. The cache still shows a quarantined write as
+if it were on its way, so after its drain the same sync re-reads that service in
+full. A full pass replays only waiting writes, which drops the quarantined change
+from the cache. If that pass fails, the next sync that reaches the drain tries
+again. Until it succeeds, reads can still show the unsent change.
+Native sends recheck exact payload, account, policy, directory and the bound cached
+rows after refresh, before entering the writer, and refuse that write if they
+changed. A sync has a 60-second async deadline. At most 128 waiting writes are
+admitted. Timeout after a send begins means delivery may be uncertain; the
+original durable record remains for retry. These safeguards can refuse delivery
+after a concurrent remote edit of the same item. Apple-side conflict/merge
+behavior remains native engine behavior; local acceptance is not field-level
+remote verification.
+
+The `sync` reply reports `queued` (waiting writes only), `refused` (all kept
+refused writes) and `refused_this_sync` with each write this sync refused or
+quarantined. `sync_status` reports per service the refused count and the 20 newest
+as `refused_recent`. Both show id, service, kind, record and a reason code, never
+payloads; engine and Apple reasons appear only as `refused_by_sync_engine`. A
+sync that fails after its local gate does not list its quarantines; `sync_status`
+does.
+
+Refused writes stay in the private directory and `sync_status` counts them. They
+do not count toward the 128 waiting writes. Up to 1024 refused writes are kept;
+after that new writes fail with `quarantine_full_retire_in_terminal`. The
+human-only `skykeep-mcp quarantine --state-dir DIR` lists them in a user-owned
+terminal (id, service, kind, record, reason; no payloads) and deletes exactly the
+listed rows after the literal answer `retire`. Retired writes are never sent. No
+MCP tool can resend, release or retire a refused write.
+
+Canonical read-only Hermes `tools/mcp_tool_sampling.py` currently returns empty
+content on accept (`ElicitationHandler._result`). That cannot satisfy this server's
+required boolean. Minimal owner-directed Hermes integration: collect the boolean
+through the native form callback, return the actual validated content, and expose
+the full inert preview on each supported surface. Until then Hermes acceptance
+fails closed. No Hermes files were edited and no rendered UI was tested. OpenClaw
+runtime interoperability is untested. The candidate is based on cleanup main;
+deleted app files have not been restored. Independent security re-review is required.
+
+References: [MCP elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation),
+[MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools),
+[Hermes configuration](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference).
+Client UI is client-owned. A same-user executable can forge consent or edit state;
+MCP-only approvals cannot defend against that authority.
+
 - Notes with structures the engine can't round-trip are refused rather than flattened. Markdown export is not a lossless copy of a note.
 - A write that iCloud accepts is reported as sent, not as verified field by field. Partial reminder writes are a known inherited gap.
 - Attachments, folder and list management, and bulk operations are not exposed.

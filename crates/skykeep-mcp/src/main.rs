@@ -3,7 +3,7 @@ use serde_json::json;
 use skykeep_mcp::{login, state::PrivateState, terminal, Server};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -26,6 +26,8 @@ async fn run() -> Result<(), &'static str> {
             "approve",
             "require-approval",
             "allow-routine",
+            "policy",
+            "quarantine",
         ]
         .iter()
         .any(|name| s == name)
@@ -38,6 +40,16 @@ async fn run() -> Result<(), &'static str> {
         return Err("usage: skykeep-mcp [login|logout] --state-dir PRIVATE_DIRECTORY");
     }
     let dir = PathBuf::from(args.next().ok_or("state_directory_required")?);
+    let policy_mode = if command == "policy" {
+        Some(
+            args.next()
+                .ok_or("policy_mode_required")?
+                .to_string_lossy()
+                .to_string(),
+        )
+    } else {
+        None
+    };
     if args.next().is_some() {
         return Err("unexpected_argument");
     }
@@ -48,6 +60,44 @@ async fn run() -> Result<(), &'static str> {
         }
         // Check the user terminal before touching a keyring or any network.
         let mut tty = terminal::controlling()?;
+        if let Some(mode) = policy_mode {
+            use std::io::Write;
+            writeln!(tty, "Set approval mode to {mode} for {}. YOLO includes deletion without prompts. All currently pending writes will be quarantined, including previously approved writes. Old terminal proposals cannot be released under this policy. Type confirm to persist.", dir.display()).map_err(|_| "terminal_unavailable")?;
+            let answer = terminal::hidden(&mut tty, "Confirmation: ", Duration::from_secs(180))?;
+            if *answer != "confirm" {
+                return Err("policy_change_cancelled");
+            }
+            let saved = Server::open(&dir)?.set_policy(&mode)?;
+            writeln!(tty, "Saved policy: {saved}").map_err(|_| "terminal_unavailable")?;
+            return Ok(());
+        }
+        if command == "quarantine" {
+            use std::io::Write;
+            let mut server = Server::open(&dir)?;
+            let rows = server.quarantined()?;
+            if rows.is_empty() {
+                writeln!(tty, "No quarantined writes.").map_err(|_| "terminal_unavailable")?;
+                return Ok(());
+            }
+            for row in &rows {
+                writeln!(tty, "{row}").map_err(|_| "terminal_unavailable")?;
+            }
+            writeln!(tty, "These {} writes were refused or quarantined and will never be sent. Retiring deletes exactly these rows from {} for good.", rows.len(), dir.display()).map_err(|_| "terminal_unavailable")?;
+            let answer = terminal::hidden(
+                &mut tty,
+                "Type retire to delete them, anything else cancels: ",
+                Duration::from_secs(180),
+            )?;
+            if *answer != "retire" {
+                return Err("quarantine_retire_cancelled");
+            }
+            let ids: Vec<i64> = rows.iter().filter_map(|r| r["id"].as_i64()).collect();
+            let retired = server.retire_quarantined(&ids)?;
+            let left = server.quarantined()?.len();
+            writeln!(tty, "Retired {retired} quarantined writes. {left} remain.")
+                .map_err(|_| "terminal_unavailable")?;
+            return Ok(());
+        }
         if command == "approve" {
             use std::io::Write;
             let id = terminal::hidden(&mut tty, "Approval request ID: ", Duration::from_secs(180))?;
@@ -73,6 +123,15 @@ async fn run() -> Result<(), &'static str> {
         }
         let held = PrivateState::open(&dir)?;
         if command == "require-approval" || command == "allow-routine" {
+            let library =
+                quince_core::Library::open(&held.path).map_err(|_| "library_unavailable")?;
+            if library
+                .state("mcp.policy")
+                .map_err(|_| "policy_unavailable")?
+                .is_some()
+            {
+                return Err("use_policy_command");
+            }
             let answer = terminal::hidden(
                 &mut tty,
                 "Type confirm to change write policy for this directory: ",
@@ -122,7 +181,8 @@ async fn run() -> Result<(), &'static str> {
         return Ok(());
     }
     let mut server = Server::open(&dir)?;
-    let mut input = BufReader::new(tokio::io::stdin()).lines();
+    let mut input = BufReader::new(tokio::io::stdin());
+    let mut frame = Vec::new();
     let mut output = tokio::io::stdout();
     let mut poll = tokio::time::interval(Duration::from_secs(5));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -130,8 +190,14 @@ async fn run() -> Result<(), &'static str> {
         skykeep_mcp::scheduler::Schedule::new(std::time::Instant::now(), Duration::from_secs(300));
     loop {
         let line = tokio::select! {
-            line = input.next_line() => match line.map_err(|_| "transport_failed")? { Some(line) => line, None => break },
+            line = skykeep_mcp::read_frame(&mut input, &mut frame) => match line? { Some(line) => line, None => break },
             _ = poll.tick() => {
+                if let Some(response) = server.expire_consent() {
+                    let mut bytes = serde_json::to_vec(&response).map_err(|_| "transport_failed")?;
+                    bytes.push(b'\n');
+                    output.write_all(&bytes).await.map_err(|_| "transport_failed")?;
+                    output.flush().await.map_err(|_| "transport_failed")?;
+                }
                 if schedule.due(std::time::Instant::now()) { let _ = server.refresh().await; }
                 continue;
             }
