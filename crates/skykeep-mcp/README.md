@@ -76,6 +76,74 @@ What approval protects against: an agent that reaches this server only through M
 
 ## Limitations
 
+### Issue #7 staged implementation checkpoint
+
+This slice implements local cached reads and exact note/reminder creation with
+persisted approval modes. Missing policy retains all legacy behavior. It is not
+ready for real-account rollout: configured policies block **all sync and all
+existing-item mutations**, including deletion, pending the durable-send and
+resolved-item-preview work below. YOLO means no per-operation prompts for supported
+operations; it does not make unsupported operations available.
+
+The human-only command is `skykeep-mcp policy --state-dir DIR MODE`, where MODE is
+`reads_and_writes`, `writes_only`, or `yolo`. It requires a user-owned terminal,
+literal `confirm`, persists a fresh revision bound to the account and directory
+device/inode, and prints the saved record. It is never exposed as an MCP tool.
+Account changes or copied policies fail closed until the human explicitly migrates
+again. Existing terminal policy commands cannot override an activated new policy.
+No migration back to legacy is provided. No real state was migrated in development.
+
+| Mode | Cached content reads | Supported creates |
+| --- | --- | --- |
+| reads_and_writes | One-shot form approval | One-shot form approval |
+| writes_only | No prompt | One-shot form approval |
+| yolo | No prompt | No prompt |
+
+2025-11-25 clients advertising `elicitation: {}` or `form: {}` receive standard
+`elicitation/create` with a required boolean. Only `accept` with exactly
+`content: {"approve": true}` authorizes execution. Unsupported versions, URL-only,
+absent, malformed and unknown-only capabilities fail closed when consent is needed.
+Legacy terminal proposals continue to work only in legacy state.
+
+Consent is an in-memory continuation: the stdio loop resumes receiving messages
+while the human decides, without retaining the directory lock. One consent can be
+pending per connection; ping/status remain available. The originating RPC, complete
+arguments, account, policy revision and directory identity are retained privately;
+execution revalidates them under the operation lock. IDs use a UUID server namespace;
+only response envelopes can complete consent. Decline, cancel, malformed replies,
+policy changes, timeout (180 seconds), disconnect and replay cannot enqueue. No
+durable consent record is written. EOF drops the pending continuation. Cancellation
+after enqueue cannot roll back an already committed operation.
+
+The complete create/read-request JSON is sent without truncation, with markup and
+non-ASCII characters escaped as inert Unicode sequences. Existing-item writes are
+refused because their full resolved-item previews are not implemented. The owner
+must verify that the client exposes the entire preview before approving; source or
+SDK tests do not establish UI rendering. Forms request only approval, never secrets.
+
+Configured sync is refused before session/keyring/network access, including startup
+and timer refresh. This quarantines all legacy and new outbox entries and old
+terminal proposals; migration never releases them. Remaining work: bind each exact
+durable payload and policy revision through send/retry/coalescing, implement safe
+queue migration and bounded refresh, then enable sync. Do not weaken this refusal
+to obtain remote writes. Existing-item mutations also require immutable resolved
+state preview and revalidation before they can be enabled.
+
+Canonical read-only Hermes `tools/mcp_tool_sampling.py` currently returns empty
+content on accept (`ElicitationHandler._result`). That cannot satisfy this server's
+required boolean. Minimal owner-directed Hermes integration: collect the boolean
+through the native form callback, return the actual validated content, and expose
+the full inert preview on each supported surface. Until then Hermes acceptance
+fails closed. No Hermes files were edited and no rendered UI was tested. OpenClaw
+runtime interoperability is untested. Cleanup PR #11 merged separately; root
+workspace, lockfile and app-removal files are not edited here.
+
+References: [MCP elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation),
+[MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools),
+[Hermes configuration](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference).
+Client UI is client-owned. A same-user executable can forge consent or edit state;
+MCP-only approvals cannot defend against that authority.
+
 - Notes with structures the engine can't round-trip are refused rather than flattened. Markdown export is not a lossless copy of a note.
 - A write that iCloud accepts is reported as sent, not as verified field by field. Partial reminder writes are a known inherited gap.
 - Attachments, folder and list management, and bulk operations are not exposed.

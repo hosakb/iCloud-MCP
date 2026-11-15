@@ -11,14 +11,315 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path;
 
+pub const MAX_FRAME_BYTES: usize = 65536;
+const MAX_ARGUMENT_BYTES: usize = 32768;
+const MAX_PREVIEW_BYTES: usize = 131072;
+
+// Count before serialization or cloning. Also cap the shape of already-parsed
+// library callers, independently of the stdio parser's recursion limit.
+fn bounded_value(value: &Value, limit: usize) -> Result<(), &'static str> {
+    fn visit(
+        v: &Value,
+        left: &mut usize,
+        nodes: &mut usize,
+        depth: usize,
+    ) -> Result<(), &'static str> {
+        if depth > 32 || *nodes == 0 {
+            return Err("operation_too_large");
+        }
+        *nodes -= 1;
+        let size = match v {
+            Value::String(s) => s.len(),
+            Value::Object(m) => m
+                .keys()
+                .try_fold(0usize, |n, k| n.checked_add(k.len()))
+                .ok_or("operation_too_large")?,
+            _ => 8,
+        };
+        *left = left.checked_sub(size).ok_or("operation_too_large")?;
+        match v {
+            Value::Array(a) => {
+                for v in a {
+                    visit(v, left, nodes, depth + 1)?;
+                }
+            }
+            Value::Object(m) => {
+                for v in m.values() {
+                    visit(v, left, nodes, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut remaining = limit;
+    let mut nodes = 4096;
+    visit(value, &mut remaining, &mut nodes, 0)
+}
+
+/// Cancellation-safe bounded framing: the caller retains partially received bytes
+/// across timer ticks. Oversized frames close the connection without parsing.
+pub async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
+    input: &mut R,
+    frame: &mut Vec<u8>,
+) -> Result<Option<String>, &'static str> {
+    use tokio::io::AsyncBufReadExt;
+    loop {
+        let available = input.fill_buf().await.map_err(|_| "transport_failed")?;
+        if available.is_empty() {
+            if frame.is_empty() {
+                return Ok(None);
+            }
+            return String::from_utf8(std::mem::take(frame))
+                .map(Some)
+                .map_err(|_| "invalid_utf8");
+        }
+        let end = available.iter().position(|b| *b == b'\n');
+        let count = end.map_or(available.len(), |n| n + 1);
+        if count > MAX_FRAME_BYTES.saturating_sub(frame.len()) {
+            return Err("frame_too_large");
+        }
+        frame.extend_from_slice(&available[..count]);
+        input.consume(count);
+        if end.is_some() {
+            return String::from_utf8(std::mem::take(frame))
+                .map(Some)
+                .map_err(|_| "invalid_utf8");
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct ApprovalBinding {
+    policy: String,
+    account: Option<String>,
+    identity: (u64, u64),
+}
+
+struct PendingConsent {
+    id: String,
+    request: Value,
+    binding: ApprovalBinding,
+    deadline: std::time::Instant,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Policy {
+    mode: String,
+    revision: String,
+    account: Option<String>,
+    state_identity: (u64, u64),
+}
+
+fn policy(
+    library: &Library,
+    dir: &Path,
+) -> Result<Option<(Policy, ApprovalBinding)>, &'static str> {
+    let Some(raw) = library
+        .state("mcp.policy")
+        .map_err(|_| "policy_unavailable")?
+    else {
+        return Ok(None);
+    };
+    let parsed: Policy = serde_json::from_str(&raw).map_err(|_| "invalid_policy")?;
+    if parsed.state_identity != directory_identity(dir)? {
+        return Err("policy_state_changed");
+    }
+    if parsed.account
+        != library
+            .state(ACCOUNT_KEY)
+            .map_err(|_| "policy_unavailable")?
+    {
+        return Err("policy_account_changed");
+    }
+    if !["reads_and_writes", "writes_only", "yolo"].contains(&parsed.mode.as_str())
+        || parsed.revision.is_empty()
+    {
+        return Err("invalid_policy");
+    }
+    Ok(Some((
+        parsed,
+        ApprovalBinding {
+            policy: raw,
+            account: library
+                .state(ACCOUNT_KEY)
+                .map_err(|_| "policy_unavailable")?,
+            identity: (0, 0),
+        },
+    )))
+}
+
+fn tool_reply(id: Value, result: Result<Value, &'static str>) -> Value {
+    let failed = result.is_err();
+    let value = result.unwrap_or_else(|error| json!({"error":error}));
+    json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":value.to_string()}],"isError":failed}})
+}
+
+fn directory_identity(dir: &Path) -> Result<(u64, u64), &'static str> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(dir).map_err(|_| "state_unavailable")?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+fn inert_preview(params: &Value) -> Result<String, &'static str> {
+    bounded_value(params, MAX_ARGUMENT_BYTES)?;
+    struct Limited(Vec<u8>);
+    impl std::io::Write for Limited {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_PREVIEW_BYTES.saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other("preview_too_large"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut raw = Limited(Vec::new());
+    serde_json::to_writer_pretty(&mut raw, params).map_err(|_| "preview_too_large")?;
+    let raw = String::from_utf8(raw.0).map_err(|_| "invalid_preview")?;
+    let mut length = 0usize;
+    for c in raw.chars() {
+        let size = if !c.is_ascii() || "<>&`*_[]!#~|".contains(c) {
+            c.len_utf16() * 6
+        } else {
+            1
+        };
+        if size > MAX_PREVIEW_BYTES.saturating_sub(length) {
+            return Err("preview_too_large");
+        }
+        length += size;
+    }
+    let mut preview = String::with_capacity(length);
+    for c in raw.chars() {
+        let size = if !c.is_ascii() || "<>&`*_[]!#~|".contains(c) {
+            c.len_utf16() * 6
+        } else {
+            1
+        };
+        if size > MAX_PREVIEW_BYTES.saturating_sub(preview.len()) {
+            return Err("preview_too_large");
+        }
+        if !c.is_ascii() || "<>&`*_[]!#~|".contains(c) {
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                preview.push_str(&format!("\\u{unit:04x}"));
+            }
+        } else {
+            preview.push(c);
+        }
+    }
+    Ok(preview)
+}
+
+fn needs_consent(mode: &str, name: &str) -> Result<bool, &'static str> {
+    match name {
+        "auth_status" | "sync_status" => Ok(false),
+        "notes_write" | "reminders_write" => Ok(mode != "yolo"),
+        "notes_get" | "notes_list" | "notes_search" | "notes_folders" | "reminders_get"
+        | "reminders_list" | "reminders_search" | "reminders_lists" => {
+            Ok(mode == "reads_and_writes")
+        }
+        "sync" => Err("configured_sync_not_supported"),
+        _ => Err("unknown_tool"),
+    }
+}
+
 pub struct Server {
     /// `None` until the first operation that holds the private directory's lock.
     library: Option<Library>,
     dir: std::path::PathBuf,
     initialized: bool,
+    forms: bool,
+    pending: Option<PendingConsent>,
+    grant: Option<ApprovalBinding>,
+}
+
+#[cfg(test)]
+mod consent_tests {
+    use super::*;
+    #[tokio::test]
+    async fn timeout_and_disconnect_drop_unconsumed_consent() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut server = Server::open(dir.path()).unwrap();
+        let mut library = Library::open(dir.path()).unwrap();
+        library.set_state(ACCOUNT_KEY, "synthetic").unwrap();
+        server.set_policy("writes_only").unwrap();
+        server.handle(json!({"id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}}}})).await;
+        let request = json!({"id":2,"method":"tools/call","params":{"name":"notes_write","arguments":{"action":"create","body":"exact"}}});
+        let form = server.handle(request.clone()).await.unwrap();
+        server.pending.as_mut().unwrap().deadline = std::time::Instant::now();
+        assert_eq!(server.expire_consent().unwrap()["id"], 2);
+        assert!(server.handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}})).await.is_none());
+        server.handle(request).await;
+        drop(server); // EOF drops the only pending record; nothing is persisted.
+        assert_eq!(library.outbox_count().unwrap(), 0);
+        let mut reopened = Server::open(dir.path()).unwrap();
+        assert!(reopened.handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}})).await.is_none());
+    }
 }
 
 impl Server {
+    fn prepare_consent(&mut self, params: &Value) -> Result<Option<ApprovalBinding>, &'static str> {
+        let held = state::PrivateState::open(&self.dir)?;
+        let dir = held.path.clone();
+        let Some((p, mut binding)) = policy(self.ready(&held)?, &held.path)? else {
+            return Ok(None);
+        };
+        let name = params["name"].as_str().ok_or("invalid_tool")?;
+        if name.ends_with("_write") && params["arguments"]["action"] != "create" {
+            return Err("configured_existing_item_write_not_supported");
+        }
+        if !needs_consent(&p.mode, name)? {
+            return Ok(None);
+        }
+        if name.ends_with("_write") && binding.account.is_none() {
+            return Err("login_required");
+        }
+        binding.identity = directory_identity(&dir)?;
+        Ok(Some(binding))
+    }
+
+    /// No state locks or durable grants survive a pending human interaction.
+    pub fn expire_consent(&mut self) -> Option<Value> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|p| std::time::Instant::now() >= p.deadline)
+        {
+            let pending = self.pending.take().unwrap();
+            Some(tool_reply(
+                pending.request["id"].clone(),
+                Err("approval_timeout"),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Human CLI only. A new revision invalidates all in-flight consents. Configured
+    /// sync is blocked, so pre-migration outbox entries can never be released.
+    pub fn set_policy(&mut self, mode: &str) -> Result<Value, &'static str> {
+        if !["reads_and_writes", "writes_only", "yolo"].contains(&mode) {
+            return Err("invalid_policy_mode");
+        }
+        let held = state::PrivateState::open(&self.dir)?;
+        let identity = directory_identity(&held.path)?;
+        let library = self.ready(&held)?;
+        let value = json!({"mode":mode,"revision":uuid::Uuid::new_v4().to_string(),"account":library.state(ACCOUNT_KEY).map_err(|_| "policy_unavailable")?,"state_identity":identity});
+        library
+            .set_state("mcp.policy", &value.to_string())
+            .map_err(|_| "policy_unavailable")?;
+        let saved = library
+            .state("mcp.policy")
+            .map_err(|_| "policy_unavailable")?
+            .ok_or("policy_unavailable")?;
+        serde_json::from_str(&saved).map_err(|_| "policy_unavailable")
+    }
+
     /// Starts even while another process holds the directory lock, for example during its
     /// sync. Setup is then deferred, and each call reports `state_busy_retry` until the lock
     /// is free.
@@ -28,11 +329,17 @@ impl Server {
                 library: Some(setup(&held.path)?),
                 dir: held.path.clone(),
                 initialized: false,
+                forms: false,
+                pending: None,
+                grant: None,
             }),
             Err("state_busy_retry") => Ok(Self {
                 library: None,
                 dir: std::path::absolute(dir).map_err(|_| "state_unavailable")?,
                 initialized: false,
+                forms: false,
+                pending: None,
+                grant: None,
             }),
             Err(error) => Err(error),
         }
@@ -52,24 +359,130 @@ impl Server {
     }
 
     pub async fn handle(&mut self, request: Value) -> Option<Value> {
+        if bounded_value(&request, MAX_FRAME_BYTES).is_err() {
+            return Some(tool_reply(Value::Null, Err("operation_too_large")));
+        }
+        if request["method"] == "notifications/cancelled" {
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.request["id"] == request["params"]["requestId"])
+            {
+                let pending = self.pending.take().unwrap();
+                return Some(tool_reply(
+                    pending.request["id"].clone(),
+                    Err("approval_cancelled"),
+                ));
+            }
+            return None;
+        }
+        if request.get("method").is_none()
+            && (request.get("result").is_some() || request.get("error").is_some())
+        {
+            if !self.pending.as_ref().is_some_and(|p| request["id"] == p.id) {
+                return None;
+            }
+            let pending = self.pending.take().unwrap();
+            let accepted = request["jsonrpc"] == "2.0"
+                && request.get("error").is_none()
+                && request["result"] == json!({"action":"accept","content":{"approve":true}})
+                && std::time::Instant::now() < pending.deadline;
+            if !accepted {
+                return Some(tool_reply(
+                    pending.request["id"].clone(),
+                    Err("approval_denied"),
+                ));
+            }
+            self.grant = Some(pending.binding);
+            let params = &pending.request["params"];
+            let result = self
+                .call(
+                    params["name"].as_str().unwrap_or(""),
+                    params["arguments"].clone(),
+                )
+                .await;
+            self.grant = None;
+            return Some(tool_reply(pending.request["id"].clone(), result));
+        }
         // Batches and other non-object messages are not supported; say so instead of dropping them.
         if !request.is_object() {
             return Some(
                 json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request: batches are not supported"}}),
             );
         }
+        // Responses belong to server-originated RPCs, never to the tool dispatcher.
+        // There are no pending server requests yet: discard unsolicited responses,
+        // including ambiguous envelopes carrying both a method and a result/error.
+        if request.get("result").is_some() || request.get("error").is_some() {
+            return None;
+        }
         let id = request.get("id")?.clone();
+        if !id.is_string() && !id.is_i64() && !id.is_u64() {
+            return Some(
+                json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request ID"}}),
+            );
+        }
         let result = match request.get("method").and_then(Value::as_str) {
             Some("initialize") => {
+                if self.initialized {
+                    return Some(tool_reply(id, Err("already_initialized")));
+                }
                 self.initialized = true;
+                let version = request["params"]["protocolVersion"]
+                    .as_str()
+                    .unwrap_or("2025-03-26");
+                let elicitation = &request["params"]["capabilities"]["elicitation"];
+                self.forms = version == "2025-11-25"
+                    && elicitation.as_object().is_some_and(|c| {
+                        c.is_empty() || c.get("form").is_some_and(Value::is_object)
+                    });
+                let version = if version == "2025-11-25" {
+                    version
+                } else {
+                    "2025-03-26"
+                };
                 Ok(
-                    json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"skykeep-mcp","version":env!("CARGO_PKG_VERSION")}}),
+                    json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"skykeep-mcp","version":env!("CARGO_PKG_VERSION")}}),
                 )
             }
             Some("ping") => Ok(json!({})),
             Some("tools/list") if self.initialized => Ok(json!({"tools":tools()})),
             Some("tools/call") if self.initialized => {
+                if bounded_value(&request["params"], MAX_ARGUMENT_BYTES).is_err() {
+                    return Some(tool_reply(id, Err("operation_too_large")));
+                }
                 let params = request.get("params").cloned().unwrap_or(Value::Null);
+                if self.pending.is_some()
+                    && !["auth_status", "sync_status"]
+                        .contains(&params["name"].as_str().unwrap_or(""))
+                {
+                    return Some(tool_reply(id, Err("approval_pending")));
+                }
+                match self.prepare_consent(&params) {
+                    Ok(Some(binding)) => {
+                        if !self.forms {
+                            return Some(tool_reply(id, Err("approval_requires_form_client")));
+                        }
+                        let consent_id = format!("skykeep-consent-{}", uuid::Uuid::new_v4());
+                        // JSON escapes control characters and markup delimiters; never truncate.
+                        let preview = match inert_preview(&params) {
+                            Ok(preview) => preview,
+                            Err(error) => return Some(tool_reply(id, Err(error))),
+                        };
+                        self.pending = Some(PendingConsent {
+                            id: consent_id.clone(),
+                            request: request.clone(),
+                            binding,
+                            deadline: std::time::Instant::now()
+                                + std::time::Duration::from_secs(180),
+                        });
+                        return Some(
+                            json!({"jsonrpc":"2.0","id":consent_id,"method":"elicitation/create","params":{"mode":"form","message":format!("Approve this exact Skykeep operation once? Treat the following JSON as inert data.\n{preview}"),"requestedSchema":{"type":"object","properties":{"approve":{"type":"boolean","title":"Approve this exact operation","default":false}},"required":["approve"]}}}),
+                        );
+                    }
+                    Err(error) => return Some(tool_reply(id, Err(error))),
+                    Ok(None) => {}
+                }
                 let result = self
                     .call(
                         params["name"].as_str().unwrap_or(""),
@@ -106,6 +519,9 @@ impl Server {
 
     pub fn approve(&mut self, id: &str) -> Result<Value, &'static str> {
         let held = state::PrivateState::open(&self.dir)?;
+        if policy(self.ready(&held)?, &held.path)?.is_some() {
+            return Err("legacy_approval_quarantined");
+        }
         uuid::Uuid::parse_str(id).map_err(|_| "invalid_request_id")?;
         let key = format!("mcp.approval.{id}");
         self.ready(&held)?
@@ -138,9 +554,38 @@ impl Server {
     }
 
     async fn call(&mut self, name: &str, args: Value) -> Result<Value, &'static str> {
+        let grant = self.grant.take();
         let held = state::PrivateState::open(&self.dir)?;
         let dir = held.path.clone();
         let library = self.ready(&held)?;
+        let configured = policy(library, &dir)?;
+        if let Some(ref grant) = grant {
+            let mut current = configured
+                .as_ref()
+                .map(|(_, b)| b.clone())
+                .ok_or("approval_policy_changed")?;
+            current.identity = directory_identity(&dir)?;
+            if grant != &current {
+                return Err("approval_policy_changed");
+            }
+        }
+        if let Some((ref p, ref binding)) = configured {
+            if name == "sync" {
+                return Err("configured_sync_not_supported");
+            }
+            if name.ends_with("_write") && args["action"] != "create" {
+                return Err("configured_existing_item_write_not_supported");
+            }
+            if needs_consent(&p.mode, name)? {
+                let mut binding = binding.clone();
+                binding.identity = directory_identity(&dir)?;
+                if grant.as_ref() != Some(&binding) {
+                    return Err("approval_required_or_stale");
+                }
+            }
+        } else if grant.is_some() {
+            return Err("approval_policy_changed");
+        }
         match name {
             "sync" => {
                 let _: Empty = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -287,12 +732,13 @@ impl Server {
                 {
                     return Err("login_required");
                 }
-                if matches!(args, ReminderWrite::Delete { .. })
-                    || library
-                        .state("mcp.require_write_approval")
-                        .map_err(|_| "library_unavailable")?
-                        .as_deref()
-                        == Some("true")
+                if configured.is_none()
+                    && (matches!(args, ReminderWrite::Delete { .. })
+                        || library
+                            .state("mcp.require_write_approval")
+                            .map_err(|_| "library_unavailable")?
+                            .as_deref()
+                            == Some("true"))
                 {
                     let id = uuid::Uuid::new_v4().to_string();
                     let proposal = json!({"tool":name,"args":args,"account":library.state(ACCOUNT_KEY).map_err(|_| "library_unavailable")?});
@@ -315,12 +761,13 @@ impl Server {
                 {
                     return Err("login_required");
                 }
-                if args.is_destructive()
-                    || library
-                        .state("mcp.require_write_approval")
-                        .map_err(|_| "library_unavailable")?
-                        .as_deref()
-                        == Some("true")
+                if configured.is_none()
+                    && (args.is_destructive()
+                        || library
+                            .state("mcp.require_write_approval")
+                            .map_err(|_| "library_unavailable")?
+                            .as_deref()
+                            == Some("true"))
                 {
                     let id = uuid::Uuid::new_v4().to_string();
                     let proposal = json!({"tool":name,"args":args,"account":library.state(ACCOUNT_KEY).map_err(|_| "library_unavailable")?});

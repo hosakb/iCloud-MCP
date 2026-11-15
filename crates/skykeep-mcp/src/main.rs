@@ -3,7 +3,7 @@ use serde_json::json;
 use skykeep_mcp::{login, state::PrivateState, terminal, Server};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -26,6 +26,7 @@ async fn run() -> Result<(), &'static str> {
             "approve",
             "require-approval",
             "allow-routine",
+            "policy",
         ]
         .iter()
         .any(|name| s == name)
@@ -38,6 +39,16 @@ async fn run() -> Result<(), &'static str> {
         return Err("usage: skykeep-mcp [login|logout] --state-dir PRIVATE_DIRECTORY");
     }
     let dir = PathBuf::from(args.next().ok_or("state_directory_required")?);
+    let policy_mode = if command == "policy" {
+        Some(
+            args.next()
+                .ok_or("policy_mode_required")?
+                .to_string_lossy()
+                .to_string(),
+        )
+    } else {
+        None
+    };
     if args.next().is_some() {
         return Err("unexpected_argument");
     }
@@ -48,6 +59,17 @@ async fn run() -> Result<(), &'static str> {
         }
         // Check the user terminal before touching a keyring or any network.
         let mut tty = terminal::controlling()?;
+        if let Some(mode) = policy_mode {
+            use std::io::Write;
+            writeln!(tty, "Set approval mode to {mode} for {}. YOLO includes deletion without prompts. This staged implementation blocks remote sync and existing-item writes; legacy queue entries remain quarantined. Type confirm to persist.", dir.display()).map_err(|_| "terminal_unavailable")?;
+            let answer = terminal::hidden(&mut tty, "Confirmation: ", Duration::from_secs(180))?;
+            if *answer != "confirm" {
+                return Err("policy_change_cancelled");
+            }
+            let saved = Server::open(&dir)?.set_policy(&mode)?;
+            writeln!(tty, "Saved policy: {saved}").map_err(|_| "terminal_unavailable")?;
+            return Ok(());
+        }
         if command == "approve" {
             use std::io::Write;
             let id = terminal::hidden(&mut tty, "Approval request ID: ", Duration::from_secs(180))?;
@@ -73,6 +95,15 @@ async fn run() -> Result<(), &'static str> {
         }
         let held = PrivateState::open(&dir)?;
         if command == "require-approval" || command == "allow-routine" {
+            let library =
+                quince_core::Library::open(&held.path).map_err(|_| "library_unavailable")?;
+            if library
+                .state("mcp.policy")
+                .map_err(|_| "policy_unavailable")?
+                .is_some()
+            {
+                return Err("use_policy_command");
+            }
             let answer = terminal::hidden(
                 &mut tty,
                 "Type confirm to change write policy for this directory: ",
@@ -122,7 +153,8 @@ async fn run() -> Result<(), &'static str> {
         return Ok(());
     }
     let mut server = Server::open(&dir)?;
-    let mut input = BufReader::new(tokio::io::stdin()).lines();
+    let mut input = BufReader::new(tokio::io::stdin());
+    let mut frame = Vec::new();
     let mut output = tokio::io::stdout();
     let mut poll = tokio::time::interval(Duration::from_secs(5));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -130,8 +162,14 @@ async fn run() -> Result<(), &'static str> {
         skykeep_mcp::scheduler::Schedule::new(std::time::Instant::now(), Duration::from_secs(300));
     loop {
         let line = tokio::select! {
-            line = input.next_line() => match line.map_err(|_| "transport_failed")? { Some(line) => line, None => break },
+            line = skykeep_mcp::read_frame(&mut input, &mut frame) => match line? { Some(line) => line, None => break },
             _ = poll.tick() => {
+                if let Some(response) = server.expire_consent() {
+                    let mut bytes = serde_json::to_vec(&response).map_err(|_| "transport_failed")?;
+                    bytes.push(b'\n');
+                    output.write_all(&bytes).await.map_err(|_| "transport_failed")?;
+                    output.flush().await.map_err(|_| "transport_failed")?;
+                }
                 if schedule.due(std::time::Instant::now()) { let _ = server.refresh().await; }
                 continue;
             }

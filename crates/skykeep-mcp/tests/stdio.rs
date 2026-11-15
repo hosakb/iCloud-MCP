@@ -2,6 +2,56 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+#[test]
+fn negotiated_form_approves_exact_create_before_enqueue() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut library = quince_core::Library::open(dir.path()).unwrap();
+    library.set_state("account", "synthetic").unwrap();
+    library
+        .put_reminder_lists(&[quince_core::reminders::ReminderList {
+            guid: "list".into(),
+            title: "Synthetic".into(),
+            ..Default::default()
+        }])
+        .unwrap();
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        std::fs::set_permissions(
+            entry.unwrap().path(),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    skykeep_mcp::Server::open(dir.path())
+        .unwrap()
+        .set_policy("writes_only")
+        .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_skykeep-mcp"))
+        .args(["--state-dir"])
+        .arg(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+    writeln!(input, "{}", json!({"id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{"form":{}}}}})).unwrap();
+    let _: Value = serde_json::from_str(&output.next().unwrap().unwrap()).unwrap();
+    writeln!(input, "{}", json!({"id":2,"method":"tools/call","params":{"name":"reminders_write","arguments":{"action":"create","list_guid":"list","title":"exact synthetic operation"}}})).unwrap();
+    let form: Value = serde_json::from_str(&output.next().unwrap().unwrap()).unwrap();
+    assert_eq!(form["method"], "elicitation/create");
+    assert_eq!(library.outbox_count().unwrap(), 0);
+    writeln!(input, "{}", json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}})).unwrap();
+    let reply: Value = serde_json::from_str(&output.next().unwrap().unwrap()).unwrap();
+    assert_eq!(reply["id"], 2);
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    assert_eq!(library.outbox_count().unwrap(), 1);
+    drop(input);
+    assert!(child.wait().unwrap().success());
+}
+
 /// Subprocesses must not inherit markers from an agent shell running the tests.
 fn clean() -> Vec<(&'static str, &'static str)> {
     skykeep_mcp::terminal::AGENT_MARKERS
@@ -59,6 +109,17 @@ fn agent_marked_process_cannot_open_a_secret_prompt() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("user_owned_terminal_required"));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    let policy = Command::new(env!("CARGO_BIN_EXE_skykeep-mcp"))
+        .args(["policy", "--state-dir"])
+        .arg(dir.path())
+        .arg("yolo")
+        .env("HERMES_AGENT", "true")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!policy.status.success());
+    assert!(String::from_utf8_lossy(&policy.stderr).contains("user_owned_terminal_required"));
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
