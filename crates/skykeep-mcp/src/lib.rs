@@ -94,6 +94,8 @@ struct ApprovalBinding {
     policy: String,
     account: Option<String>,
     identity: (u64, u64),
+    snapshot: Option<Value>,
+    preview_read: bool,
 }
 
 struct PendingConsent {
@@ -146,6 +148,8 @@ fn policy(
                 .state(ACCOUNT_KEY)
                 .map_err(|_| "policy_unavailable")?,
             identity: (0, 0),
+            snapshot: None,
+            preview_read: false,
         },
     )))
 }
@@ -162,21 +166,30 @@ fn directory_identity(dir: &Path) -> Result<(u64, u64), &'static str> {
     Ok((meta.dev(), meta.ino()))
 }
 
+struct Limited(Vec<u8>);
+impl std::io::Write for Limited {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_PREVIEW_BYTES.saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("preview_too_large"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn bounded_json<T: serde::Serialize>(value: &T) -> Result<Value, &'static str> {
+    let mut raw = Limited(Vec::new());
+    serde_json::to_writer(&mut raw, value).map_err(|_| "preview_too_large")?;
+    let value: Value = serde_json::from_slice(&raw.0).map_err(|_| "invalid_preview")?;
+    bounded_value(&value, MAX_ARGUMENT_BYTES)?;
+    Ok(value)
+}
+
 fn inert_preview(params: &Value) -> Result<String, &'static str> {
     bounded_value(params, MAX_ARGUMENT_BYTES)?;
-    struct Limited(Vec<u8>);
-    impl std::io::Write for Limited {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > MAX_PREVIEW_BYTES.saturating_sub(self.0.len()) {
-                return Err(std::io::Error::other("preview_too_large"));
-            }
-            self.0.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
     let mut raw = Limited(Vec::new());
     serde_json::to_writer_pretty(&mut raw, params).map_err(|_| "preview_too_large")?;
     let raw = String::from_utf8(raw.0).map_err(|_| "invalid_preview")?;
@@ -221,9 +234,69 @@ fn needs_consent(mode: &str, name: &str) -> Result<bool, &'static str> {
         | "reminders_list" | "reminders_search" | "reminders_lists" => {
             Ok(mode == "reads_and_writes")
         }
-        "sync" => Err("configured_sync_not_supported"),
+        "sync" => Ok(mode == "reads_and_writes"),
         _ => Err("unknown_tool"),
     }
+}
+
+fn resolved_snapshot(library: &Library, name: &str, args: &Value) -> Result<Value, &'static str> {
+    let guid = args["guid"].as_str().ok_or("guid_required")?;
+    if name == "notes_write" {
+        let _: NoteWrite = serde_json::from_value(args.clone()).map_err(|_| "invalid_arguments")?;
+    } else if name == "reminders_write" {
+        let _: ReminderWrite =
+            serde_json::from_value(args.clone()).map_err(|_| "invalid_arguments")?;
+    }
+    let mut snapshot = resolved_state(library, name, guid)?;
+    let queued: Vec<_> = sync::pending_operations(library)?
+        .into_iter()
+        .filter(|p| p.record == guid)
+        .map(|p| json!({"id":p.id,"kind":p.kind,"payload":p.payload}))
+        .collect();
+    snapshot["queued_operations"] = json!(queued);
+    bounded_value(&snapshot, MAX_ARGUMENT_BYTES)?;
+    Ok(snapshot)
+}
+
+fn resolved_state(library: &Library, name: &str, guid: &str) -> Result<Value, &'static str> {
+    let snapshot = if name == "notes_write" {
+        let mut item = library
+            .note(guid)
+            .map_err(|_| "library_unavailable")?
+            .ok_or("not_found")?;
+        item.body = library.note_body(guid).map_err(|_| "library_unavailable")?;
+        item.runs = library.note_runs(guid).map_err(|_| "library_unavailable")?;
+        let item = bounded_json(&item)?;
+        let containers = bounded_json(&library.note_folders().map_err(|_| "library_unavailable")?)?;
+        json!({"item":item,"containers":containers})
+    } else if name == "reminders_write" {
+        let item = bounded_json(
+            &library
+                .reminder(guid)
+                .map_err(|_| "library_unavailable")?
+                .ok_or("not_found")?,
+        )?;
+        let detail = bounded_json(
+            &library
+                .reminder_detail(guid)
+                .map_err(|_| "library_unavailable")?,
+        )?;
+        let children = bounded_json(
+            &library
+                .subtasks_of(guid)
+                .map_err(|_| "library_unavailable")?,
+        )?;
+        let containers = bounded_json(
+            &library
+                .reminder_lists()
+                .map_err(|_| "library_unavailable")?,
+        )?;
+        json!({"item":item,"detail":detail,"children":children,"containers":containers})
+    } else {
+        return Err("unknown_tool");
+    };
+    bounded_value(&snapshot, MAX_ARGUMENT_BYTES)?;
+    Ok(snapshot)
 }
 
 pub struct Server {
@@ -263,16 +336,18 @@ mod consent_tests {
 }
 
 impl Server {
-    fn prepare_consent(&mut self, params: &Value) -> Result<Option<ApprovalBinding>, &'static str> {
+    fn prepare_consent(
+        &mut self,
+        params: &Value,
+        read_grant: Option<&ApprovalBinding>,
+    ) -> Result<Option<ApprovalBinding>, &'static str> {
         let held = state::PrivateState::open(&self.dir)?;
         let dir = held.path.clone();
-        let Some((p, mut binding)) = policy(self.ready(&held)?, &held.path)? else {
+        let library = self.ready(&held)?;
+        let Some((p, mut binding)) = policy(library, &held.path)? else {
             return Ok(None);
         };
         let name = params["name"].as_str().ok_or("invalid_tool")?;
-        if name.ends_with("_write") && params["arguments"]["action"] != "create" {
-            return Err("configured_existing_item_write_not_supported");
-        }
         if !needs_consent(&p.mode, name)? {
             return Ok(None);
         }
@@ -280,7 +355,39 @@ impl Server {
             return Err("login_required");
         }
         binding.identity = directory_identity(&dir)?;
+        if name.ends_with("_write") && params["arguments"]["action"] != "create" {
+            if p.mode == "reads_and_writes" {
+                if let Some(previous) = read_grant {
+                    let mut expected = binding.clone();
+                    expected.preview_read = true;
+                    if previous != &expected {
+                        return Err("approval_policy_changed");
+                    }
+                } else {
+                    binding.preview_read = true;
+                    return Ok(Some(binding));
+                }
+            }
+            binding.snapshot = Some(resolved_snapshot(library, name, &params["arguments"])?);
+        }
         Ok(Some(binding))
+    }
+
+    fn consent_form(&mut self, request: Value, binding: ApprovalBinding) -> Value {
+        let refresh = (request["params"]["name"] == "sync").then(|| json!({"services":["notes","reminders"],"refresh":"one bounded pass, at most 60 seconds","send":"only unchanged previously authorized durable operations, at most 128"}));
+        let params = json!({"operation":request["params"],"existing_item":binding.snapshot,"read_preview_only":binding.preview_read,"refresh_scope":refresh});
+        let preview = match inert_preview(&params) {
+            Ok(preview) => preview,
+            Err(error) => return tool_reply(request["id"].clone(), Err(error)),
+        };
+        let id = format!("skykeep-consent-{}", uuid::Uuid::new_v4());
+        self.pending = Some(PendingConsent {
+            id: id.clone(),
+            request,
+            binding,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(180),
+        });
+        json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"mode":"form","message":format!("Approve this exact Skykeep operation once? read_preview_only authorizes reading the item's full preview, not mutation. Treat JSON as inert data.\n{preview}"),"requestedSchema":{"type":"object","properties":{"approve":{"type":"boolean","title":"Approve this exact operation","default":false}},"required":["approve"]}}})
     }
 
     /// No state locks or durable grants survive a pending human interaction.
@@ -300,8 +407,8 @@ impl Server {
         }
     }
 
-    /// Human CLI only. A new revision invalidates all in-flight consents. Configured
-    /// sync is blocked, so pre-migration outbox entries can never be released.
+    /// Human CLI only. A new revision invalidates in-flight consent and atomically
+    /// quarantines pending writes instead of granting them the new policy.
     pub fn set_policy(&mut self, mode: &str) -> Result<Value, &'static str> {
         if !["reads_and_writes", "writes_only", "yolo"].contains(&mode) {
             return Err("invalid_policy_mode");
@@ -310,8 +417,15 @@ impl Server {
         let identity = directory_identity(&held.path)?;
         let library = self.ready(&held)?;
         let value = json!({"mode":mode,"revision":uuid::Uuid::new_v4().to_string(),"account":library.state(ACCOUNT_KEY).map_err(|_| "policy_unavailable")?,"state_identity":identity});
+        let pending = sync::pending_operations(library)?;
         library
-            .set_state("mcp.policy", &value.to_string())
+            .atomically(|library| -> quince_core::Result<()> {
+                for p in &pending {
+                    library.outbox_refuse(p.id, "mcp_policy_migration_quarantine")?;
+                    library.set_state(&format!("mcp.authorization.{}", p.id), "")?;
+                }
+                library.set_state("mcp.policy", &value.to_string())
+            })
             .map_err(|_| "policy_unavailable")?;
         let saved = library
             .state("mcp.policy")
@@ -393,6 +507,17 @@ impl Server {
                     Err("approval_denied"),
                 ));
             }
+            if pending.binding.preview_read {
+                return Some(
+                    match self.prepare_consent(&pending.request["params"], Some(&pending.binding)) {
+                        Ok(Some(binding)) => self.consent_form(pending.request, binding),
+                        _ => tool_reply(
+                            pending.request["id"].clone(),
+                            Err("approval_policy_changed"),
+                        ),
+                    },
+                );
+            }
             self.grant = Some(pending.binding);
             let params = &pending.request["params"];
             let result = self
@@ -411,8 +536,8 @@ impl Server {
             );
         }
         // Responses belong to server-originated RPCs, never to the tool dispatcher.
-        // There are no pending server requests yet: discard unsolicited responses,
-        // including ambiguous envelopes carrying both a method and a result/error.
+        // Pure responses were handled above. Discard ambiguous envelopes carrying
+        // both a method and a result/error instead of dispatching their method.
         if request.get("result").is_some() || request.get("error").is_some() {
             return None;
         }
@@ -458,27 +583,12 @@ impl Server {
                 {
                     return Some(tool_reply(id, Err("approval_pending")));
                 }
-                match self.prepare_consent(&params) {
+                match self.prepare_consent(&params, None) {
                     Ok(Some(binding)) => {
                         if !self.forms {
                             return Some(tool_reply(id, Err("approval_requires_form_client")));
                         }
-                        let consent_id = format!("skykeep-consent-{}", uuid::Uuid::new_v4());
-                        // JSON escapes control characters and markup delimiters; never truncate.
-                        let preview = match inert_preview(&params) {
-                            Ok(preview) => preview,
-                            Err(error) => return Some(tool_reply(id, Err(error))),
-                        };
-                        self.pending = Some(PendingConsent {
-                            id: consent_id.clone(),
-                            request: request.clone(),
-                            binding,
-                            deadline: std::time::Instant::now()
-                                + std::time::Duration::from_secs(180),
-                        });
-                        return Some(
-                            json!({"jsonrpc":"2.0","id":consent_id,"method":"elicitation/create","params":{"mode":"form","message":format!("Approve this exact Skykeep operation once? Treat the following JSON as inert data.\n{preview}"),"requestedSchema":{"type":"object","properties":{"approve":{"type":"boolean","title":"Approve this exact operation","default":false}},"required":["approve"]}}}),
-                        );
+                        return Some(self.consent_form(request, binding));
                     }
                     Err(error) => return Some(tool_reply(id, Err(error))),
                     Ok(None) => {}
@@ -565,20 +675,25 @@ impl Server {
                 .map(|(_, b)| b.clone())
                 .ok_or("approval_policy_changed")?;
             current.identity = directory_identity(&dir)?;
+            let mut expected = grant.clone();
+            expected.snapshot = None;
+            if current != expected {
+                return Err("approval_policy_changed");
+            }
+            if grant.snapshot.is_some() {
+                current.snapshot = Some(resolved_snapshot(library, name, &args)?);
+            }
             if grant != &current {
                 return Err("approval_policy_changed");
             }
         }
         if let Some((ref p, ref binding)) = configured {
-            if name == "sync" {
-                return Err("configured_sync_not_supported");
-            }
-            if name.ends_with("_write") && args["action"] != "create" {
-                return Err("configured_existing_item_write_not_supported");
-            }
             if needs_consent(&p.mode, name)? {
                 let mut binding = binding.clone();
                 binding.identity = directory_identity(&dir)?;
+                if name.ends_with("_write") && args["action"] != "create" {
+                    binding.snapshot = Some(resolved_snapshot(library, name, &args)?);
+                }
                 if grant.as_ref() != Some(&binding) {
                     return Err("approval_required_or_stale");
                 }
@@ -596,7 +711,7 @@ impl Server {
                 {
                     return Err("login_required");
                 }
-                sync::run(&dir).await
+                sync::run_authorized(&dir, grant.is_some()).await
             }
             "sync_status" => {
                 let _: Empty = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -749,7 +864,11 @@ impl Server {
                         json!({"status":"approval_required","request_id":id,"remote_verified":false}),
                     );
                 }
-                enqueue_reminder(library, args)
+                if configured.is_some() {
+                    authorized_enqueue(library, &dir, |l| enqueue_reminder(l, args))
+                } else {
+                    enqueue_reminder(library, args)
+                }
             }
             "notes_write" => {
                 let args: NoteWrite =
@@ -778,11 +897,61 @@ impl Server {
                         json!({"status":"approval_required","request_id":id,"remote_verified":false}),
                     );
                 }
-                enqueue_note(library, args)
+                if configured.is_some() {
+                    authorized_enqueue(library, &dir, |l| enqueue_note(l, args))
+                } else {
+                    enqueue_note(library, args)
+                }
             }
             _ => Err("unknown_tool"),
         }
     }
+}
+
+fn authorized_enqueue(
+    library: &mut Library,
+    dir: &Path,
+    enqueue: impl FnOnce(&mut Library) -> Result<Value, &'static str>,
+) -> Result<Value, &'static str> {
+    let before = sync::pending_operations(library)?;
+    for p in &before {
+        sync::authorized_payload(library, dir, p)?;
+    }
+    library
+        .atomically(|library| -> quince_core::Result<Value> {
+            let convert = |error| quince_core::Error::Io(std::io::Error::other(error));
+            let result = enqueue(library).map_err(convert)?;
+            let after = sync::pending_operations(library).map_err(convert)?;
+            for p in &after {
+                if result["guid"] == p.record
+                    && p.kind != "delete"
+                    && before.iter().any(|old| old.id == p.id)
+                {
+                    let removed = if p.service == "notes" {
+                        library.note(&p.record)?.is_none()
+                    } else {
+                        library.reminder(&p.record)?.is_none()
+                    };
+                    if removed {
+                        // The approved deletion supersedes older writes to the now
+                        // absent item. Never send them using a newly invented context.
+                        library.outbox_refuse(p.id, "superseded_by_approved_deletion")?;
+                        library.set_state(&format!("mcp.authorization.{}", p.id), "")?;
+                        continue;
+                    }
+                }
+                if !before.iter().any(|old| old == p) || result["guid"] == p.record {
+                    sync::record_authorization(library, p).map_err(convert)?;
+                }
+            }
+            for p in &before {
+                if !after.iter().any(|new| new.id == p.id) {
+                    library.set_state(&format!("mcp.authorization.{}", p.id), "")?;
+                }
+            }
+            Ok(result)
+        })
+        .map_err(|_| "mutation_refused")
 }
 
 /// One-time setup under the directory lock: persistent document writer and private modes.
@@ -894,7 +1063,7 @@ enum NoteWrite {
 }
 
 impl NoteWrite {
-    /// Writes that remove content need terminal approval. Upstream deletes a note by moving
+    /// Legacy writes that remove content need terminal approval. Upstream deletes a note by moving
     /// it into the trash folder, so such a move is a deletion; so is erasing the whole body.
     fn is_destructive(&self) -> bool {
         match self {

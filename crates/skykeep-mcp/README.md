@@ -78,12 +78,10 @@ What approval protects against: an agent that reaches this server only through M
 
 ### Issue #7 staged implementation checkpoint
 
-This slice implements local cached reads and exact note/reminder creation with
-persisted approval modes. Missing policy retains all legacy behavior. It is not
-ready for real-account rollout: configured policies block **all sync and all
-existing-item mutations**, including deletion, pending the durable-send and
-resolved-item-preview work below. YOLO means no per-operation prompts for supported
-operations; it does not make unsupported operations available.
+This candidate implements policy-controlled reads, Notes and Reminders mutations,
+and bounded sync. Missing policy retains legacy behavior. It is not ready for
+real-account rollout while the Hermes boolean-content and rendered-preview gates
+below remain open. No mode has been activated on real state.
 
 The human-only command is `skykeep-mcp policy --state-dir DIR MODE`, where MODE is
 `reads_and_writes`, `writes_only`, or `yolo`. It requires a user-owned terminal,
@@ -93,7 +91,7 @@ Account changes or copied policies fail closed until the human explicitly migrat
 again. Existing terminal policy commands cannot override an activated new policy.
 No migration back to legacy is provided. No real state was migrated in development.
 
-| Mode | Cached content reads | Supported creates |
+| Mode | Content reads and refresh | Mutations, including deletion |
 | --- | --- | --- |
 | reads_and_writes | One-shot form approval | One-shot form approval |
 | writes_only | No prompt | One-shot form approval |
@@ -116,18 +114,36 @@ durable consent record is written. EOF drops the pending continuation. Cancellat
 after enqueue cannot roll back an already committed operation.
 
 The complete create/read-request JSON is sent without truncation, with markup and
-non-ASCII characters escaped as inert Unicode sequences. Existing-item writes are
-refused because their full resolved-item previews are not implemented. The owner
+non-ASCII characters escaped as inert Unicode sequences. Existing-item mutations
+show the cached item, body/runs or reminder details, affected subtasks, containers,
+and prior queued operations. Execution checks that snapshot again under lock.
+In `reads_and_writes`, a first consent authorizes reading this preview; a second
+consent authorizes the mutation. A stale policy cannot authorize preview reads.
+Frames are limited to 64 KiB before parsing, arguments to 32 KiB before cloning,
+and escaped previews to 128 KiB before expansion. Parsed values also have depth
+and node limits. Oversized operations are rejected, never silently truncated. The owner
 must verify that the client exposes the entire preview before approving; source or
 SDK tests do not establish UI rendering. Forms request only approval, never secrets.
 
-Configured sync is refused before session/keyring/network access, including startup
-and timer refresh. This quarantines all legacy and new outbox entries and old
-terminal proposals; migration never releases them. Remaining work: bind each exact
-durable payload and policy revision through send/retry/coalescing, implement safe
-queue migration and bounded refresh, then enable sync. Do not weaken this refusal
-to obtain remote writes. Existing-item mutations also require immutable resolved
-state preview and revalidation before they can be enabled.
+Migration atomically marks existing pending writes refused with the reason
+`mcp_policy_migration_quarantine` and invalidates their grants. It also blocks old
+terminal proposals. Every new enqueue records the exact native payload and policy
+revision in the same transaction. Coalescing requires previously authorized input
+and replaces the resulting payload grant. Tries can change during retry; operation
+bytes cannot. Changing policy quarantines even previously approved pending writes.
+
+Before session validation, sync checks read permission and pending grants. In
+`reads_and_writes`, startup/timer refresh is refused without issuing a form;
+only an originating `sync` call can request one-shot refresh consent. The other
+modes permit background refresh. Native sends recheck exact payload, account,
+policy, directory and mutable cached inputs after refresh, before entering the
+writer. Changed inputs fail closed. A sync has a 60-second async deadline and at
+most 128 pending/refused records are admitted. Timeout after a send begins means
+delivery may be uncertain; the original durable record remains for retry.
+Partial native payload narrowing or changed cached inputs need fresh authorization
+and are never silently blessed. These safeguards can refuse delivery after a
+concurrent remote edit. Apple-side conflict/merge behavior remains native engine
+behavior; local acceptance is not field-level remote verification.
 
 Canonical read-only Hermes `tools/mcp_tool_sampling.py` currently returns empty
 content on accept (`ElicitationHandler._result`). That cannot satisfy this server's
@@ -135,8 +151,8 @@ required boolean. Minimal owner-directed Hermes integration: collect the boolean
 through the native form callback, return the actual validated content, and expose
 the full inert preview on each supported surface. Until then Hermes acceptance
 fails closed. No Hermes files were edited and no rendered UI was tested. OpenClaw
-runtime interoperability is untested. Cleanup PR #11 merged separately; root
-workspace, lockfile and app-removal files are not edited here.
+runtime interoperability is untested. The candidate is based on cleanup main;
+deleted app files have not been restored. Independent security re-review is required.
 
 References: [MCP elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation),
 [MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools),

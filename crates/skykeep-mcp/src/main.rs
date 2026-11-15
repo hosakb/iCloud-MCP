@@ -61,7 +61,7 @@ async fn run() -> Result<(), &'static str> {
         let mut tty = terminal::controlling()?;
         if let Some(mode) = policy_mode {
             use std::io::Write;
-            writeln!(tty, "Set approval mode to {mode} for {}. YOLO includes deletion without prompts. This staged implementation blocks remote sync and existing-item writes; legacy queue entries remain quarantined. Type confirm to persist.", dir.display()).map_err(|_| "terminal_unavailable")?;
+            writeln!(tty, "Set approval mode to {mode} for {}. YOLO includes deletion without prompts. All currently pending writes will be quarantined, including previously approved writes. Old terminal proposals cannot be released under this policy. Type confirm to persist.", dir.display()).map_err(|_| "terminal_unavailable")?;
             let answer = terminal::hidden(&mut tty, "Confirmation: ", Duration::from_secs(180))?;
             if *answer != "confirm" {
                 return Err("policy_change_cancelled");

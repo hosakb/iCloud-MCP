@@ -2,6 +2,239 @@ use serde_json::json;
 use skykeep_mcp::Server;
 
 #[tokio::test]
+async fn nonempty_cached_pages_remain_incomplete_and_require_parent_for_reminders() {
+    let (_dir, mut server, mut library) = configured("yolo", json!({}), "2025-11-25").await;
+    library
+        .put_reminder_lists(&[quince_core::reminders::ReminderList {
+            guid: "list".into(),
+            ..Default::default()
+        }])
+        .unwrap();
+    for i in 0..3 {
+        library
+            .put_reminder_local(&quince_core::reminders::Reminder {
+                guid: format!("r{i}"),
+                list_guid: "list".into(),
+                title: format!("title{i}"),
+                ..Default::default()
+            })
+            .unwrap();
+        let reply = server
+            .handle(operation(
+                2,
+                "notes_write",
+                json!({"action":"create","body":format!("note{i}")}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reply["result"]["isError"], false);
+    }
+    for (name, parent) in [
+        ("notes_list", serde_json::Value::Null),
+        ("reminders_list", json!("list")),
+    ] {
+        let mut seen = std::collections::HashSet::new();
+        for offset in 0..3 {
+            let mut args = json!({"offset":offset,"limit":1});
+            if !parent.is_null() {
+                args["parent"] = parent.clone();
+            }
+            let reply = server.handle(operation(3, name, args)).await.unwrap();
+            let page: serde_json::Value =
+                serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(page["source"], "local_cache");
+            assert_eq!(page["complete_representation"], false);
+            assert_eq!(page["total"], 3);
+            assert!(seen.insert(page["items"][0]["guid"].as_str().unwrap().to_owned()));
+            assert_eq!(
+                page["next_offset"],
+                if offset < 2 {
+                    json!(offset + 1)
+                } else {
+                    serde_json::Value::Null
+                }
+            );
+        }
+    }
+    assert_eq!(
+        server
+            .handle(operation(4, "reminders_list", json!({})))
+            .await
+            .unwrap()["result"]["isError"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn configured_note_mutations_require_exact_forms_and_yolo_deletion_does_not() {
+    let (_dir, mut server, mut library) =
+        configured("yolo", json!({"elicitation":{}}), "2025-11-25").await;
+    library
+        .put_note_folders(&[quince_core::notes::NoteFolder {
+            guid: "folder".into(),
+            title: "Target".into(),
+            sort_order: 0,
+            parent_guid: None,
+        }])
+        .unwrap();
+    let reply = server
+        .handle(operation(
+            2,
+            "notes_write",
+            json!({"action":"create","body":"full original body"}),
+        ))
+        .await
+        .unwrap();
+    let created: serde_json::Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let guid = created["guid"].as_str().unwrap();
+    server.set_policy("writes_only").unwrap();
+    for args in [
+        json!({"action":"save","guid":guid,"body":"updated full body"}),
+        json!({"action":"pin","guid":guid,"pinned":true}),
+        json!({"action":"move","guid":guid,"folder_guid":"folder"}),
+        json!({"action":"delete","guid":guid}),
+    ] {
+        let action = args["action"].as_str().unwrap().to_owned();
+        let count = library.outbox_count().unwrap();
+        let form = server
+            .handle(operation(3, "notes_write", args))
+            .await
+            .unwrap();
+        assert_eq!(form["method"], "elicitation/create", "{form}");
+        assert_eq!(library.outbox_count().unwrap(), count);
+        let reply=server.handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}})).await.unwrap();
+        assert_eq!(reply["result"]["isError"], false, "{action}: {reply}");
+    }
+    server.set_policy("yolo").unwrap();
+    let reply = server
+        .handle(operation(
+            4,
+            "notes_write",
+            json!({"action":"create","body":"yolo delete fixture"}),
+        ))
+        .await
+        .unwrap();
+    let created: serde_json::Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let guid = created["guid"].as_str().unwrap();
+    let reply = server
+        .handle(operation(
+            4,
+            "notes_write",
+            json!({"action":"delete","guid":guid}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    assert!(reply.get("method").is_none());
+}
+
+#[tokio::test]
+async fn oversized_stdio_frame_is_bounded_before_parsing() {
+    let bytes = vec![b'x'; skykeep_mcp::MAX_FRAME_BYTES + 1];
+    let mut input = tokio::io::BufReader::new(bytes.as_slice());
+    let mut frame = Vec::new();
+    assert_eq!(
+        skykeep_mcp::read_frame(&mut input, &mut frame)
+            .await
+            .unwrap_err(),
+        "frame_too_large"
+    );
+    assert!(frame.len() <= skykeep_mcp::MAX_FRAME_BYTES);
+}
+
+#[tokio::test]
+async fn read_write_policy_requires_read_consent_before_resolved_mutation_preview() {
+    let (_dir, mut server, mut library) =
+        configured("reads_and_writes", json!({"elicitation":{}}), "2025-11-25").await;
+    library
+        .put_reminder_lists(&[quince_core::reminders::ReminderList {
+            guid: "list".into(),
+            ..Default::default()
+        }])
+        .unwrap();
+    library
+        .put_reminder_local(&quince_core::reminders::Reminder {
+            guid: "r".into(),
+            list_guid: "list".into(),
+            title: "private resolved title".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let first = server
+        .handle(operation(
+            2,
+            "reminders_write",
+            json!({"action":"delete","guid":"r"}),
+        ))
+        .await
+        .unwrap();
+    assert!(!first["params"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("private resolved title"));
+    let second=server.handle(json!({"jsonrpc":"2.0","id":first["id"],"result":{"action":"accept","content":{"approve":true}}})).await.unwrap();
+    assert_ne!(first["id"], second["id"]);
+    assert!(second["params"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("private resolved title"));
+    assert_eq!(library.outbox_count().unwrap(), 0);
+    let reply=server.handle(json!({"jsonrpc":"2.0","id":second["id"],"result":{"action":"accept","content":{"approve":true}}})).await.unwrap();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    assert_eq!(library.outbox_count().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn coalesced_payload_is_reauthorized_and_policy_changes_quarantine_it() {
+    let (dir, mut server, library) = configured("yolo", json!({}), "2025-11-25").await;
+    let reply = server
+        .handle(operation(
+            2,
+            "notes_write",
+            json!({"action":"create","body":"first"}),
+        ))
+        .await
+        .unwrap();
+    let result: serde_json::Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let guid = result["guid"].as_str().unwrap();
+    let mut original = None;
+    for body in ["second", "final exact body"] {
+        let reply = server
+            .handle(operation(
+                3,
+                "notes_write",
+                json!({"action":"save","guid":guid,"body":body}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        if original.is_none() {
+            original = library
+                .outbox_pending("notes")
+                .unwrap()
+                .into_iter()
+                .find(|p| p.kind == "save");
+        }
+    }
+    let original = original.unwrap();
+    let pending = library.outbox_pending("notes").unwrap();
+    assert_eq!(pending.len(), 2); // Create stays ordered before the coalesced save.
+    let save = pending.iter().find(|p| p.kind == "save").unwrap();
+    assert_ne!(save.payload, original.payload);
+    assert!(save.payload.contains("final exact body"));
+    assert!(skykeep_mcp::sync::authorized(&library, dir.path(), save).is_ok());
+    assert!(skykeep_mcp::sync::authorized(&library, dir.path(), &original).is_err());
+    server.set_policy("writes_only").unwrap();
+    assert!(library.outbox_pending("notes").unwrap().is_empty());
+    assert_eq!(library.outbox_refused().unwrap().len(), 2);
+    assert!(skykeep_mcp::sync::authorized(&library, dir.path(), &pending[0]).is_err());
+}
+
+#[tokio::test]
 async fn oversized_operations_and_expanding_previews_are_rejected_without_queueing() {
     for (mode, body) in [
         ("yolo", "x".repeat(40000)),
@@ -23,6 +256,82 @@ async fn oversized_operations_and_expanding_previews_are_rejected_without_queuei
         );
         assert_eq!(library.outbox_count().unwrap(), 0);
     }
+}
+
+#[tokio::test]
+async fn existing_reminder_preview_is_complete_and_stale_consent_cannot_mutate() {
+    let (_dir, mut server, mut library) =
+        configured("writes_only", json!({"elicitation":{}}), "2025-11-25").await;
+    library
+        .put_reminder_lists(&[quince_core::reminders::ReminderList {
+            guid: "list".into(),
+            ..Default::default()
+        }])
+        .unwrap();
+    library
+        .put_reminder_local(&quince_core::reminders::Reminder {
+            guid: "r".into(),
+            list_guid: "list".into(),
+            title: "full existing title".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let args = json!({"action":"delete","guid":"r"});
+    let form = server
+        .handle(operation(2, "reminders_write", args.clone()))
+        .await
+        .unwrap();
+    assert_eq!(form["method"], "elicitation/create");
+    assert!(form["params"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("full existing title"));
+    library
+        .put_reminder_local(&quince_core::reminders::Reminder {
+            guid: "r".into(),
+            list_guid: "list".into(),
+            title: "changed while awaiting consent".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let reply = server.handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}})).await.unwrap();
+    assert_eq!(reply["result"]["isError"], true);
+    assert_eq!(library.outbox_count().unwrap(), 0);
+    let form = server
+        .handle(operation(3, "reminders_write", args))
+        .await
+        .unwrap();
+    let reply = server.handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}})).await.unwrap();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    assert_eq!(library.outbox_count().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn configured_mutation_persists_exact_payload_authorization() {
+    let (_dir, mut server, library) = configured("yolo", json!({}), "2025-11-25").await;
+    let reply = server
+        .handle(operation(
+            2,
+            "notes_write",
+            json!({"action":"create","body":"exact durable body"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reply["result"]["isError"], false);
+    let pending = library.outbox_pending("notes").unwrap().remove(0);
+    let raw = library
+        .state(&format!("mcp.authorization.{}", pending.id))
+        .unwrap();
+    assert!(
+        raw.is_some(),
+        "enqueue and durable authorization must commit together"
+    );
+    let record: serde_json::Value = serde_json::from_str(&raw.unwrap()).unwrap();
+    assert_eq!(record["pending"]["payload"], pending.payload);
+    assert_eq!(
+        record["policy"],
+        library.state("mcp.policy").unwrap().unwrap()
+    );
 }
 
 async fn configured(
