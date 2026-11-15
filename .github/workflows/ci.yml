@@ -1,364 +1,50 @@
-# Every push and pull request to main, on Linux:
-#   published — what the repository tracks, the workflows' wiring, the Flatpak's sources, and
-#          no secret in any commit;
-#   rust — cargo fmt, clippy with warnings as errors, and the real tests (libraries, the app
-#          and test files; the probe examples are live tools, not tests);
-#   android — the engine for the phone, the app built and its unit tests run (job below);
-#   web  — npm ci, the type check, the production build, the model tests, and a smoke run of
-#          the key interface suites in Chromium against `vite preview`.
-# The jobs run side by side. A pull request's newer push cancels its older run. Windows is
-# proven by windows-checks.yml on every push to main, and by windows.yml by hand or for a
-# release. A branch can be run by hand (Actions → CI → Run workflow) before it goes to main.
-name: CI
+name: MCP CI
 
 on:
-  workflow_dispatch:
-  # A change to the words or pictures alone (README, docs) builds nothing: it skipped no check
-  # that could fail, and every README edit cancelled the run before it. Secrets in any commit are
-  # still refused by the pre-commit guard, and the release runs every check whatever changed.
   push:
     branches: [main]
-    paths-ignore: ["**.md", "docs/media/**"]
   pull_request:
     branches: [main]
-    paths-ignore: ["**.md", "docs/media/**"]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-# A pull request's newer push cancels its older run. On main every commit keeps its own run (the
-# group is its SHA), as uv's CI does: a push landing while a release candidate was being checked
-# cancelled the candidate's run, the one its tag depends on.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: "0"
-  # No debug info in CI builds: smaller cache, faster links, same checks.
-  CARGO_PROFILE_DEV_DEBUG: "0"
-  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
-  # What the repository publishes: only paths .github/published-paths names (a broad `git add`
-  # once published another app's installer and every local note), and no secret in any commit.
-  published:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      # Every workflow's expressions, inputs and job wiring checked before GitHub runs them:
-      # actionlint's own release, pinned and checked against its published checksum.
-      - name: Workflows are well formed
-        env:
-          VERSION: "1.7.12"
-          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
-        run: |
-          curl -sSfL -o actionlint.tar.gz "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
-          echo "${SHA256}  actionlint.tar.gz" | sha256sum -c -
-          tar -xzf actionlint.tar.gz actionlint
-          # The workflows' wiring; their scripts' style is not this check's (-shellcheck= off).
-          ./actionlint -shellcheck=
-          rm actionlint actionlint.tar.gz
-      - name: Nothing stray is tracked
-        run: |
-          stray=$(git ls-files | grep -vxE -f <(grep -vE '^(#|$)' .github/published-paths) || true)
-          if [ -n "$stray" ]; then
-            echo "::error::Tracked but not meant to be published (add to .github/published-paths only if it is):"
-            echo "$stray"
-            exit 1
-          fi
-      # The Flatpak builds offline from packaging/flatpak/*-sources.json; a dependency added
-      # without them regenerated failed only there, at release (v0.1.18).
-      - name: The Flatpak's offline sources match the lockfiles
-        run: python3 packaging/flatpak/sources-current.py
-      - name: No secret in any commit
-        env:
-          GITLEAKS: "8.30.1"
-        run: |
-          curl -fsSL -o gl.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS}/gitleaks_${GITLEAKS}_linux_x64.tar.gz"
-          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS}/gitleaks_${GITLEAKS}_checksums.txt" \
-            | grep " gitleaks_${GITLEAKS}_linux_x64.tar.gz$" | sed 's/ .*/  gl.tgz/' | sha256sum -c -
-          tar -xzf gl.tgz gitleaks
-          ./gitleaks git --no-banner --redact .
-
-  # Every Rust dependency against deny.toml (cargo-deny): RustSec advisories (vulnerabilities,
-  # unsound or unmaintained crates, yanked versions), licences, duplicate versions, and that
-  # every crate comes from crates.io. Reads Cargo.lock and the advisory database; builds nothing.
-  supply-chain:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
-        with:
-          tool: cargo-deny@0.20.2
-      - run: cargo deny --locked check advisories bans licenses sources
-
-  # On x86_64 and on 64-bit ARM: Apple Silicon Macs run Linux (Asahi, Omarchy) on aarch64.
-  # What a pull request touches decides how much runs: a translation alone (src/locales/*.json,
-  # nothing else) is checked by the type checker and the language test in a minute; anything else,
-  # and every push to main, runs everything below.
-  scope:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      full: ${{ steps.files.outputs.full }}
-    steps:
-      - id: files
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          full=true
-          if [ -n "$PR" ]; then
-            files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename')
-            if [ -n "$files" ] && ! grep -qvE '^src/locales/[^/]+\.json$' <<< "$files"; then full=false; fi
-          fi
-          echo "full=$full" | tee -a "$GITHUB_OUTPUT"
-
-  languages:
-    needs: scope
-    if: needs.scope.outputs.full != 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci --no-audit --no-fund
-      - run: npx tsc --noEmit
-      - run: node --test .uiverify/i18n.test.mjs
-
-  rust:
-    needs: scope
-    if: needs.scope.outputs.full == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 50  # a cold cache (new toolchain, new lockfile) compiles everything; warm runs take ~12
-    permissions:
-      contents: read
-      pull-requests: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Build dependencies
-        run: |
-          sudo apt-get -o Acquire::Retries=5 update
-          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
-            libsecret-1-dev libheif-dev libheif-plugin-libde265 libfuse3-dev pkg-config \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
-          # The codecs, not only their headers: a video test reads an .mp4's first frames, and
-          # Copy's test decodes a HEIC (libde265, which the .deb depends on too).
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # Only main writes the cache; pull requests read it, so they cannot crowd it out.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo fmt --all --check
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 22
-          cache: npm
-      # The window's files must exist for the app crate to compile (tauri::generate_context!).
-      - run: npm ci --no-audit --no-fund
-      # The installer build refuses a Tauri npm package and Rust crate on different minor
-      # versions; caught here in seconds rather than at the end of a Windows build.
-      - name: Tauri versions match
-        run: |
-          node -e '
-            const lock = require("./package-lock.json").packages;
-            const npm = lock["node_modules/@tauri-apps/api"].version;
-            const rust = require("fs").readFileSync("Cargo.lock", "utf8").match(/name = "tauri"\nversion = "([^"]+)"/)[1];
-            const mm = (v) => v.split(".").slice(0, 2).join(".");
-            console.log(`@tauri-apps/api ${npm}, tauri crate ${rust}`);
-            if (mm(npm) !== mm(rust)) { console.error("Tauri npm package and crate differ: align them"); process.exit(1); }'
-      - run: npx vite build
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      # In a zone west of UTC with clock changes: in UTC a time read in the wrong zone reads
-      # the same as the right one, so #23 (a floating reminder rang hours early) passed here.
-      # The gate runs in its own machine's zone and Windows in UTC: three kinds of offset.
-      # nextest (.config/nextest.toml): each test in its own process across every core, a hung
-      # one stopped and failed, the slow ones named — as uv and Zed run theirs.
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
-        with:
-          tool: cargo-nextest
-      # A pull request builds and tests the packages it changed and every package that depends
-      # on them (.github/scripts/test-scope.py, cargo's own graph), as Zed's CI does; a change to
-      # the lockfile, the toolchain or the CI tests everything, and so does every push to main.
-      - name: What to test
-        id: scope
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          if [ -n "$PR" ]; then
-            scope=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename' | python3 .github/scripts/test-scope.py)
-          else
-            scope=all
-          fi
-          case "$scope" in all) sel=--workspace ;; none) sel= ;; *) sel=$(printf -- '-p %s ' $scope) ;; esac
-          echo "scope: $scope"
-          { echo "scope=$scope"; echo "sel=$sel"; } >> "$GITHUB_OUTPUT"
-      - if: steps.scope.outputs.scope != 'none'
-        run: cargo nextest run ${{ steps.scope.outputs.sel }} --lib --bins --tests --locked --profile ci
-        env:
-          TZ: America/Chicago
-      # The keyring code against a real, throwaway gnome-keyring on a private bus (check.sh's
-      # "real keyring"): what the keyring crate saved reads with ours, and a burst is survived.
-      # The ignored tests below run through nextest with the suite's own selection, so they
-      # reuse its binaries: `cargo test` built examples and doc tests again (3.6 min, 11 Nov).
-      - name: A real keyring
-        if: runner.arch == 'X64' && (steps.scope.outputs.scope == 'all' || contains(steps.scope.outputs.scope, 'quince-auth'))
-        run: |
-          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends gnome-keyring dbus-daemon
-          t=$(mktemp -d); mkdir -p "$t/data" "$t/run"; chmod 700 "$t/run"
-          XDG_DATA_HOME="$t/data" XDG_RUNTIME_DIR="$t/run" dbus-run-session -- bash -c '
-            echo -n throwaway | gnome-keyring-daemon --unlock --components=secrets >/dev/null 2>&1
-            export QUINCE_ISOLATED_KEYRING=$DBUS_SESSION_BUS_ADDRESS
-            cargo nextest run ${{ steps.scope.outputs.sel }} --lib --bins --tests --locked --profile ci --run-ignored only -E "test(secret_service)"'
-      # A download onto a disk that really fills up (a 1 MB tmpfs): the disk's own refusal,
-      # not a made-up free-space number, stops it cleanly (folder_download/tests.rs).
-      - name: A real full disk
-        if: steps.scope.outputs.scope == 'all' || contains(steps.scope.outputs.scope, 'quince-app')
-        run: |
-          sudo mkdir -p /mnt/skykeep-full
-          sudo mount -t tmpfs -o size=1m,uid=$(id -u) tmpfs /mnt/skykeep-full
-          SKYKEEP_FULL_DISK=/mnt/skykeep-full cargo nextest run ${{ steps.scope.outputs.sel }} --lib --bins --tests --locked --profile ci --run-ignored only -E 'test(real_full_disk)'
-
-  # The Android app, which nothing else here builds: the engine for both ABIs (cargo-ndk) and its
-  # Kotlin bindings made from that same code, the app and its device-test APK compiled, the JVM
-  # unit tests run, and every engine library checked for 16 KB pages (Android 15+ devices with
-  # 16 KB pages refuse a library aligned for 4 KB). The device tests themselves need an
-  # emulator signed in to iCloud: they run locally (`am instrument`, never Gradle's connected
-  # tasks, which uninstall the app).
-  android:
-    needs: scope
-    if: needs.scope.outputs.full == 'true'
+  mcp:
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
-        with:
-          distribution: temurin
-          java-version: 17
-          cache: gradle
-      # Added when the bindings came from a host build of quince-mobile, which linked the desktop
-      # media libraries quince-media uses on Linux. They now come from crates/uniffi-bindgen, a
-      # crate of its own that builds nothing of the engine for this machine, so this step may no
-      # longer be needed; drop it once a run without it is green.
-      - name: Host libraries for the bindings build
+      - name: Install Linux build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Read pinned Rust version
+        id: rust
         run: |
-          sudo apt-get -o Acquire::Retries=5 update
-          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends pkg-config libheif-dev \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
-      # The repository's own Rust (rust-toolchain.toml), with the two phone targets added to it.
-      - run: rustup target add aarch64-linux-android x86_64-linux-android
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path('rust-toolchain.toml').read_text())['toolchain']['channel']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\n')
+          PY
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          workspaces: ". -> target-android"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo install cargo-ndk --version 4.1.2 --locked
-      # The engine's crate licences are written into the app at build time (about.toml).
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
-        with:
-          tool: cargo-about@0.9.3
-      - name: The app, its device tests and its unit tests
-        working-directory: android
-        # The runner's newest NDK (its own variable, not the workflow's env context).
-        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ./gradlew --no-daemon assembleDebug assembleDebugAndroidTest testDebugUnitTest
-      - name: Engine libraries aligned for 16 KB pages
-        run: |
-          for so in android/app/src/main/jniLibs/*/*.so; do
-            bad=$(readelf -lW "$so" | awk '$1 == "LOAD" && $NF != "0x4000" && $NF != "0x10000" { print $NF }')
-            if [ -n "$bad" ]; then echo "::error::$so has LOAD segments aligned to $bad, not 16 KB"; exit 1; fi
-            echo "$so: 16 KB"
-          done
-
-  web:
-    needs: scope
-    if: needs.scope.outputs.full == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25  # the interface suites grew past 15 minutes; a warm run takes ~16
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci --no-audit --no-fund
-      - run: npx tsc --noEmit
-      - run: npx vite build
-      - name: Model tests
-        run: node --test .uiverify/*.test.mjs
-      - name: Playwright version
-        id: pw
-        run: echo "version=$(node -p 'require("playwright/package.json").version')" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ steps.pw.outputs.version }}
-      - name: Chromium
-        run: npx playwright install --with-deps --only-shell chromium
-      - name: Interface smoke, in Chromium
-        env:
-          ENGINE: chromium
-        run: |
-          shots="$RUNNER_TEMP/shots"; mkdir -p "$shots"
-          export TMPDIR="$shots"
-          # The preview server, on every address so "localhost" answers as 127.0.0.1 or ::1.
-          node node_modules/vite/bin/vite.js preview --port 4173 --strictPort --host >"$shots/preview.log" 2>&1 &
-          preview=$!
-          up=
-          for _ in $(seq 60); do
-            if ! kill -0 "$preview" 2>/dev/null; then break; fi
-            if curl -sf -o /dev/null http://localhost:4173/; then up=1; break; fi
-            sleep 0.5
-          done
-          if [ -z "$up" ]; then
-            cat "$shots/preview.log"
-            echo "::error::the preview server did not come up on :4173"
-            exit 1
-          fi
-          echo "preview up"
-          # The key flows, one or two per app: the window's security policy, accessibility,
-          # sign-out, Skykeep's window and each app's own, and an instant write in each app.
-          # check.sh refuses a name here that is not a suite it runs.
-          suites="csp a11y boundary signout notes-compose notes-instant reminders-add-done
-                  reminders-instant calendar-edits contacts-select drive-nav photos settings
-                  app-window updates device-approval"
-          failed=()
-          for t in $suites; do
-            if node ".uiverify/$t.mjs" >"$shots/$t.log" 2>&1; then
-              echo "ok   $t"
-            else
-              echo "FAIL $t"; failed+=("$t"); sed 's/^/    /' "$shots/$t.log" | tail -40
-            fi
-          done
-          kill "$preview" 2>/dev/null || true
-          if [ "${#failed[@]}" -gt 0 ]; then
-            echo "::error::${#failed[@]} suite(s) failed: ${failed[*]}"
-            exit 1
-          fi
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: failure()
-        with:
-          name: ui-smoke
-          path: ${{ runner.temp }}/shots
-          if-no-files-found: ignore
-          retention-days: 7
+          toolchain: ${{ steps.rust.outputs.version }}
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint all remaining crates
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Test MCP and engine crates
+        run: cargo test --locked --workspace
+      - name: Build MCP server
+        run: cargo build --locked -p skykeep-mcp

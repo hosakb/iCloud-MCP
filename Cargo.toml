@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 default-members = ["crates/skykeep-mcp"]
-members = ["crates/skykeep-mcp", "probe", "crates/quince-mobile", "crates/quince-auth", "crates/quince-core", "crates/quince-icloud", "crates/quince-media", "crates/quince-vfs", "crates/quince-thumbs", "crates/quince-sync", "crates/uniffi-bindgen", "src-tauri"]
+members = ["crates/skykeep-mcp", "crates/quince-auth", "crates/quince-core", "crates/quince-icloud", "crates/quince-sync"]
 
 [workspace.package]
 edition = "2021"
@@ -17,35 +17,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 uuid = { version = "1", features = ["v4"] }
-quince-media = { path = "crates/quince-media" }
 
-# Debug builds without the full debug symbols of every dependency. Those symbols were most of
-# a forty-gigabyte target directory — each probe and test is its own binary, and the app alone
-# came to three hundred megabytes a copy — and nobody steps through webkit2gtk in a debugger.
-# Line tables are kept for this project's own code, so a panic still names the line it came from.
+# Keep line tables for workspace code and omit full dependency debug symbols.
 [profile.dev]
 debug = "line-tables-only"
-# The app he runs every day is this build: unoptimised, every picture served, every reply
-# parsed and every database read ran many times slower than it needs to. Our own code a
-# little optimised (still quick to rebuild), everything it stands on fully.
+# Preserve the engine's development optimization settings.
 opt-level = 1
 
 [profile.dev.package."*"]
 debug = false
 opt-level = 3
 
-# What people install. Measured on the release binary (2026-10-22): the defaults left 16
-# codegen units per crate and no cross-crate inlining, and shipped the symbol table — about a
-# fifth of the binary, mapped into memory with it.
-# - opt-level 3: photos are decoded, resized and hashed in this process; size-tuned code
-#   ("s"/"z") is slower exactly there.
-# - lto "thin" + one codegen unit: inlining across crates (serde, rusqlite, image, reqwest)
-#   at a fraction of fat LTO's link time and memory, which on a small CI machine is the
-#   difference between a build and an out-of-memory kill.
-# - strip: no symbol table on disk or in memory; a panic still says where in its message.
-# - panic stays "unwind": the library rolls a half-applied change back when one panics
-#   (quince-core `atomically` catches the unwind), and a command that panics fails alone
-#   instead of taking the app and its open windows down. "abort" would undo both.
+# Preserve release profile values. Unwinding lets quince-core roll back a transaction
+# that panics instead of aborting the server process.
 [profile.release]
 opt-level = 3
 lto = "thin"

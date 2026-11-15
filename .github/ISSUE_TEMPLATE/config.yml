@@ -1,8 +1,5 @@
-blank_issues_enabled: false
+blank_issues_enabled: true
 contact_links:
-  - name: Question or help
-    url: https://github.com/YashwanthKamireddi/Skykeep/discussions/categories/q-a
-    about: Ask in Discussions. Issues are for bugs and feature requests. SUPPORT.md lists where everything else goes.
-  - name: Security problem
-    url: https://github.com/YashwanthKamireddi/Skykeep/security/advisories/new
-    about: Please report security problems privately here, not as an issue.
+  - name: Security reporting policy
+    url: https://github.com/hosakb/skykeep-mcp/blob/main/SECURITY.md
+    about: Report vulnerabilities privately using this fork's security policy, not public issues.

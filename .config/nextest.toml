@@ -29,11 +29,3 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 fail-fast = false
 failure-output = "immediate-final"
 final-status-level = "slow"
-
-# Windows: the scale tests stay on Linux. Each makes up to a hundred thousand real files, and
-# Windows' scanning of every new file turned one of them into most of a 29-minute test step;
-# what they prove (bounded memory, paging) is the engine's, not the platform's. The Explorer test
-# (cloud_windows) has its own step, one test at a time: it registers real sync roots with Windows.
-[profile.ci-windows]
-inherits = "ci"
-default-filter = "not test(/hundred_thousand|forty_thousand|of_thousands_arrives/) and not binary(cloud_windows)"

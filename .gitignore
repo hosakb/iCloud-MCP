@@ -1,27 +1,12 @@
 /target
-/dist
-/node_modules
-/src-tauri/gen
-.uiverify/*.png
+/target-*/
 findings.md
 session.json
 cookies.json
 
-# What makepkg leaves behind: the unpacked sources, the staged package tree, and the package
-# itself. Built from the checkout, so none of it belongs in the checkout.
-packaging/arch/src/
-packaging/arch/pkg/
-packaging/arch/*.pkg.tar.zst
-packaging/arch/*.log
-
-# Local agent workspaces, never part of the project.
+# Local agent workspaces and test artifacts are never published.
 .claude/
+/.scratch/
 
-# docs/ is local working notes (handoffs, research, launch plans), never published. Only the
-# README's images are. An ignore rule, not a note in the folder: a broad `git add` once swept
-# every note into the public repo (0.1.6).
-/docs/*
-!/docs/media/
-
-# Other build folders: the checks' (target-check) and the Android engine's (target-android).
-/target-*/
+# Local working notes are not project documentation.
+/docs/
