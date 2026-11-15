@@ -2,6 +2,111 @@ use serde_json::json;
 use skykeep_mcp::Server;
 
 #[tokio::test]
+async fn confirmation_accepts_empty_content_and_inert_result_metadata_only() {
+    for metadata in [
+        None,
+        Some(json!({"arguments":{"body":"must not replace original"},"action":"decline"})),
+    ] {
+        let (_dir, mut server, library) =
+            configured("writes_only", json!({"elicitation":{}}), "2025-11-25").await;
+        let form = server
+            .handle(operation(
+                2,
+                "notes_write",
+                json!({"action":"create","body":"immutable original"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            form["params"]["requestedSchema"],
+            json!({"type":"object","properties":{}})
+        );
+        let mut result = json!({"action":"accept","content":{}});
+        if let Some(meta) = metadata {
+            result["_meta"] = meta;
+        }
+        let reply = server
+            .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":result}))
+            .await
+            .unwrap();
+        assert_eq!(reply["result"]["isError"], false, "{reply}");
+        let queued: serde_json::Value =
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            library
+                .note_body(queued["guid"].as_str().unwrap())
+                .unwrap()
+                .as_deref(),
+            Some("immutable original")
+        );
+        assert_eq!(library.outbox_count().unwrap(), 1);
+        assert!(server
+            .handle(
+                json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}})
+            )
+            .await
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn confirmation_rejects_missing_nonempty_or_malformed_content_and_ambiguous_envelopes() {
+    for result in [
+        json!({"action":"accept"}),
+        json!({"action":"accept","content":null}),
+        json!({"action":"accept","content":[]}),
+        json!({"action":"accept","content":false}),
+        json!({"action":"accept","content":{"approve":true}}),
+        json!({"action":"accept","content":{},"_meta":null}),
+        json!({"action":"accept","content":{},"_meta":[]}),
+        json!({"action":"accept","content":{},"other":true}),
+        json!({"content":{}}),
+    ] {
+        let (_dir, mut server, library) =
+            configured("writes_only", json!({"elicitation":{}}), "2025-11-25").await;
+        let form = server
+            .handle(operation(
+                2,
+                "notes_write",
+                json!({"action":"create","body":"must not queue"}),
+            ))
+            .await
+            .unwrap();
+        let reply = server
+            .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":result}))
+            .await
+            .unwrap();
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert_eq!(library.outbox_count().unwrap(), 0);
+    }
+    for extra in [
+        json!({"error":{"code":-32603,"message":"ambiguous"}}),
+        json!({"params":{}}),
+        json!({"method":"tools/call"}),
+    ] {
+        let (_dir, mut server, library) =
+            configured("writes_only", json!({"elicitation":{}}), "2025-11-25").await;
+        let form = server
+            .handle(operation(
+                2,
+                "notes_write",
+                json!({"action":"create","body":"must not queue"}),
+            ))
+            .await
+            .unwrap();
+        let mut reply =
+            json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}});
+        reply
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let response = server.handle(reply).await;
+        assert!(response.is_none() || response.unwrap()["result"]["isError"] == true);
+        assert_eq!(library.outbox_count().unwrap(), 0);
+    }
+}
+
+#[tokio::test]
 async fn nonempty_cached_pages_remain_incomplete_and_require_parent_for_reminders() {
     let (_dir, mut server, mut library) = configured("yolo", json!({}), "2025-11-25").await;
     library
@@ -104,7 +209,12 @@ async fn configured_note_mutations_require_exact_forms_and_yolo_deletion_does_no
             .unwrap();
         assert_eq!(form["method"], "elicitation/create", "{form}");
         assert_eq!(library.outbox_count().unwrap(), count);
-        let reply=server.handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}})).await.unwrap();
+        let reply = server
+            .handle(
+                json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}),
+            )
+            .await
+            .unwrap();
         assert_eq!(reply["result"]["isError"], false, "{action}: {reply}");
     }
     server.set_policy("yolo").unwrap();
@@ -175,14 +285,22 @@ async fn read_write_policy_requires_read_consent_before_resolved_mutation_previe
         .as_str()
         .unwrap()
         .contains("private resolved title"));
-    let second=server.handle(json!({"jsonrpc":"2.0","id":first["id"],"result":{"action":"accept","content":{"approve":true}}})).await.unwrap();
+    let second = server
+        .handle(json!({"jsonrpc":"2.0","id":first["id"],"result":{"action":"accept","content":{}}}))
+        .await
+        .unwrap();
     assert_ne!(first["id"], second["id"]);
     assert!(second["params"]["message"]
         .as_str()
         .unwrap()
         .contains("private resolved title"));
     assert_eq!(library.outbox_count().unwrap(), 0);
-    let reply=server.handle(json!({"jsonrpc":"2.0","id":second["id"],"result":{"action":"accept","content":{"approve":true}}})).await.unwrap();
+    let reply = server
+        .handle(
+            json!({"jsonrpc":"2.0","id":second["id"],"result":{"action":"accept","content":{}}}),
+        )
+        .await
+        .unwrap();
     assert_eq!(reply["result"]["isError"], false, "{reply}");
     assert_eq!(library.outbox_count().unwrap(), 1);
 }
@@ -294,14 +412,20 @@ async fn existing_reminder_preview_is_complete_and_stale_consent_cannot_mutate()
             ..Default::default()
         })
         .unwrap();
-    let reply = server.handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}})).await.unwrap();
+    let reply = server
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .await
+        .unwrap();
     assert_eq!(reply["result"]["isError"], true);
     assert_eq!(library.outbox_count().unwrap(), 0);
     let form = server
         .handle(operation(3, "reminders_write", args))
         .await
         .unwrap();
-    let reply = server.handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}})).await.unwrap();
+    let reply = server
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .await
+        .unwrap();
     assert_eq!(reply["result"]["isError"], false, "{reply}");
     assert_eq!(library.outbox_count().unwrap(), 1);
 }
@@ -440,7 +564,7 @@ async fn accepted_operation_is_single_use_and_legacy_queue_stays_quarantined() {
         ))
         .await
         .unwrap();
-    let accept = json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}});
+    let accept = json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}});
     let reply = server.handle(accept.clone()).await.unwrap();
     let result: serde_json::Value =
         serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
@@ -470,7 +594,10 @@ async fn read_consent_is_required_before_returning_cached_content() {
         .await
         .unwrap();
     assert_eq!(form["method"], "elicitation/create");
-    let reply = server.handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}})).await.unwrap();
+    let reply = server
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .await
+        .unwrap();
     assert_eq!(reply["id"], 2);
     assert_eq!(reply["result"]["isError"], false);
     assert_eq!(library.outbox_count().unwrap(), 0);
@@ -538,7 +665,7 @@ async fn consent_decline_cancel_malformed_mismatch_replay_and_policy_change() {
             .await
             .unwrap();
         assert!(server
-            .handle(json!({"id":2,"result":{"action":"accept","content":{"approve":true}}}))
+            .handle(json!({"id":2,"result":{"action":"accept","content":{}}}))
             .await
             .is_none());
         assert_eq!(
@@ -554,7 +681,12 @@ async fn consent_decline_cancel_malformed_mismatch_replay_and_policy_change() {
             .unwrap();
         assert_eq!(denied["id"], 2);
         assert_eq!(denied["result"]["isError"], true);
-        assert!(server.handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}})).await.is_none());
+        assert!(server
+            .handle(
+                json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}})
+            )
+            .await
+            .is_none());
         assert_eq!(library.outbox_count().unwrap(), 0);
     }
     let (_dir, mut server, library) =
@@ -568,7 +700,10 @@ async fn consent_decline_cancel_malformed_mismatch_replay_and_policy_change() {
         .await
         .unwrap();
     server.set_policy("yolo").unwrap();
-    let reply = server.handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}})).await.unwrap();
+    let reply = server
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .await
+        .unwrap();
     assert_eq!(reply["result"]["isError"], true);
     assert_eq!(library.outbox_count().unwrap(), 0);
 }
@@ -612,7 +747,10 @@ async fn incapable_clients_fail_closed_and_pending_calls_cancel() {
         .await
         .unwrap();
     assert_eq!(cancelled["id"], 2);
-    assert!(server.handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}})).await.is_none());
+    assert!(server
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .await
+        .is_none());
     assert_eq!(library.outbox_count().unwrap(), 0);
 }
 
@@ -623,7 +761,7 @@ async fn unsolicited_consent_responses_are_never_requests() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut server = Server::open(dir.path()).unwrap();
     for message in [
-        json!({"jsonrpc":"2.0","id":1,"result":{"action":"accept","content":{"approve":true}}}),
+        json!({"jsonrpc":"2.0","id":1,"result":{"action":"accept","content":{}}}),
         json!({"jsonrpc":"2.0","id":"approval-1","error":{"code":-32603,"message":"cancelled"}}),
     ] {
         assert!(

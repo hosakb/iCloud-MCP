@@ -42,8 +42,17 @@ fn negotiated_form_approves_exact_create_before_enqueue() {
     writeln!(input, "{}", json!({"id":2,"method":"tools/call","params":{"name":"reminders_write","arguments":{"action":"create","list_guid":"list","title":"exact synthetic operation"}}})).unwrap();
     let form: Value = serde_json::from_str(&output.next().unwrap().unwrap()).unwrap();
     assert_eq!(form["method"], "elicitation/create");
+    assert_eq!(
+        form["params"]["requestedSchema"],
+        json!({"type":"object","properties":{}})
+    );
     assert_eq!(library.outbox_count().unwrap(), 0);
-    writeln!(input, "{}", json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}})).unwrap();
+    writeln!(
+        input,
+        "{}",
+        json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}})
+    )
+    .unwrap();
     let reply: Value = serde_json::from_str(&output.next().unwrap().unwrap()).unwrap();
     assert_eq!(reply["id"], 2);
     assert_eq!(reply["result"]["isError"], false, "{reply}");

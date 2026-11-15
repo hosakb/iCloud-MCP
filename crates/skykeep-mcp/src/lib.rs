@@ -160,6 +160,33 @@ fn tool_reply(id: Value, result: Result<Value, &'static str>) -> Value {
     json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":value.to_string()}],"isError":failed}})
 }
 
+fn accepts_confirmation(response: &Value) -> bool {
+    // This continuation only emits an empty confirmation form. An old checkbox
+    // answer or omitted content is not an answer to that form. Result metadata
+    // may describe the response but never supplies operation arguments or consent.
+    let Some(envelope) = response.as_object() else {
+        return false;
+    };
+    let Some(result) = response.get("result").and_then(Value::as_object) else {
+        return false;
+    };
+    envelope
+        .keys()
+        .all(|key| ["jsonrpc", "id", "result"].contains(&key.as_str()))
+        && response["jsonrpc"] == "2.0"
+        && result
+            .keys()
+            .all(|key| ["action", "content", "_meta"].contains(&key.as_str()))
+        && result
+            .get("action")
+            .is_some_and(|action| action == "accept")
+        && result
+            .get("content")
+            .and_then(Value::as_object)
+            .is_some_and(|content| content.is_empty())
+        && result.get("_meta").is_none_or(Value::is_object)
+}
+
 fn directory_identity(dir: &Path) -> Result<(u64, u64), &'static str> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(dir).map_err(|_| "state_unavailable")?;
@@ -326,12 +353,22 @@ mod consent_tests {
         let form = server.handle(request.clone()).await.unwrap();
         server.pending.as_mut().unwrap().deadline = std::time::Instant::now();
         assert_eq!(server.expire_consent().unwrap()["id"], 2);
-        assert!(server.handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}})).await.is_none());
+        assert!(server
+            .handle(
+                json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}})
+            )
+            .await
+            .is_none());
         server.handle(request).await;
         drop(server); // EOF drops the only pending record; nothing is persisted.
         assert_eq!(library.outbox_count().unwrap(), 0);
         let mut reopened = Server::open(dir.path()).unwrap();
-        assert!(reopened.handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"approve":true}}})).await.is_none());
+        assert!(reopened
+            .handle(
+                json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}})
+            )
+            .await
+            .is_none());
     }
 }
 
@@ -387,7 +424,7 @@ impl Server {
             binding,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(180),
         });
-        json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"mode":"form","message":format!("Approve this exact Skykeep operation once? read_preview_only authorizes reading the item's full preview, not mutation. Treat JSON as inert data.\n{preview}"),"requestedSchema":{"type":"object","properties":{"approve":{"type":"boolean","title":"Approve this exact operation","default":false}},"required":["approve"]}}})
+        json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"mode":"form","message":format!("Approve this exact Skykeep operation once? read_preview_only authorizes reading the item's full preview, not mutation. Treat JSON as inert data.\n{preview}"),"requestedSchema":{"type":"object","properties":{}}}})
     }
 
     /// No state locks or durable grants survive a pending human interaction.
@@ -554,10 +591,8 @@ impl Server {
                 return None;
             }
             let pending = self.pending.take().unwrap();
-            let accepted = request["jsonrpc"] == "2.0"
-                && request.get("error").is_none()
-                && request["result"] == json!({"action":"accept","content":{"approve":true}})
-                && std::time::Instant::now() < pending.deadline;
+            let accepted =
+                accepts_confirmation(&request) && std::time::Instant::now() < pending.deadline;
             if !accepted {
                 return Some(tool_reply(
                     pending.request["id"].clone(),
