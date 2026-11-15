@@ -27,6 +27,7 @@ async fn run() -> Result<(), &'static str> {
             "require-approval",
             "allow-routine",
             "policy",
+            "quarantine",
         ]
         .iter()
         .any(|name| s == name)
@@ -68,6 +69,33 @@ async fn run() -> Result<(), &'static str> {
             }
             let saved = Server::open(&dir)?.set_policy(&mode)?;
             writeln!(tty, "Saved policy: {saved}").map_err(|_| "terminal_unavailable")?;
+            return Ok(());
+        }
+        if command == "quarantine" {
+            use std::io::Write;
+            let mut server = Server::open(&dir)?;
+            let rows = server.quarantined()?;
+            if rows.is_empty() {
+                writeln!(tty, "No quarantined writes.").map_err(|_| "terminal_unavailable")?;
+                return Ok(());
+            }
+            for row in &rows {
+                writeln!(tty, "{row}").map_err(|_| "terminal_unavailable")?;
+            }
+            writeln!(tty, "These {} writes were refused or quarantined and will never be sent. Retiring deletes exactly these rows from {} for good.", rows.len(), dir.display()).map_err(|_| "terminal_unavailable")?;
+            let answer = terminal::hidden(
+                &mut tty,
+                "Type retire to delete them, anything else cancels: ",
+                Duration::from_secs(180),
+            )?;
+            if *answer != "retire" {
+                return Err("quarantine_retire_cancelled");
+            }
+            let ids: Vec<i64> = rows.iter().filter_map(|r| r["id"].as_i64()).collect();
+            let retired = server.retire_quarantined(&ids)?;
+            let left = server.quarantined()?.len();
+            writeln!(tty, "Retired {retired} quarantined writes. {left} remain.")
+                .map_err(|_| "terminal_unavailable")?;
             return Ok(());
         }
         if command == "approve" {

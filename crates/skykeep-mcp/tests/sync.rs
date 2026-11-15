@@ -122,11 +122,21 @@ async fn configured_native_send_uses_exact_grant_and_tampering_never_reaches_net
         .outbox_append("reminders", "unapproved", "create", "{}")
         .unwrap();
     let client = saved_client(dir.path(), &remote.uri());
+    // The reset mock has no routes, so the pass itself fails after the local gate.
     assert!(skykeep_mcp::sync::with_client(dir.path(), client)
         .await
         .is_err());
-    assert!(remote.received_requests().await.unwrap().is_empty());
-    assert_eq!(library.outbox_pending("reminders").unwrap()[0].id, id);
+    assert!(remote
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|r| !r.url.path().ends_with("/records/modify")));
+    // The unapproved row is quarantined alone, kept for the human and never sent.
+    assert!(library.outbox_pending("reminders").unwrap().is_empty());
+    let refused = library.outbox_refused().unwrap();
+    assert_eq!(refused[0].change.id, id);
+    assert_eq!(refused[0].reason, "mcp_quarantine:legacy_write_quarantined");
 }
 
 #[tokio::test]

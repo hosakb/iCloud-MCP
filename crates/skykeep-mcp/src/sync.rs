@@ -7,11 +7,18 @@ use std::path::Path;
 use tokio::sync::Mutex;
 
 pub(crate) const MAX_PENDING: usize = 128;
+/// Refused rows kept for the human before admission stops.
+pub const MAX_REFUSED: usize = 1024;
 
 pub(crate) fn pending_operations(
     library: &Library,
 ) -> Result<Vec<quince_core::outbox::Pending>, &'static str> {
-    if library.outbox_count().map_err(|_| "library_unavailable")? > MAX_PENDING {
+    // Refused rows wait for the human (`skykeep-mcp quarantine`); they never count here.
+    let all = library.outbox_count().map_err(|_| "library_unavailable")?;
+    let refused = library
+        .outbox_refused_count()
+        .map_err(|_| "library_unavailable")?;
+    if all.saturating_sub(refused) > MAX_PENDING {
         return Err("queue_too_large");
     }
     let mut pending = library
@@ -48,10 +55,87 @@ fn send_context(
             Ok(json!({"template":template}))
         }
         ("reminders", "create") | (_, "delete") => Ok(Value::Null),
-        ("notes", _) => crate::resolved_state(library, "notes_write", &p.record),
-        ("reminders", _) => crate::resolved_state(library, "reminders_write", &p.record),
+        // Only the cached rows the native sender reads for this operation. Lists, folders
+        // and sibling items stay out, so unrelated refreshes and writes cannot stale it.
+        ("notes", kind) => {
+            let mut item = library
+                .note(&p.record)
+                .map_err(|_| "library_unavailable")?
+                .ok_or("not_found")?;
+            if kind == "save" {
+                item.body = library
+                    .note_body(&p.record)
+                    .map_err(|_| "library_unavailable")?;
+                item.runs = library
+                    .note_runs(&p.record)
+                    .map_err(|_| "library_unavailable")?;
+            }
+            bounded_context(json!({"item":crate::bounded_json(&item)?}))
+        }
+        ("reminders", kind) => {
+            let item = library
+                .reminder(&p.record)
+                .map_err(|_| "library_unavailable")?
+                .ok_or("not_found")?;
+            // An edit that moves lists also moves the cached subtasks with it.
+            let edit: Value = serde_json::from_str(&p.payload).unwrap_or(Value::Null);
+            let moves = kind == "edit"
+                && edit["list_guid"]
+                    .as_str()
+                    .is_some_and(|to| Some(to) != edit["from_list"].as_str());
+            let children = if moves {
+                crate::bounded_json(
+                    &library
+                        .subtasks_of(&p.record)
+                        .map_err(|_| "library_unavailable")?,
+                )?
+            } else {
+                Value::Null
+            };
+            bounded_context(json!({"item":crate::bounded_json(&item)?,"children":children}))
+        }
         _ => Err("unknown_service"),
     }
+}
+
+fn bounded_context(context: Value) -> Result<Value, &'static str> {
+    crate::bounded_value(&context, crate::MAX_ARGUMENT_BYTES)?;
+    Ok(context)
+}
+
+/// Grant failures that belong to one queued write. Anything else (an unreadable library,
+/// a changed policy, account or directory) still stops the whole pass.
+const QUARANTINABLE: [&str; 9] = [
+    "payload_too_large",
+    "legacy_write_quarantined",
+    "authorization_too_large",
+    "invalid_authorization",
+    "write_authorization_stale",
+    "not_found",
+    "operation_too_large",
+    "template_too_large",
+    "unknown_service",
+];
+
+/// Moves each pending write without a current grant out of the queue, alone, with its
+/// reason. It is kept for the human and never sent or re-authorized.
+fn quarantine_unauthorized(library: &mut Library, dir: &Path) -> Result<(), &'static str> {
+    let pending = library
+        .outbox_all_pending()
+        .map_err(|_| "library_unavailable")?;
+    for p in pending {
+        match authorized(library, dir, &p) {
+            Ok(()) => {}
+            Err(reason) if QUARANTINABLE.contains(&reason) => library
+                .atomically(|library| -> quince_core::Result<()> {
+                    library.outbox_refuse(p.id, &format!("mcp_quarantine:{reason}"))?;
+                    library.set_state(&format!("mcp.authorization.{}", p.id), "")
+                })
+                .map_err(|_| "library_unavailable")?,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn record_authorization(
@@ -121,7 +205,7 @@ pub async fn run(dir: &Path) -> Result<Value, &'static str> {
 }
 
 fn refresh_gate(dir: &Path, approved: bool) -> Result<bool, &'static str> {
-    let library = Library::open(dir).map_err(|_| "library_unavailable")?;
+    let mut library = Library::open(dir).map_err(|_| "library_unavailable")?;
     let configured = crate::policy(&library, dir)?;
     if configured
         .as_ref()
@@ -131,9 +215,7 @@ fn refresh_gate(dir: &Path, approved: bool) -> Result<bool, &'static str> {
         return Err("read_approval_required");
     }
     if configured.is_some() {
-        for p in pending_operations(&library)? {
-            authorized(&library, dir, &p)?;
-        }
+        quarantine_unauthorized(&mut library, dir)?;
     }
     Ok(configured.is_some())
 }

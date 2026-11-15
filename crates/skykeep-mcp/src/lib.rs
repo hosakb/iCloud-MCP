@@ -417,7 +417,11 @@ impl Server {
         let identity = directory_identity(&held.path)?;
         let library = self.ready(&held)?;
         let value = json!({"mode":mode,"revision":uuid::Uuid::new_v4().to_string(),"account":library.state(ACCOUNT_KEY).map_err(|_| "policy_unavailable")?,"state_identity":identity});
-        let pending = sync::pending_operations(library)?;
+        // Uncapped on purpose: migration only quarantines, so a large legacy queue
+        // must never prevent moving to a configured policy.
+        let pending = library
+            .outbox_all_pending()
+            .map_err(|_| "policy_unavailable")?;
         library
             .atomically(|library| -> quince_core::Result<()> {
                 for p in &pending {
@@ -432,6 +436,55 @@ impl Server {
             .map_err(|_| "policy_unavailable")?
             .ok_or("policy_unavailable")?;
         serde_json::from_str(&saved).map_err(|_| "policy_unavailable")
+    }
+
+    /// Human CLI only. Refused writes kept for review, without their payloads.
+    pub fn quarantined(&mut self) -> Result<Vec<Value>, &'static str> {
+        let held = state::PrivateState::open(&self.dir)?;
+        let library = self.ready(&held)?;
+        let refused = library
+            .outbox_refused()
+            .map_err(|_| "library_unavailable")?;
+        Ok(refused
+            .iter()
+            .map(|r| {
+                // Upstream reasons can hold HTTP text; the terminal gets a bounded line.
+                let reason: String = r
+                    .reason
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(160)
+                    .collect();
+                json!({"id":r.change.id,"service":r.change.service,"kind":r.change.kind,
+                    "record":r.change.record,"reason":reason,"refused_at":r.refused_at})
+            })
+            .collect())
+    }
+
+    /// Human CLI only, after `quarantined` was shown. Discards exactly these ids while they
+    /// are still refused; waiting writes and rows refused later are left alone. Retired
+    /// writes are never sent.
+    pub fn retire_quarantined(&mut self, ids: &[i64]) -> Result<usize, &'static str> {
+        let held = state::PrivateState::open(&self.dir)?;
+        let library = self.ready(&held)?;
+        let refused = library
+            .outbox_refused()
+            .map_err(|_| "library_unavailable")?;
+        let chosen: Vec<i64> = refused
+            .iter()
+            .map(|r| r.change.id)
+            .filter(|id| ids.contains(id))
+            .collect();
+        library
+            .atomically(|library| -> quince_core::Result<()> {
+                for id in &chosen {
+                    library.outbox_discard(*id)?;
+                    library.set_state(&format!("mcp.authorization.{id}"), "")?;
+                }
+                Ok(())
+            })
+            .map_err(|_| "library_unavailable")?;
+        Ok(chosen.len())
     }
 
     /// Starts even while another process holds the directory lock, for example during its
@@ -913,9 +966,35 @@ fn authorized_enqueue(
     dir: &Path,
     enqueue: impl FnOnce(&mut Library) -> Result<Value, &'static str>,
 ) -> Result<Value, &'static str> {
+    if library
+        .outbox_refused_count()
+        .map_err(|_| "library_unavailable")?
+        >= sync::MAX_REFUSED
+    {
+        return Err("quarantine_full_retire_in_terminal");
+    }
     let before = sync::pending_operations(library)?;
     for p in &before {
         sync::authorized_payload(library, dir, p)?;
+    }
+    let exists = |library: &Library, p: &quince_core::outbox::Pending| {
+        if p.service == "notes" {
+            library.note(&p.record).map(|n| n.is_some())
+        } else {
+            library.reminder(&p.record).map(|r| r.is_some())
+        }
+    };
+    // Writes whose full grant, context included, is current right now. Only this approved
+    // write can change their context before the transaction ends, so they may be re-bound.
+    let mut current = Vec::new();
+    let mut present = Vec::new();
+    for p in &before {
+        if sync::authorized(library, dir, p).is_ok() {
+            current.push(p.id);
+        }
+        if exists(library, p).map_err(|_| "library_unavailable")? {
+            present.push(p.id);
+        }
     }
     library
         .atomically(|library| -> quince_core::Result<Value> {
@@ -923,24 +1002,27 @@ fn authorized_enqueue(
             let result = enqueue(library).map_err(convert)?;
             let after = sync::pending_operations(library).map_err(convert)?;
             for p in &after {
-                if result["guid"] == p.record
+                let old = before.iter().find(|old| old.id == p.id);
+                if old.is_some()
                     && p.kind != "delete"
-                    && before.iter().any(|old| old.id == p.id)
+                    && present.contains(&p.id)
+                    && !exists(library, p)?
                 {
-                    let removed = if p.service == "notes" {
-                        library.note(&p.record)?.is_none()
-                    } else {
-                        library.reminder(&p.record)?.is_none()
-                    };
-                    if removed {
-                        // The approved deletion supersedes older writes to the now
-                        // absent item. Never send them using a newly invented context.
-                        library.outbox_refuse(p.id, "superseded_by_approved_deletion")?;
-                        library.set_state(&format!("mcp.authorization.{}", p.id), "")?;
-                        continue;
-                    }
+                    // This approved deletion removed the item, or its parent took it along.
+                    // Older writes to it are superseded, never sent with an invented context.
+                    library.outbox_refuse(p.id, "superseded_by_approved_deletion")?;
+                    library.set_state(&format!("mcp.authorization.{}", p.id), "")?;
+                    continue;
                 }
-                if !before.iter().any(|old| old == p) || result["guid"] == p.record {
+                // A new operation from this write, or any queued operation on the record
+                // the human just reviewed (the preview lists them), takes a fresh grant. An
+                // unchanged write elsewhere is re-bound only if its grant was current a
+                // moment ago, so only this approved write moved its context. A changed
+                // payload on another record is never re-authorized; sync quarantines it.
+                if old.is_none()
+                    || result["guid"] == p.record
+                    || (old == Some(p) && current.contains(&p.id))
+                {
                     sync::record_authorization(library, p).map_err(convert)?;
                 }
             }

@@ -127,23 +127,45 @@ SDK tests do not establish UI rendering. Forms request only approval, never secr
 
 Migration atomically marks existing pending writes refused with the reason
 `mcp_policy_migration_quarantine` and invalidates their grants. It also blocks old
-terminal proposals. Every new enqueue records the exact native payload and policy
-revision in the same transaction. Coalescing requires previously authorized input
-and replaces the resulting payload grant. Tries can change during retry; operation
-bytes cannot. Changing policy quarantines even previously approved pending writes.
+terminal proposals. It runs however large a legacy queue is. Every new enqueue
+records the exact native payload and policy revision in the same transaction.
+Coalescing requires previously authorized input and replaces the resulting payload
+grant. Tries can change during retry; operation bytes cannot. Changing policy
+quarantines even previously approved pending writes.
 
-Before session validation, sync checks read permission and pending grants. In
+A grant binds only the cached rows the native sender reads for that operation:
+the item itself, a note's body and runs for `save`, the subtasks for a reminder
+edit that moves lists, and the notes template for a note `create`. Lists, folders
+and other items are not bound, so refreshing them does not stale a grant. When an
+approved write changes the cached rows of another queued write (a subtask edit
+under a parent's list move, or a parent move that rewrites its subtasks), that
+write is re-bound in the same transaction, but only if its grant was current just
+before. An approved deletion that removes an item, or its subtasks, refuses older
+writes to those items with `superseded_by_approved_deletion`. A changed payload
+on another record is never re-authorized.
+
+Before session validation, sync checks read permission and the policy binding. In
 `reads_and_writes`, startup/timer refresh is refused without issuing a form;
 only an originating `sync` call can request one-shot refresh consent. The other
-modes permit background refresh. Native sends recheck exact payload, account,
-policy, directory and mutable cached inputs after refresh, before entering the
-writer. Changed inputs fail closed. A sync has a 60-second async deadline and at
-most 128 pending/refused records are admitted. Timeout after a send begins means
-delivery may be uncertain; the original durable record remains for retry.
-Partial native payload narrowing or changed cached inputs need fresh authorization
-and are never silently blessed. These safeguards can refuse delivery after a
-concurrent remote edit. Apple-side conflict/merge behavior remains native engine
-behavior; local acceptance is not field-level remote verification.
+modes permit background refresh. A queued write whose grant is missing, stale,
+oversized or whose item is gone is refused alone with the reason
+`mcp_quarantine:<code>` and is never sent; the rest of the queue continues.
+Native sends recheck exact payload, account, policy, directory and the bound cached
+rows after refresh, before entering the writer, and refuse that write if they
+changed. A sync has a 60-second async deadline. At most 128 waiting writes are
+admitted. Timeout after a send begins means delivery may be uncertain; the
+original durable record remains for retry. These safeguards can refuse delivery
+after a concurrent remote edit of the same item. Apple-side conflict/merge
+behavior remains native engine behavior; local acceptance is not field-level
+remote verification.
+
+Refused writes stay in the private directory and `sync_status` counts them. They
+do not count toward the 128 waiting writes. Up to 1024 refused writes are kept;
+after that new writes fail with `quarantine_full_retire_in_terminal`. The
+human-only `skykeep-mcp quarantine --state-dir DIR` lists them in a user-owned
+terminal (id, service, kind, record, reason; no payloads) and deletes exactly the
+listed rows after the literal answer `retire`. Retired writes are never sent. No
+MCP tool can resend, release or retire a refused write.
 
 Canonical read-only Hermes `tools/mcp_tool_sampling.py` currently returns empty
 content on accept (`ElicitationHandler._result`). That cannot satisfy this server's

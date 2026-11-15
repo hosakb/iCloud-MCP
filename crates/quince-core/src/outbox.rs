@@ -174,6 +174,16 @@ impl Library {
         Ok(usize::try_from(n).unwrap_or(0))
     }
 
+    /// Refused changes kept for the person to look at, whatever their service.
+    pub fn outbox_refused_count(&self) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM outbox WHERE refused_at IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
     /// Apple has it: no longer waiting.
     pub fn outbox_done(&mut self, id: i64) -> Result<()> {
         self.conn
