@@ -142,7 +142,7 @@ fn quarantine_unauthorized(library: &mut Library, dir: &Path) -> Result<(), &'st
 /// Set when a write is quarantined: the cache still shows it as if on its way. The next
 /// pass that reaches the drain re-reads the service in full, which replays only waiting
 /// writes, and clears this once that pass succeeds. Kept until then, across failures.
-fn reread_key(service: &str) -> String {
+pub(crate) fn reread_key(service: &str) -> String {
     format!("mcp.full_reread.{service}")
 }
 

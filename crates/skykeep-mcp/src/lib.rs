@@ -292,10 +292,19 @@ fn resolved_state(library: &Library, name: &str, guid: &str) -> Result<Value, &'
             .map_err(|_| "library_unavailable")?
             .ok_or("not_found")?;
         item.body = library.note_body(guid).map_err(|_| "library_unavailable")?;
-        item.runs = library.note_runs(guid).map_err(|_| "library_unavailable")?;
+        // Note.runs intentionally does not serialize. Bind its complete cached
+        // representation explicitly, with the same budgets as the rest of the preview.
+        let runs = bounded_json(&library.note_runs(guid).map_err(|_| "library_unavailable")?)?;
+        let runs = match runs {
+            Value::String(raw) => {
+                serde_json::from_str::<Value>(&raw).map_err(|_| "invalid_cached_runs")?
+            }
+            _ => Value::Null,
+        };
+        bounded_value(&runs, MAX_ARGUMENT_BYTES)?;
         let item = bounded_json(&item)?;
         let containers = bounded_json(&library.note_folders().map_err(|_| "library_unavailable")?)?;
-        json!({"item":item,"containers":containers})
+        json!({"item":item,"runs":runs,"containers":containers})
     } else if name == "reminders_write" {
         let item = bounded_json(
             &library
@@ -464,6 +473,9 @@ impl Server {
                 for p in &pending {
                     library.outbox_refuse(p.id, "mcp_policy_migration_quarantine")?;
                     library.set_state(&format!("mcp.authorization.{}", p.id), "")?;
+                    if ["notes", "reminders"].contains(&p.service.as_str()) {
+                        library.set_state(&sync::reread_key(&p.service), "1")?;
+                    }
                 }
                 library.set_state("mcp.policy", &value.to_string())
             })

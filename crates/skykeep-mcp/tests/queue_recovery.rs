@@ -52,6 +52,219 @@ fn private_dir() -> tempfile::TempDir {
     dir
 }
 
+#[tokio::test]
+async fn policy_migration_restores_populated_remote_and_keeps_failed_reread_pending() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let (dir, mut server, mut library) = family().await;
+    approved(
+        &mut server,
+        2,
+        json!({"action":"edit","guid":"other","patch":{"title":"UNSENT-EDIT"}}),
+    )
+    .await;
+    let created = write(
+        &mut server,
+        3,
+        "reminders_write",
+        json!({"action":"create","list_guid":"list","title":"UNSENT-CREATE"}),
+    )
+    .await;
+    let created: Value =
+        serde_json::from_str(created["content"][0]["text"].as_str().unwrap()).unwrap();
+    let local_guid = created["guid"].as_str().unwrap();
+    let kept = library
+        .outbox_append("notes", "already-refused", "save", "unchanged history")
+        .unwrap();
+    library.outbox_refuse(kept, "already reported").unwrap();
+    server.set_policy("yolo").unwrap();
+    assert_eq!(
+        library
+            .state("mcp.full_reread.reminders")
+            .unwrap()
+            .as_deref(),
+        Some("1")
+    );
+    assert_eq!(library.state("mcp.full_reread.notes").unwrap(), None);
+    assert!(library.outbox_pending("reminders").unwrap().is_empty());
+    assert!(library
+        .outbox_refused()
+        .unwrap()
+        .iter()
+        .any(|r| r.change.id == kept
+            && r.change.payload == "unchanged history"
+            && r.reason == "already reported"));
+    drop(server);
+    let _reopened = skykeep_mcp::Server::open(dir.path()).unwrap();
+    assert_eq!(
+        library
+            .state("mcp.full_reread.reminders")
+            .unwrap()
+            .as_deref(),
+        Some("1")
+    );
+    let remote = remote().await;
+    let failed = Arc::new(AtomicBool::new(false));
+    let fail_once = failed.clone();
+    Mock::given(method("POST")).and(path_regex(".*/com.apple.reminders/.*/changes/zone$"))
+        .respond_with(move |request: &wiremock::Request| {
+            let delta = String::from_utf8_lossy(&request.body).contains("prior");
+            if !delta && !fail_once.load(Ordering::SeqCst) { return ResponseTemplate::new(400); }
+            let records = if delta { json!([]) } else { json!([
+                {"recordName":"list","recordType":"List","recordChangeTag":"remote-list","fields":{"Name":{"type":"STRING","value":"Remote list"}}},
+                {"recordName":"other","recordType":"Reminder","recordChangeTag":"remote-item","fields":{"List":{"type":"REFERENCE","value":{"recordName":"list"}},"TitleDocument":{"type":"ENCRYPTED_BYTES","value":quince_icloud::ckdocument::text_to_base64("UNCHANGED-REMOTE-TITLE")}}}
+            ]) };
+            ResponseTemplate::new(200).set_body_json(json!({"zones":[{"records":records,"syncToken":"restored","moreComing":false}]}))
+        }).with_priority(1).mount(&remote).await;
+    skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+        .await
+        .unwrap();
+    assert!(
+        remote.received_requests().await.unwrap().iter().any(|r| r
+            .url
+            .path()
+            .contains("com.apple.reminders")
+            && r.url.path().ends_with("/changes/zone")
+            && !String::from_utf8_lossy(&r.body).contains("prior")),
+        "the scheduled full read was attempted"
+    );
+    assert_eq!(
+        library
+            .state("mcp.full_reread.reminders")
+            .unwrap()
+            .as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        library.reminder("other").unwrap().unwrap().title,
+        "UNSENT-EDIT"
+    );
+    failed.store(true, Ordering::SeqCst);
+    skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+        .await
+        .unwrap();
+    assert_eq!(
+        library.reminder("other").unwrap().unwrap().title,
+        "UNCHANGED-REMOTE-TITLE"
+    );
+    assert!(library.reminder(local_guid).unwrap().is_none());
+    assert_eq!(
+        library
+            .state("mcp.full_reread.reminders")
+            .unwrap()
+            .as_deref(),
+        Some("")
+    );
+    assert!(
+        library.note("note").unwrap().is_some(),
+        "unaffected Notes cache remains incremental"
+    );
+    assert!(library
+        .outbox_refused()
+        .unwrap()
+        .iter()
+        .any(|r| r.change.id == kept && r.change.payload == "unchanged history"));
+}
+
+#[tokio::test]
+async fn policy_migration_marks_both_affected_services_atomically() {
+    let (_dir, mut server, library) = family().await;
+    approved(
+        &mut server,
+        2,
+        json!({"action":"edit","guid":"other","patch":{"title":"pending"}}),
+    )
+    .await;
+    let result = write(
+        &mut server,
+        3,
+        "notes_write",
+        json!({"action":"pin","guid":"note","pinned":true,"base_etag":"n1"}),
+    )
+    .await;
+    assert_eq!(result["isError"], false);
+    let policy = library.state("mcp.policy").unwrap();
+    library.conn().execute_batch("CREATE TRIGGER fail_reread BEFORE INSERT ON app_state WHEN NEW.key = 'mcp.full_reread.reminders' BEGIN SELECT RAISE(ABORT, 'synthetic rollback'); END;").unwrap();
+    assert!(server.set_policy("writes_only").is_err());
+    assert_eq!(library.state("mcp.policy").unwrap(), policy);
+    assert_eq!(library.outbox_all_pending().unwrap().len(), 2);
+    assert_eq!(library.state("mcp.full_reread.notes").unwrap(), None);
+    library
+        .conn()
+        .execute_batch("DROP TRIGGER fail_reread")
+        .unwrap();
+    server.set_policy("writes_only").unwrap();
+    for service in ["notes", "reminders"] {
+        assert_eq!(
+            library
+                .state(&format!("mcp.full_reread.{service}"))
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+}
+
+#[tokio::test]
+async fn policy_migration_restores_populated_remote_note_body() {
+    let (dir, mut server, library) = family().await;
+    let edited = write(
+        &mut server,
+        2,
+        "notes_write",
+        json!({"action":"save","guid":"note","base_etag":"n1","body":"UNSENT-NOTE-BODY"}),
+    )
+    .await;
+    assert_eq!(edited["isError"], false);
+    let created = write(
+        &mut server,
+        3,
+        "notes_write",
+        json!({"action":"create","body":"UNSENT-LOCAL-NOTE"}),
+    )
+    .await;
+    let created: Value =
+        serde_json::from_str(created["content"][0]["text"].as_str().unwrap()).unwrap();
+    let local_guid = created["guid"].as_str().unwrap();
+    server.set_policy("yolo").unwrap();
+    assert_eq!(
+        library.state("mcp.full_reread.notes").unwrap().as_deref(),
+        Some("1")
+    );
+    assert_eq!(library.state("mcp.full_reread.reminders").unwrap(), None);
+    let remote = remote().await;
+    Mock::given(method("POST")).and(path_regex(".*/com.apple.notes/.*/changes/zone$"))
+        .respond_with(|request: &wiremock::Request| {
+            let delta = String::from_utf8_lossy(&request.body).contains("prior");
+            let records = if delta { json!([]) } else { json!([
+                {"recordName":"note","recordType":"Note","recordChangeTag":"remote-note","fields":{"TitleEncrypted":{"type":"ENCRYPTED_BYTES","value":quince_icloud::ckdocument::text_to_base64("REMOTE-NOTE-TITLE")},"TextDataEncrypted":{"type":"ENCRYPTED_BYTES","value":quince_icloud::ckdocument::text_to_base64("REMOTE-NOTE-BODY")}}}
+            ]) };
+            ResponseTemplate::new(200).set_body_json(json!({"zones":[{"records":records,"syncToken":"restored-notes","moreComing":false}]}))
+        }).with_priority(1).mount(&remote).await;
+    skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+        .await
+        .unwrap();
+    assert_eq!(
+        library.note("note").unwrap().unwrap().title,
+        "REMOTE-NOTE-TITLE"
+    );
+    assert_eq!(
+        library.note_body("note").unwrap().as_deref(),
+        Some("REMOTE-NOTE-BODY")
+    );
+    assert!(library.note(local_guid).unwrap().is_none());
+    assert_eq!(
+        library.state("mcp.full_reread.notes").unwrap().as_deref(),
+        Some("")
+    );
+    assert!(
+        library.reminder("other").unwrap().is_some(),
+        "unaffected service remains incremental"
+    );
+}
+
 /// Two lists; "parent" has subtask "child"; "other" stands alone. Policy is yolo, so
 /// every write is approved by the human-set policy without a form.
 async fn family() -> (tempfile::TempDir, skykeep_mcp::Server, quince_core::Library) {

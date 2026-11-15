@@ -2,6 +2,82 @@ use serde_json::json;
 use skykeep_mcp::Server;
 
 #[tokio::test]
+async fn note_confirmation_exposes_existing_runs_and_rejects_changed_formatting() {
+    let (_dir, mut server, mut library) =
+        configured("yolo", json!({"elicitation":{}}), "2025-11-25").await;
+    let reply = server
+        .handle(operation(
+            2,
+            "notes_write",
+            json!({"action":"create","body":"Format body"}),
+        ))
+        .await
+        .unwrap();
+    let created: serde_json::Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let guid = created["guid"].as_str().unwrap();
+    let bold = json!([{"length":11,"bold":true}]);
+    library.set_note_runs(guid, &bold.to_string()).unwrap();
+    server.set_policy("writes_only").unwrap();
+    let args = json!({"action":"save","guid":guid,"body":"Format body","runs":[{"length":11,"italic":true}]});
+    let form = server
+        .handle(operation(3, "notes_write", args.clone()))
+        .await
+        .unwrap();
+    let message = form["params"]["message"].as_str().unwrap();
+    // The inert display also escapes array punctuation outside string literals.
+    let shown = message
+        .split_once('\n')
+        .unwrap()
+        .1
+        .replace("\\u005b", "[")
+        .replace("\\u005d", "]");
+    let preview: serde_json::Value = serde_json::from_str(&shown).unwrap();
+    assert_eq!(
+        preview["existing_item"]["runs"], bold,
+        "the form must include existing formatting separately from Note serialization"
+    );
+    assert_eq!(preview["operation"]["arguments"]["runs"][0]["italic"], true);
+    library
+        .set_note_runs(guid, &json!([{"length":11,"underline":true}]).to_string())
+        .unwrap();
+    let reply = server
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .await
+        .unwrap();
+    assert_eq!(
+        reply["result"]["isError"], true,
+        "format-only changes invalidate consent"
+    );
+    assert!(library.outbox_all_pending().unwrap().is_empty());
+    let fresh = server
+        .handle(operation(4, "notes_write", args))
+        .await
+        .unwrap();
+    let reply = server
+        .handle(json!({"jsonrpc":"2.0","id":fresh["id"],"result":{"action":"accept","content":{}}}))
+        .await
+        .unwrap();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let pending = library.outbox_all_pending().unwrap();
+    let oversized = serde_json::to_string(&vec![json!({"length":11,"bold":true}); 2000]).unwrap();
+    library.set_note_runs(guid, &oversized).unwrap();
+    let refused = server
+        .handle(operation(
+            5,
+            "notes_write",
+            json!({"action":"pin","guid":guid,"pinned":true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        refused["result"]["isError"], true,
+        "oversized cached runs must be refused, never truncated"
+    );
+    assert_eq!(library.outbox_all_pending().unwrap(), pending);
+}
+
+#[tokio::test]
 async fn confirmation_accepts_empty_content_and_inert_result_metadata_only() {
     for metadata in [
         None,
