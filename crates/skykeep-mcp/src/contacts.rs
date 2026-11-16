@@ -1,6 +1,7 @@
 //! Apple iCloud Contacts, read-only: cached list, search and get, and an explicit refresh
 //! that reads Apple's address book into the local cache. Nothing here writes to Apple or
-//! sends queued changes. The engine crates own the fetch, the parsing and the cache.
+//! sends queued changes. The engine crates own the parsing and the cache; the refresh's
+//! requests are made here so every response is read under a byte limit.
 use crate::account::{binding, Binding};
 use quince_auth::{Client, Endpoints, Store};
 use quince_core::contacts::{Card, ContactMethod, PostalAddress};
@@ -10,19 +11,25 @@ use quince_sync::{library_lock::LibraryLock, pass, queue::ACCOUNT_KEY};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 const SERVICE: &str = "contacts";
 const DEFAULT_LIMIT: usize = 25;
 pub(crate) const MAX_LIMIT: usize = 100;
 pub(crate) const MAX_QUERY_BYTES: usize = 256;
 const MAX_GUID_BYTES: usize = 512;
-/// A page stops early, with `next_offset`, rather than grow past this.
+/// Caps on a tool result's text as encoded in the JSON-RPC frame. A page stops early, with
+/// `next_offset`, rather than grow past its cap.
 const MAX_PAGE_BYTES: usize = 262_144;
 const MAX_CARD_BYTES: usize = 524_288;
-/// Per summary: longer text is cut and the summary says so.
-const MAX_SUMMARY_CHARS: usize = 512;
-const MAX_SUMMARY_METHODS: usize = 20;
-const REFRESH_SECONDS: u64 = 60;
+/// One summary, encoded. With identifiers at most `MAX_GUID_BYTES` the last level always fits,
+/// so the first item of a page always fits and every page makes progress.
+const MAX_ITEM_BYTES: usize = 32_768;
+/// (characters per text field, entries per email or phone list), tried in turn until a
+/// summary fits. Zero characters leaves only the identifier and the counts.
+const SUMMARY_LEVELS: [(usize, usize); 4] = [(512, 20), (128, 8), (32, 2), (0, 0)];
+/// The same for one card: whole, then each text cut and each list shortened.
+const CARD_LEVELS: [Option<(usize, usize)>; 3] = [None, Some((4096, 100)), Some((256, 20))];
 
 /// What a cached card does not hold. The cache is a projection of Apple's card, not a copy.
 const NOT_INCLUDED: [&str; 5] = [
@@ -139,30 +146,34 @@ fn ordered(mut cards: Vec<Card>) -> Vec<Card> {
     keyed.into_iter().map(|(_, c)| c).collect()
 }
 
-fn cut(text: Option<&str>, cut_any: &mut bool) -> Option<String> {
-    text.map(|t| {
-        if t.chars().count() > MAX_SUMMARY_CHARS {
-            *cut_any = true;
-            t.chars().take(MAX_SUMMARY_CHARS).collect()
-        } else {
-            t.to_string()
-        }
-    })
+/// Bytes a value takes as tool-result text inside the JSON-RPC frame: serialized once as the
+/// text, then again as a JSON string.
+fn encoded_len(value: &Value) -> usize {
+    serde_json::to_string(&Value::String(value.to_string())).map_or(usize::MAX, |s| s.len())
 }
 
-fn summary(card: &Card) -> Value {
+fn cut(text: Option<&str>, chars: usize, cut_any: &mut bool) -> Option<String> {
+    let text = text?;
+    if text.chars().count() <= chars {
+        return Some(text.to_string());
+    }
+    *cut_any = true;
+    (chars > 0).then(|| text.chars().take(chars).collect())
+}
+
+fn summary(card: &Card, chars: usize, entries: usize) -> Value {
     let c = &card.contact;
     let mut cut_any = false;
     let mut of_kind = |kind: &str| {
         let all: Vec<&ContactMethod> = c.methods.iter().filter(|m| m.kind == kind).collect();
-        if all.len() > MAX_SUMMARY_METHODS {
+        if all.len() > entries {
             cut_any = true;
         }
         let shown: Vec<Value> = all
             .iter()
-            .take(MAX_SUMMARY_METHODS)
+            .take(entries)
             .map(|m| {
-                json!({"label":cut(m.label.as_deref(), &mut cut_any),"value":cut(Some(&m.value), &mut cut_any)})
+                json!({"label":cut(m.label.as_deref(), chars, &mut cut_any),"value":cut(Some(&m.value), chars, &mut cut_any)})
             })
             .collect();
         (shown, all.len())
@@ -171,11 +182,11 @@ fn summary(card: &Card) -> Value {
     let (phones, phones_total) = of_kind("phone");
     json!({
         "guid": c.guid,
-        "display_name": cut(Some(&c.display_name()), &mut cut_any),
-        "first_name": cut(c.first_name.as_deref(), &mut cut_any),
-        "middle_name": cut(c.middle_name.as_deref(), &mut cut_any),
-        "last_name": cut(c.last_name.as_deref(), &mut cut_any),
-        "company": cut(c.company.as_deref(), &mut cut_any),
+        "display_name": cut(Some(&c.display_name()), chars, &mut cut_any),
+        "first_name": cut(c.first_name.as_deref(), chars, &mut cut_any),
+        "middle_name": cut(c.middle_name.as_deref(), chars, &mut cut_any),
+        "last_name": cut(c.last_name.as_deref(), chars, &mut cut_any),
+        "company": cut(c.company.as_deref(), chars, &mut cut_any),
         "is_company": c.is_company,
         "emails": emails,
         "emails_total": emails_total,
@@ -186,6 +197,23 @@ fn summary(card: &Card) -> Value {
     })
 }
 
+/// One page entry. An identifier too long to ask for with `contacts_get` is never cut into a
+/// different, unusable one: the entry says so, with its length, and holds its place.
+fn item(card: &Card) -> Value {
+    let guid = &card.contact.guid;
+    if guid.len() > MAX_GUID_BYTES {
+        return json!({"guid":null,"unsupported":"guid_too_long","guid_bytes":guid.len(),"summary_truncated":true});
+    }
+    let mut shown = Value::Null;
+    for (chars, entries) in SUMMARY_LEVELS {
+        shown = summary(card, chars, entries);
+        if encoded_len(&shown) <= MAX_ITEM_BYTES {
+            break;
+        }
+    }
+    shown
+}
+
 fn paged(
     library: &Library,
     cards: Vec<Card>,
@@ -193,32 +221,50 @@ fn paged(
     limit: usize,
 ) -> Result<Value, &'static str> {
     let total = cards.len();
+    let cache = cache_state(library)?;
+    let page = |items: &[Value], shortened: bool| {
+        let next = offset.saturating_add(items.len());
+        json!({
+            "source": "local_cache",
+            "items": items,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "next_offset": (next < total).then_some(next),
+            "page_shortened_to_fit": shortened,
+            "unsupported_items": items.iter().filter(|i| i["guid"].is_null()).count(),
+            "summaries_truncated": items.iter().filter(|i| i["summary_truncated"] == true).count(),
+            "complete_representation": false,
+            "cache": cache,
+            "remote_verified": false,
+        })
+    };
+    // Each item adds its encoded text and a comma; the envelope is measured with room for
+    // its counts to grow.
+    let mut used = encoded_len(&page(&[], true)).saturating_add(64);
     let mut items = Vec::new();
-    let mut used = 0usize;
     let mut shortened = false;
     for card in cards.iter().skip(offset).take(limit) {
-        let item = summary(card);
-        let size = item.to_string().len();
-        if !items.is_empty() && used.saturating_add(size) > MAX_PAGE_BYTES {
+        let item = item(card);
+        let size = encoded_len(&item).saturating_sub(1);
+        if used.saturating_add(size) > MAX_PAGE_BYTES {
             shortened = true;
             break;
         }
         used = used.saturating_add(size);
         items.push(item);
     }
-    let next = offset.saturating_add(items.len());
-    Ok(json!({
-        "source": "local_cache",
-        "items": items,
-        "total": total,
-        "offset": offset,
-        "limit": limit,
-        "next_offset": (next < total).then_some(next),
-        "page_shortened_to_fit": shortened,
-        "complete_representation": false,
-        "cache": cache_state(library)?,
-        "remote_verified": false,
-    }))
+    // The page as it will be sent, measured: never over the cap.
+    loop {
+        let value = page(&items, shortened);
+        if encoded_len(&value) <= MAX_PAGE_BYTES {
+            return Ok(value);
+        }
+        if items.pop().is_none() {
+            return Err("page_too_large");
+        }
+        shortened = true;
+    }
 }
 
 pub(crate) fn list(library: &Library, args: Value) -> Result<Value, &'static str> {
@@ -257,6 +303,37 @@ fn address_view(a: &PostalAddress) -> Value {
     })
 }
 
+/// Every text cut to `chars` characters and every list to `entries`, identifiers excepted.
+fn cut_card(value: &Value, chars: usize, entries: usize, cut_any: &mut bool) -> Value {
+    match value {
+        Value::String(text) => Value::String(cut(Some(text), chars, cut_any).unwrap_or_default()),
+        Value::Array(list) => {
+            if list.len() > entries {
+                *cut_any = true;
+            }
+            Value::Array(
+                list.iter()
+                    .take(entries)
+                    .map(|v| cut_card(v, chars, entries, cut_any))
+                    .collect(),
+            )
+        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    let v = if k == "guid" {
+                        v.clone()
+                    } else {
+                        cut_card(v, chars, entries, cut_any)
+                    };
+                    (k.clone(), v)
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 pub(crate) fn get(library: &Library, args: Value) -> Result<Value, &'static str> {
     let args = get_args(&args)?;
     let card = library
@@ -288,45 +365,65 @@ pub(crate) fn get(library: &Library, args: Value) -> Result<Value, &'static str>
         .filter(|m| !["email", "phone", "address"].contains(&m.kind.as_str()))
         .map(|m| json!({"kind":m.kind,"label":m.label,"value":m.value}))
         .collect();
-    let value = json!({
-        "source": "local_cache",
-        "contact": {
-            "guid": c.guid,
-            "display_name": c.display_name(),
-            "first_name": c.first_name,
-            "middle_name": c.middle_name,
-            "last_name": c.last_name,
-            "company": c.company,
-            "is_company": c.is_company,
-            "birthday": c.birthday,
-            "notes": c.notes,
-            "etag": c.etag,
-            "details": {
-                "prefix": d.prefix,
-                "suffix": d.suffix,
-                "nickname": d.nickname,
-                "phonetic_first_name": d.phonetic_first_name,
-                "phonetic_last_name": d.phonetic_last_name,
-                "phonetic_company": d.phonetic_company,
-                "job_title": d.job_title,
-                "department": d.department,
-            },
-            "emails": kind("email"),
-            "phones": kind("phone"),
-            "postal_addresses": addresses.iter().map(address_view).collect::<Vec<_>>(),
-            "other_methods": others,
-            "lists": lists,
-            "photo": {"present": c.photo_url.is_some(), "image_included": false},
-        },
-        "complete_representation": false,
-        "not_included": NOT_INCLUDED,
-        "cache": cache_state(library)?,
-        "remote_verified": false,
+    let (emails, phones) = (kind("email"), kind("phone"));
+    let totals = json!({
+        "emails": emails.len(),
+        "phones": phones.len(),
+        "postal_addresses": addresses.len(),
+        "other_methods": others.len(),
+        "lists": lists.len(),
     });
-    if value.to_string().len() > MAX_CARD_BYTES {
-        return Err("contact_too_large");
+    let whole = json!({
+        "guid": c.guid,
+        "display_name": c.display_name(),
+        "first_name": c.first_name,
+        "middle_name": c.middle_name,
+        "last_name": c.last_name,
+        "company": c.company,
+        "is_company": c.is_company,
+        "birthday": c.birthday,
+        "notes": c.notes,
+        "etag": c.etag,
+        "details": {
+            "prefix": d.prefix,
+            "suffix": d.suffix,
+            "nickname": d.nickname,
+            "phonetic_first_name": d.phonetic_first_name,
+            "phonetic_last_name": d.phonetic_last_name,
+            "phonetic_company": d.phonetic_company,
+            "job_title": d.job_title,
+            "department": d.department,
+        },
+        "emails": emails,
+        "phones": phones,
+        "postal_addresses": addresses.iter().map(address_view).collect::<Vec<_>>(),
+        "other_methods": others,
+        "lists": lists,
+        "photo": {"present": c.photo_url.is_some(), "image_included": false},
+    });
+    let cache = cache_state(library)?;
+    for level in CARD_LEVELS {
+        let mut cut_any = false;
+        let contact = match level {
+            None => whole.clone(),
+            Some((chars, entries)) => cut_card(&whole, chars, entries, &mut cut_any),
+        };
+        let value = json!({
+            "source": "local_cache",
+            "contact": contact,
+            "card_truncated": cut_any,
+            "truncation": level.filter(|_| cut_any).map(|(chars, entries)| json!({"max_chars_per_text":chars,"max_entries_per_list":entries})),
+            "entry_totals": totals,
+            "complete_representation": false,
+            "not_included": NOT_INCLUDED,
+            "cache": cache,
+            "remote_verified": false,
+        });
+        if encoded_len(&value) <= MAX_CARD_BYTES {
+            return Ok(value);
+        }
     }
-    Ok(value)
+    Err("contact_too_large")
 }
 
 /// Refuses before any keyring, session or network use: an unapproved read under
@@ -347,6 +444,299 @@ fn gate(dir: &Path, approved: bool) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Resource limits of one refresh. Bytes are counted as decoded, as they arrive.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct RefreshLimits {
+    /// One response.
+    pub max_response_bytes: usize,
+    /// Every response of the refresh together.
+    pub max_total_bytes: usize,
+    /// Cards in the book.
+    pub max_contacts: usize,
+    /// One card as Apple sent it.
+    pub max_card_bytes: usize,
+    /// The whole refresh; nothing is stored once it has passed.
+    pub timeout: Duration,
+}
+
+impl Default for RefreshLimits {
+    fn default() -> Self {
+        Self {
+            max_response_bytes: 32 * 1024 * 1024,
+            max_total_bytes: 64 * 1024 * 1024,
+            max_contacts: 25_000,
+            max_card_bytes: 256 * 1024,
+            timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+/// `/co/changeset` answers with tokens and, at most, a few changed records.
+const MAX_CHANGESET_BYTES: usize = 1024 * 1024;
+/// Cards per page when the book is read in pages, as icloud.com reads it.
+const PAGE_CARDS: usize = 500;
+
+/// Why a refresh read stopped. Apple's own error bodies are never read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    Reauth,
+    Busy,
+    Failed,
+    TooLarge,
+    BookTooLarge,
+    CardTooLarge,
+}
+
+impl Stop {
+    fn code(self) -> &'static str {
+        match self {
+            Stop::Reauth => "login_required",
+            Stop::Busy | Stop::Failed => "contacts_refresh_failed_cache_kept",
+            Stop::TooLarge => "contacts_response_too_large_cache_kept",
+            Stop::BookTooLarge => "contacts_book_too_large_cache_kept",
+            Stop::CardTooLarge => "contacts_card_too_large_cache_kept",
+        }
+    }
+
+    /// What the library records for the failed pass: a fixed phrase, never Apple's text.
+    fn error(self) -> quince_icloud::Error {
+        match self {
+            Stop::Reauth => quince_icloud::Error::ReauthRequired,
+            Stop::Busy => quince_icloud::Error::Busy,
+            other => quince_icloud::Error::Protocol(other.code().into()),
+        }
+    }
+}
+
+fn refused(status: u16) -> Option<Stop> {
+    match status {
+        200..=299 => None,
+        450 => Some(Stop::Reauth),
+        429 | 500..=599 => Some(Stop::Busy),
+        _ => Some(Stop::Failed),
+    }
+}
+
+/// Reads a response body chunk by chunk, as decoded, and stops at whichever of `cap` and the
+/// refresh's remaining `budget` comes first. No length Apple announces is trusted or used to
+/// reserve memory.
+macro_rules! read_capped {
+    ($response:expr, $cap:expr, $budget:expr) => {{
+        let mut response = $response;
+        let cap: usize = $cap;
+        let budget: &mut usize = $budget;
+        let mut body: Vec<u8> = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if chunk.len() > cap.saturating_sub(body.len()) || chunk.len() > *budget {
+                        break Err(Stop::TooLarge);
+                    }
+                    *budget -= chunk.len();
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => break Ok(body),
+                Err(_) => break Err(Stop::Failed),
+            }
+        }
+    }};
+}
+
+/// The query every Contacts request carries, as the engine sends it.
+fn base_query(client: &Client) -> Vec<(String, String)> {
+    let mut query = client.service_params();
+    query.push(("clientVersion".into(), "2.1".into()));
+    query.push(("locale".into(), "en_US".into()));
+    query.push(("order".into(), "last,first".into()));
+    query
+}
+
+/// Whether the book moved since `tokens`, by Apple's `/co/changeset`; its tokens are taken.
+async fn changed(
+    client: &Client,
+    root: &str,
+    tokens: &mut Tokens,
+    budget: &mut usize,
+) -> Result<bool, Stop> {
+    let mut query = base_query(client);
+    query.push(("prefToken".into(), tokens.pref.clone()));
+    query.push(("syncToken".into(), tokens.sync.clone()));
+    let response = client
+        .http()
+        .post(format!("{}/co/changeset", root.trim_end_matches('/')))
+        .query(&query)
+        .send()
+        .await
+        .map_err(|_| Stop::Failed)?;
+    let status = response.status().as_u16();
+    if status == 420 {
+        return Ok(true);
+    }
+    if let Some(stop) = refused(status) {
+        return Err(stop);
+    }
+    let body = read_capped!(response, MAX_CHANGESET_BYTES, budget)?;
+    let body: Value = serde_json::from_slice(&body).map_err(|_| Stop::Failed)?;
+    let carries = |key: &str| {
+        body.get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty())
+    };
+    let gone = body
+        .get("deletes")
+        .and_then(Value::as_object)
+        .is_some_and(|d| {
+            d.values()
+                .any(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+        });
+    let mut moved = carries("contacts") || carries("groups") || gone;
+    if let Some(sync) = body.get("syncToken").and_then(Value::as_str) {
+        moved |= sync != tokens.sync;
+        tokens.sync = sync.to_string();
+    }
+    if let Some(pref) = body.get("prefToken").and_then(Value::as_str) {
+        tokens.pref = pref.to_string();
+    }
+    Ok(moved)
+}
+
+/// Bytes one card takes as JSON, counted without building the text.
+fn card_bytes(card: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, card).map_or(usize::MAX, |()| count.0)
+}
+
+/// The whole book by `/co/startup` and, for a large one, its pages, each read under the limits.
+/// Parsed by the engine's own readers.
+async fn whole_book(
+    client: &Client,
+    root: &str,
+    limits: &RefreshLimits,
+    budget: &mut usize,
+) -> Result<(apple::AddressBook, Tokens), Stop> {
+    let root = root.trim_end_matches('/');
+    let query = base_query(client);
+    let response = client
+        .http()
+        .get(format!("{root}/co/startup"))
+        .query(&query)
+        .send()
+        .await
+        .map_err(|_| Stop::Failed)?;
+    if let Some(stop) = refused(response.status().as_u16()) {
+        return Err(stop);
+    }
+    let bytes = read_capped!(response, limits.max_response_bytes, budget)?;
+    let mut body: Value = serde_json::from_slice(&bytes).map_err(|_| Stop::Failed)?;
+    drop(bytes);
+    let token = |key: &str| {
+        body.get(key)
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .ok_or(Stop::Failed)
+    };
+    let tokens = Tokens {
+        sync: token("syncToken")?,
+        pref: token("prefToken")?,
+    };
+    let wanted = body
+        .get("contactsOrder")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let cards = body
+        .as_object_mut()
+        .ok_or(Stop::Failed)?
+        .entry("contacts")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Value::Array(cards) = cards else {
+        return Err(Stop::Failed);
+    };
+    if wanted > limits.max_contacts || cards.len() > limits.max_contacts {
+        return Err(Stop::BookTooLarge);
+    }
+    // A large book comes in pages; each page adds at least one card or the read stops.
+    while cards.len() < wanted {
+        let mut page_query = query.clone();
+        page_query.push(("syncToken".into(), tokens.sync.clone()));
+        page_query.push(("prefToken".into(), tokens.pref.clone()));
+        page_query.push(("offset".into(), cards.len().to_string()));
+        page_query.push(("limit".into(), PAGE_CARDS.to_string()));
+        let response = client
+            .http()
+            .get(format!("{root}/co/contacts/card/"))
+            .query(&page_query)
+            .send()
+            .await
+            .map_err(|_| Stop::Failed)?;
+        let status = response.status().as_u16();
+        if let Some(stop) = refused(status) {
+            return Err(if stop == Stop::Reauth {
+                stop
+            } else {
+                Stop::Failed
+            });
+        }
+        let bytes = read_capped!(response, limits.max_response_bytes, budget)?;
+        let mut page: Value = serde_json::from_slice(&bytes).map_err(|_| Stop::Failed)?;
+        drop(bytes);
+        let more = match page.get_mut("contacts").map(Value::take) {
+            Some(Value::Array(more)) if !more.is_empty() => more,
+            // Stored short, the cards it missed would read as deleted.
+            _ => return Err(Stop::Failed),
+        };
+        if more.len() > limits.max_contacts.saturating_sub(cards.len()) {
+            return Err(Stop::BookTooLarge);
+        }
+        cards.extend(more);
+    }
+    if cards
+        .iter()
+        .any(|card| card_bytes(card) > limits.max_card_bytes)
+    {
+        return Err(Stop::CardTooLarge);
+    }
+    let book = apple::AddressBook {
+        contacts: apple::parse(&body),
+        lists: apple::parse_lists(&body),
+        me: apple::me_card(&body),
+        addresses: apple::parse_addresses(&body),
+        details: apple::parse_details(&body),
+    };
+    Ok((book, tokens))
+}
+
+/// As the engine's Contacts pass: a cheap changeset check when tokens are kept, and the whole
+/// book only when it moved (or the check could not say). Every read is bounded.
+async fn fetch(
+    client: &Client,
+    root: &str,
+    since: Option<Tokens>,
+    limits: &RefreshLimits,
+) -> Result<apple::Pass, Stop> {
+    let mut budget = limits.max_total_bytes;
+    if let Some(mut tokens) = since {
+        match changed(client, root, &mut tokens, &mut budget).await {
+            Ok(false) => return Ok(apple::Pass::Unchanged(tokens)),
+            Ok(true) => {}
+            Err(stop @ (Stop::Reauth | Stop::TooLarge)) => return Err(stop),
+            Err(_) => {}
+        }
+    }
+    let (book, tokens) = whole_book(client, root, limits, &mut budget).await?;
+    Ok(apple::Pass::Read(book, tokens))
+}
+
 /// Production refresh: the directory's own keyring session and Apple's endpoints only.
 /// Caller holds the private directory's exclusive operation lock.
 pub(crate) async fn refresh(dir: &Path, approved: bool) -> Result<Value, &'static str> {
@@ -359,28 +749,42 @@ pub(crate) async fn refresh(dir: &Path, approved: bool) -> Result<Value, &'stati
         return Err("login_required");
     }
     let client = Client::with(dir, Endpoints::default(), store).map_err(|_| "login_required")?;
-    timed(dir, client).await
+    timed(dir, client, RefreshLimits::default()).await
 }
 
 /// Test seam with synthetic endpoints, never approved for `reads_and_writes`.
 /// Caller holds the private directory's exclusive operation lock.
 pub async fn refresh_with_client(dir: &Path, client: Client) -> Result<Value, &'static str> {
+    refresh_with_client_limited(dir, client, RefreshLimits::default()).await
+}
+
+/// [`refresh_with_client`] under other limits, so tests can reach them with small bodies.
+#[doc(hidden)]
+pub async fn refresh_with_client_limited(
+    dir: &Path,
+    client: Client,
+    limits: RefreshLimits,
+) -> Result<Value, &'static str> {
     gate(dir, false)?;
-    timed(dir, client).await
+    timed(dir, client, limits).await
 }
 
-async fn timed(dir: &Path, client: Client) -> Result<Value, &'static str> {
-    // The store is one synchronous transaction after the network half, so a timeout
-    // leaves either the old cache or the new one.
-    tokio::time::timeout(
-        std::time::Duration::from_secs(REFRESH_SECONDS),
-        read_book(dir, client),
-    )
-    .await
-    .map_err(|_| "contacts_refresh_timeout_cache_kept")?
+async fn timed(dir: &Path, client: Client, limits: RefreshLimits) -> Result<Value, &'static str> {
+    // Network reads are cancelled at the deadline. Parsing and storing are bounded by the
+    // byte and card limits, and nothing is stored once the deadline has passed; the store is
+    // one transaction, so a refresh leaves either the old cache or the new one.
+    let deadline = Instant::now() + limits.timeout;
+    tokio::time::timeout(limits.timeout, read_book(dir, client, limits, deadline))
+        .await
+        .map_err(|_| "contacts_refresh_timeout_cache_kept")?
 }
 
-async fn read_book(dir: &Path, mut client: Client) -> Result<Value, &'static str> {
+async fn read_book(
+    dir: &Path,
+    mut client: Client,
+    limits: RefreshLimits,
+    deadline: Instant,
+) -> Result<Value, &'static str> {
     if !client
         .resume()
         .await
@@ -414,12 +818,21 @@ async fn read_book(dir: &Path, mut client: Client) -> Result<Value, &'static str
         .await
         .as_deref()
         .and_then(Tokens::from_stored);
-    let reauth = std::sync::atomic::AtomicBool::new(false);
+    let stopped = std::sync::Mutex::new(None::<&'static str>);
     let lock = tokio::sync::Mutex::new(());
     let report = pass::driven(SERVICE, &ctx, &data, &lock, async {
-        let fetched = apple::pass(&ctx.http, &root, ctx.params.clone(), since).await;
-        if matches!(fetched, Err(quince_icloud::Error::ReauthRequired)) {
-            reauth.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut fetched = fetch(&client, &root, since, &limits).await.map_err(|stop| {
+            *stopped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stop.code());
+            stop.error()
+        });
+        if fetched.is_ok() && Instant::now() >= deadline {
+            let code = "contacts_refresh_timeout_cache_kept";
+            *stopped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(code);
+            fetched = Err(quince_icloud::Error::Protocol(code.into()));
         }
         // Queued Contacts changes are neither sent nor laid over what Apple returned.
         pass::store(
@@ -446,8 +859,15 @@ async fn read_book(dir: &Path, mut client: Client) -> Result<Value, &'static str
     match report.outcome {
         pass::Outcome::Ok => {}
         pass::Outcome::Paused => return Err("contacts_paused_approve_on_apple_device"),
-        _ if reauth.load(std::sync::atomic::Ordering::SeqCst) => return Err("login_required"),
-        _ => return Err("contacts_refresh_failed_cache_kept"),
+        _ if report.detail.as_deref() == Some(pass::NOT_YOURS_WORDS) => {
+            return Err("account_changed_during_refresh_cache_kept")
+        }
+        _ => {
+            let stopped = *stopped
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            return Err(stopped.unwrap_or("contacts_refresh_failed_cache_kept"));
+        }
     }
     let library = data.lock().await;
     let cached = library.contact_count().map_err(|_| "library_unavailable")?;

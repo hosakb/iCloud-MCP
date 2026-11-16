@@ -1177,3 +1177,741 @@ fn private_files(dir: &std::path::Path) {
         .unwrap();
     }
 }
+
+// --- Response size: every emitted page and card fits its cap, measured as sent.
+
+const PAGE_CAP: usize = 262_144;
+const CARD_CAP: usize = 524_288;
+
+/// The tool result's text as it is encoded inside the JSON-RPC frame, and the whole frame.
+fn emitted(reply: &Value) -> (usize, usize) {
+    let text = serde_json::to_string(&reply["result"]["content"][0]["text"]).unwrap();
+    (text.len(), serde_json::to_string(reply).unwrap().len())
+}
+
+/// Text that grows when encoded: quotes, a control character, markup and multibyte letters.
+fn awkward(chars: usize) -> String {
+    "\"\u{1}<é東\\".chars().cycle().take(chars).collect()
+}
+
+fn huge_book() -> AddressBook {
+    let mut contacts = Vec::new();
+    let mut long_id = person(&"G".repeat(300_000), Some("Huge"), Some("Longid"));
+    long_id.methods = vec![method_of("email", None, "long@example.com")];
+    contacts.push(long_id);
+    contacts.push(person(&"東".repeat(200), Some("Huge"), Some("Multibyte")));
+    contacts.push(person("C-\"\\\u{1}<é>", Some("Huge"), Some("Escaped")));
+    for i in 0..40 {
+        let mut wide = person(
+            &format!("C-WIDE-{i:02}"),
+            Some(&format!("Huge{}", awkward(600))),
+            Some(&awkward(600)),
+        );
+        wide.company = Some(awkward(600));
+        wide.methods = (0..25)
+            .flat_map(|n| {
+                [
+                    method_of(
+                        "email",
+                        Some(&awkward(600)),
+                        &format!("{n}{}", awkward(600)),
+                    ),
+                    method_of(
+                        "phone",
+                        Some(&awkward(600)),
+                        &format!("+1 555 {n:04}{}", awkward(600)),
+                    ),
+                ]
+            })
+            .collect();
+        contacts.push(wide);
+    }
+    let mut notes = person("C-NOTES", Some("Huge"), Some("Notes"));
+    notes.notes = Some(awkward(2_000_000));
+    contacts.push(notes);
+    let mut many = person("C-MANY", Some("Huge"), Some("Many"));
+    many.methods = (0..2000)
+        .map(|n| method_of("email", Some("HOME"), &format!("{n}{}", awkward(600))))
+        .collect();
+    contacts.push(many);
+    AddressBook {
+        contacts,
+        lists: vec![ContactList {
+            guid: "L-HUGE".into(),
+            name: awkward(300),
+            members: vec!["C-NOTES".into()],
+            etag: None,
+        }],
+        me: None,
+        addresses: Vec::new(),
+        details: Vec::new(),
+    }
+}
+
+/// Walks every page; each must fit the cap, move forward, and account for every contact.
+async fn walk(server: &mut Server, name: &str, mut args: Value) -> Vec<Value> {
+    let mut items = Vec::new();
+    let mut offset = 0u64;
+    let mut total = None;
+    loop {
+        args["offset"] = json!(offset);
+        args["limit"] = json!(100);
+        let reply = call(server, 9, name, args.clone()).await;
+        assert_eq!(
+            reply["result"]["isError"],
+            false,
+            "{}",
+            &reply.to_string()[..300]
+        );
+        let (text, frame) = emitted(&reply);
+        assert!(text <= PAGE_CAP, "{name} page text {text}");
+        assert!(frame <= PAGE_CAP + 256, "{name} frame {frame}");
+        let page = text_of(&reply);
+        total.get_or_insert(page["total"].as_u64().unwrap());
+        let got = page["items"].as_array().unwrap();
+        assert!(!got.is_empty(), "every page makes progress");
+        items.extend(got.iter().cloned());
+        match page["next_offset"].as_u64() {
+            Some(next) => {
+                assert_eq!(next, offset + got.len() as u64);
+                assert!(page["page_shortened_to_fit"] == true || got.len() == 100);
+                offset = next;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(items.len() as u64, total.unwrap(), "no contact skipped");
+    items
+}
+
+fn text_of(reply: &Value) -> Value {
+    text(reply)
+}
+
+#[tokio::test]
+async fn list_and_search_pages_fit_the_cap_with_huge_identifiers_and_fields() {
+    let dir = private_dir();
+    let mut server = Server::open(dir.path()).unwrap();
+    let mut library = quince_core::Library::open(dir.path()).unwrap();
+    quince_icloud::contacts::apply(&mut library, huge_book()).unwrap();
+    init(&mut server, false).await;
+    for (name, args) in [
+        ("contacts_list", json!({})),
+        ("contacts_search", json!({"query":"huge"})),
+    ] {
+        let items = walk(&mut server, name, args).await;
+        assert_eq!(items.len(), 45, "{name}");
+        // Identifiers too long to address are shown as unsupported, never cut or skipped.
+        let unsupported: Vec<&Value> = items.iter().filter(|i| i["guid"].is_null()).collect();
+        assert_eq!(unsupported.len(), 2, "{name}");
+        for item in &unsupported {
+            assert_eq!(item["unsupported"], "guid_too_long");
+        }
+        let mut lengths: Vec<u64> = unsupported
+            .iter()
+            .map(|i| i["guid_bytes"].as_u64().unwrap())
+            .collect();
+        lengths.sort_unstable();
+        assert_eq!(lengths, [600, 300_000]);
+        // Every other identifier comes back exactly, escaped characters included.
+        let ids: Vec<&str> = items.iter().filter_map(|i| i["guid"].as_str()).collect();
+        assert!(ids.contains(&"C-\"\\\u{1}<é>"), "{name}");
+        assert!(ids.contains(&"C-NOTES") && ids.contains(&"C-MANY"));
+        assert_eq!(ids.iter().filter(|g| g.starts_with("C-WIDE-")).count(), 40);
+        for item in items
+            .iter()
+            .filter(|i| i["guid"].as_str().is_some_and(|g| g.starts_with("C-WIDE-")))
+        {
+            assert_eq!(item["summary_truncated"], true, "{name}");
+            assert_eq!(item["emails_total"], 25);
+            assert!(item["emails"].as_array().unwrap().len() < 25);
+            assert!(serde_json::to_string(&item.to_string()).unwrap().len() <= 32_768);
+        }
+        let many = items.iter().find(|i| i["guid"] == "C-MANY").unwrap();
+        assert_eq!(many["emails_total"], 2000);
+        assert_eq!(many["summary_truncated"], true);
+    }
+}
+
+#[tokio::test]
+async fn get_fits_the_cap_by_cutting_fields_it_says_it_cut() {
+    let dir = private_dir();
+    let mut server = Server::open(dir.path()).unwrap();
+    let mut library = quince_core::Library::open(dir.path()).unwrap();
+    quince_icloud::contacts::apply(&mut library, huge_book()).unwrap();
+    init(&mut server, false).await;
+    for guid in ["C-NOTES", "C-MANY", "C-WIDE-07", "C-\"\\\u{1}<é>"] {
+        let reply = call(&mut server, 9, "contacts_get", json!({"guid":guid})).await;
+        assert_eq!(reply["result"]["isError"], false, "{guid}");
+        let (text, frame) = emitted(&reply);
+        assert!(text <= CARD_CAP, "{guid} card text {text}");
+        assert!(frame <= CARD_CAP + 256, "{guid} frame {frame}");
+        let got = text_of(&reply);
+        assert_eq!(got["contact"]["guid"], guid, "the identifier is never cut");
+    }
+    let notes = ok(&mut server, "contacts_get", json!({"guid":"C-NOTES"})).await;
+    assert_eq!(notes["card_truncated"], true);
+    assert!(notes["contact"]["notes"].as_str().unwrap().chars().count() < 2_000_000);
+    assert_eq!(notes["entry_totals"]["lists"], 1);
+    let many = ok(&mut server, "contacts_get", json!({"guid":"C-MANY"})).await;
+    assert_eq!(many["card_truncated"], true);
+    assert_eq!(many["entry_totals"]["emails"], 2000);
+    assert!(many["contact"]["emails"].as_array().unwrap().len() < 2000);
+    let plain = ok(
+        &mut server,
+        "contacts_get",
+        json!({"guid":"C-\"\\\u{1}<é>"}),
+    )
+    .await;
+    assert_eq!(plain["card_truncated"], false);
+    // Identifiers over the request limit cannot be asked for; list shows them as unsupported.
+    assert_eq!(
+        error(
+            &mut server,
+            "contacts_get",
+            json!({"guid":"東".repeat(200)})
+        )
+        .await,
+        "invalid_arguments"
+    );
+}
+
+// --- Refresh resource bounds, against a hand-written loopback server.
+
+enum RawBody {
+    /// Sent with Content-Length as given (true or not), then the connection closes.
+    Plain {
+        length: Option<usize>,
+        gzip: bool,
+        bytes: Vec<u8>,
+    },
+    /// Chunked transfer: `head`, then `fill` bytes of `a` in 64 KiB chunks, then `tail`.
+    Chunked {
+        head: Vec<u8>,
+        fill: usize,
+        tail: Vec<u8>,
+        pause_ms: u64,
+    },
+}
+
+struct Raw {
+    uri: String,
+    sent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    paths: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+/// One canned HTTP/1.1 answer per connection, chosen by path. Counts the body bytes the
+/// client accepted before it stopped reading.
+fn raw_server(answer: impl Fn(&str) -> (u16, RawBody) + Send + Sync + 'static) -> Raw {
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let uri = format!("http://{}", listener.local_addr().unwrap());
+    let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let answer = std::sync::Arc::new(answer);
+    let (counter, seen) = (sent.clone(), paths.clone());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let (answer, counter, seen) = (answer.clone(), counter.clone(), seen.clone());
+            std::thread::spawn(move || {
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    if stream.read(&mut byte).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    request.push(byte[0]);
+                }
+                let line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let target = line.split(' ').nth(1).unwrap_or("").to_string();
+                let path = target.split('?').next().unwrap_or("").to_string();
+                seen.lock().unwrap().push(path.clone());
+                let (status, body) = answer(&path);
+                let mut head = format!("HTTP/1.1 {status} X\r\nConnection: close\r\nContent-Type: application/json\r\n");
+                let write = |stream: &mut std::net::TcpStream, bytes: &[u8]| -> bool {
+                    if stream.write_all(bytes).is_err() {
+                        return false;
+                    }
+                    counter.fetch_add(bytes.len(), Ordering::SeqCst);
+                    true
+                };
+                match body {
+                    RawBody::Plain {
+                        length,
+                        gzip,
+                        bytes,
+                    } => {
+                        if let Some(n) = length {
+                            head.push_str(&format!("Content-Length: {n}\r\n"));
+                        }
+                        if gzip {
+                            head.push_str("Content-Encoding: gzip\r\n");
+                        }
+                        head.push_str("\r\n");
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = write(&mut stream, &bytes);
+                    }
+                    RawBody::Chunked {
+                        head: start,
+                        fill,
+                        tail,
+                        pause_ms,
+                    } => {
+                        head.push_str("Transfer-Encoding: chunked\r\n\r\n");
+                        let _ = stream.write_all(head.as_bytes());
+                        let chunk = |stream: &mut std::net::TcpStream, data: &[u8]| -> bool {
+                            stream
+                                .write_all(format!("{:x}\r\n", data.len()).as_bytes())
+                                .is_ok()
+                                && write(stream, data)
+                                && stream.write_all(b"\r\n").is_ok()
+                        };
+                        if !chunk(&mut stream, &start) {
+                            return;
+                        }
+                        let piece = vec![b'a'; 65_536];
+                        let mut left = fill;
+                        while left > 0 {
+                            let n = left.min(piece.len());
+                            if pause_ms > 0 {
+                                std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+                            }
+                            if !chunk(&mut stream, &piece[..n]) {
+                                return;
+                            }
+                            left -= n;
+                        }
+                        if chunk(&mut stream, &tail) {
+                            let _ = stream.write_all(b"0\r\n\r\n");
+                        }
+                    }
+                }
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            });
+        }
+    });
+    Raw { uri, sent, paths }
+}
+
+/// Apple's sign-in validated by wiremock; Contacts served from `contacts`.
+async fn apple_at(contacts: &str) -> MockServer {
+    let remote = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/setup/ws/1/validate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "dsInfo":{"dsid":DSID},
+            "webservices":{"contacts":{"url":contacts}}
+        })))
+        .mount(&remote)
+        .await;
+    remote
+}
+
+/// A bound directory with the synthetic book cached and unrelated queued writes.
+fn cached_with_unrelated_state() -> (tempfile::TempDir, Value) {
+    let (dir, _server, _) = bound_with_unrelated_state(Some("writes_only"));
+    let mut library = quince_core::Library::open(dir.path()).unwrap();
+    quince_icloud::contacts::apply(&mut library, synthetic_book()).unwrap();
+    let before = cache_snapshot(dir.path());
+    (dir, before)
+}
+
+/// Everything a refused refresh must leave alone: cache, cursor and unrelated state.
+fn cache_snapshot(dir: &std::path::Path) -> Value {
+    let library = quince_core::Library::open(dir).unwrap();
+    let cards: Vec<String> = library
+        .contacts(None)
+        .unwrap()
+        .iter()
+        .map(|c| format!("{}:{:?}", c.guid, c.first_name))
+        .collect();
+    json!({
+        "cards": cards,
+        "cursor": library.sync_token("contacts").unwrap(),
+        "lists": library.state("contacts.lists").unwrap(),
+        "unrelated": unrelated_snapshot(dir),
+    })
+}
+
+fn small_limits() -> skykeep_mcp::contacts::RefreshLimits {
+    skykeep_mcp::contacts::RefreshLimits {
+        max_response_bytes: 65_536,
+        max_total_bytes: 131_072,
+        max_contacts: 2,
+        max_card_bytes: 4_096,
+        timeout: std::time::Duration::from_secs(10),
+    }
+}
+
+async fn refresh_limited(
+    dir: &std::path::Path,
+    sign_in: &MockServer,
+    limits: skykeep_mcp::contacts::RefreshLimits,
+) -> Result<Value, &'static str> {
+    skykeep_mcp::contacts::refresh_with_client_limited(
+        dir,
+        saved_client(dir, &sign_in.uri()),
+        limits,
+    )
+    .await
+}
+
+fn startup_bytes(cards: Value, order: Value) -> Vec<u8> {
+    json!({"syncToken":"S-NEW","prefToken":"P-NEW","contactsOrder":order,"contacts":cards})
+        .to_string()
+        .into_bytes()
+}
+
+#[tokio::test]
+async fn a_streamed_body_over_the_production_cap_stops_reading_and_keeps_the_cache() {
+    let raw = raw_server(|_| {
+        (
+            200,
+            RawBody::Chunked {
+                head:
+                    br#"{"syncToken":"S","prefToken":"P","contactsOrder":[],"contacts":[],"pad":""#
+                        .to_vec(),
+                fill: 64 * 1024 * 1024,
+                tail: br#""}"#.to_vec(),
+                pause_ms: 0,
+            },
+        )
+    });
+    let sign_in = apple_at(&raw.uri).await;
+    let (dir, before) = cached_with_unrelated_state();
+    let error = skykeep_mcp::contacts::refresh_with_client(
+        dir.path(),
+        saved_client(dir.path(), &sign_in.uri()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, "contacts_response_too_large_cache_kept");
+    let sent = raw.sent.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        sent < 48 * 1024 * 1024,
+        "reading stopped near the cap, not at the end: {sent}"
+    );
+    assert_eq!(cache_snapshot(dir.path()), before);
+    assert_eq!(*raw.paths.lock().unwrap(), ["/co/startup"]);
+}
+
+#[tokio::test]
+async fn unannounced_mislabelled_and_compressed_bodies_are_bounded_as_decoded() {
+    // No length and no chunking: the body ends when the connection closes.
+    let unannounced = raw_server(|_| {
+        (
+            200,
+            RawBody::Plain {
+                length: None,
+                gzip: false,
+                bytes: startup_bytes(json!([]), json!([]))
+                    .into_iter()
+                    .chain(vec![b' '; 1_000_000])
+                    .collect(),
+            },
+        )
+    });
+    // A length far below the body: only that much is read, and it is not a book.
+    let short_label = raw_server(|_| {
+        (
+            200,
+            RawBody::Plain {
+                length: Some(20),
+                gzip: false,
+                bytes: startup_bytes(json!([remote_card("R-1", "Ines")]), json!(["R-1"])),
+            },
+        )
+    });
+    // A length far above the body: the body is cut off, never trusted or preallocated.
+    let long_label = raw_server(|_| {
+        (
+            200,
+            RawBody::Plain {
+                length: Some(1_000_000_000),
+                gzip: false,
+                bytes: startup_bytes(json!([remote_card("R-1", "Ines")]), json!(["R-1"])),
+            },
+        )
+    });
+    // 1 KiB compressed that decodes to over 1 MiB.
+    let compressed = raw_server(|_| {
+        (
+            200,
+            RawBody::Plain {
+                length: Some(GZIP_BOMB_LEN),
+                gzip: true,
+                bytes: gzip_bomb(),
+            },
+        )
+    });
+    for (raw, expected) in [
+        (&unannounced, "contacts_response_too_large_cache_kept"),
+        (&short_label, "contacts_refresh_failed_cache_kept"),
+        (&long_label, "contacts_refresh_failed_cache_kept"),
+        (&compressed, "contacts_response_too_large_cache_kept"),
+    ] {
+        let sign_in = apple_at(&raw.uri).await;
+        let (dir, before) = cached_with_unrelated_state();
+        assert_eq!(
+            refresh_limited(dir.path(), &sign_in, small_limits())
+                .await
+                .unwrap_err(),
+            expected,
+            "{}",
+            raw.uri
+        );
+        assert_eq!(cache_snapshot(dir.path()), before, "{}", raw.uri);
+    }
+}
+
+const GZIP_BOMB_LEN: usize = 1091;
+
+/// gzip of `{"syncToken":"S","prefToken":"P","pad":"` + 1 MiB of `a` + `"}`, mtime 0.
+fn gzip_bomb() -> Vec<u8> {
+    let hex = |s: &str| -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    };
+    let mut bytes = hex("1f8b08000000000002ffedc7b10d40401880d15dfeda04a690b0c085d3488e9c4ac4ee284ca07daffabe33f6a38cc3bae4126df4d1c456f3fc7df77e9a9e4a");
+    bytes.extend(std::iter::repeat_n(0u8, 1016));
+    bytes.extend(hex("3fc5750346bc7f312a001000"));
+    assert_eq!(bytes.len(), GZIP_BOMB_LEN);
+    bytes
+}
+
+#[tokio::test]
+async fn a_huge_field_is_refused_whole_with_production_limits() {
+    let remote = apple().await;
+    let mut card = remote_card("R-1", "Ines");
+    card["notes"] = json!("n".repeat(2_000_000));
+    Mock::given(method("GET"))
+        .and(path("/co/startup"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(startup_body(json!([card]), "SYNC-1")),
+        )
+        .mount(&remote)
+        .await;
+    let (dir, before) = cached_with_unrelated_state();
+    assert_eq!(
+        skykeep_mcp::contacts::refresh_with_client(
+            dir.path(),
+            saved_client(dir.path(), &remote.uri())
+        )
+        .await
+        .unwrap_err(),
+        "contacts_card_too_large_cache_kept"
+    );
+    assert_eq!(cache_snapshot(dir.path()), before);
+}
+
+#[tokio::test]
+async fn card_counts_and_total_bytes_across_pages_are_bounded() {
+    // More cards named than the limit: refused before any page is read.
+    let raw = raw_server(|_| {
+        (
+            200,
+            RawBody::Plain {
+                length: None,
+                gzip: false,
+                bytes: startup_bytes(
+                    json!([remote_card("R-1", "Ines")]),
+                    json!(["R-1", "R-2", "R-3"]),
+                ),
+            },
+        )
+    });
+    let sign_in = apple_at(&raw.uri).await;
+    let (dir, before) = cached_with_unrelated_state();
+    assert_eq!(
+        refresh_limited(dir.path(), &sign_in, small_limits())
+            .await
+            .unwrap_err(),
+        "contacts_book_too_large_cache_kept"
+    );
+    assert_eq!(*raw.paths.lock().unwrap(), ["/co/startup"]);
+    assert_eq!(cache_snapshot(dir.path()), before);
+    // Pages that each fit but together pass the total.
+    let raw = raw_server(|path| {
+        let pad = " ".repeat(60_000);
+        let bytes = if path == "/co/startup" {
+            format!(
+                r#"{{"syncToken":"S","prefToken":"P","contactsOrder":["R-1","R-2"],"contacts":[{}]{pad}}}"#,
+                remote_card("R-1", "Ines")
+            )
+        } else {
+            format!(r#"{{"contacts":[{}]{pad}}}"#, remote_card("R-2", "Jun"))
+        };
+        (
+            200,
+            RawBody::Plain {
+                length: None,
+                gzip: false,
+                bytes: bytes.into_bytes(),
+            },
+        )
+    });
+    let sign_in = apple_at(&raw.uri).await;
+    let (dir, before) = cached_with_unrelated_state();
+    let mut limits = small_limits();
+    limits.max_total_bytes = 100_000;
+    assert_eq!(
+        refresh_limited(dir.path(), &sign_in, limits)
+            .await
+            .unwrap_err(),
+        "contacts_response_too_large_cache_kept"
+    );
+    assert_eq!(cache_snapshot(dir.path()), before);
+    // Within every limit, the same pages are read and stored.
+    let mut limits = small_limits();
+    limits.max_total_bytes = 1_000_000;
+    let (dir, _) = cached_with_unrelated_state();
+    let done = refresh_limited(dir.path(), &sign_in, limits).await.unwrap();
+    assert_eq!(done["cached_contacts"], 2);
+    assert_eq!(done["read"], "full");
+}
+
+#[tokio::test]
+async fn an_oversized_changeset_is_refused_without_reading_the_book() {
+    let remote = apple().await;
+    Mock::given(method("GET"))
+        .and(path("/co/startup"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(startup_body(json!([remote_card("R-1", "Ines")]), "SYNC-1")),
+        )
+        .up_to_n_times(1)
+        .mount(&remote)
+        .await;
+    let (dir, _) = cached_with_unrelated_state();
+    skykeep_mcp::contacts::refresh_with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+        .await
+        .unwrap();
+    Mock::given(method("POST"))
+        .and(path("/co/changeset"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"syncToken":"SYNC-1","prefToken":"PREF-1","pad":"p".repeat(2_000_000)}),
+        ))
+        .mount(&remote)
+        .await;
+    let before = cache_snapshot(dir.path());
+    assert_eq!(
+        skykeep_mcp::contacts::refresh_with_client(
+            dir.path(),
+            saved_client(dir.path(), &remote.uri())
+        )
+        .await
+        .unwrap_err(),
+        "contacts_response_too_large_cache_kept"
+    );
+    assert_eq!(cache_snapshot(dir.path()), before);
+    let startups = remote
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/co/startup")
+        .count();
+    assert_eq!(
+        startups, 1,
+        "the book is not read after an oversized changeset"
+    );
+}
+
+#[tokio::test]
+async fn apple_error_bodies_are_never_read_into_the_library() {
+    let remote = apple().await;
+    Mock::given(method("GET"))
+        .and(path("/co/startup"))
+        .respond_with(ResponseTemplate::new(422).set_body_string("SYNTHETIC-UPSTREAM-BODY"))
+        .mount(&remote)
+        .await;
+    let (dir, before) = cached_with_unrelated_state();
+    assert_eq!(
+        skykeep_mcp::contacts::refresh_with_client(
+            dir.path(),
+            saved_client(dir.path(), &remote.uri())
+        )
+        .await
+        .unwrap_err(),
+        "contacts_refresh_failed_cache_kept"
+    );
+    let library = quince_core::Library::open(dir.path()).unwrap();
+    let health = library.sync_health().unwrap();
+    let mine = health.iter().find(|h| h.service == "contacts").unwrap();
+    let error = mine.last_error.as_deref().unwrap();
+    assert!(!error.contains("SYNTHETIC-UPSTREAM-BODY"), "{error}");
+    assert_eq!(cache_snapshot(dir.path())["cards"], before["cards"]);
+}
+
+#[tokio::test]
+async fn a_slow_stream_times_out_and_stores_nothing() {
+    let raw = raw_server(|_| {
+        (
+            200,
+            RawBody::Chunked {
+                head:
+                    br#"{"syncToken":"S","prefToken":"P","contactsOrder":[],"contacts":[],"pad":""#
+                        .to_vec(),
+                fill: 10 * 65_536,
+                tail: br#""}"#.to_vec(),
+                pause_ms: 200,
+            },
+        )
+    });
+    let sign_in = apple_at(&raw.uri).await;
+    let (dir, before) = cached_with_unrelated_state();
+    let mut limits = small_limits();
+    limits.max_response_bytes = 4 * 1024 * 1024;
+    limits.max_total_bytes = 4 * 1024 * 1024;
+    limits.timeout = std::time::Duration::from_millis(500);
+    let started = std::time::Instant::now();
+    assert_eq!(
+        refresh_limited(dir.path(), &sign_in, limits)
+            .await
+            .unwrap_err(),
+        "contacts_refresh_timeout_cache_kept"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(cache_snapshot(dir.path()), before);
+}
+
+#[tokio::test]
+async fn an_account_change_during_refresh_stores_nothing() {
+    let remote = apple().await;
+    Mock::given(method("GET"))
+        .and(path("/co/startup"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(startup_body(json!([remote_card("R-1", "Ines")]), "SYNC-1"))
+                .set_delay(std::time::Duration::from_millis(600)),
+        )
+        .mount(&remote)
+        .await;
+    let (dir, before) = cached_with_unrelated_state();
+    let path = dir.path().to_owned();
+    let switch = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        quince_core::Library::open(&path)
+            .unwrap()
+            .set_state("account", &quince_sync::queue::account_tag("9999999999"))
+            .unwrap();
+    });
+    let error = skykeep_mcp::contacts::refresh_with_client(
+        dir.path(),
+        saved_client(dir.path(), &remote.uri()),
+    )
+    .await
+    .unwrap_err();
+    switch.join().unwrap();
+    assert_eq!(error, "account_changed_during_refresh_cache_kept");
+    assert_eq!(cache_snapshot(dir.path())["cards"], before["cards"]);
+    assert_eq!(cache_snapshot(dir.path())["cursor"], before["cursor"]);
+}
