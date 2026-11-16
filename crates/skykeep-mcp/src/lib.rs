@@ -1,5 +1,6 @@
 //! Local MCP adapter. The library and codecs remain owned by the upstream crates.
 pub mod account;
+pub mod contacts;
 pub mod login;
 pub mod scheduler;
 pub mod state;
@@ -262,6 +263,10 @@ fn needs_consent(mode: &str, name: &str) -> Result<bool, &'static str> {
             Ok(mode == "reads_and_writes")
         }
         "sync" => Ok(mode == "reads_and_writes"),
+        // Contacts content and its refresh are reads: prompted only under reads_and_writes.
+        "contacts_list" | "contacts_search" | "contacts_get" | "contacts_refresh" => {
+            Ok(mode == "reads_and_writes")
+        }
         _ => Err("unknown_tool"),
     }
 }
@@ -379,6 +384,61 @@ mod consent_tests {
             .await
             .is_none());
     }
+
+    #[tokio::test]
+    async fn a_timed_out_contacts_read_returns_nothing_and_its_late_answer_is_ignored() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut server = Server::open(dir.path()).unwrap();
+        let mut library = Library::open(dir.path()).unwrap();
+        library.set_state(ACCOUNT_KEY, "synthetic").unwrap();
+        let mut card = quince_core::contacts::Contact {
+            guid: "C-1".into(),
+            first_name: Some("Synthetic".into()),
+            middle_name: None,
+            photo_url: None,
+            photo_signature: None,
+            photo_crop: None,
+            last_name: Some("Person".into()),
+            company: None,
+            is_company: false,
+            birthday: None,
+            notes: None,
+            etag: None,
+            methods: Vec::new(),
+        };
+        card.notes = Some("SYNTHETIC-PRIVATE".into());
+        library.put_contacts(&[card]).unwrap();
+        server.set_policy("reads_and_writes").unwrap();
+        server.handle(json!({"id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}}}})).await;
+        for (name, args) in [
+            ("contacts_get", json!({"guid":"C-1"})),
+            ("contacts_refresh", json!({})),
+        ] {
+            let form = server
+                .handle(
+                    json!({"id":2,"method":"tools/call","params":{"name":name,"arguments":args}}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(form["method"], "elicitation/create");
+            server.pending.as_mut().unwrap().deadline = std::time::Instant::now();
+            let expired = server.expire_consent().unwrap();
+            assert_eq!(expired["id"], 2);
+            assert!(expired.to_string().contains("approval_timeout"));
+            assert!(!expired.to_string().contains("SYNTHETIC-PRIVATE"));
+            assert!(server
+                .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+                .await
+                .is_none());
+        }
+        assert!(library
+            .sync_health()
+            .unwrap()
+            .iter()
+            .all(|h| h.service != "contacts" || h.last_error.is_none()));
+    }
 }
 
 impl Server {
@@ -394,6 +454,8 @@ impl Server {
             return Ok(None);
         };
         let name = params["name"].as_str().ok_or("invalid_tool")?;
+        // Malformed Contacts arguments are refused before anyone is asked to approve them.
+        contacts::validate(name, &params["arguments"])?;
         if !needs_consent(&p.mode, name)? {
             return Ok(None);
         }
@@ -420,7 +482,15 @@ impl Server {
     }
 
     fn consent_form(&mut self, request: Value, binding: ApprovalBinding) -> Value {
-        let refresh = (request["params"]["name"] == "sync").then(|| json!({"services":["notes","reminders"],"refresh":"one bounded pass, at most 60 seconds","send":"only unchanged previously authorized durable operations, at most 128"}));
+        let refresh = match request["params"]["name"].as_str() {
+            Some("sync") => Some(
+                json!({"services":["notes","reminders"],"refresh":"one bounded pass, at most 60 seconds","send":"only unchanged previously authorized durable operations, at most 128"}),
+            ),
+            Some("contacts_refresh") => Some(
+                json!({"services":["contacts"],"refresh":"one read of Apple iCloud Contacts into the local cache, at most 60 seconds","send":"nothing is sent; queued changes stay queued"}),
+            ),
+            _ => None,
+        };
         let params = json!({"operation":request["params"],"existing_item":binding.snapshot,"read_preview_only":binding.preview_read,"refresh_scope":refresh});
         let preview = match inert_preview(&params) {
             Ok(preview) => preview,
@@ -822,6 +892,20 @@ impl Server {
                     return Err("login_required");
                 }
                 sync::run_authorized(&dir, grant.is_some()).await
+            }
+            "contacts_list" => contacts::list(library, args),
+            "contacts_search" => contacts::search(library, args),
+            "contacts_get" => contacts::get(library, args),
+            "contacts_refresh" => {
+                contacts::validate(name, &args)?;
+                if library
+                    .state(ACCOUNT_KEY)
+                    .map_err(|_| "library_unavailable")?
+                    .is_none()
+                {
+                    return Err("login_required");
+                }
+                contacts::refresh(&dir, grant.is_some()).await
             }
             "sync_status" => {
                 let _: Empty = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -1464,8 +1548,8 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
     }
 }
 
-const SERVER_TITLE: &str = "Skykeep: Apple iCloud Notes & Reminders";
-const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache. Reads return cached data. Changes follow the configured approval mode and are queued until sync sends them. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
+const SERVER_TITLE: &str = "Skykeep: Apple iCloud Notes, Reminders & Contacts";
+const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, and reads the user's Apple iCloud Contacts (read-only). Reads return cached data. Contacts refresh only through contacts_refresh. Changes follow the configured approval mode and are queued until sync sends them. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
 
 fn tools() -> Vec<Value> {
     // (name, description, parent property, parent required)
@@ -1522,6 +1606,14 @@ fn tools() -> Vec<Value> {
     tools.push(json!({"name":"notes_get","description":"Read one cached Apple iCloud Notes note. Not a complete preservation archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools.push(json!({"name":"sync","description":"Refresh Apple iCloud Notes and Apple Reminders and send approved queued changes. Queued/sent is not field-level remote verification. Never opens a login prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
     tools.push(json!({"name":"sync_status","description":"Local sync state for Apple iCloud Notes and Reminders: last refresh, whether the last pass failed, pending and refused queued changes. No network access.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
+    let page = json!({"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":contacts::MAX_LIMIT,"default":25}});
+    let read = json!({"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false});
+    tools.push(json!({"name":"contacts_list","description":"List the user's Apple iCloud Contacts from the local cache, in name order, as summaries with emails and phones. Read-only; refresh with contacts_refresh.","inputSchema":{"type":"object","properties":page,"additionalProperties":false},"annotations":read}));
+    let mut search = page.clone();
+    search["query"] = json!({"type":"string","minLength":1,"maxLength":contacts::MAX_QUERY_BYTES,"description":"Words matched against names, company, details, emails, phones and other cached fields, ignoring case and accents. At most 256 UTF-8 bytes."});
+    tools.push(json!({"name":"contacts_search","description":"Search the user's cached Apple iCloud Contacts by name, email, phone or other kept fields. Read-only.","inputSchema":{"type":"object","properties":search,"required":["query"],"additionalProperties":false},"annotations":read}));
+    tools.push(json!({"name":"contacts_get","description":"Read one cached Apple iCloud Contacts card with its kept fields and lists. Not a complete card: photos, the original vCard and fields the cache does not keep are not included.","inputSchema":{"type":"object","properties":{"guid":{"type":"string","minLength":1,"maxLength":512,"description":"Contact GUID from contacts_list or contacts_search. At most 512 UTF-8 bytes."}},"required":["guid"],"additionalProperties":false},"annotations":read}));
+    tools.push(json!({"name":"contacts_refresh","description":"Read the user's Apple iCloud Contacts from Apple into the local cache, replacing the cached copy. Never changes contacts at Apple and sends no queued changes. Never opens a login prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}));
     tools.push(json!({"name":"auth_status","description":"Apple iCloud sign-in status and setup instructions. Never accepts secrets or opens a prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools
 }

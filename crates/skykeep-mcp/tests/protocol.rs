@@ -882,11 +882,22 @@ async fn initialize_and_discover_only_notes_and_reminders_tools() {
         .collect();
     assert!(names.contains(&"notes_list"));
     assert!(names.contains(&"reminders_list"));
-    assert!(!names.iter().any(|n| [
-        "photos", "drive", "calendar", "contacts", "secret", "password", "code"
-    ]
-    .iter()
-    .any(|s| n.contains(s))));
+    assert!(!names.iter().any(
+        |n| ["photos", "drive", "calendar", "secret", "password", "code"]
+            .iter()
+            .any(|s| n.contains(s))
+    ));
+    // Contacts are read-only in this phase.
+    let contacts: Vec<_> = names.iter().filter(|n| n.contains("contacts")).collect();
+    assert_eq!(
+        contacts,
+        [
+            &"contacts_list",
+            &"contacts_search",
+            &"contacts_get",
+            &"contacts_refresh"
+        ]
+    );
     assert!(server
         .handle(
             json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}})
