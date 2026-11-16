@@ -670,8 +670,14 @@ impl Server {
                 } else {
                     "2025-03-26"
                 };
+                let mut server_info =
+                    json!({"name":"skykeep-mcp","version":env!("CARGO_PKG_VERSION")});
+                // Implementation.title exists only from protocol 2025-06-18 on.
+                if version == "2025-11-25" {
+                    server_info["title"] = json!(SERVER_TITLE);
+                }
                 Ok(
-                    json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"skykeep-mcp","version":env!("CARGO_PKG_VERSION")}}),
+                    json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":server_info,"instructions":SERVER_INSTRUCTIONS}),
                 )
             }
             Some("ping") => Ok(json!({})),
@@ -1458,19 +1464,38 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
     }
 }
 
+const SERVER_TITLE: &str = "Skykeep: Apple iCloud Notes & Reminders";
+const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache. Reads return cached data. Changes follow the configured approval mode and are queued until sync sends them. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
+
 fn tools() -> Vec<Value> {
-    // (name, parent property, parent required)
+    // (name, description, parent property, parent required)
     let lists = [
         (
             "notes_list",
+            "List the user's Apple iCloud Notes from the local cache.",
             Some("Folder GUID; omit for all notes."),
             false,
         ),
-        ("reminders_list", Some("Reminder list GUID."), true),
-        ("notes_folders", None, false),
-        ("reminders_lists", None, false),
+        (
+            "reminders_list",
+            "List the user's Apple Reminders in one list from the local cache.",
+            Some("Reminder list GUID."),
+            true,
+        ),
+        (
+            "notes_folders",
+            "List Apple iCloud Notes folders from the local cache.",
+            None,
+            false,
+        ),
+        (
+            "reminders_lists",
+            "List Apple Reminders lists from the local cache.",
+            None,
+            false,
+        ),
     ];
-    let mut tools: Vec<_> = lists.iter().map(|(name, parent, required)| {
+    let mut tools: Vec<_> = lists.iter().map(|(name, description, parent, required)| {
         let mut properties = json!({"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}});
         if let Some(description) = parent {
             properties["parent"] = json!({"type":"string","description":description});
@@ -1480,20 +1505,23 @@ fn tools() -> Vec<Value> {
             schema["required"] = json!(["parent"]);
         }
         json!({
-            "name":name,"description":"Read locally cached items. Sync requires an authenticated session.",
+            "name":name,"description":format!("{description} Sync requires an authenticated session."),
             "inputSchema":schema,
             "annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}
         })
     }).collect();
-    for name in ["notes_search", "reminders_search"] {
-        tools.push(json!({"name":name,"description":"Search cached items through the upstream local index.","inputSchema":{"type":"object","properties":{"query":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}},"required":["query"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
+    for (name, kind) in [
+        ("notes_search", "Apple iCloud Notes"),
+        ("reminders_search", "Apple Reminders"),
+    ] {
+        tools.push(json!({"name":name,"description":format!("Search the user's {kind} in the local cache index."),"inputSchema":{"type":"object","properties":{"query":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}},"required":["query"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     }
-    tools.push(json!({"name":"notes_write","description":"Queue a supported native Notes mutation. Queued is not remote-verified.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","save","move","pin","delete"]},"body":{"type":"string"},"pinned":{"type":"boolean"},"runs":{"type":["array","null"],"items":{"type":"object"}},"folder_guid":{"type":["string","null"]},"guid":{"type":"string"},"base_etag":{"type":["string","null"]}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
-    tools.push(json!({"name":"reminders_write","description":"Queue native reminder create/edit/tick/delete. Deletions need local terminal approval. No field-level remote verification.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
-    tools.push(json!({"name":"reminders_get","description":"Read a cached reminder and supported native details. Not a complete archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
-    tools.push(json!({"name":"notes_get","description":"Read a cached native note. Not a complete preservation archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
-    tools.push(json!({"name":"sync","description":"Refresh Notes and Reminders and send approved queued changes. Queued/sent is not field-level remote verification. Never opens a login prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
-    tools.push(json!({"name":"sync_status","description":"Local sync state: last refresh, whether the last pass failed, pending and refused queued changes. No network access.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
-    tools.push(json!({"name":"auth_status","description":"Authentication setup instructions. Never accepts secrets or opens a prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
+    tools.push(json!({"name":"notes_write","description":"Queue a change to the user's Apple iCloud Notes (create, save, move, pin, delete). Follows the approval mode. Queued is not remote-verified.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","save","move","pin","delete"]},"body":{"type":"string"},"pinned":{"type":"boolean"},"runs":{"type":["array","null"],"items":{"type":"object"}},"folder_guid":{"type":["string","null"]},"guid":{"type":"string"},"base_etag":{"type":["string","null"]}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
+    tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). Deletions need local terminal approval. No field-level remote verification.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
+    tools.push(json!({"name":"reminders_get","description":"Read one cached Apple Reminders item and its supported details. Not a complete archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
+    tools.push(json!({"name":"notes_get","description":"Read one cached Apple iCloud Notes note. Not a complete preservation archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
+    tools.push(json!({"name":"sync","description":"Refresh Apple iCloud Notes and Apple Reminders and send approved queued changes. Queued/sent is not field-level remote verification. Never opens a login prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
+    tools.push(json!({"name":"sync_status","description":"Local sync state for Apple iCloud Notes and Reminders: last refresh, whether the last pass failed, pending and refused queued changes. No network access.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
+    tools.push(json!({"name":"auth_status","description":"Apple iCloud sign-in status and setup instructions. Never accepts secrets or opens a prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools
 }

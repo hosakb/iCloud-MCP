@@ -894,3 +894,50 @@ async fn initialize_and_discover_only_notes_and_reminders_tools() {
         .await
         .is_none());
 }
+
+#[tokio::test]
+async fn initialize_and_tools_name_apple_icloud_notes_and_reminders() {
+    for version in ["2025-03-26", "2025-11-25"] {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut server = Server::open(dir.path()).unwrap();
+        let init = server.handle(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"test","version":"1"}}})).await.unwrap();
+        assert_eq!(init["result"]["protocolVersion"], version);
+        let instructions = init["result"]["instructions"].as_str().unwrap();
+        for phrase in [
+            "Apple iCloud Notes",
+            "Apple Reminders",
+            "local",
+            "approval",
+            "terminal",
+        ] {
+            assert!(instructions.contains(phrase), "{version}: {phrase}");
+        }
+        // `title` on Implementation exists only from protocol 2025-06-18 on.
+        let title = &init["result"]["serverInfo"]["title"];
+        if version == "2025-11-25" {
+            let title = title.as_str().unwrap();
+            assert!(title.contains("Apple iCloud Notes") && title.contains("Reminders"));
+        } else {
+            assert!(title.is_null(), "{version}: unexpected title");
+        }
+        let list = server
+            .handle(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+            .await
+            .unwrap();
+        for tool in list["result"]["tools"].as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            let description = tool["description"].as_str().unwrap();
+            if name.starts_with("notes_") {
+                assert!(description.contains("Apple iCloud Notes"), "{name}");
+            } else if name.starts_with("reminders_") {
+                assert!(description.contains("Apple Reminders"), "{name}");
+            } else {
+                assert!(description.contains("Apple"), "{name}");
+            }
+        }
+    }
+}
