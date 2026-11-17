@@ -486,7 +486,15 @@ impl Server {
         Ok(Some(binding))
     }
 
-    fn consent_form(&mut self, request: Value, binding: ApprovalBinding) -> Value {
+    fn consent_form(&mut self, mut request: Value, binding: ApprovalBinding) -> Value {
+        // A default Calendar refresh window depends on the day: fixed now, so the approved
+        // dates are the ones that run.
+        if request["params"]["name"] == "calendar_refresh" {
+            match calendar::resolved_refresh_args(&request["params"]["arguments"]) {
+                Ok(args) => request["params"]["arguments"] = args,
+                Err(error) => return tool_reply(request["id"].clone(), Err(error)),
+            }
+        }
         let refresh = match request["params"]["name"].as_str() {
             Some("sync") => Some(
                 json!({"services":["notes","reminders"],"refresh":"one bounded pass, at most 60 seconds","send":"only unchanged previously authorized durable operations, at most 128"}),

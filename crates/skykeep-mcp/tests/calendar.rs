@@ -1488,6 +1488,153 @@ async fn oversized_answers_and_too_many_events_are_refused_and_the_cache_kept() 
 }
 
 #[tokio::test]
+async fn unreadable_rows_are_never_taken_as_removed_and_odd_bodies_are_refused() {
+    // A row Apple still lists but the engine cannot read keeps its cached event.
+    let remote = apple().await;
+    let mut body = apple_body();
+    body["Event"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"guid":"BAD-ROW","pGuid":"cal-work","title":"x","startDate":"not a date"}));
+    answer(&remote, body).await;
+    let (dir, _server) = bound_with_unrelated_state(Some("yolo"));
+    {
+        let mut library = quince_core::Library::open(dir.path()).unwrap();
+        store_body(&mut library, &apple_body());
+        library
+            .put_events(&[quince_core::calendar::Event {
+                guid: "BAD-ROW".into(),
+                calendar_guid: "cal-work".into(),
+                title: "Read before".into(),
+                starts_at: 1_791_000_000,
+                ends_at: 1_791_003_600,
+                timezone: Some("UTC".into()),
+                ..Default::default()
+            }])
+            .unwrap();
+    }
+    refresh(
+        dir.path(),
+        &remote.uri(),
+        json!({"from":"2026-10-01","to":"2026-11-01"}),
+    )
+    .await
+    .unwrap();
+    let library = quince_core::Library::open(dir.path()).unwrap();
+    assert_eq!(
+        library.event("BAD-ROW").unwrap().unwrap().title,
+        "Read before"
+    );
+    // A body that is not a JSON object, and an event zone name longer than any zone's,
+    // fail the refresh before the engine reads them.
+    let kept = cached(dir.path());
+    let mut long_zone = apple_body();
+    long_zone["Event"][0]["tz"] = json!("a/".repeat(200));
+    for bad in [json!([]), json!(null), long_zone] {
+        let remote = apple().await;
+        answer(&remote, bad.clone()).await;
+        assert_eq!(
+            refresh(
+                dir.path(),
+                &remote.uri(),
+                json!({"from":"2026-10-01","to":"2026-11-01"})
+            )
+            .await
+            .unwrap_err(),
+            "calendar_refresh_failed_cache_kept",
+            "{}",
+            bad.to_string().chars().take(80).collect::<String>()
+        );
+        assert_eq!(cached(dir.path()), kept);
+    }
+}
+
+#[tokio::test]
+async fn a_refresh_keeps_subscribed_calendars_and_their_events() {
+    let remote = apple().await;
+    answer(&remote, apple_body()).await;
+    let (dir, _server) = bound_with_unrelated_state(Some("yolo"));
+    {
+        let mut library = quince_core::Library::open(dir.path()).unwrap();
+        store_body(&mut library, &apple_body());
+        add_foreign_calendars(&mut library);
+    }
+    refresh(
+        dir.path(),
+        &remote.uri(),
+        json!({"from":"2026-09-01","to":"2026-11-01"}),
+    )
+    .await
+    .unwrap();
+    let library = quince_core::Library::open(dir.path()).unwrap();
+    let guids: Vec<String> = library
+        .calendars()
+        .unwrap()
+        .into_iter()
+        .map(|c| c.guid)
+        .collect();
+    assert!(
+        guids
+            .iter()
+            .any(|g| g.starts_with(quince_icloud::calendar_feeds::PREFIX)),
+        "{guids:?}"
+    );
+    assert!(
+        guids
+            .iter()
+            .any(|g| g.starts_with(quince_core::dav::PREFIX)),
+        "{guids:?}"
+    );
+    // Inside the refreshed window, yet not Apple's to remove.
+    assert!(library.event("FEED-1").unwrap().is_some());
+    assert!(library.event("DAV-1").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_default_refresh_is_approved_for_the_dates_it_shows() {
+    let (_dir, mut server) = seeded(Some("reads_and_writes"));
+    init(&mut server, true).await;
+    let form = call(&mut server, 3, "calendar_refresh", json!({})).await;
+    let message = form["params"]["message"].as_str().unwrap();
+    // The operation carries the resolved dates, shown beside the days Apple is asked.
+    assert!(message.matches("\"from\": \"20").count() >= 2, "{message}");
+    assert!(
+        message.contains("asked\\u005fapple\\u005fdays"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn get_refuses_an_event_whose_calendar_id_is_too_long() {
+    let (dir, mut server) = seeded(None);
+    let mut library = quince_core::Library::open(dir.path()).unwrap();
+    let long = format!("cal-{}", "x".repeat(600));
+    let mut all = library.calendars().unwrap();
+    all.push(quince_core::calendar::Calendar {
+        guid: long.clone(),
+        title: "Long".into(),
+        ..Default::default()
+    });
+    library.put_calendars(&all).unwrap();
+    library
+        .put_events(&[quince_core::calendar::Event {
+            guid: "SHORT".into(),
+            calendar_guid: long,
+            title: "Short id".into(),
+            starts_at: 1_791_000_000,
+            ends_at: 1_791_003_600,
+            timezone: Some("UTC".into()),
+            ..Default::default()
+        }])
+        .unwrap();
+    init(&mut server, false).await;
+    assert_eq!(
+        error(&mut server, "calendar_get", json!({"guid":"SHORT"})).await,
+        "calendar_guid_too_long"
+    );
+}
+
+#[tokio::test]
 async fn a_slow_answer_times_out_stores_nothing_and_is_recorded() {
     let remote = apple().await;
     for p in ["/ca/startup", "/ca/events"] {

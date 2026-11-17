@@ -403,10 +403,21 @@ pub(crate) fn validate(name: &str, args: &Value) -> Result<(), &'static str> {
     }
 }
 
-/// What the approval prompt says a refresh will read.
+/// A refresh's arguments with its window resolved to explicit dates, so what is approved is
+/// what runs even if the day changes between the prompt and the answer.
+pub(crate) fn resolved_refresh_args(args: &Value) -> Result<Value, &'static str> {
+    let w = refresh_window(args)?;
+    Ok(json!({"from":day_text(w.from),"to":day_text(w.to)}))
+}
+
+/// What the approval prompt says a refresh will read: the window, and the days Apple is asked.
 pub(crate) fn refresh_scope(args: &Value) -> Value {
-    let window = refresh_window(args).ok().map(Window::view);
-    json!({"services":["calendar"],"window":window,"refresh":"one read of Apple iCloud Calendar over this window into the local cache, at most 60 seconds","send":"nothing is sent; queued changes stay queued"})
+    let window = refresh_window(args).ok();
+    let asked = window.map(|w| {
+        let (first, last) = w.asked();
+        json!({"first":day_text(first),"last":day_text(last),"in":"UTC"})
+    });
+    json!({"services":["calendar"],"window":window.map(Window::view),"asked_apple_days":asked,"refresh":"one read of Apple iCloud Calendar over these days into the local cache; events Apple no longer lists on them are removed from the cache; at most 60 seconds","send":"nothing is sent; queued changes stay queued"})
 }
 
 /// An Apple iCloud calendar: not another account's (CalDAV) and not a subscribed feed.
@@ -512,13 +523,20 @@ fn occurrence(e: &Event) -> Value {
     }
 }
 
+/// An all-day event's first day and the day after its last. Its times are midnights, but one
+/// the clocks skipped in this computer's zone when it was read in is stored an hour off
+/// (Sao Paulo's 2018-11-04), so each is taken to the nearest midnight. An end at or before
+/// the start leaves the event one day long.
+fn all_day_days(e: &Event) -> (i64, i64) {
+    let nearest = |t: i64| t.saturating_add(DAY / 2).div_euclid(DAY);
+    let first = nearest(e.starts_at);
+    (first, nearest(e.ends_at).max(first + 1))
+}
+
 /// An event's start and end, as the module's notes say. Read through [`wall_view`].
 fn times(e: &Event, requested: Option<&Zone>) -> (Value, Value, Value) {
     if e.all_day {
-        let first = e.starts_at.div_euclid(DAY);
-        // Apple's end is the midnight after the last day. An end inside a day counts that
-        // day; an end at or before the start leaves the event one day long.
-        let last = (e.ends_at + DAY - 1).div_euclid(DAY).max(first + 1);
+        let (first, last) = all_day_days(e);
         return (
             json!({"date":day_text(first)}),
             json!({"date":day_text(last)}),
@@ -705,14 +723,19 @@ pub(crate) fn events(library: &mut Library, args: Value) -> Result<Value, &'stat
                 .is_none_or(|g| *g == e.calendar_guid)
         })
         .filter(|e| {
-            if floats(e) {
+            if e.all_day {
+                let (first, last) = all_day_days(e);
+                overlaps(first * DAY, last * DAY, wall_from, wall_to)
+            } else if floats(e) {
                 overlaps(e.starts_at, e.ends_at, wall_from, wall_to)
             } else {
                 overlaps(e.starts_at, e.ends_at, at_from, at_to)
             }
         })
         .map(|e| {
-            let key = if floats(&e) {
+            let key = if e.all_day {
+                instant_of(all_day_days(&e).0 * DAY, &span.zone.tz)
+            } else if floats(&e) {
                 instant_of(e.starts_at, &span.zone.tz)
             } else {
                 e.starts_at
@@ -873,6 +896,9 @@ pub(crate) fn get(library: &mut Library, args: Value) -> Result<Value, &'static 
         library.event(&args.guid).map_err(|_| "library_unavailable")
     })?
     .ok_or("not_found")?;
+    if event.calendar_guid.len() > MAX_GUID_BYTES {
+        return Err("calendar_guid_too_long");
+    }
     let calendar = calendars
         .iter()
         .find(|c| c.guid == event.calendar_guid)
@@ -992,7 +1018,7 @@ async fn window_read(
     (from, to): (i64, i64),
     limits: &RefreshLimits,
     budget: &mut usize,
-) -> Result<Snapshot, Stop> {
+) -> Result<(Snapshot, Vec<String>), Stop> {
     let mut query = client.service_params();
     // Without the web client's version Apple answers 200 with no events at all.
     query.push(("clientVersion".into(), "5.1".into()));
@@ -1013,7 +1039,40 @@ async fn window_read(
     }
     let body = read_capped!(response, limits.max_response_bytes, budget)?;
     let body: Value = serde_json::from_slice(&body).map_err(|_| Stop::Failed)?;
-    Ok(parse_snapshot(&body))
+    let listed = checked_rows(&body, limits)?;
+    Ok((parse_snapshot(&body), listed))
+}
+
+/// Checks an answer before the engine reads it, and returns the id of every event row in it.
+/// It must be a JSON object. Its rows are counted before they are parsed, and a zone name
+/// longer than any zone's is refused: the engine's zone lookup tries every tail of a
+/// slash-separated name, which on a long one would hold the server past its deadline. Every
+/// row with an id counts as listed, read or not, so a row the engine cannot read is never
+/// taken as removed. An answer without an `Event` list has no events, as the engine reads it.
+fn checked_rows(body: &Value, limits: &RefreshLimits) -> Result<Vec<String>, Stop> {
+    if !body.is_object() {
+        return Err(Stop::Failed);
+    }
+    let Some(rows) = body.get("Event").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    if rows.len() > limits.max_events {
+        return Err(Stop::TooManyEvents);
+    }
+    let mut listed = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row
+            .get("tz")
+            .and_then(Value::as_str)
+            .is_some_and(|tz| tz.len() > MAX_ZONE_BYTES)
+        {
+            return Err(Stop::Failed);
+        }
+        if let Some(guid) = row.get("guid").and_then(Value::as_str) {
+            listed.push(guid.to_string());
+        }
+    }
+    Ok(listed)
 }
 
 /// As the engine's `fetch_calendar`: every 28-day window asked both ways (`/ca/startup` does
@@ -1024,17 +1083,20 @@ async fn fetch(
     root: &str,
     window: Window,
     limits: &RefreshLimits,
-) -> Result<Snapshot, Stop> {
+) -> Result<(Snapshot, std::collections::HashSet<String>), Stop> {
     let mut budget = limits.max_total_bytes;
     let mut calendars = Vec::new();
     let mut events = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut listed = std::collections::HashSet::new();
     let (first, last) = window.asked();
     let mut start = first;
     while start <= last {
         let end = (start + APPLE_WINDOW_DAYS - 1).min(last);
         for path in ["/ca/startup", "/ca/events"] {
-            let read = window_read(client, root, path, (start, end), limits, &mut budget).await?;
+            let (read, rows) =
+                window_read(client, root, path, (start, end), limits, &mut budget).await?;
+            listed.extend(rows);
             if calendars.is_empty() {
                 calendars = read.calendars;
             }
@@ -1054,15 +1116,18 @@ async fn fetch(
         return Err(Stop::Failed);
     }
     // Removal is left to `prune`, over the window's wall-clock days.
-    Ok(Snapshot {
-        calendars,
-        events,
-        covers: None,
-    })
+    Ok((
+        Snapshot {
+            calendars,
+            events,
+            covers: None,
+        },
+        listed,
+    ))
 }
 
 /// Removes the events of the calendars Apple listed that start in `covers` and that Apple did
-/// not return. As `apply_calendar` does for its own window, but an all-day or floating event
+/// not list (`returned`: every row Apple sent with an id, whether the engine could read it). As `apply_calendar` does for its own window, but an all-day or floating event
 /// is judged by its wall-clock start (read through the UTC view, see [`wall_view`]) rather
 /// than as an instant in this computer's zone, which put one on the window's first day
 /// outside it east of UTC and left it cached after Apple removed it.
@@ -1217,29 +1282,47 @@ async fn read_window(
             fetched = Err(quince_icloud::Error::Protocol(TIMED_OUT.into()));
         }
         // Queued Calendar changes are neither sent nor laid over what Apple returned.
-        pass::store(SERVICE, &data, &ctx, fetched, |library, snapshot| {
-            let known: std::collections::HashSet<String> =
-                snapshot.calendars.iter().map(|c| c.guid.clone()).collect();
-            let returned: std::collections::HashSet<String> = snapshot
-                .events
-                .iter()
-                .filter(|e| known.contains(&e.calendar_guid))
-                .map(|e| e.guid.clone())
-                .collect();
-            let summary = quince_icloud::sync::apply_calendar(library, snapshot)?;
-            prune(library, window.covers(), &known, &returned)?;
-            library.mark_synced(SERVICE, Some(&window.token()))?;
-            *read
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                (summary.calendars, summary.events);
-            // Last, before the transaction commits: past the deadline, it rolls back and the
-            // pass is recorded as failed.
-            if expired() {
-                return Err(quince_icloud::Error::Protocol(TIMED_OUT.into()));
-            }
-            Ok("read".to_string())
-        })
+        pass::store(
+            SERVICE,
+            &data,
+            &ctx,
+            fetched,
+            |library, (mut snapshot, returned)| {
+                // Checked again inside the transaction: another process may have changed the
+                // account since `pass::store` looked, and nothing is written for the wrong one.
+                if !pass::owned(library, ctx.account.as_deref()) {
+                    *stopped
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some("account_changed_during_refresh_cache_kept");
+                    return Err(quince_icloud::Error::Protocol(pass::NOT_YOURS_WORDS.into()));
+                }
+                let known: std::collections::HashSet<String> =
+                    snapshot.calendars.iter().map(|c| c.guid.clone()).collect();
+                // `apply_calendar` replaces the set of calendars and keeps only other accounts'
+                // (CalDAV): subscribed calendars are carried over as they are, so neither they nor
+                // their events go. They are not Apple's, so `prune` never judges them.
+                snapshot.calendars.extend(
+                    library
+                        .calendars()?
+                        .into_iter()
+                        .filter(|c| c.guid.starts_with(quince_icloud::calendar_feeds::PREFIX)),
+                );
+                let summary = quince_icloud::sync::apply_calendar(library, snapshot)?;
+                prune(library, window.covers(), &known, &returned)?;
+                library.mark_synced(SERVICE, Some(&window.token()))?;
+                *read
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    (summary.calendars, summary.events);
+                // Last, before the transaction commits: past the deadline, it rolls back and the
+                // pass is recorded as failed.
+                if expired() {
+                    return Err(quince_icloud::Error::Protocol(TIMED_OUT.into()));
+                }
+                Ok("read".to_string())
+            },
+        )
         .await
     })
     .await;
@@ -1306,6 +1389,27 @@ mod tests {
             assert_eq!(parse_day(bad), Err("invalid_date"), "{bad}");
         }
         assert_eq!(wall_text(-1), "1969-12-31T23:59:59");
+    }
+
+    #[test]
+    fn all_day_days_survive_a_shift_at_a_daylight_saving_midnight() {
+        let day = 17_839; // 2018-11-04, when Sao Paulo's clocks skipped midnight.
+        let e = Event {
+            guid: "D".into(),
+            all_day: true,
+            // The day before, its end read an hour late; and a start read an hour late.
+            starts_at: (day - 1) * DAY,
+            ends_at: day * DAY + 3600,
+            ..Default::default()
+        };
+        assert_eq!(all_day_days(&e), (day - 1, day));
+        let e = Event {
+            starts_at: day * DAY + 3600,
+            ends_at: (day + 1) * DAY,
+            ..e
+        };
+        assert_eq!(all_day_days(&e), (day, day + 1));
+        assert_eq!(times(&e, None).0, json!({"date":"2018-11-04"}));
     }
 
     #[test]
