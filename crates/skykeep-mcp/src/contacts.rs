@@ -148,11 +148,11 @@ fn ordered(mut cards: Vec<Card>) -> Vec<Card> {
 
 /// Bytes a value takes as tool-result text inside the JSON-RPC frame: serialized once as the
 /// text, then again as a JSON string.
-fn encoded_len(value: &Value) -> usize {
+pub(crate) fn encoded_len(value: &Value) -> usize {
     serde_json::to_string(&Value::String(value.to_string())).map_or(usize::MAX, |s| s.len())
 }
 
-fn cut(text: Option<&str>, chars: usize, cut_any: &mut bool) -> Option<String> {
+pub(crate) fn cut(text: Option<&str>, chars: usize, cut_any: &mut bool) -> Option<String> {
     let text = text?;
     if text.chars().count() <= chars {
         return Some(text.to_string());
@@ -428,7 +428,7 @@ pub(crate) fn get(library: &Library, args: Value) -> Result<Value, &'static str>
 
 /// Refuses before any keyring, session or network use: an unapproved read under
 /// `reads_and_writes`, or a directory not yet bound to an account. Touches no queued write.
-fn gate(dir: &Path, approved: bool) -> Result<(), &'static str> {
+pub(crate) fn gate(dir: &Path, approved: bool) -> Result<(), &'static str> {
     let library = Library::open(dir).map_err(|_| "library_unavailable")?;
     if crate::policy(&library, dir)?.is_some_and(|(p, _)| p.mode == "reads_and_writes") && !approved
     {
@@ -545,6 +545,8 @@ macro_rules! read_capped {
         }
     }};
 }
+/// Shared with the Calendar refresh, which names its own `Stop` with the same two variants.
+pub(crate) use read_capped;
 
 /// The query every Contacts request carries, as the engine sends it.
 fn base_query(client: &Client) -> Vec<(String, String)> {
@@ -775,7 +777,7 @@ pub async fn refresh_with_client_limited(
 const TIMED_OUT: &str = "contacts_refresh_timeout_cache_kept";
 
 /// Who the directory belongs to: its account tag and its identity on disk.
-fn owner(dir: &Path) -> Result<(Option<String>, (u64, u64)), &'static str> {
+pub(crate) fn owner(dir: &Path) -> Result<(Option<String>, (u64, u64)), &'static str> {
     let library = Library::open(dir).map_err(|_| "library_unavailable")?;
     let account = library
         .state(ACCOUNT_KEY)
@@ -786,6 +788,16 @@ fn owner(dir: &Path) -> Result<(Option<String>, (u64, u64)), &'static str> {
 /// A refresh cut off by its deadline is a failed refresh, recorded as one only while the
 /// directory is the same one and still names the account the refresh started for.
 fn record_timeout(dir: &Path, started_for: &(Option<String>, (u64, u64))) {
+    record_timeout_of(dir, started_for, SERVICE, TIMED_OUT);
+}
+
+/// [`record_timeout`] for any service: `words` recorded as its failure.
+pub(crate) fn record_timeout_of(
+    dir: &Path,
+    started_for: &(Option<String>, (u64, u64)),
+    service: &str,
+    words: &str,
+) {
     if started_for.0.is_none() || crate::directory_identity(dir).ok() != Some(started_for.1) {
         return;
     }
@@ -794,7 +806,7 @@ fn record_timeout(dir: &Path, started_for: &(Option<String>, (u64, u64))) {
     };
     let _ = library.atomically(|library| -> quince_core::Result<()> {
         if library.state(ACCOUNT_KEY)? == started_for.0 {
-            library.mark_sync_failed(SERVICE, TIMED_OUT)?;
+            library.mark_sync_failed(service, words)?;
         }
         Ok(())
     });

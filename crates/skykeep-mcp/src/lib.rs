@@ -1,5 +1,6 @@
 //! Local MCP adapter. The library and codecs remain owned by the upstream crates.
 pub mod account;
+pub mod calendar;
 pub mod contacts;
 pub mod login;
 pub mod scheduler;
@@ -267,6 +268,9 @@ fn needs_consent(mode: &str, name: &str) -> Result<bool, &'static str> {
         "contacts_list" | "contacts_search" | "contacts_get" | "contacts_refresh" => {
             Ok(mode == "reads_and_writes")
         }
+        // Calendar content and its refresh are reads too.
+        "calendar_calendars" | "calendar_events" | "calendar_search" | "calendar_get"
+        | "calendar_refresh" => Ok(mode == "reads_and_writes"),
         _ => Err("unknown_tool"),
     }
 }
@@ -456,6 +460,7 @@ impl Server {
         let name = params["name"].as_str().ok_or("invalid_tool")?;
         // Malformed Contacts arguments are refused before anyone is asked to approve them.
         contacts::validate(name, &params["arguments"])?;
+        calendar::validate(name, &params["arguments"])?;
         if !needs_consent(&p.mode, name)? {
             return Ok(None);
         }
@@ -481,7 +486,15 @@ impl Server {
         Ok(Some(binding))
     }
 
-    fn consent_form(&mut self, request: Value, binding: ApprovalBinding) -> Value {
+    fn consent_form(&mut self, mut request: Value, binding: ApprovalBinding) -> Value {
+        // A default Calendar refresh window depends on the day: fixed now, so the approved
+        // dates are the ones that run.
+        if request["params"]["name"] == "calendar_refresh" {
+            match calendar::resolved_refresh_args(&request["params"]["arguments"]) {
+                Ok(args) => request["params"]["arguments"] = args,
+                Err(error) => return tool_reply(request["id"].clone(), Err(error)),
+            }
+        }
         let refresh = match request["params"]["name"].as_str() {
             Some("sync") => Some(
                 json!({"services":["notes","reminders"],"refresh":"one bounded pass, at most 60 seconds","send":"only unchanged previously authorized durable operations, at most 128"}),
@@ -489,6 +502,9 @@ impl Server {
             Some("contacts_refresh") => Some(
                 json!({"services":["contacts"],"refresh":"one read of Apple iCloud Contacts into the local cache, at most 60 seconds","send":"nothing is sent; queued changes stay queued"}),
             ),
+            Some("calendar_refresh") => {
+                Some(calendar::refresh_scope(&request["params"]["arguments"]))
+            }
             _ => None,
         };
         let params = json!({"operation":request["params"],"existing_item":binding.snapshot,"read_preview_only":binding.preview_read,"refresh_scope":refresh});
@@ -906,6 +922,21 @@ impl Server {
                     return Err("login_required");
                 }
                 contacts::refresh(&dir, grant.is_some()).await
+            }
+            "calendar_calendars" => calendar::calendars(library, args),
+            "calendar_events" => calendar::events(library, args),
+            "calendar_search" => calendar::search(library, args),
+            "calendar_get" => calendar::get(library, args),
+            "calendar_refresh" => {
+                calendar::validate(name, &args)?;
+                if library
+                    .state(ACCOUNT_KEY)
+                    .map_err(|_| "library_unavailable")?
+                    .is_none()
+                {
+                    return Err("login_required");
+                }
+                calendar::refresh(&dir, grant.is_some(), args).await
             }
             "sync_status" => {
                 let _: Empty = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -1548,8 +1579,8 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
     }
 }
 
-const SERVER_TITLE: &str = "Skykeep: Apple iCloud Notes, Reminders & Contacts";
-const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, and reads the user's Apple iCloud Contacts (read-only). Reads return cached data. Contacts refresh only through contacts_refresh. Changes follow the configured approval mode and are queued until sync sends them. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
+const SERVER_TITLE: &str = "Skykeep: Apple iCloud Notes, Reminders, Contacts & Calendar";
+const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, and reads the user's Apple iCloud Contacts and Apple iCloud Calendar (read-only). Reads return cached data. Contacts refresh only through contacts_refresh, and Calendar only through calendar_refresh. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode and are queued until sync sends them. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
 
 fn tools() -> Vec<Value> {
     // (name, description, parent property, parent required)
@@ -1614,6 +1645,24 @@ fn tools() -> Vec<Value> {
     tools.push(json!({"name":"contacts_search","description":"Search the user's cached Apple iCloud Contacts by name, email, phone or other kept fields. Read-only.","inputSchema":{"type":"object","properties":search,"required":["query"],"additionalProperties":false},"annotations":read}));
     tools.push(json!({"name":"contacts_get","description":"Read one cached Apple iCloud Contacts card with its kept fields and lists. Not a complete card: photos, the original vCard and fields the cache does not keep are not included.","inputSchema":{"type":"object","properties":{"guid":{"type":"string","minLength":1,"maxLength":512,"description":"Contact GUID from contacts_list or contacts_search. At most 512 UTF-8 bytes."}},"required":["guid"],"additionalProperties":false},"annotations":read}));
     tools.push(json!({"name":"contacts_refresh","description":"Read the user's Apple iCloud Contacts from Apple into the local cache, replacing the cached copy. Never changes contacts at Apple and sends no queued changes. Never opens a login prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}));
+    let page = json!({"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":calendar::MAX_LIMIT,"default":25}});
+    let day = |what: &str| json!({"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":what});
+    let guid = json!({"type":"string","minLength":1,"maxLength":calendar::MAX_GUID_BYTES});
+    tools.push(json!({"name":"calendar_calendars","description":"List the user's Apple iCloud Calendar calendars from the local cache, with which is the default and which are read-only. Read-only; refresh with calendar_refresh.","inputSchema":{"type":"object","properties":page,"additionalProperties":false},"annotations":read}));
+    let mut range = page.clone();
+    range["from"] = day("First day, YYYY-MM-DD, in timezone.");
+    range["to"] = day(&format!(
+        "Day after the last, YYYY-MM-DD (exclusive). At most {} days after from.",
+        calendar::MAX_RANGE_DAYS
+    ));
+    range["timezone"] = json!({"type":"string","minLength":1,"maxLength":calendar::MAX_ZONE_BYTES,"description":"IANA time zone the days are read in, such as Europe/Berlin."});
+    range["calendar_guid"] = guid.clone();
+    tools.push(json!({"name":"calendar_events","description":"List the user's Apple iCloud Calendar events from the local cache that overlap a date range. All-day events are dates and floating events are clock times; timed events give UTC and zone times. Says whether the last calendar_refresh covered the range. Read-only.","inputSchema":{"type":"object","properties":range,"required":["from","to","timezone"],"additionalProperties":false},"annotations":read}));
+    let mut search = page.clone();
+    search["query"] = json!({"type":"string","minLength":1,"maxLength":calendar::MAX_QUERY_BYTES,"description":"Words matched against title, location and notes, ignoring case and accents. At most 256 UTF-8 bytes."});
+    tools.push(json!({"name":"calendar_search","description":"Search the user's cached Apple iCloud Calendar events by title, location or notes. At most 300 matches nearest today are kept. Read-only.","inputSchema":{"type":"object","properties":search,"required":["query"],"additionalProperties":false},"annotations":read}));
+    tools.push(json!({"name":"calendar_get","description":"Read one cached Apple iCloud Calendar event with its notes and calendar. Not a complete event: attendees, alerts, the repeat rule and status are not included.","inputSchema":{"type":"object","properties":{"guid":guid},"required":["guid"],"additionalProperties":false},"annotations":read}));
+    tools.push(json!({"name":"calendar_refresh","description":format!("Read the user's Apple iCloud Calendar from Apple into the local cache over a window (default: last month to three months ahead; at most {} days). Never changes events at Apple, never answers invitations and sends no queued changes. Never opens a login prompt.", calendar::MAX_REFRESH_DAYS),"inputSchema":{"type":"object","properties":{"from":day("First day, YYYY-MM-DD (UTC)."),"to":day("Day after the last, YYYY-MM-DD (exclusive).")},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}));
     tools.push(json!({"name":"auth_status","description":"Apple iCloud sign-in status and setup instructions. Never accepts secrets or opens a prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools
 }
