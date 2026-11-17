@@ -383,3 +383,32 @@ async fn reminder_list_discovery_reads_upstream_cache() {
     let result = call(&mut server, "reminders_lists", json!({})).await;
     assert_eq!(result["items"], json!(library.reminder_lists().unwrap()));
 }
+#[tokio::test]
+async fn reminder_list_discovery_reports_pin_dates() {
+    let (_dir, mut server, mut library) = setup();
+    let list =
+        |guid: &str, pinned: bool, pinned_at: Option<i64>| quince_core::reminders::ReminderList {
+            guid: guid.into(),
+            title: "Synthetic".into(),
+            pinned,
+            pinned_at,
+            ..Default::default()
+        };
+    library
+        .put_reminder_lists(&[
+            list("dated", true, Some(1_790_609_001_389)),
+            list("undated", true, None),
+            list("plain", false, None),
+        ])
+        .unwrap();
+    let result = call(&mut server, "reminders_lists", json!({})).await;
+    let items = result["items"].as_array().unwrap();
+    let item = |guid: &str| items.iter().find(|i| i["guid"] == guid).unwrap().clone();
+    assert_eq!(item("dated")["pinned"], true);
+    assert_eq!(item("dated")["pinnedAt"], 1_790_609_001_389_i64);
+    assert_eq!(item("undated")["pinned"], true);
+    assert_eq!(item("undated")["pinnedAt"], Value::Null);
+    assert_eq!(item("plain")["pinned"], false);
+    assert_eq!(item("plain")["pinnedAt"], Value::Null);
+    assert!(items.iter().all(|i| i.get("reminderOrder").is_none()));
+}
