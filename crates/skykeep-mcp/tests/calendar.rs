@@ -687,6 +687,75 @@ async fn search_finds_icloud_matches_behind_many_from_other_calendars() {
 }
 
 #[tokio::test]
+async fn search_reads_every_start_once_and_keeps_the_nearest_matches() {
+    let (dir, mut server) = seeded(None);
+    let mut library = quince_core::Library::open(dir.path()).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let event = |guid: &str, title: &str, start: i64, end: i64| quince_core::calendar::Event {
+        guid: guid.into(),
+        calendar_guid: "cal-work".into(),
+        title: title.into(),
+        starts_at: start,
+        ends_at: end,
+        timezone: Some("UTC".into()),
+        ..Default::default()
+    };
+    // Before 1970, at it with no length, long past 2200, and one running across years.
+    library
+        .put_events(&[
+            event("OLD", "Archive sweep", -400_000_000, -399_996_400),
+            event("ZERO", "Archive sweep", 0, 0),
+            event("FAR", "Archive sweep", 8_000_000_000, 8_000_003_600),
+            event("LONG", "Archive sweep", 100_000_000, 400_000_000),
+        ])
+        .unwrap();
+    init(&mut server, false).await;
+    let found = ok(
+        &mut server,
+        "calendar_search",
+        json!({"query":"archive sweep"}),
+    )
+    .await;
+    assert_eq!(guids(&found), ["OLD", "ZERO", "LONG", "FAR"], "{found}");
+    assert_eq!(found["may_be_incomplete"], false);
+
+    // More matches than are kept: the 300 nearest today, said to be incomplete.
+    let many: Vec<_> = (0..700)
+        .map(|i| {
+            event(
+                &format!("N{i:03}"),
+                "Daily sync",
+                now + i * 3600,
+                now + i * 3600 + 60,
+            )
+        })
+        .collect();
+    library.put_events(&many).unwrap();
+    let mut seen = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = ok(
+            &mut server,
+            "calendar_search",
+            json!({"query":"daily sync","limit":100,"offset":offset}),
+        )
+        .await;
+        assert_eq!(page["total"], 300);
+        assert_eq!(page["may_be_incomplete"], true);
+        seen.extend(guids(&page));
+        match page["next_offset"].as_u64() {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    let nearest: Vec<String> = (0..300).map(|i| format!("N{i:03}")).collect();
+    assert_eq!(seen, nearest);
+}
+
+#[tokio::test]
 async fn reads_report_cache_freshness_and_coverage_honestly() {
     let (_dir, mut server) = seeded(None);
     init(&mut server, false).await;
