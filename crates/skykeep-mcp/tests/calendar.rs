@@ -642,6 +642,51 @@ async fn search_and_get_read_the_cached_event_and_say_what_is_not_kept() {
 }
 
 #[tokio::test]
+async fn search_finds_icloud_matches_behind_many_from_other_calendars() {
+    let (dir, mut server) = seeded(None);
+    let mut library = quince_core::Library::open(dir.path()).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    // More matches than the search keeps, all in another account's calendar and nearer
+    // today than the one iCloud match, five years out.
+    let dav = format!("{}acct/home", quince_core::dav::PREFIX);
+    let near: Vec<quince_core::calendar::Event> = (0..350)
+        .map(|i| quince_core::calendar::Event {
+            guid: format!("DAV-R{i}"),
+            calendar_guid: dav.clone(),
+            title: "Quarterly review".into(),
+            starts_at: now + i * 60,
+            ends_at: now + i * 60 + 60,
+            timezone: Some("UTC".into()),
+            ..Default::default()
+        })
+        .collect();
+    library.put_events(&near).unwrap();
+    library
+        .put_events(&[quince_core::calendar::Event {
+            guid: "ICLOUD-R".into(),
+            calendar_guid: "cal-work".into(),
+            title: "Quarterly review".into(),
+            starts_at: now + 5 * 365 * 86_400,
+            ends_at: now + 5 * 365 * 86_400 + 3600,
+            timezone: Some("UTC".into()),
+            ..Default::default()
+        }])
+        .unwrap();
+    init(&mut server, false).await;
+    let found = ok(
+        &mut server,
+        "calendar_search",
+        json!({"query":"quarterly review"}),
+    )
+    .await;
+    assert_eq!(guids(&found), ["ICLOUD-R"], "{found}");
+    assert_eq!(found["may_be_incomplete"], false);
+}
+
+#[tokio::test]
 async fn reads_report_cache_freshness_and_coverage_honestly() {
     let (_dir, mut server) = seeded(None);
     init(&mut server, false).await;
@@ -990,8 +1035,11 @@ async fn refreshed_events_read_back_with_the_window_they_were_read_in() {
     );
     assert_eq!(inside["cache"]["refreshed"], true);
     assert_eq!(inside["cache"]["last_refresh_failed"], false);
-    // Outside the window the cache may hold events, but makes no claim about them.
-    let outside = events(&mut server, "2026-12-01", "2026-12-02", "UTC").await;
+    // Apple is asked about one day either side of the window, and that day counts as
+    // covered; past it the cache may hold events, but makes no claim about them.
+    let margin = events(&mut server, "2026-12-01", "2026-12-02", "UTC").await;
+    assert_eq!(margin["coverage"]["range_within_last_refresh"], true);
+    let outside = events(&mut server, "2026-12-02", "2026-12-03", "UTC").await;
     assert_eq!(outside["coverage"]["range_within_last_refresh"], false);
     let straddling = events(&mut server, "2026-11-20", "2026-12-05", "UTC").await;
     assert_eq!(straddling["coverage"]["range_within_last_refresh"], false);

@@ -321,18 +321,19 @@ impl Window {
         json!({"from":day_text(self.from),"to":day_text(self.to),"to_is_exclusive":true})
     }
 
-    /// What the cache judges against: every event starting in `[from, to)`, by its instant
-    /// or, for an all-day or floating one, its wall-clock time read in this computer's zone.
-    fn covers(self) -> (i64, i64) {
-        (self.from * DAY, self.to * DAY)
-    }
-
     /// The days Apple is asked about, inclusive: one more on each side than the window, so
-    /// that what the cache reads in this computer's zone (never a whole day from UTC) is
-    /// always inside what Apple answered for, and nothing Apple was not asked about is taken
-    /// as gone.
+    /// a day of the window read in any zone (never a whole day from UTC) lies inside them.
     fn asked(self) -> (i64, i64) {
         (self.from - 1, self.to)
+    }
+
+    /// Exactly what Apple was asked about, in seconds `[from, to)`: what a refresh removes
+    /// unlisted events from and what reads call covered. A timed event with a zone is judged
+    /// by its instant; an all-day or floating one by its wall-clock start, which is how
+    /// Apple, asked in UTC, places it (see [`prune`]).
+    fn covers(self) -> (i64, i64) {
+        let (first, last) = self.asked();
+        (first * DAY, (last + 1) * DAY)
     }
 
     fn token(self) -> String {
@@ -733,23 +734,45 @@ pub(crate) fn events(library: &mut Library, args: Value) -> Result<Value, &'stat
     )
 }
 
+/// Events whose title, location or notes hold every word of the query, by the engine's own
+/// folding (`search_events_near`), but matched over iCloud calendars only and only then cut
+/// to the [`SEARCH_KEEPS`] nearest today: cut first, matches in other accounts' calendars
+/// could push every iCloud match out.
 pub(crate) fn search(library: &mut Library, args: Value) -> Result<Value, &'static str> {
+    use quince_core::fold;
     let args = search_args(&args)?;
     let limit = page_limit(args.limit)?;
     let calendars = icloud_calendars(library)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
-    let found = wall_view(library, |library| {
+    let words = fold::words(&args.query);
+    let everything = wall_view(library, |library| {
         library
-            .search_events_near(&args.query, now)
+            .events_between(i64::MIN / 4, i64::MAX / 4)
             .map_err(|_| "search_unavailable")
     })?;
-    let capped = found.len() >= SEARCH_KEEPS;
-    let mut all: Vec<Event> = found
+    let mut all: Vec<Event> = everything
         .into_iter()
         .filter(|e| calendars.iter().any(|c| c.guid == e.calendar_guid))
+        .filter(|e| {
+            let text = [
+                Some(e.title.as_str()),
+                e.location.as_deref(),
+                e.notes.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+            !words.is_empty() && fold::holds_all(&fold::fold(&text), &words)
+        })
         .collect();
+    let capped = all.len() > SEARCH_KEEPS;
+    if capped {
+        all.sort_by_key(|e| (e.ends_at.max(e.starts_at).saturating_sub(now)).saturating_abs());
+        all.truncate(SEARCH_KEEPS);
+    }
     all.sort_by(|a, b| {
         a.starts_at
             .cmp(&b.starts_at)
@@ -979,11 +1002,38 @@ async fn fetch(
     if calendars.is_empty() {
         return Err(Stop::Failed);
     }
+    // Removal is left to `prune`, over the window's wall-clock days.
     Ok(Snapshot {
         calendars,
         events,
-        covers: Some(window.covers()),
+        covers: None,
     })
+}
+
+/// Removes the events of the calendars Apple listed that start in `covers` and that Apple did
+/// not return. As `apply_calendar` does for its own window, but an all-day or floating event
+/// is judged by its wall-clock start (read through the UTC view, see [`wall_view`]) rather
+/// than as an instant in this computer's zone, which put one on the window's first day
+/// outside it east of UTC and left it cached after Apple removed it.
+fn prune(
+    library: &mut Library,
+    covers: (i64, i64),
+    known: &std::collections::HashSet<String>,
+    returned: &std::collections::HashSet<String>,
+) -> quince_icloud::Result<usize> {
+    let utc = zone("UTC").ok_or_else(|| {
+        quince_icloud::Error::Protocol("calendar_refresh_failed_cache_kept".into())
+    })?;
+    library.set_zone(Some(utc.tz));
+    let found = library.events_starting_between(covers.0, covers.1);
+    library.set_zone(None);
+    let gone: Vec<String> = found?
+        .into_iter()
+        .filter(|(guid, calendar)| known.contains(calendar) && !returned.contains(guid))
+        .map(|(guid, _)| guid)
+        .collect();
+    library.forget_events(&gone)?;
+    Ok(gone.len())
 }
 
 /// Production refresh: the directory's own keyring session and Apple's endpoints only.
@@ -1117,7 +1167,16 @@ async fn read_window(
         }
         // Queued Calendar changes are neither sent nor laid over what Apple returned.
         pass::store(SERVICE, &data, &ctx, fetched, |library, snapshot| {
+            let known: std::collections::HashSet<String> =
+                snapshot.calendars.iter().map(|c| c.guid.clone()).collect();
+            let returned: std::collections::HashSet<String> = snapshot
+                .events
+                .iter()
+                .filter(|e| known.contains(&e.calendar_guid))
+                .map(|e| e.guid.clone())
+                .collect();
             let summary = quince_icloud::sync::apply_calendar(library, snapshot)?;
+            prune(library, window.covers(), &known, &returned)?;
             library.mark_synced(SERVICE, Some(&window.token()))?;
             *read
                 .lock()
