@@ -4345,7 +4345,14 @@ mod detail_tests {
     /// The Library's sidebar counts and its smart-list reads agree for every new rule.
     #[test]
     fn counts_match_reads_for_apple_rules() {
-        let now = 1_800_014_400; // 2027-01-15 12:00 UTC; the 15th from UTC-11 to UTC+11.
+        // Noon on 15 January 2027 on this machine's clock, so the fixture's day is the
+        // server's local day in every zone the Library reads it in.
+        let now = jiff::civil::date(2027, 1, 15)
+            .at(12, 0, 0, 0)
+            .to_zoned(jiff::tz::TimeZone::system())
+            .unwrap()
+            .timestamp()
+            .as_second();
         let mut lib = library();
         let mut timed = reminder("Reminder/5", "List/A");
         timed.due_at = Some(now + 1_800);
