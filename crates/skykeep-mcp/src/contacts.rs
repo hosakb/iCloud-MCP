@@ -458,6 +458,8 @@ pub struct RefreshLimits {
     pub max_card_bytes: usize,
     /// The whole refresh; nothing is stored once it has passed.
     pub timeout: Duration,
+    /// The time source the deadline is checked against; `Instant::now` outside tests.
+    pub clock: fn() -> Instant,
 }
 
 impl Default for RefreshLimits {
@@ -468,6 +470,7 @@ impl Default for RefreshLimits {
             max_contacts: 25_000,
             max_card_bytes: 256 * 1024,
             timeout: Duration::from_secs(60),
+            clock: Instant::now,
         }
     }
 }
@@ -769,14 +772,48 @@ pub async fn refresh_with_client_limited(
     timed(dir, client, limits).await
 }
 
+const TIMED_OUT: &str = "contacts_refresh_timeout_cache_kept";
+
+/// Who the directory belongs to: its account tag and its identity on disk.
+fn owner(dir: &Path) -> Result<(Option<String>, (u64, u64)), &'static str> {
+    let library = Library::open(dir).map_err(|_| "library_unavailable")?;
+    let account = library
+        .state(ACCOUNT_KEY)
+        .map_err(|_| "library_unavailable")?;
+    Ok((account, crate::directory_identity(dir)?))
+}
+
+/// A refresh cut off by its deadline is a failed refresh, recorded as one only while the
+/// directory is the same one and still names the account the refresh started for.
+fn record_timeout(dir: &Path, started_for: &(Option<String>, (u64, u64))) {
+    if started_for.0.is_none() || crate::directory_identity(dir).ok() != Some(started_for.1) {
+        return;
+    }
+    let Ok(mut library) = Library::open(dir) else {
+        return;
+    };
+    let _ = library.atomically(|library| -> quince_core::Result<()> {
+        if library.state(ACCOUNT_KEY)? == started_for.0 {
+            library.mark_sync_failed(SERVICE, TIMED_OUT)?;
+        }
+        Ok(())
+    });
+}
+
 async fn timed(dir: &Path, client: Client, limits: RefreshLimits) -> Result<Value, &'static str> {
     // Network reads are cancelled at the deadline. Parsing and storing are bounded by the
-    // byte and card limits, and nothing is stored once the deadline has passed; the store is
-    // one transaction, so a refresh leaves either the old cache or the new one.
-    let deadline = Instant::now() + limits.timeout;
-    tokio::time::timeout(limits.timeout, read_book(dir, client, limits, deadline))
-        .await
-        .map_err(|_| "contacts_refresh_timeout_cache_kept")?
+    // byte and card limits. The deadline is checked again inside the store's transaction,
+    // which rolls back when it has passed, so a refresh leaves either the old cache or the
+    // new one, and never a new one after its deadline.
+    let started_for = owner(dir)?;
+    let deadline = (limits.clock)() + limits.timeout;
+    match tokio::time::timeout(limits.timeout, read_book(dir, client, limits, deadline)).await {
+        Ok(result) => result,
+        Err(_) => {
+            record_timeout(dir, &started_for);
+            Err(TIMED_OUT)
+        }
+    }
 }
 
 async fn read_book(
@@ -827,32 +864,39 @@ async fn read_book(
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stop.code());
             stop.error()
         });
-        if fetched.is_ok() && Instant::now() >= deadline {
-            let code = "contacts_refresh_timeout_cache_kept";
-            *stopped
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(code);
-            fetched = Err(quince_icloud::Error::Protocol(code.into()));
+        let expired = || {
+            let late = (limits.clock)() >= deadline;
+            if late {
+                *stopped
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(TIMED_OUT);
+            }
+            late
+        };
+        if fetched.is_ok() && expired() {
+            fetched = Err(quince_icloud::Error::Protocol(TIMED_OUT.into()));
         }
         // Queued Contacts changes are neither sent nor laid over what Apple returned.
-        pass::store(
-            SERVICE,
-            &data,
-            &ctx,
-            fetched,
-            |library, found| match found {
+        pass::store(SERVICE, &data, &ctx, fetched, |library, found| {
+            let read = match found {
                 apple::Pass::Read(book, tokens) => {
                     apple::apply(library, book)?;
                     library.mark_synced(SERVICE, Some(&tokens.stored()))?;
                     library.mark_full_sync(SERVICE)?;
-                    Ok("full".to_string())
+                    "full"
                 }
                 apple::Pass::Unchanged(tokens) => {
                     library.mark_synced(SERVICE, Some(&tokens.stored()))?;
-                    Ok("unchanged".to_string())
+                    "unchanged"
                 }
-            },
-        )
+            };
+            // Last, before the transaction commits: past the deadline, it rolls back
+            // and the pass is recorded as failed.
+            if expired() {
+                return Err(quince_icloud::Error::Protocol(TIMED_OUT.into()));
+            }
+            Ok(read.to_string())
+        })
         .await
     })
     .await;

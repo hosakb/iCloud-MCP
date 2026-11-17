@@ -1546,6 +1546,7 @@ fn small_limits() -> skykeep_mcp::contacts::RefreshLimits {
         max_contacts: 2,
         max_card_bytes: 4_096,
         timeout: std::time::Duration::from_secs(10),
+        clock: std::time::Instant::now,
     }
 }
 
@@ -1914,4 +1915,155 @@ async fn an_account_change_during_refresh_stores_nothing() {
     assert_eq!(error, "account_changed_during_refresh_cache_kept");
     assert_eq!(cache_snapshot(dir.path())["cards"], before["cards"]);
     assert_eq!(cache_snapshot(dir.path())["cursor"], before["cursor"]);
+}
+
+// --- Deadline and failure status (review cycle 3).
+
+static COMMIT_CLOCK_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Real time for the refresh's first two readings (setting the deadline, and the check after
+/// the fetch), then an hour later: the deadline passes while the cache is being written.
+fn late_at_commit() -> std::time::Instant {
+    let call = COMMIT_CLOCK_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let now = std::time::Instant::now();
+    if call < 2 {
+        now
+    } else {
+        now + std::time::Duration::from_secs(3600)
+    }
+}
+
+fn contacts_failed(dir: &std::path::Path) -> bool {
+    quince_core::Library::open(dir)
+        .unwrap()
+        .sync_health()
+        .unwrap()
+        .iter()
+        .any(|h| h.service == "contacts" && h.last_error.is_some())
+}
+
+#[tokio::test]
+async fn a_deadline_passed_while_storing_rolls_the_store_back() {
+    let remote = apple().await;
+    Mock::given(method("GET"))
+        .and(path("/co/startup"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(startup_body(
+            json!([remote_card("R-1", "Ines"), remote_card("R-2", "Jun")]),
+            "SYNC-LATE",
+        )))
+        .mount(&remote)
+        .await;
+    let (dir, before) = cached_with_unrelated_state();
+    let limits = skykeep_mcp::contacts::RefreshLimits {
+        clock: late_at_commit,
+        ..Default::default()
+    };
+    let error = skykeep_mcp::contacts::refresh_with_client_limited(
+        dir.path(),
+        saved_client(dir.path(), &remote.uri()),
+        limits,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, "contacts_refresh_timeout_cache_kept");
+    assert_eq!(
+        cache_snapshot(dir.path()),
+        before,
+        "cache, cursor and lists unchanged"
+    );
+    assert!(
+        contacts_failed(dir.path()),
+        "the refresh is recorded as failed"
+    );
+}
+
+/// A refresh that succeeds, then one whose body trickles in past a short deadline.
+async fn refreshed_then_slow() -> (tempfile::TempDir, Raw, MockServer) {
+    let remote = apple().await;
+    Mock::given(method("GET"))
+        .and(path("/co/startup"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(startup_body(json!([remote_card("R-1", "Ines")]), "SYNC-1")),
+        )
+        .mount(&remote)
+        .await;
+    let (dir, _) = cached_with_unrelated_state();
+    skykeep_mcp::contacts::refresh_with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+        .await
+        .unwrap();
+    assert!(!contacts_failed(dir.path()));
+    // Forget the cursor's daily walk, so the next refresh reads the book whole.
+    quince_core::Library::open(dir.path())
+        .unwrap()
+        .forget_full_sync("contacts")
+        .unwrap();
+    let raw = raw_server(|_| {
+        (
+            200,
+            RawBody::Chunked {
+                head:
+                    br#"{"syncToken":"S","prefToken":"P","contactsOrder":[],"contacts":[],"pad":""#
+                        .to_vec(),
+                fill: 10 * 65_536,
+                tail: br#""}"#.to_vec(),
+                pause_ms: 200,
+            },
+        )
+    });
+    let sign_in = apple_at(&raw.uri).await;
+    (dir, raw, sign_in)
+}
+
+fn slow_limits() -> skykeep_mcp::contacts::RefreshLimits {
+    skykeep_mcp::contacts::RefreshLimits {
+        timeout: std::time::Duration::from_millis(500),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn a_timed_out_refresh_is_recorded_as_failed() {
+    let (dir, _raw, sign_in) = refreshed_then_slow().await;
+    let before = cache_snapshot(dir.path());
+    assert_eq!(
+        refresh_limited(dir.path(), &sign_in, slow_limits())
+            .await
+            .unwrap_err(),
+        "contacts_refresh_timeout_cache_kept"
+    );
+    assert_eq!(cache_snapshot(dir.path()), before);
+    assert!(
+        contacts_failed(dir.path()),
+        "last_refresh_failed after a timeout"
+    );
+    private_files(dir.path());
+    let mut server = Server::open(dir.path()).unwrap();
+    init(&mut server, false).await;
+    let page = ok(&mut server, "contacts_list", json!({})).await;
+    assert_eq!(page["cache"]["last_refresh_failed"], true);
+}
+
+#[tokio::test]
+async fn a_timeout_after_an_account_change_records_nothing() {
+    let (dir, _raw, sign_in) = refreshed_then_slow().await;
+    let path = dir.path().to_owned();
+    let switch = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        quince_core::Library::open(&path)
+            .unwrap()
+            .set_state("account", &quince_sync::queue::account_tag("9999999999"))
+            .unwrap();
+    });
+    assert_eq!(
+        refresh_limited(dir.path(), &sign_in, slow_limits())
+            .await
+            .unwrap_err(),
+        "contacts_refresh_timeout_cache_kept"
+    );
+    switch.join().unwrap();
+    assert!(
+        !contacts_failed(dir.path()),
+        "no status written for a directory that now names another account"
+    );
 }
