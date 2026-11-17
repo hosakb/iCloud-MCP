@@ -734,26 +734,6 @@ pub(crate) fn events(library: &mut Library, args: Value) -> Result<Value, &'stat
     )
 }
 
-/// Start times a search reads at once: one slice of the cache in memory at a time.
-const SEARCH_SLICE: i64 = 366 * DAY;
-
-/// Slices covering every start a cached event can have, each read once: before 1970, a year
-/// at a time to 2200, and after.
-fn search_slices() -> Vec<(i64, i64)> {
-    let (first, last) = (
-        days_from_civil(*YEARS.start(), 1, 1) * DAY,
-        days_from_civil(*YEARS.end() + 1, 1, 1) * DAY,
-    );
-    let mut slices = vec![(i64::MIN / 4, first)];
-    let mut at = first;
-    while at < last {
-        slices.push((at, (at + SEARCH_SLICE).min(last)));
-        at += SEARCH_SLICE;
-    }
-    slices.push((last, i64::MAX / 4));
-    slices
-}
-
 /// Keeps the [`SEARCH_KEEPS`] matches nearest `now`, as `search_events_near` chooses them.
 fn keep_nearest(found: &mut Vec<Event>, now: i64) {
     found.sort_by_cached_key(|e| {
@@ -769,15 +749,23 @@ fn keep_nearest(found: &mut Vec<Event>, now: i64) {
 }
 
 /// Events whose title, location or notes hold every word of the query, by the engine's own
-/// folding (`search_events_near`), matched over iCloud calendars only and only then cut to
-/// the [`SEARCH_KEEPS`] nearest today: cut first, matches in other accounts' calendars could
-/// push every iCloud match out. The cache is read one slice of start times at a time, and
-/// only matches are kept, never more than twice what is returned.
+/// folding, at most the [`SEARCH_KEEPS`] nearest today, iCloud calendars only.
+///
+/// When every cached calendar is iCloud's (the MCP server never adds any other), the engine's
+/// `search_events_near` does it in one pass, keeping only matches. Otherwise its cut to the
+/// nearest across every calendar could leave out every iCloud match, so the cache is read
+/// once as identifiers and calendars, and only iCloud events are read whole, one at a time,
+/// keeping only matches, never more than twice what is returned.
 pub(crate) fn search(library: &mut Library, args: Value) -> Result<Value, &'static str> {
     use quince_core::fold;
     let args = search_args(&args)?;
     let limit = page_limit(args.limit)?;
     let calendars = icloud_calendars(library)?;
+    let foreign = library
+        .calendars()
+        .map_err(|_| "library_unavailable")?
+        .iter()
+        .any(|c| !icloud(&c.guid));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
@@ -796,24 +784,36 @@ pub(crate) fn search(library: &mut Library, args: Value) -> Result<Value, &'stat
     };
     let mut all: Vec<Event> = Vec::new();
     let mut matched = 0usize;
-    if !words.is_empty() {
+    if !foreign {
+        all = wall_view(library, |library| {
+            library
+                .search_events_near(&args.query, now)
+                .map_err(|_| "search_unavailable")
+        })?;
+        all.retain(|e| calendars.iter().any(|c| c.guid == e.calendar_guid));
+        // The engine keeps the nearest when more match, and does not say how many did.
+        matched = if all.len() >= SEARCH_KEEPS {
+            SEARCH_KEEPS + 1
+        } else {
+            all.len()
+        };
+    } else if !words.is_empty() {
         wall_view(library, |library| {
-            for (from, to) in search_slices() {
-                // Overlap is what the cache answers; each event is taken in the one slice its
-                // start falls in. One second earlier keeps an event with no length.
-                for e in library
-                    .events_between(from.saturating_sub(1), to)
-                    .map_err(|_| "search_unavailable")?
-                {
-                    if (from..to).contains(&e.starts_at)
-                        && calendars.iter().any(|c| c.guid == e.calendar_guid)
-                        && matches(&e)
-                    {
-                        matched += 1;
-                        all.push(e);
-                        if all.len() >= 2 * SEARCH_KEEPS {
-                            keep_nearest(&mut all, now);
-                        }
+            let rows = library
+                .events_starting_between(i64::MIN / 4, i64::MAX / 4)
+                .map_err(|_| "search_unavailable")?;
+            for (guid, calendar) in rows {
+                if !calendars.iter().any(|c| c.guid == calendar) {
+                    continue;
+                }
+                let Some(e) = library.event(&guid).map_err(|_| "search_unavailable")? else {
+                    continue;
+                };
+                if matches(&e) {
+                    matched += 1;
+                    all.push(e);
+                    if all.len() >= 2 * SEARCH_KEEPS {
+                        keep_nearest(&mut all, now);
                     }
                 }
             }
@@ -1306,17 +1306,6 @@ mod tests {
             assert_eq!(parse_day(bad), Err("invalid_date"), "{bad}");
         }
         assert_eq!(wall_text(-1), "1969-12-31T23:59:59");
-    }
-
-    #[test]
-    fn search_slices_cover_every_start_once() {
-        let slices = search_slices();
-        assert_eq!(slices[0].0, i64::MIN / 4);
-        assert_eq!(slices.last().unwrap().1, i64::MAX / 4);
-        assert!(slices
-            .windows(2)
-            .all(|w| w[0].1 == w[1].0 && w[0].0 < w[0].1));
-        assert!(slices.len() < 300);
     }
 
     #[test]
