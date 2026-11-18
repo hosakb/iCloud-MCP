@@ -41,6 +41,9 @@ pub struct ReminderList {
     /// Shown as a tile beside Today and Scheduled.
     #[serde(default)]
     pub pinned: bool,
+    /// When it was pinned (ms since 1970), where Apple gave a date.
+    #[serde(default)]
+    pub pinned_at: Option<i64>,
     /// How the list orders its reminders: `manual`, `displayDate_asc`, and so on.
     #[serde(default)]
     pub sorting: Option<String>,
@@ -114,6 +117,21 @@ fn sort_as_the_list_does(
         };
         done.then(chosen).then_with(|| by_hand(a).cmp(&by_hand(b)))
     });
+}
+
+/// What a `pinned` column holds: when the item was pinned (ms since 1970), 1 for pinned with no
+/// date (as written before the date was kept), or 0 for not pinned. One column, no migration.
+fn pinned_column(pinned: bool, pinned_at: Option<i64>) -> i64 {
+    match (pinned, pinned_at) {
+        (false, _) => 0,
+        (true, Some(at)) if at > 1 => at,
+        (true, _) => 1,
+    }
+}
+
+/// The pin's date from a `pinned` column, where one was kept.
+fn pinned_at_of(column: i64) -> Option<i64> {
+    (column > 1).then_some(column)
 }
 
 fn order_json(order: &[String]) -> Option<String> {
@@ -499,7 +517,7 @@ impl Library {
                     i64::from(l.enabled),
                     l.emblem,
                     l.group_guid,
-                    i64::from(l.pinned),
+                    pinned_column(l.pinned, l.pinned_at),
                     l.sorting,
                     order_json(&l.reminder_order),
                     stamp
@@ -829,7 +847,7 @@ impl Library {
                     i64::from(l.enabled),
                     l.emblem,
                     l.group_guid,
-                    i64::from(l.pinned),
+                    pinned_column(l.pinned, l.pinned_at),
                     l.sorting,
                     order_json(&l.reminder_order),
                     stamp
@@ -1044,6 +1062,7 @@ impl Library {
                 emblem: row.get(6)?,
                 group_guid: row.get(7)?,
                 pinned: row.get::<_, i64>(8)? != 0,
+                pinned_at: pinned_at_of(row.get(8)?),
                 sorting: row.get(9)?,
                 reminder_order: order_from_json(row.get(10)?),
             })
@@ -1307,6 +1326,112 @@ mod tests {
             "done",
             "completed items sink to the bottom"
         );
+    }
+
+    /// A pin keeps its date in the one `pinned` column, through a merge and a whole put. A pin
+    /// with no date still reads as pinned, and no pin reads as none.
+    #[test]
+    fn a_pin_keeps_its_date() {
+        let dated = ReminderList {
+            pinned: true,
+            pinned_at: Some(1_790_609_001_389),
+            ..list("d")
+        };
+        let undated = ReminderList {
+            pinned: true,
+            pinned_at: None,
+            ..list("u")
+        };
+        let plain = list("p");
+        let lists = [dated, undated, plain];
+        let mut merged = seeded();
+        merged.merge_reminder_lists(&lists).unwrap();
+        let mut put = Library::in_memory().unwrap();
+        put.put_reminder_lists(&lists).unwrap();
+        for lib in [&merged, &put] {
+            let got = |g: &str| {
+                lib.reminder_lists()
+                    .unwrap()
+                    .into_iter()
+                    .find(|l| l.guid == g)
+                    .unwrap()
+            };
+            assert!(got("d").pinned);
+            assert_eq!(got("d").pinned_at, Some(1_790_609_001_389));
+            assert!(got("u").pinned && got("u").pinned_at.is_none());
+            assert!(!got("p").pinned && got("p").pinned_at.is_none());
+        }
+    }
+
+    /// A date with no pin is not stored. An unpinned list stores 0, whatever date came with it.
+    #[test]
+    fn an_unpinned_list_stores_no_date() {
+        let mut lib = Library::in_memory().unwrap();
+        lib.put_reminder_lists(&[ReminderList {
+            pinned: false,
+            pinned_at: Some(1_790_609_001_389),
+            ..list("x")
+        }])
+        .unwrap();
+        let stored: i64 = lib
+            .conn
+            .query_row(
+                "SELECT pinned FROM reminder_lists WHERE guid = 'x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 0);
+        let got = &lib.reminder_lists().unwrap()[0];
+        assert!(!got.pinned && got.pinned_at.is_none());
+    }
+
+    /// Libraries written before the date was kept hold 0 or 1. They read as before, with no
+    /// date, and need no migration.
+    #[test]
+    fn old_boolean_pins_still_read() {
+        let mut lib = Library::in_memory().unwrap();
+        lib.put_reminder_lists(&[list("zero"), list("one")])
+            .unwrap();
+        lib.conn
+            .execute(
+                "UPDATE reminder_lists SET pinned = 1 WHERE guid = 'one'",
+                [],
+            )
+            .unwrap();
+        let got = |g: &str| {
+            lib.reminder_lists()
+                .unwrap()
+                .into_iter()
+                .find(|l| l.guid == g)
+                .unwrap()
+        };
+        assert!(got("one").pinned && got("one").pinned_at.is_none());
+        assert!(!got("zero").pinned && got("zero").pinned_at.is_none());
+    }
+
+    /// The date reaches anything that reads the list as JSON, and older JSON with no date
+    /// still reads.
+    #[test]
+    fn a_pin_date_serializes_and_old_json_reads() {
+        let dated = ReminderList {
+            pinned: true,
+            pinned_at: Some(1_790_609_001_389),
+            ..list("d")
+        };
+        let v = serde_json::to_value(&dated).unwrap();
+        assert_eq!(v["pinned"], true);
+        assert_eq!(v["pinnedAt"], 1_790_609_001_389_i64);
+        assert_eq!(
+            serde_json::to_value(list("p")).unwrap()["pinnedAt"],
+            serde_json::Value::Null
+        );
+        let old: ReminderList = serde_json::from_value(serde_json::json!({
+            "guid": "o", "title": "Old", "colour": null, "ctag": null,
+            "sortOrder": 0, "enabled": true, "pinned": true
+        }))
+        .unwrap();
+        assert!(old.pinned && old.pinned_at.is_none());
     }
 
     /// The bug this guards: an incremental sync returns only what changed, so treating
@@ -2569,6 +2694,9 @@ pub struct ReminderSmartList {
     pub colour: Option<String>,
     pub emblem: Option<String>,
     pub pinned: bool,
+    /// When it was pinned (ms since 1970), where Apple gave a date.
+    #[serde(default)]
+    pub pinned_at: Option<i64>,
     pub sorting: Option<String>,
     /// `FilterData` as Apple wrote it (JSON), for a custom list.
     pub filter: Option<String>,
@@ -3329,7 +3457,7 @@ impl Library {
                     s.title,
                     s.colour,
                     s.emblem,
-                    i64::from(s.pinned),
+                    pinned_column(s.pinned, s.pinned_at),
                     s.sorting,
                     s.filter,
                     stamp
@@ -3534,6 +3662,7 @@ impl Library {
                 colour: r.get(3)?,
                 emblem: r.get(4)?,
                 pinned: r.get::<_, i64>(5)? != 0,
+                pinned_at: pinned_at_of(r.get(5)?),
                 sorting: r.get(6)?,
                 filter: r.get(7)?,
             })
@@ -3871,6 +4000,49 @@ mod detail_tests {
         assert!(d.early_alerts.is_empty());
         assert_eq!(lib.reminder_detail("Reminder/2").unwrap().tags.len(), 2);
         assert_eq!(lib.reminder_smart_lists().unwrap().len(), 1, "kept");
+    }
+
+    /// A smart list keeps its pin date in the same `pinned` column as a list, and an old 1
+    /// still reads as pinned with no date.
+    #[test]
+    fn a_smart_list_pin_keeps_its_date() {
+        let mut lib = Library::in_memory().unwrap();
+        let smart = |g: &str, pinned: bool, pinned_at: Option<i64>| ReminderSmartList {
+            guid: g.into(),
+            kind: "custom".into(),
+            pinned,
+            pinned_at,
+            ..Default::default()
+        };
+        lib.put_reminder_details(&ReminderDetailsPass {
+            whole: true,
+            smart_lists: vec![
+                smart("SmartList/D", true, Some(1_700_000_000_000)),
+                smart("SmartList/U", true, None),
+                smart("SmartList/P", false, Some(1_700_000_000_000)),
+                smart("SmartList/O", false, None),
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+        lib.conn
+            .execute(
+                "UPDATE reminder_smart_lists SET pinned = 1 WHERE guid = 'SmartList/O'",
+                [],
+            )
+            .unwrap();
+        let got = |g: &str| {
+            lib.reminder_smart_lists()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.guid == g)
+                .unwrap()
+        };
+        assert!(got("SmartList/D").pinned);
+        assert_eq!(got("SmartList/D").pinned_at, Some(1_700_000_000_000));
+        assert!(got("SmartList/U").pinned && got("SmartList/U").pinned_at.is_none());
+        assert!(!got("SmartList/P").pinned && got("SmartList/P").pinned_at.is_none());
+        assert!(got("SmartList/O").pinned && got("SmartList/O").pinned_at.is_none());
     }
 
     /// A reminder deleted takes its details with it.

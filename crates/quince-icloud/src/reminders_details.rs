@@ -221,10 +221,8 @@ pub fn smart_list_from_record(record: &Value) -> Option<ReminderSmartList> {
                 .and_then(|v| v.get("daHexString")?.as_str().map(str::to_ascii_uppercase))
         }),
         emblem: field::string(record, "BadgeEmblem").filter(|e| !e.trim().is_empty()),
-        pinned: record
-            .pointer("/fields/PinnedDate/value")
-            .and_then(Value::as_i64)
-            .is_some_and(|ms| ms > 0),
+        pinned: super::pinned_at(record).is_some(),
+        pinned_at: super::pinned_at(record),
         sorting: field::string(record, "SortingStyle"),
         filter,
     })
@@ -1447,7 +1445,14 @@ mod tests {
             "SmartListType": { "type": "STRING", "value": "com.apple.reminders.smartlist.today" },
             "PinnedDate": { "type": "TIMESTAMP", "value": 1_700_000_000_000_i64 } } });
         let t = smart_list_from_record(&today).unwrap();
+        assert_eq!(t.pinned_at, Some(1_700_000_000_000));
         assert_eq!((t.kind.as_str(), t.pinned, t.filter), ("today", true, None));
+        assert!(!s.pinned && s.pinned_at.is_none());
+        // Unpinning leaves a date in year one behind rather than clearing the field.
+        let mut unpinned = today.clone();
+        unpinned["fields"]["PinnedDate"]["value"] = json!(-62_135_769_600_000_i64);
+        let u = smart_list_from_record(&unpinned).unwrap();
+        assert!(!u.pinned && u.pinned_at.is_none());
     }
 
     #[test]
