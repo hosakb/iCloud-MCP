@@ -882,11 +882,11 @@ async fn initialize_and_discover_only_notes_and_reminders_tools() {
         .collect();
     assert!(names.contains(&"notes_list"));
     assert!(names.contains(&"reminders_list"));
-    assert!(!names
-        .iter()
-        .any(|n| ["photos", "drive", "secret", "password", "code"]
+    assert!(!names.iter().any(
+        |n| ["photos", "secret", "password", "code", "download", "upload"]
             .iter()
-            .any(|s| n.contains(s))));
+            .any(|s| n.contains(s))
+    ));
     // Contacts are read-only in this phase.
     let contacts: Vec<_> = names.iter().filter(|n| n.contains("contacts")).collect();
     assert_eq!(
@@ -908,6 +908,17 @@ async fn initialize_and_discover_only_notes_and_reminders_tools() {
             &"calendar_search",
             &"calendar_get",
             &"calendar_refresh"
+        ]
+    );
+    // Drive is read-only metadata in this phase.
+    let drive: Vec<_> = names.iter().filter(|n| n.contains("drive")).collect();
+    assert_eq!(
+        drive,
+        [
+            &"drive_list",
+            &"drive_get",
+            &"drive_search",
+            &"drive_refresh"
         ]
     );
     assert!(server
