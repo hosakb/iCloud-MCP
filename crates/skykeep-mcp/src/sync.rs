@@ -329,9 +329,18 @@ async fn sync_pass(
     );
     let root = ctx.cloudkit.as_deref().ok_or("service_unavailable")?;
     let mut services = Vec::new();
+    // Each write waiting before the drain: the ones gone after it, not refused, were taken by
+    // CloudKit (every step of a write answered done). Taken is not read back.
+    let mut waiting_before = Vec::new();
     for service in ["notes", "reminders"] {
         let lock = Mutex::new(());
         let before = pass::run(service, &ctx, &data, &lock).await;
+        waiting_before.extend(
+            data.lock()
+                .await
+                .outbox_pending(service)
+                .map_err(|_| "library_unavailable")?,
+        );
         // Never send when the authenticated read is gated or failed.
         let mut sent = false;
         if matches!(before.outcome, pass::Outcome::Ok) {
@@ -396,6 +405,22 @@ async fn sync_pass(
         .outbox_count()
         .map_err(|_| "library_unavailable")?
         .saturating_sub(refused.len());
+    let mut still = Vec::new();
+    for service in ["notes", "reminders"] {
+        still.extend(
+            library
+                .outbox_pending(service)
+                .map_err(|_| "library_unavailable")?
+                .into_iter()
+                .map(|p| p.id),
+        );
+    }
+    let accepted: Vec<Value> = waiting_before
+        .iter()
+        .filter(|p| !still.contains(&p.id) && !refused.iter().any(|r| r.id == p.id))
+        .take(MAX_PENDING)
+        .map(|p| json!({"service":p.service,"kind":p.kind,"record":p.record}))
+        .collect();
     // Bounded: admission stops at MAX_PENDING waiting writes, and each is refused at most once.
     let refused_now: Vec<Value> = refused
         .iter()
@@ -404,6 +429,6 @@ async fn sync_pass(
         .map(refused_view)
         .collect();
     Ok(
-        json!({"services":services,"queued":waiting,"refused":refused.len(),"refused_this_sync":refused_now,"remote_verified":false,"verification":"upstream sync and replay only; field-level read-back is not guaranteed"}),
+        json!({"services":services,"queued":waiting,"refused":refused.len(),"refused_this_sync":refused_now,"cloudkit_accepted_this_sync":accepted,"remote_verified":false,"verification":"upstream sync and replay only; field-level read-back is not guaranteed"}),
     )
 }

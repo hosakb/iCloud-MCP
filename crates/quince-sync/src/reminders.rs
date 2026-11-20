@@ -28,6 +28,12 @@ pub struct Done {
 }
 
 /// A reminder made here, under the name it was given here.
+///
+/// The options after `flagged` are each written as their own CloudKit records after the
+/// reminder. Every record name they need is chosen when the change is queued and kept here,
+/// so a send repeated after a lost answer, a failure part way or a restart finds what it made
+/// and finishes, never making a second rule or alert or leaving one nothing points at. Left
+/// out of the queued JSON when unset, so a plain create reads and writes as it always did.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Create {
     pub list_guid: String,
@@ -35,6 +41,86 @@ pub struct Create {
     pub due_at: Option<i64>,
     pub all_day: Option<bool>,
     pub flagged: Option<bool>,
+    /// The IANA zone a timed date is kept and rung in; `None` is this computer's zone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<CreateRepeat>,
+    /// An alert at the due time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alarm: Option<CreateAlarm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub early_alert: Option<CreateEarlyAlert>,
+}
+
+impl Create {
+    fn has_options(&self) -> bool {
+        self.repeat.is_some() || self.alarm.is_some() || self.early_alert.is_some()
+    }
+}
+
+/// A new reminder's repeat: Apple's frequency (0 daily) and interval, the instant it ends
+/// (seconds) or `None` for ever, and the bare id of the rule record it is written as.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateRepeat {
+    pub frequency: i64,
+    pub interval: i64,
+    pub end_at: Option<i64>,
+    pub rule_id: String,
+}
+
+/// A new reminder's alert at its due time: the bare ids of its alarm and trigger records.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateAlarm {
+    pub alarm_id: String,
+    pub trigger_id: String,
+}
+
+/// A new reminder's early alert: `count` units before it is due (unit 0 minutes, 1 hours,
+/// 2 days, 3 weeks, 4 months), the account id Apple writes inside it, and its own id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateEarlyAlert {
+    pub count: i64,
+    pub unit: i64,
+    pub account: String,
+    pub id: String,
+}
+
+/// The longest zone name looked up; no IANA name comes close.
+const MOST_ZONE_BYTES: usize = 64;
+
+/// `name` as an IANA zone this computer's zone database knows, by its canonical name, or
+/// `None`. Only IANA names: a fixed offset or a POSIX rule string is not a zone a phone keeps.
+#[must_use]
+pub fn iana_zone(name: &str) -> Option<String> {
+    if name.is_empty() || name.len() > MOST_ZONE_BYTES || name.trim() != name {
+        return None;
+    }
+    let zone = jiff::tz::TimeZone::get(name).ok()?;
+    zone.iana_name().map(ToString::to_string)
+}
+
+/// This computer's zone by its IANA name, UTC when it has none.
+#[must_use]
+pub fn system_zone() -> String {
+    jiff::tz::TimeZone::system()
+        .iana_name()
+        .unwrap_or("UTC")
+        .to_string()
+}
+
+/// The last second of `date` (`YYYY-MM-DD`) in `zone`, in Unix seconds: a repeat ending on a
+/// day still rings that day. Worked out in the zone, so a day a clock moves on is still that
+/// day's end. `None` for anything that is not a real date or zone.
+#[must_use]
+pub fn end_of_day(date: &str, zone: &str) -> Option<i64> {
+    if date.len() != 10 {
+        return None;
+    }
+    let day: jiff::civil::Date = date.parse().ok()?;
+    let zone = jiff::tz::TimeZone::get(zone).ok()?;
+    let at = day.at(23, 59, 59, 0).to_zoned(zone).ok()?;
+    Some(at.timestamp().as_second())
 }
 
 /// `Option<Option<T>>` kept whole through JSON: absent is "leave it", null is "clear it".
@@ -128,6 +214,7 @@ impl Edit {
             priority: self.priority,
             list_guid: self.list_guid.clone(),
             parent_guid: self.parent_guid.clone(),
+            timezone: None,
         }
     }
 
@@ -210,15 +297,25 @@ fn lay_create(l: &mut Library, guid: &str, c: &Create) -> quince_core::Result<()
     if !l.reminder_lists()?.iter().any(|x| x.guid == c.list_guid) {
         return Ok(());
     }
+    let all_day = c.all_day.unwrap_or(false) && c.due_at.is_some();
     l.put_reminder_local(&Reminder {
         guid: guid.to_string(),
         list_guid: c.list_guid.clone(),
         title: c.title.trim().to_string(),
         due_at: c.due_at,
-        all_day: c.all_day.unwrap_or(false) && c.due_at.is_some(),
+        all_day,
         flagged: c.flagged.unwrap_or(false),
+        timezone: c
+            .timezone
+            .clone()
+            .filter(|_| !all_day && c.due_at.is_some()),
         ..Default::default()
-    })
+    })?;
+    // Shown repeating at once, so a tick before it is sent moves it on, in its own zone.
+    if let Some(r) = &c.repeat {
+        l.set_reminder_repeat(guid, r.frequency, r.interval)?;
+    }
+    Ok(())
 }
 
 /// An edit to a reminder. Edits not yet sent and still the last word on it are one edit.
@@ -420,6 +517,82 @@ pub fn apply(
 
 // --- Sending: the queue's half.
 
+/// The rest of a reminder made here with a repeat or alerts, once the reminder itself is at
+/// Apple: its date, flag and zone, then its repeat, its alert at the due time and its early
+/// alert, in that order (each needs the date). Every step is safe to run again: the reminder
+/// is made under its own name, the date is set to the same value, and each part is written
+/// under the id it was queued with and found, not made again, when a send is repeated. So a
+/// step that fails fails the whole change, which the queue sends again from the start, and
+/// the answer says done only when Apple took every step.
+async fn send_create_options(
+    http: &reqwest::Client,
+    root: &str,
+    params: Vec<(String, String)>,
+    guid: &str,
+    c: &Create,
+) -> Result<(), Error> {
+    use quince_icloud::reminders::{self as r, details as d};
+    let zone = c.timezone.clone().unwrap_or_else(system_zone);
+    let made = Reminder {
+        guid: guid.to_string(),
+        list_guid: c.list_guid.clone(),
+        title: c.title.clone(),
+        due_at: c.due_at,
+        ..Default::default()
+    };
+    let edit = ReminderEdit {
+        due_at: c.due_at.map(Some),
+        all_day: c.all_day,
+        flagged: c.flagged,
+        timezone: Some(zone.clone()),
+        ..Default::default()
+    };
+    r::edit_cloudkit(http, root, params.clone(), &made, &edit).await?;
+    if let Some(rep) = &c.repeat {
+        let repeat = r::Repeat {
+            frequency: rep.frequency,
+            interval: rep.interval,
+        };
+        r::set_repeat_named_cloudkit(
+            http,
+            root,
+            params.clone(),
+            &made,
+            repeat,
+            rep.end_at,
+            &[],
+            &rep.rule_id,
+        )
+        .await?;
+    }
+    if let (Some(alarm), Some(due)) = (&c.alarm, c.due_at) {
+        r::add_alarm_named_cloudkit(
+            http,
+            root,
+            params.clone(),
+            guid,
+            due,
+            &zone,
+            &alarm.alarm_id,
+            &alarm.trigger_id,
+        )
+        .await?;
+    }
+    if let Some(early) = &c.early_alert {
+        d::add_early_alert_named_cloudkit(
+            http,
+            root,
+            params,
+            guid,
+            (early.count, early.unit),
+            Some(&early.account),
+            &early.id,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 pub async fn send(
     library: &LibraryLock,
     http: &reqwest::Client,
@@ -454,6 +627,9 @@ pub async fn send(
                 &c.title,
             )
             .await?;
+            if c.has_options() {
+                return send_create_options(http, root, params, &p.record, &c).await;
+            }
             if c.due_at.is_some() || c.flagged.is_some() {
                 let made = Reminder {
                     guid: p.record.clone(),
@@ -465,6 +641,7 @@ pub async fn send(
                     due_at: c.due_at.map(Some),
                     all_day: c.all_day,
                     flagged: c.flagged,
+                    timezone: c.timezone.clone(),
                     ..Default::default()
                 };
                 // The reminder exists at Apple now: its date or flag failing is noted, never
@@ -551,3 +728,6 @@ pub async fn send(
         ))),
     }
 }
+
+#[cfg(test)]
+mod create_tests;
