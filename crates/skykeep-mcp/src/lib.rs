@@ -1623,7 +1623,7 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
 }
 
 const SERVER_TITLE: &str =
-    "Skykeep: Apple iCloud Notes, Reminders, Contacts, Calendar, Photos & Drive";
+    "Skykeep: Apple iCloud Notes, Reminders, Contacts, Calendar, Photos & iCloud Drive";
 const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, and reads the user's Apple iCloud Contacts, Apple iCloud Calendar and Apple iCloud Photos metadata (read-only), and Apple iCloud Drive folder listings and file details (read-only; no file contents). Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode and are queued until sync sends them. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
 
 fn tools() -> Vec<Value> {

@@ -357,6 +357,8 @@ async fn tools_list_names_apple_icloud_drive_with_strict_read_only_schemas() {
         "{instructions}"
     );
     assert!(instructions.contains("drive_refresh"), "{instructions}");
+    let title = init["result"]["serverInfo"]["title"].as_str().unwrap();
+    assert!(title.contains("iCloud Drive"), "{title}");
     let list = server
         .handle(json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
         .await
@@ -1464,4 +1466,157 @@ async fn a_folder_moved_into_a_folder_read_in_the_same_refresh_keeps_its_content
     assert!(library.drive_children(PROJECTS).unwrap().is_empty());
     let listed = library.state("mcp.drive.listed").unwrap().unwrap();
     assert!(!listed.contains("PROJECTS"), "{listed}");
+}
+
+#[tokio::test]
+async fn a_folder_apple_files_in_the_trash_is_refused_and_its_items_not_stored() {
+    for marks in [
+        json!({"parentId":"TRASH_ROOT"}),
+        json!({"restorePath":"/Documents"}),
+        json!({"dateExpiration":"2026-12-01T00:00:00Z"}),
+    ] {
+        let (dir, _server, _old) = refreshed(Some("yolo")).await;
+        let kept = cached(dir.path());
+        let mut record = json!({"drivewsid":DOCS,"status":"OK",
+            "items":[file("FILE::z::LIVE", "live", "txt", 1)]});
+        for (k, v) in marks.as_object().unwrap() {
+            record[k] = v.clone();
+        }
+        let remote = apple().await;
+        serve(
+            &remote,
+            DOCS,
+            ResponseTemplate::new(200).set_body_json(json!([record])),
+        )
+        .await;
+        assert_eq!(
+            refresh(dir.path(), &remote.uri(), json!({"id":DOCS}))
+                .await
+                .unwrap_err(),
+            "drive_folder_in_trash_cache_kept",
+            "{marks}"
+        );
+        assert_eq!(cached(dir.path()), kept, "{marks}");
+        let library = quince_core::Library::open(dir.path()).unwrap();
+        assert!(library.drive_item("FILE::z::LIVE").unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn a_folder_that_leaves_the_cache_during_refresh_gets_no_rows() {
+    let (dir, _server, _old) = refreshed(Some("yolo")).await;
+    let remote = apple().await;
+    serve(
+        &remote,
+        DEEP,
+        ResponseTemplate::new(200)
+            .set_body_json(listing(
+                DEEP,
+                json!([file("FILE::z::NEW", "new", "txt", 1)]),
+            ))
+            .set_delay(std::time::Duration::from_millis(300)),
+    )
+    .await;
+    let path_buf = dir.path().to_owned();
+    let uri = remote.uri();
+    let running = tokio::spawn(async move { refresh(&path_buf, &uri, json!({"id":DEEP})).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Another writer drops the folder's row while the answer is on its way.
+    {
+        let mut library = quince_core::Library::open(dir.path()).unwrap();
+        let mut docs = library.drive_children(DOCS).unwrap();
+        docs.retain(|i| i.drivewsid != DEEP);
+        library.put_drive_children(DOCS, &docs).unwrap();
+    }
+    let before = cached(dir.path());
+    assert_eq!(
+        running.await.unwrap().unwrap_err(),
+        "drive_folder_left_cache_cache_kept"
+    );
+    assert_eq!(cached(dir.path()), before);
+    let library = quince_core::Library::open(dir.path()).unwrap();
+    assert!(library.drive_item("FILE::z::NEW").unwrap().is_none());
+    assert!(drive_failed(dir.path()));
+}
+
+#[tokio::test]
+async fn a_folder_read_above_is_never_stored_as_a_child_below() {
+    let remote = apple().await;
+    let answer =
+        |id: &str, items: Value| ResponseTemplate::new(200).set_body_json(listing(id, items));
+    serve(
+        &remote,
+        ROOT,
+        answer(ROOT, json!([folder(DOCS, "Documents")])),
+    )
+    .await;
+    serve(
+        &remote,
+        DOCS,
+        answer(DOCS, json!([folder(DEEP, DEEP_NAME)])),
+    )
+    .await;
+    // Apple lists the deep folder's own grandparent inside it.
+    serve(
+        &remote,
+        DEEP,
+        answer(
+            DEEP,
+            json!([folder(DOCS, "Loop"), file("FILE::z::x", "x", "txt", 1)]),
+        ),
+    )
+    .await;
+    let (dir, mut server) = bound(Some("yolo"));
+    refresh(
+        dir.path(),
+        &remote.uri(),
+        json!({"path":format!("/Documents/{DEEP_NAME}")}),
+    )
+    .await
+    .unwrap();
+    let library = quince_core::Library::open(dir.path()).unwrap();
+    assert_eq!(
+        library
+            .drive_item(DOCS)
+            .unwrap()
+            .unwrap()
+            .parent_id
+            .as_deref(),
+        Some(ROOT)
+    );
+    let inside: Vec<String> = library
+        .drive_children(DEEP)
+        .unwrap()
+        .into_iter()
+        .map(|i| i.drivewsid)
+        .collect();
+    assert_eq!(inside, ["FILE::z::x"]);
+    init(&mut server, false).await;
+    let got = ok(&mut server, "drive_get", json!({"id":DEEP})).await;
+    assert_eq!(got["item"]["path"], format!("/Documents/{DEEP_NAME}"));
+}
+
+#[tokio::test]
+async fn search_skips_items_in_folders_whose_listed_mark_was_let_go() {
+    let (dir, mut server, _remote) = refreshed(Some("yolo")).await;
+    // The mark for Documents goes, as it would past the 10,000-folder limit.
+    {
+        let mut library = quince_core::Library::open(dir.path()).unwrap();
+        let mut listed: serde_json::Map<String, Value> =
+            serde_json::from_str(&library.state("mcp.drive.listed").unwrap().unwrap()).unwrap();
+        assert!(listed.remove(DOCS).is_some());
+        library
+            .set_state("mcp.drive.listed", &Value::Object(listed).to_string())
+            .unwrap();
+    }
+    init(&mut server, false).await;
+    let scans = ok(&mut server, "drive_search", json!({"query":"scan"})).await;
+    assert_eq!(scans["items"], json!([]));
+    assert_eq!(scans["total"], 0);
+    let deep = ok(&mut server, "drive_search", json!({"query":"unicode"})).await;
+    assert_eq!(deep["items"], json!([]), "Documents holds it");
+    let report = ok(&mut server, "drive_search", json!({"query":"report"})).await;
+    assert_eq!(names(&report), ["report.pdf"]);
+    let bell = ok(&mut server, "drive_search", json!({"query":"bell"})).await;
+    assert_eq!(bell["total"], 1, "the deep folder is still marked");
 }

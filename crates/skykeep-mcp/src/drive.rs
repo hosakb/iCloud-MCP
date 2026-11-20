@@ -512,8 +512,16 @@ pub(crate) fn search(library: &Library, args: Value) -> Result<Value, &'static s
     let mut found = library
         .search_drive(&args.query, SEARCH_KEEPS + 1)
         .map_err(|_| "search_unavailable")?;
-    found.retain(|i| !is_trash(i));
     let capped = found.len() > SEARCH_KEEPS;
+    // Only items in folders still marked as read: a folder whose mark was let go (past
+    // `MAX_LISTED`) no longer says its items are current.
+    let listed = listed_map(library);
+    found.retain(|i| {
+        !is_trash(i)
+            && i.parent_id
+                .as_deref()
+                .is_some_and(|p| listed.contains_key(p))
+    });
     found.truncate(SEARCH_KEEPS);
     let entries: Vec<Value> = found
         .iter()
@@ -641,6 +649,7 @@ enum Stop {
     PathNotFound,
     Ambiguous,
     NotAFolder,
+    InTrash,
 }
 
 impl Stop {
@@ -656,6 +665,7 @@ impl Stop {
             Stop::PathNotFound => "drive_path_not_found_cache_kept",
             Stop::Ambiguous => "drive_ambiguous_path_cache_kept",
             Stop::NotAFolder => "drive_not_a_folder_cache_kept",
+            Stop::InTrash => "drive_folder_in_trash_cache_kept",
         }
     }
 
@@ -738,6 +748,21 @@ fn checked_listing(id: &str, body: &Value, limits: &RefreshLimits) -> Result<Vec
         None | Some("OK") => {}
         Some("ID_INVALID") => return Err(Stop::FolderGone),
         Some(_) => return Err(Stop::Failed),
+    }
+    // A folder in Recently Deleted is not listed as live, nor are its items. Apple marks one
+    // there as it marks a trashed item: filed under the trash, or carrying where Recover puts
+    // it back.
+    let filed_in_trash = ["parentId", "drivewsid"].iter().any(|key| {
+        folder
+            .get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|v| v.contains(TRASH))
+    });
+    if filed_in_trash
+        || folder.get("restorePath").is_some()
+        || folder.get("dateExpiration").is_some()
+    {
+        return Err(Stop::InTrash);
     }
     let rows = folder
         .get("items")
@@ -823,6 +848,12 @@ fn child_named<'a>(items: &'a [DriveItem], name: &str) -> Result<&'a DriveItem, 
     Ok(first)
 }
 
+/// Drops from a folder's items any folder already read above it in this refresh: stored, it
+/// would make a folder its own ancestor.
+fn not_above(items: &mut Vec<DriveItem>, above: &[(String, Vec<DriveItem>)]) {
+    items.retain(|i| !above.iter().any(|(id, _)| *id == i.drivewsid));
+}
+
 /// Reads the folder `start` names: for a path, the root and each folder on it in turn; for an
 /// id, that folder alone. Any read failing fails the whole refresh.
 async fn fetch(
@@ -835,21 +866,24 @@ async fn fetch(
     match start {
         Start::Folder(id, path) => {
             let items = folder_read(client, root, id, limits, &mut budget).await?;
+            // `checked_listing` already drops the folder itself from its own items.
             Ok(Read {
                 folders: vec![(id.clone(), items)],
                 path: path.clone(),
             })
         }
         Start::Path(names) => {
-            let mut folders = Vec::new();
+            let mut folders: Vec<(String, Vec<DriveItem>)> = Vec::new();
             let mut id = ROOT.to_string();
             for name in names {
-                let items = folder_read(client, root, &id, limits, &mut budget).await?;
+                let mut items = folder_read(client, root, &id, limits, &mut budget).await?;
+                not_above(&mut items, &folders);
                 let next = child_named(&items, name)?.drivewsid.clone();
                 folders.push((id, items));
                 id = next;
             }
-            let items = folder_read(client, root, &id, limits, &mut budget).await?;
+            let mut items = folder_read(client, root, &id, limits, &mut budget).await?;
+            not_above(&mut items, &folders);
             folders.push((id, items));
             Ok(Read {
                 folders,
@@ -881,6 +915,16 @@ fn apply(library: &mut Library, read: &Read) -> quince_icloud::Result<()> {
         .collect();
     let mut gone = Vec::new();
     for (id, items) in &read.folders {
+        // Still a live cached folder: the root, one this refresh stored a moment ago, or the
+        // one asked for by id. Something else may have changed the cache since it was read;
+        // items stored under a folder it no longer holds would be rows no path reaches.
+        let live = id == ROOT
+            || library
+                .drive_item(id)?
+                .is_some_and(|f| f.is_container() && !is_trash(&f));
+        if !live {
+            return Err(quince_icloud::Error::Protocol(LEFT_CACHE.into()));
+        }
         let before: Vec<String> = library
             .drive_children(id)?
             .into_iter()
@@ -910,6 +954,9 @@ fn apply(library: &mut Library, read: &Read) -> quince_icloud::Result<()> {
     library.mark_synced(SERVICE, cursor.as_deref())?;
     Ok(())
 }
+
+/// A folder that was cached when the refresh started and is not any more.
+const LEFT_CACHE: &str = "drive_folder_left_cache_cache_kept";
 
 /// Where a refresh starts, settled from the cache before anything is asked.
 #[derive(Clone, Debug)]
@@ -1085,7 +1132,14 @@ async fn read_folder(
                     Some("account_changed_during_refresh_cache_kept");
                 return Err(quince_icloud::Error::Protocol(pass::NOT_YOURS_WORDS.into()));
             }
-            apply(library, &read)?;
+            if let Err(e) = apply(library, &read) {
+                if matches!(&e, quince_icloud::Error::Protocol(m) if m == LEFT_CACHE) {
+                    *stopped
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(LEFT_CACHE);
+                }
+                return Err(e);
+            }
             if let Some((id, items)) = read.folders.last() {
                 *summary
                     .lock()
