@@ -506,6 +506,38 @@ pub(crate) fn list(library: &Library, args: Value) -> Result<Value, &'static str
     })
 }
 
+/// A folder's cached children in no particular order: the rows and columns
+/// `Library::drive_children` reads, without its name sort, which folds both names on every
+/// comparison. For search, which orders its matches by date itself.
+fn unsorted_children(library: &Library, parent: &str) -> Result<Vec<DriveItem>, ()> {
+    let mut stmt = library
+        .conn()
+        .prepare_cached(
+            "SELECT drivewsid, parent_id, name, extension, kind, size, child_count,
+                    created_at, modified_at, etag
+             FROM drive_items
+             WHERE parent_id = ?1",
+        )
+        .map_err(|_| ())?;
+    let rows = stmt
+        .query_map([parent], |row| {
+            Ok(DriveItem {
+                drivewsid: row.get(0)?,
+                parent_id: row.get(1)?,
+                name: row.get(2)?,
+                extension: row.get(3)?,
+                kind: row.get(4)?,
+                size: row.get(5)?,
+                child_count: row.get(6)?,
+                created_at: row.get(7)?,
+                modified_at: row.get(8)?,
+                etag: row.get(9)?,
+            })
+        })
+        .map_err(|_| ())?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|_| ())
+}
+
 /// Newest first: changed most recently, undated last, then by id so equal dates keep one
 /// order. The engine's search orders the same way, without the id.
 fn newest_first(a: &DriveItem, b: &DriveItem) -> std::cmp::Ordering {
@@ -534,9 +566,7 @@ fn eligible_matches(
     folders.sort();
     let mut found: Vec<DriveItem> = Vec::new();
     for folder in folders {
-        let held = library
-            .drive_children(&folder)
-            .map_err(|_| "search_unavailable")?;
+        let held = unsorted_children(library, &folder).map_err(|_| "search_unavailable")?;
         for item in held.into_iter().filter(|i| !is_trash(i)) {
             let name = format!("{}.{}", item.name, item.extension.as_deref().unwrap_or(""));
             if quince_core::fold::holds_all(&quince_core::fold::fold(&name), &words) {
@@ -1314,6 +1344,48 @@ mod tests {
         assert_eq!(items[1].extension.as_deref(), Some(" txt"));
         assert_eq!(items[2].name, "Untitled");
         assert_eq!(items[2].extension, None);
+    }
+
+    /// The unsorted read holds exactly the rows `drive_children` holds, field for field.
+    #[test]
+    fn the_unsorted_child_read_matches_the_engine_read() {
+        let mut library = Library::in_memory().unwrap();
+        let item = |id: &str, name: &str, kind: &str, at: Option<i64>| DriveItem {
+            drivewsid: id.into(),
+            parent_id: None,
+            name: name.into(),
+            extension: (kind == "FILE").then(|| "txt".to_string()),
+            kind: kind.into(),
+            size: (kind == "FILE").then_some(3),
+            child_count: (kind == "FOLDER").then_some(2),
+            created_at: Some(1),
+            modified_at: at,
+            etag: Some("e".into()),
+        };
+        library
+            .put_drive_children(
+                ROOT,
+                &[
+                    item("FILE::z::b", "Scan 10", "FILE", Some(5)),
+                    item("FOLDER::z::a", "Zoo", "FOLDER", None),
+                    item("FILE::z::c", " Été ", "FILE", Some(9)),
+                ],
+            )
+            .unwrap();
+        library
+            .put_drive_children("FOLDER::z::a", &[item("FILE::z::d", "in", "FILE", None)])
+            .unwrap();
+        let key = |mut v: Vec<DriveItem>| {
+            v.sort_by(|a, b| a.drivewsid.cmp(&b.drivewsid));
+            v
+        };
+        for parent in [ROOT, "FOLDER::z::a", "FOLDER::z::none"] {
+            assert_eq!(
+                key(unsorted_children(&library, parent).unwrap()),
+                key(library.drive_children(parent).unwrap()),
+                "{parent}"
+            );
+        }
     }
 
     #[test]
