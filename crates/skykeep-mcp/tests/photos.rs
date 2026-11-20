@@ -343,6 +343,9 @@ async fn albums_list_and_album_pages_leave_out_hidden_and_shared_photos() {
     assert_eq!(items[1]["id"], "ALB-TRIP");
     assert_eq!(items[1]["name"], "Trip");
     assert_eq!(items[1]["parent_id"], "FOLDER-1");
+    // Counted as the album's page shows it: the hidden and the Shared Library photo left out.
+    assert_eq!(items[1]["photo_count"], 2);
+    assert_eq!(items[0]["photo_count"], 0);
     let page = ok(&mut server, "photos_list", json!({"album_id":"ALB-TRIP"})).await;
     assert_eq!(ids(&page), ["P-VIDEO", "P-BEACH"], "album order");
     assert_eq!(page["album"]["name"], "Trip");
@@ -585,6 +588,75 @@ async fn long_fields_are_shortened_marked_and_fit_their_caps() {
 }
 
 #[tokio::test]
+async fn a_huge_file_type_is_shortened_and_pages_still_move_on() {
+    let (dir, mut server) = bound(None);
+    let odd: Vec<Photo> = (0..100)
+        .map(|n| {
+            let mut p = photo(&format!("P-ODD-{n:02}"), 1_700_000_000 - n);
+            p.uti = Some("\u{1}".repeat(50_000));
+            p
+        })
+        .collect();
+    quince_core::Library::open(dir.path())
+        .unwrap()
+        .put_photos_in(None, &odd)
+        .unwrap();
+    init(&mut server, false).await;
+    let reply = call(&mut server, 3, "photos_list", json!({"limit":100})).await;
+    assert!(reply_bytes(&reply) <= 262_144);
+    let page = text(&reply);
+    let items = page["items"].as_array().unwrap();
+    assert!(!items.is_empty(), "a page always makes progress: {page}");
+    assert_eq!(
+        page["next_offset"].as_u64(),
+        (items.len() < 100).then_some(items.len() as u64)
+    );
+    for item in items {
+        let size = serde_json::to_string(&serde_json::to_string(item).unwrap())
+            .unwrap()
+            .len();
+        assert!(size <= 8192, "{size}");
+        assert!(item["shortened"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("file_type")));
+        assert!(item["file_type"].as_str().unwrap().chars().count() <= 256);
+    }
+    let reply = call(&mut server, 4, "photos_get", json!({"id":"P-ODD-00"})).await;
+    assert!(reply_bytes(&reply) <= 65_536);
+    let one = text(&reply);
+    assert_eq!(
+        one["photo"]["file_type"].as_str().unwrap().chars().count(),
+        256
+    );
+    assert_eq!(one["photo_shortened"], true);
+}
+
+#[tokio::test]
+async fn exactly_ten_thousand_albums_are_not_marked_capped() {
+    let (dir, mut server) = bound(None);
+    let albums: Vec<Album> = (0..10_000)
+        .map(|n| Album {
+            id: format!("ALB-{n:05}"),
+            name: format!("Album {n}"),
+            position: n,
+            change_tag: None,
+            folder: false,
+            parent: None,
+        })
+        .collect();
+    quince_core::Library::open(dir.path())
+        .unwrap()
+        .replace_albums(&albums)
+        .unwrap();
+    init(&mut server, false).await;
+    let page = ok(&mut server, "photos_albums", json!({"offset":9_999})).await;
+    assert_eq!(page["album_index_capped"], false);
+    assert_eq!(page["total"], 10_000);
+    assert_eq!(ids(&page), ["ALB-09999"]);
+}
+
+#[tokio::test]
 async fn the_album_index_stops_at_ten_thousand_and_pages_fit() {
     let (dir, mut server) = bound(None);
     let albums: Vec<Album> = (0..10_050)
@@ -617,6 +689,9 @@ async fn the_album_index_stops_at_ten_thousand_and_pages_fit() {
     assert_eq!(last["items"].as_array().unwrap().len(), 50);
     assert_eq!(last["items"][49]["id"], "ALB-09999");
     assert!(last["next_offset"].is_null());
+    // An album past the listing's cap is still read by its id.
+    let beyond = ok(&mut server, "photos_list", json!({"album_id":"ALB-10040"})).await;
+    assert_eq!(beyond["album"]["name"], "Album 10040");
 }
 
 // --- Approval.
