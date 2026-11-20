@@ -1331,3 +1331,137 @@ async fn pages_fit_the_cap_with_many_huge_names() {
     assert_eq!(got["item_truncated"], true);
     assert_eq!(got["item"]["id"], items[0].drivewsid);
 }
+
+#[tokio::test]
+async fn names_keep_their_leading_and_trailing_characters() {
+    let spaced = "FOLDER::com.apple.CloudDocs::SPACED";
+    let remote = apple().await;
+    serve(
+        &remote,
+        ROOT,
+        ResponseTemplate::new(200).set_body_json(listing(
+            ROOT,
+            json!([
+                folder(spaced, " Reports "),
+                folder(DOCS, "Reports"),
+                file("FILE::com.apple.CloudDocs::BELL", "\u{7}lead", "txt", 1),
+            ]),
+        )),
+    )
+    .await;
+    serve(
+        &remote,
+        spaced,
+        ResponseTemplate::new(200).set_body_json(listing(
+            spaced,
+            json!([file("FILE::com.apple.CloudDocs::IN", "inside", "txt", 1)]),
+        )),
+    )
+    .await;
+    let (dir, mut server) = bound(Some("yolo"));
+    let result = refresh(dir.path(), &remote.uri(), json!({"path":"/ Reports "}))
+        .await
+        .unwrap();
+    assert_eq!(
+        result["folder"]["id"], spaced,
+        "not the folder named Reports"
+    );
+    init(&mut server, false).await;
+    let top = ok(&mut server, "drive_list", json!({})).await;
+    assert_eq!(names(&top), [" Reports ", "Reports", "\u{7}lead.txt"]);
+    let inside = ok(&mut server, "drive_list", json!({"path":"/ Reports "})).await;
+    assert_eq!(inside["folder"]["id"], spaced);
+    assert_eq!(names(&inside), ["inside.txt"]);
+    let plain = ok(&mut server, "drive_list", json!({"path":"/Reports"})).await;
+    assert_eq!(plain["folder"]["id"], DOCS);
+    assert_eq!(plain["folder"]["listed"], false);
+    // A leading control character stays, so the name cannot be written as a path.
+    let bell = ok(
+        &mut server,
+        "drive_get",
+        json!({"id":"FILE::com.apple.CloudDocs::BELL"}),
+    )
+    .await;
+    assert_eq!(bell["item"]["name"], "\u{7}lead");
+    assert_eq!(bell["path_addressable"], false);
+}
+
+#[tokio::test]
+async fn a_folder_moved_into_a_folder_read_in_the_same_refresh_keeps_its_contents() {
+    const PROJECTS: &str = "FOLDER::com.apple.CloudDocs::PROJECTS";
+    const ARCHIVE: &str = "FOLDER::com.apple.CloudDocs::ARCHIVE";
+    let plan = || file("FILE::com.apple.CloudDocs::PLAN", "plan", "txt", 1);
+    let answer =
+        |id: &str, items: Value| ResponseTemplate::new(200).set_body_json(listing(id, items));
+    // Before: /Documents/Projects (holding plan.txt) and an empty /Documents/Archive.
+    let remote = apple().await;
+    serve(
+        &remote,
+        ROOT,
+        answer(ROOT, json!([folder(DOCS, "Documents")])),
+    )
+    .await;
+    serve(
+        &remote,
+        DOCS,
+        answer(
+            DOCS,
+            json!([folder(PROJECTS, "Projects"), folder(ARCHIVE, "Archive")]),
+        ),
+    )
+    .await;
+    serve(&remote, PROJECTS, answer(PROJECTS, json!([plan()]))).await;
+    serve(&remote, ARCHIVE, answer(ARCHIVE, json!([]))).await;
+    let (dir, mut server) = bound(Some("yolo"));
+    for path in ["/Documents/Projects", "/Documents/Archive"] {
+        refresh(dir.path(), &remote.uri(), json!({"path":path}))
+            .await
+            .unwrap();
+    }
+    // Projects moves into Archive; Archive is refreshed, which reads Documents first.
+    let remote = apple().await;
+    serve(
+        &remote,
+        ROOT,
+        answer(ROOT, json!([folder(DOCS, "Documents")])),
+    )
+    .await;
+    serve(
+        &remote,
+        DOCS,
+        answer(DOCS, json!([folder(ARCHIVE, "Archive")])),
+    )
+    .await;
+    serve(
+        &remote,
+        ARCHIVE,
+        answer(ARCHIVE, json!([folder(PROJECTS, "Projects")])),
+    )
+    .await;
+    refresh(
+        dir.path(),
+        &remote.uri(),
+        json!({"path":"/Documents/Archive"}),
+    )
+    .await
+    .unwrap();
+    init(&mut server, false).await;
+    let moved = ok(&mut server, "drive_list", json!({"id":PROJECTS})).await;
+    assert_eq!(moved["folder"]["path"], "/Documents/Archive/Projects");
+    assert_eq!(moved["folder"]["listed"], true);
+    assert_eq!(names(&moved), ["plan.txt"], "listed, so not emptied");
+    // Projects is then deleted at Apple: it goes, with its contents and its listed mark.
+    let remote = apple().await;
+    serve(&remote, ARCHIVE, answer(ARCHIVE, json!([]))).await;
+    refresh(dir.path(), &remote.uri(), json!({"id":ARCHIVE}))
+        .await
+        .unwrap();
+    assert_eq!(
+        error(&mut server, "drive_list", json!({"id":PROJECTS})).await,
+        "not_found"
+    );
+    let library = quince_core::Library::open(dir.path()).unwrap();
+    assert!(library.drive_children(PROJECTS).unwrap().is_empty());
+    let listed = library.state("mcp.drive.listed").unwrap().unwrap();
+    assert!(!listed.contains("PROJECTS"), "{listed}");
+}

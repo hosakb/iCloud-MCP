@@ -757,10 +757,51 @@ fn checked_listing(id: &str, body: &Value, limits: &RefreshLimits) -> Result<Vec
         .iter()
         .filter(|row| row.get("restorePath").is_none() && row.get("dateExpiration").is_none())
         .collect();
-    let mut items = quince_icloud::drive::parse_folder(&json!([{ "items": kept }]));
+    let mut items = quince_icloud::drive::parse_folder(&json!([{ "items": &kept }]));
+    exact_names(&mut items, &kept);
     // Never a folder inside itself, nor the root inside anything.
     items.retain(|i| !is_trash(i) && i.drivewsid != id && i.drivewsid != ROOT);
     Ok(items)
+}
+
+/// The engine's reader trims a name and an extension, which can turn ` Reports ` into
+/// `Reports` and drop a leading control character. Each item gets back the name and the
+/// extension Apple sent, character for character, so a path names exactly what Apple has.
+/// A name Apple sent empty keeps the engine's `Untitled`, and an empty extension stays none.
+fn exact_names(items: &mut [DriveItem], rows: &[&Value]) {
+    let mut sent: std::collections::HashMap<&str, &Value> = std::collections::HashMap::new();
+    for row in rows {
+        if let Some(id) = row.get("drivewsid").and_then(Value::as_str) {
+            sent.entry(id.trim()).or_insert(row);
+        }
+    }
+    for item in items {
+        let Some(row) = sent.get(item.drivewsid.as_str()) else {
+            continue;
+        };
+        if let Some(name) = row
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty())
+        {
+            item.name = name.to_string();
+        }
+        item.extension = row
+            .get("extension")
+            .and_then(Value::as_str)
+            .filter(|e| !e.is_empty())
+            .map(ToString::to_string);
+    }
+}
+
+/// The folders cached in `before` that the folders read no longer hold anywhere. A folder
+/// that moved into another folder read in the same refresh is not gone.
+fn gone_folders(before: &[String], returned: &std::collections::HashSet<&str>) -> Vec<String> {
+    before
+        .iter()
+        .filter(|id| !returned.contains(id.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// What a refresh read: each folder's items, in the order read, the folder asked for last.
@@ -829,6 +870,16 @@ fn apply(library: &mut Library, read: &Read) -> quince_icloud::Result<()> {
     )
     .unwrap_or(i64::MAX);
     let mut listed = listed_map(library);
+    // Every item any folder read holds, gathered once. A folder that left one folder read
+    // and turned up in another moved: it keeps its cached contents. Only a folder found in
+    // none of them is forgotten, after every folder is stored, so nothing is forgotten and
+    // then stored again with its contents missing.
+    let returned: std::collections::HashSet<&str> = read
+        .folders
+        .iter()
+        .flat_map(|(_, items)| items.iter().map(|i| i.drivewsid.as_str()))
+        .collect();
+    let mut gone = Vec::new();
     for (id, items) in &read.folders {
         let before: Vec<String> = library
             .drive_children(id)?
@@ -837,13 +888,11 @@ fn apply(library: &mut Library, read: &Read) -> quince_icloud::Result<()> {
             .map(|i| i.drivewsid)
             .collect();
         library.put_drive_children(id, items)?;
-        for gone in before
-            .iter()
-            .filter(|old| !items.iter().any(|i| &i.drivewsid == *old))
-        {
-            library.forget_drive_folder(gone)?;
-        }
+        gone.extend(gone_folders(&before, &returned));
         listed.insert(id.clone(), json!(stamp));
+    }
+    for id in &gone {
+        library.forget_drive_folder(id)?;
     }
     // A folder forgotten above, or under one, is no longer listed.
     let mut kept: Vec<(String, i64)> = Vec::new();
@@ -1141,6 +1190,41 @@ mod tests {
         };
         assert!(same_name(&item, "Caf\u{e9}.txt"));
         assert!(!same_name(&item, "cafe\u{301}.txt"));
+    }
+
+    /// One pass over a folder of 50,000 child folders against 50,000 returned ids. Compared
+    /// pairwise, this took about 1.25 billion comparisons inside the write transaction.
+    #[test]
+    fn finding_gone_folders_is_one_pass_over_a_large_folder() {
+        let before: Vec<String> = (0..50_000).map(|i| format!("FOLDER::z::{i}")).collect();
+        let returned: std::collections::HashSet<&str> =
+            before.iter().skip(1).map(String::as_str).collect();
+        let started = Instant::now();
+        let gone = gone_folders(&before, &returned);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(gone, ["FOLDER::z::0"]);
+    }
+
+    #[test]
+    fn names_keep_the_spaces_and_characters_apple_sent() {
+        let rows = [
+            json!({"drivewsid":"FOLDER::z::r","name":" Reports ","type":"FOLDER"}),
+            json!({"drivewsid":"FILE::z::c","name":"\u{7}bell","extension":" txt","type":"FILE"}),
+            json!({"drivewsid":"FILE::z::e","name":"","extension":"","type":"FILE"}),
+        ];
+        let refs: Vec<&Value> = rows.iter().collect();
+        let mut items = quince_icloud::drive::parse_folder(&json!([{ "items": &refs }]));
+        assert_eq!(items[0].name, "Reports", "the engine trims");
+        exact_names(&mut items, &refs);
+        assert_eq!(items[0].name, " Reports ");
+        assert_eq!(items[1].name, "\u{7}bell");
+        assert_eq!(items[1].extension.as_deref(), Some(" txt"));
+        assert_eq!(items[2].name, "Untitled");
+        assert_eq!(items[2].extension, None);
     }
 
     #[test]
