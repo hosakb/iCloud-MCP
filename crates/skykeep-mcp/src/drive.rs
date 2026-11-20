@@ -506,23 +506,58 @@ pub(crate) fn list(library: &Library, args: Value) -> Result<Value, &'static str
     })
 }
 
+/// Newest first: changed most recently, undated last, then by id so equal dates keep one
+/// order. The engine's search orders the same way, without the id.
+fn newest_first(a: &DriveItem, b: &DriveItem) -> std::cmp::Ordering {
+    a.modified_at
+        .is_none()
+        .cmp(&b.modified_at.is_none())
+        .then_with(|| b.modified_at.cmp(&a.modified_at))
+        .then_with(|| a.drivewsid.cmp(&b.drivewsid))
+}
+
+/// Items whose name holds every word of `query` (case and accents aside, as the engine's
+/// `search_drive` matches them), only in folders still marked as read: a folder whose mark
+/// was let go (past `MAX_LISTED`) no longer says its items are current. Only eligible items
+/// count toward `SEARCH_KEEPS`, so items in unmarked folders never crowd out the rest. At most
+/// `SEARCH_KEEPS`, newest first, and whether more matched. One listed folder's children are
+/// held at a time, and the matches kept never pass twice the cap.
+fn eligible_matches(
+    library: &Library,
+    query: &str,
+) -> Result<(Vec<DriveItem>, bool), &'static str> {
+    let words = quince_core::fold::words(query);
+    if words.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    let mut folders: Vec<String> = listed_map(library).into_iter().map(|(id, _)| id).collect();
+    folders.sort();
+    let mut found: Vec<DriveItem> = Vec::new();
+    for folder in folders {
+        let held = library
+            .drive_children(&folder)
+            .map_err(|_| "search_unavailable")?;
+        for item in held.into_iter().filter(|i| !is_trash(i)) {
+            let name = format!("{}.{}", item.name, item.extension.as_deref().unwrap_or(""));
+            if quince_core::fold::holds_all(&quince_core::fold::fold(&name), &words) {
+                found.push(item);
+            }
+        }
+        if found.len() > 2 * SEARCH_KEEPS {
+            found.sort_by(newest_first);
+            found.truncate(SEARCH_KEEPS + 1);
+        }
+    }
+    found.sort_by(newest_first);
+    let more = found.len() > SEARCH_KEEPS;
+    found.truncate(SEARCH_KEEPS);
+    Ok((found, more))
+}
+
 pub(crate) fn search(library: &Library, args: Value) -> Result<Value, &'static str> {
     let args = search_args(&args)?;
     let limit = page_limit(args.limit)?;
-    let mut found = library
-        .search_drive(&args.query, SEARCH_KEEPS + 1)
-        .map_err(|_| "search_unavailable")?;
-    let capped = found.len() > SEARCH_KEEPS;
-    // Only items in folders still marked as read: a folder whose mark was let go (past
-    // `MAX_LISTED`) no longer says its items are current.
-    let listed = listed_map(library);
-    found.retain(|i| {
-        !is_trash(i)
-            && i.parent_id
-                .as_deref()
-                .is_some_and(|p| listed.contains_key(p))
-    });
-    found.truncate(SEARCH_KEEPS);
+    let (found, capped) = eligible_matches(library, &args.query)?;
     let entries: Vec<Value> = found
         .iter()
         .skip(args.offset)

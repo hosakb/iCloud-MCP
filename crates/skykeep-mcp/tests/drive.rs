@@ -1620,3 +1620,74 @@ async fn search_skips_items_in_folders_whose_listed_mark_was_let_go() {
     let bell = ok(&mut server, "drive_search", json!({"query":"bell"})).await;
     assert_eq!(bell["total"], 1, "the deep folder is still marked");
 }
+
+/// Items in a folder whose mark was let go never count toward the 1000-match cap: matches in
+/// marked folders are found however many newer ones sit in unmarked folders, and the cap is
+/// judged on eligible matches alone.
+#[tokio::test]
+async fn search_caps_on_eligible_matches_only() {
+    const KEPT: &str = "FOLDER::z::KEPT";
+    const LET_GO: &str = "FOLDER::z::LETGO";
+    let file_at = |id: String, at: i64| quince_core::drive::DriveItem {
+        drivewsid: id,
+        parent_id: None,
+        name: "match".into(),
+        extension: Some("txt".into()),
+        kind: "FILE".into(),
+        size: Some(1),
+        child_count: None,
+        created_at: None,
+        modified_at: Some(at),
+        etag: None,
+    };
+    let (dir, mut server) = bound(Some("yolo"));
+    let mut library = quince_core::Library::open(dir.path()).unwrap();
+    // 1100 newer matches in a folder whose mark is gone, one older match at the top.
+    let newer: Vec<_> = (0..1100)
+        .map(|i| file_at(format!("FILE::z::new{i:04}"), 2_000_000 + i))
+        .collect();
+    library.put_drive_children(LET_GO, &newer).unwrap();
+    library
+        .put_drive_children(ROOT, &[file_at("FILE::z::old".into(), 1_000_000)])
+        .unwrap();
+    library
+        .set_state("mcp.drive.listed", &json!({ROOT: 1}).to_string())
+        .unwrap();
+    init(&mut server, false).await;
+    let page = ok(&mut server, "drive_search", json!({"query":"match"})).await;
+    assert_eq!(ids(&page), ["FILE::z::old"]);
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["matches_capped"], false);
+    // 1001 eligible matches in a marked folder: capped at 1000, every page reachable, and
+    // none from the unmarked folder.
+    let eligible: Vec<_> = (0..1001)
+        .map(|i| file_at(format!("FILE::z::kept{i:04}"), 1_500_000 + i))
+        .collect();
+    library.put_drive_children(KEPT, &eligible).unwrap();
+    library
+        .set_state("mcp.drive.listed", &json!({ROOT: 1, KEPT: 1}).to_string())
+        .unwrap();
+    let first = ok(
+        &mut server,
+        "drive_search",
+        json!({"query":"match","limit":100}),
+    )
+    .await;
+    assert_eq!(first["total"], 1000);
+    assert_eq!(first["matches_capped"], true);
+    assert_eq!(ids(&first)[0], "FILE::z::kept1000", "newest first");
+    let last = ok(
+        &mut server,
+        "drive_search",
+        json!({"query":"match","offset":900,"limit":100}),
+    )
+    .await;
+    let shown = ids(&last);
+    assert_eq!(shown.len(), 100);
+    assert_eq!(last["next_offset"], Value::Null);
+    assert!(
+        shown.iter().all(|id| id.starts_with("FILE::z::kept")),
+        "{shown:?}"
+    );
+    assert_eq!(shown[99], "FILE::z::kept0001");
+}
