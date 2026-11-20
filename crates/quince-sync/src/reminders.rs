@@ -411,7 +411,7 @@ fn lay_advance(l: &mut Library, guid: &str, a: &Advance) -> quince_core::Result<
     // Past its End Repeat date there is no next one: the series is done, as on the phone.
     // Weekdays, Weekends or chosen days: on to the next of those, not a week on.
     let days = l.reminder_repeat_days(guid)?;
-    if r.tick_ends_series_on(l.reminder_repeat_end(guid)?, &days, a.at) {
+    if r.tick_ends_series_on(repeat_end(l, guid)?, &days, a.at) {
         r.completed_at = Some(a.at);
         return l.put_reminder_local(&r);
     }
@@ -420,6 +420,20 @@ fn lay_advance(l: &mut Library, guid: &str, a: &Advance) -> quince_core::Result<
     }
     r.completed_at = None;
     l.put_reminder_local(&r)
+}
+
+/// When a reminder's repeat ends: Apple's rule, or, for one made here and not sent yet, the
+/// end it was queued with, so a tick before the first send ends the series as the phone would.
+fn repeat_end(l: &Library, guid: &str) -> quince_core::Result<Option<i64>> {
+    if let Some(end) = l.reminder_repeat_end(guid)? {
+        return Ok(Some(end));
+    }
+    Ok(l.outbox_pending(REMINDERS)?
+        .into_iter()
+        .filter(|p| p.record == guid && p.kind == "create")
+        .find_map(|p| serde_json::from_str::<Create>(&p.payload).ok())
+        .and_then(|c| c.repeat)
+        .and_then(|r| r.end_at))
 }
 
 /// A reminder ticked or unticked here at `at`. A repeating one ticked moves on to its next date
@@ -431,7 +445,7 @@ pub fn record_reminder_tick(
     done: bool,
     at: i64,
 ) -> quince_core::Result<()> {
-    let end = library.reminder_repeat_end(&reminder.guid)?;
+    let end = repeat_end(library, &reminder.guid)?;
     let days = library.reminder_repeat_days(&reminder.guid)?;
     let last = done && reminder.tick_ends_series_on(end, &days, at);
     if !last && done && reminder.repeats() {
@@ -517,14 +531,21 @@ pub fn apply(
 
 // --- Sending: the queue's half.
 
+/// The library key holding how many of a new reminder's steps Apple has taken.
+fn create_progress_key(guid: &str) -> String {
+    format!("reminders.create_steps.{guid}")
+}
+
 /// The rest of a reminder made here with a repeat or alerts, once the reminder itself is at
-/// Apple: its date, flag and zone, then its repeat, its alert at the due time and its early
-/// alert, in that order (each needs the date). Every step is safe to run again: the reminder
-/// is made under its own name, the date is set to the same value, and each part is written
-/// under the id it was queued with and found, not made again, when a send is repeated. So a
-/// step that fails fails the whole change, which the queue sends again from the start, and
-/// the answer says done only when Apple took every step.
+/// Apple, one step at a time: its date, flag and zone, then its repeat, its alert at the due
+/// time and its early alert (each needs the date). Each step taken is noted in the library, so
+/// a send repeated after a failure takes only the steps still to do: a date the person moved
+/// on a phone in between is not put back. Every step is also safe to run again, should the
+/// note be lost with the answer: each part is written under the id it was queued with and
+/// found, not made again. A step that fails fails the whole change, which the queue sends
+/// again, and the answer says done only when Apple took every step.
 async fn send_create_options(
+    library: &LibraryLock,
     http: &reqwest::Client,
     root: &str,
     params: Vec<(String, String)>,
@@ -532,6 +553,17 @@ async fn send_create_options(
     c: &Create,
 ) -> Result<(), Error> {
     use quince_icloud::reminders::{self as r, details as d};
+    let key = create_progress_key(guid);
+    let done: u8 = library
+        .lock()
+        .await
+        .state(&key)?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let took = |step: u8| {
+        let key = key.clone();
+        async move { library.lock().await.set_state(&key, &step.to_string()) }
+    };
     let zone = c.timezone.clone().unwrap_or_else(system_zone);
     let made = Reminder {
         guid: guid.to_string(),
@@ -540,15 +572,18 @@ async fn send_create_options(
         due_at: c.due_at,
         ..Default::default()
     };
-    let edit = ReminderEdit {
-        due_at: c.due_at.map(Some),
-        all_day: c.all_day,
-        flagged: c.flagged,
-        timezone: Some(zone.clone()),
-        ..Default::default()
-    };
-    r::edit_cloudkit(http, root, params.clone(), &made, &edit).await?;
-    if let Some(rep) = &c.repeat {
+    if done < 1 {
+        let edit = ReminderEdit {
+            due_at: c.due_at.map(Some),
+            all_day: c.all_day,
+            flagged: c.flagged,
+            timezone: Some(zone.clone()),
+            ..Default::default()
+        };
+        r::edit_cloudkit(http, root, params.clone(), &made, &edit).await?;
+        took(1).await?;
+    }
+    if let Some(rep) = c.repeat.as_ref().filter(|_| done < 2) {
         let repeat = r::Repeat {
             frequency: rep.frequency,
             interval: rep.interval,
@@ -564,21 +599,22 @@ async fn send_create_options(
             &rep.rule_id,
         )
         .await?;
+        took(2).await?;
     }
-    if let (Some(alarm), Some(due)) = (&c.alarm, c.due_at) {
+    if let Some(alarm) = c.alarm.as_ref().filter(|_| done < 3) {
         r::add_alarm_named_cloudkit(
             http,
             root,
             params.clone(),
             guid,
-            due,
             &zone,
             &alarm.alarm_id,
             &alarm.trigger_id,
         )
         .await?;
+        took(3).await?;
     }
-    if let Some(early) = &c.early_alert {
+    if let Some(early) = c.early_alert.as_ref().filter(|_| done < 4) {
         d::add_early_alert_named_cloudkit(
             http,
             root,
@@ -590,6 +626,8 @@ async fn send_create_options(
         )
         .await?;
     }
+    // Every step taken: the note has served its turn.
+    library.lock().await.set_state(&key, "")?;
     Ok(())
 }
 
@@ -628,7 +666,7 @@ pub async fn send(
             )
             .await?;
             if c.has_options() {
-                return send_create_options(http, root, params, &p.record, &c).await;
+                return send_create_options(library, http, root, params, &p.record, &c).await;
             }
             if c.due_at.is_some() || c.flagged.is_some() {
                 let made = Reminder {

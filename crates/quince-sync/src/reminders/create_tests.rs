@@ -28,6 +28,8 @@ struct Store {
     fault: Option<(String, Fault)>,
     /// Records made, by name, counting a second make of the same name.
     made: Vec<String>,
+    /// Updates to `Reminder/` records.
+    updates: usize,
 }
 
 #[derive(Clone, Default)]
@@ -52,6 +54,19 @@ impl Cloud {
     }
     fn made(&self) -> Vec<String> {
         self.0.lock().unwrap().made.clone()
+    }
+    /// A phone moves the reminder to another due date.
+    fn phone_moves_due(&self, guid: &str, due: i64) {
+        let mut s = self.0.lock().unwrap();
+        s.tag += 1;
+        let tag = s.tag.to_string();
+        let r = s.records.get_mut(guid).unwrap();
+        r["fields"]["DueDate"] = json!({ "type": "TIMESTAMP", "value": due * 1000 });
+        r["recordChangeTag"] = json!(tag);
+    }
+    /// How many writes the reminder record itself has had.
+    fn reminder_updates(&self) -> usize {
+        self.0.lock().unwrap().updates
     }
     /// A phone adds an alarm of its own to the reminder.
     fn phone_adds_alarm(&self, guid: &str, id: &str) {
@@ -98,6 +113,9 @@ impl Respond for Cloud {
         let name = op["record"]["recordName"].as_str().unwrap().to_string();
         s.tag += 1;
         let tag = s.tag.to_string();
+        if op["operationType"] == "update" && name.starts_with("Reminder/") {
+            s.updates += 1;
+        }
         let answer = match op["operationType"].as_str().unwrap() {
             "create" => {
                 if s.records.contains_key(&name) {
@@ -468,4 +486,87 @@ fn zones_and_end_days_are_read_strictly_and_across_a_clock_change() {
     for bad in ["2026-02-30", "2026-3-8", "20260308", "2026-03-08T00:00"] {
         assert_eq!(end_of_day(bad, "UTC"), None, "{bad}");
     }
+}
+
+/// The early alert fails after the date and the alarm are at Apple, and the person moves the
+/// reminder on a phone before the next send. That send finishes only the early alert: it does
+/// not put the old date back over the phone's.
+#[tokio::test]
+async fn a_retry_finishes_only_what_is_left_and_keeps_a_phones_new_date() {
+    let (server, cloud) = cloud().await;
+    let mut l = library();
+    let guid = record_reminder_create(&mut l, &create()).unwrap();
+    let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+    let lock = LibraryLock::new(l, None);
+    cloud.fail_once("DueDateDeltaAlertsData", Fault::Before);
+    assert!(send_one(&lock, &server.uri(), &p).await.is_err());
+    let moved = DUE + 2 * 86_400;
+    cloud.phone_moves_due(&guid, moved);
+    let updates = cloud.reminder_updates();
+    send_one(&lock, &server.uri(), &p).await.unwrap();
+    let reminder = cloud.record(&guid).unwrap();
+    assert_eq!(reminder["fields"]["DueDate"]["value"], moved * 1000);
+    // One write to the reminder: its early alert. No date, flag or zone again.
+    assert_eq!(cloud.reminder_updates(), updates + 1);
+    assert_eq!(early_alerts(&reminder).len(), 1);
+    assert_eq!(ids(&reminder, "AlarmIDs"), ["ALARM-1"]);
+    assert_eq!(cloud.of_type("Alarm").len(), 1);
+}
+
+/// The alarm's trigger is not made yet when the phone moves the date: it rings at the date
+/// Apple holds then, not the one queued.
+#[tokio::test]
+async fn an_alert_still_to_write_rings_at_the_date_apple_holds() {
+    let (server, cloud) = cloud().await;
+    let mut l = library();
+    let guid = record_reminder_create(&mut l, &create()).unwrap();
+    let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+    let lock = LibraryLock::new(l, None);
+    cloud.fail_once("\"AlarmTrigger\"", Fault::Before);
+    assert!(send_one(&lock, &server.uri(), &p).await.is_err());
+    // 10:30 on 9 March in New York (EDT).
+    let moved = DUE + 2 * 86_400 - 3_600 + 5_400;
+    cloud.phone_moves_due(&guid, moved);
+    send_one(&lock, &server.uri(), &p).await.unwrap();
+    let trigger = cloud.record("AlarmTrigger/TRIGGER-1").unwrap();
+    let raw = trigger["fields"]["DateComponentsData"]["value"]
+        .as_str()
+        .unwrap();
+    let parts: Value = serde_json::from_slice(&b64(raw)).unwrap();
+    assert_eq!(
+        (&parts["day"], &parts["hour"], &parts["minute"]),
+        (&json!(9), &json!(10), &json!(30))
+    );
+    assert_eq!(
+        cloud.record(&guid).unwrap()["fields"]["DueDate"]["value"],
+        moved * 1000
+    );
+}
+
+/// A repeat ending on its due day, ticked before it was ever sent: the series is done, as the
+/// phone ends it, not moved on to the next day past its end.
+#[test]
+fn a_new_repeat_ending_today_ticked_offline_completes() {
+    let mut l = library();
+    let mut c = create();
+    c.repeat.as_mut().unwrap().end_at = end_of_day("2026-03-07", "America/New_York");
+    let guid = record_reminder_create(&mut l, &c).unwrap();
+    let shown = l.reminder(&guid).unwrap().unwrap();
+    record_reminder_tick(&mut l, &shown, true, DUE + 60).unwrap();
+    let after = l.reminder(&guid).unwrap().unwrap();
+    assert_eq!(after.completed_at, Some(DUE + 60));
+    assert_eq!(after.due_at, Some(DUE));
+    let kinds: Vec<String> = l
+        .outbox_pending(REMINDERS)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.kind)
+        .collect();
+    assert_eq!(kinds, ["create", "done"]);
+    // Laid again over a pass, it stays done.
+    replay(&mut l).unwrap();
+    assert_eq!(
+        l.reminder(&guid).unwrap().unwrap().completed_at,
+        Some(DUE + 60)
+    );
 }

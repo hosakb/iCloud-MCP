@@ -5184,8 +5184,10 @@ pub async fn set_alarm_cloudkit(
     Ok(())
 }
 
-/// Add one alert at `at_seconds` to a reminder, under alarm and trigger ids chosen before it
-/// is sent (bare ids), and leave every other alarm it has as it is. For a reminder made here
+/// Add one alert at a reminder's due time, as Apple holds the due date when the alarm is
+/// written (a date moved on a phone since the reminder was queued is the one it rings at), under
+/// alarm and trigger ids chosen before it is sent (bare ids), and leave every other alarm it
+/// has as it is. A reminder Apple holds with no due date gets no alarm: nothing to ring at. For a reminder made here
 /// with its alert: a send repeated after a lost answer or a restart finds the records it made
 /// and finishes the job, so it never adds a second alert or leaves one nothing points at.
 ///
@@ -5195,18 +5197,15 @@ pub async fn set_alarm_cloudkit(
 ///
 /// # Errors
 /// When Apple refuses any of the writes, or no longer has the reminder.
-#[allow(clippy::too_many_arguments)]
 pub async fn add_alarm_named_cloudkit(
     http: &reqwest::Client,
     ckdatabasews_root: &str,
     params: Vec<(String, String)>,
     reminder_guid: &str,
-    at_seconds: i64,
     timezone: &str,
     alarm_id: &str,
     trigger_id: &str,
 ) -> Result<()> {
-    let components = date_components(at_seconds, timezone)?;
     let client = ZoneClient::new(http, ckdatabasews_root, CONTAINER, params);
     let listed = |record: &Value| {
         record
@@ -5225,6 +5224,10 @@ pub async fn add_alarm_named_cloudkit(
     if listed(&current) {
         return Ok(());
     }
+    let Some(at_seconds) = field::timestamp_seconds(&current, "DueDate") else {
+        return Ok(());
+    };
+    let components = date_components(at_seconds, timezone)?;
     let alarm = format!("Alarm/{alarm_id}");
     if client.lookup_record(ZONE, &alarm).await?.is_none() {
         client

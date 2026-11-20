@@ -261,6 +261,51 @@ async fn an_all_day_reminder_repeats_until_its_last_day() {
     assert!(payload.get("alarm").is_none() && payload.get("timezone").is_none());
 }
 
+/// With no zone given, a timed create with options is kept in this computer's zone as it was
+/// when queued: the repeat's end and every later send use that one zone. A plain create
+/// queues no zone, as before.
+#[tokio::test]
+async fn the_default_zone_is_chosen_once_and_queued() {
+    let (_dir, mut server, library) = setup(false);
+    let (failed, result) = call(
+        &mut server,
+        json!({"action":"create","list_guid":"list","title":"Synthetic","due_at":DUE,
+               "repeat":{"frequency":"daily","until":"2026-03-20"}}),
+    )
+    .await;
+    assert!(!failed, "{result}");
+    let zone = result["options"]["timezone"]
+        .as_str()
+        .expect("a zone")
+        .to_string();
+    assert_eq!(
+        quince_sync::reminders::iana_zone(&zone).as_deref(),
+        Some(zone.as_str())
+    );
+    let payload: Value =
+        serde_json::from_str(&library.outbox_pending("reminders").unwrap()[0].payload).unwrap();
+    assert_eq!(payload["timezone"], zone.as_str());
+    assert_eq!(
+        payload["repeat"]["end_at"],
+        quince_sync::reminders::end_of_day("2026-03-20", &zone).unwrap()
+    );
+    let (_, plain) = call(
+        &mut server,
+        json!({"action":"create","list_guid":"list","title":"Synthetic plain","due_at":DUE}),
+    )
+    .await;
+    let queued = library.outbox_pending("reminders").unwrap();
+    let plain_payload: Value = serde_json::from_str(
+        &queued
+            .iter()
+            .find(|p| p.record == plain["guid"].as_str().unwrap())
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    assert!(plain_payload.get("timezone").is_none(), "{plain_payload}");
+}
+
 /// Under the approval policy the options wait with the rest of the create, and the human's
 /// approval queues exactly them.
 #[tokio::test]
@@ -369,6 +414,13 @@ async fn sync_names_only_writes_cloudkit_took_whole() {
         json!({"action":"create","list_guid":"list","title":"Synthetic plain"}),
     )
     .await;
+    // Its date is written after the reminder, and a failure there is only logged: it leaves
+    // the queue, but CloudKit's taking it is not confirmed.
+    let (_, dated) = call(
+        &mut server,
+        json!({"action":"create","list_guid":"list","title":"Synthetic dated","due_at":DUE}),
+    )
+    .await;
     let (failed, repeating) = call(
         &mut server,
         json!({"action":"create","list_guid":"list","title":"Synthetic daily","due_at":DUE,"repeat":{"frequency":"daily"}}),
@@ -380,10 +432,14 @@ async fn sync_names_only_writes_cloudkit_took_whole() {
             .await
             .unwrap();
     assert_eq!(result["remote_verified"], false);
-    let accepted = result["cloudkit_accepted_this_sync"].as_array().unwrap();
-    assert_eq!(accepted.len(), 1, "{result}");
-    assert_eq!(accepted[0]["record"], plain["guid"]);
-    assert_eq!(accepted[0]["kind"], "create");
+    assert!(result.get("cloudkit_accepted_this_sync").is_none());
+    let left = result["left_queue_this_sync"].as_array().unwrap();
+    assert_eq!(left.len(), 2, "{result}");
+    assert_eq!(left[0]["record"], plain["guid"]);
+    assert_eq!(left[0]["kind"], "create");
+    assert_eq!(left[0]["outcome"], "cloudkit_accepted");
+    assert_eq!(left[1]["record"], dated["guid"]);
+    assert_eq!(left[1]["outcome"], "finished_unconfirmed");
     let waiting = library.outbox_pending("reminders").unwrap();
     assert_eq!(waiting.len(), 1);
     assert_eq!(waiting[0].record, repeating["guid"].as_str().unwrap());

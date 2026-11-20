@@ -1589,6 +1589,13 @@ fn create_options(
     if timezone.is_some() && !timed {
         return Err("timezone_requires_timed_due_at");
     }
+    // A timed create with options is kept in one zone from here on: chosen now, queued, and
+    // used for its repeat's end and by every later send, whatever this computer's zone becomes.
+    let any_option = repeat.is_some() || due_time_alert == Some(true) || early_alert.is_some();
+    let timezone = match timezone {
+        None if timed && any_option => Some(r::system_zone()),
+        other => other,
+    };
     let alarm = if due_time_alert == Some(true) {
         if due_at.is_none() {
             return Err("due_time_alert_requires_due_at");
