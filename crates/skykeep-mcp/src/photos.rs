@@ -767,13 +767,23 @@ async fn post(
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
         .map(ToString::to_string);
-    let bytes = read_capped!(response, cap, budget)?;
+    let busy = matches!(status, 429 | 503);
+    let bytes = match read_capped!(response, cap, budget) {
+        Ok(bytes) => bytes,
+        // A busy answer whose body is too large or cut off still holds for its header's wait.
+        Err(stop) => {
+            if busy {
+                cloudkit::container_busy(root, apple::CONTAINER, "", retry_after.as_deref());
+            }
+            return Err(stop);
+        }
+    };
     if !(200..300).contains(&status) {
         let text = String::from_utf8_lossy(&bytes);
         if quince_icloud::locked_by_data_protection(&text) {
             return Err(Stop::Locked);
         }
-        if matches!(status, 429 | 503) {
+        if busy {
             cloudkit::container_busy(root, apple::CONTAINER, &text, retry_after.as_deref());
         }
         return Err(match status {

@@ -118,4 +118,32 @@ async fn a_long_retry_after_holds_photos_off_and_later_refreshes_fail_unsent() {
         2,
         "list and query, once"
     );
+
+    // A 503 whose body is over the cap is not read, and its header's wait still holds.
+    let oversized = remote(
+        ResponseTemplate::new(503)
+            .insert_header("Retry-After", "1800")
+            .set_body_string("x".repeat(4096)),
+    )
+    .await;
+    let dir = bound();
+    let limits = || skykeep_mcp::photos::RefreshLimits {
+        max_small_bytes: 1024,
+        ..Default::default()
+    };
+    let first = skykeep_mcp::photos::refresh_with_client_limited(
+        dir.path(),
+        client(dir.path(), &oversized.uri()),
+        limits(),
+    )
+    .await;
+    assert_eq!(first.unwrap_err(), "photos_response_too_large_cache_kept");
+    let again = skykeep_mcp::photos::refresh_with_client_limited(
+        dir.path(),
+        client(dir.path(), &oversized.uri()),
+        limits(),
+    )
+    .await;
+    assert_eq!(again.unwrap_err(), "photos_refresh_failed_cache_kept");
+    assert_eq!(cloudkit_asks(&oversized).await, 1);
 }
