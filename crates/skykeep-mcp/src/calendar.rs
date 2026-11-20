@@ -211,7 +211,7 @@ fn zoned_text(at: i64, zone: &Zone) -> String {
     )
 }
 
-fn utc_text(at: i64) -> String {
+pub(crate) fn utc_text(at: i64) -> String {
     format!("{}Z", wall_text(at))
 }
 

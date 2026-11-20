@@ -240,8 +240,16 @@ async fn tools_list_names_apple_icloud_contacts_with_strict_read_only_schemas() 
     // This phase reads only: nothing writes, deletes, merges, imports, exports or downloads.
     for tool in tools {
         let name = tool["name"].as_str().unwrap();
-        for word in ["photo", "vcard", "import", "export", "merge", "csv"] {
+        for word in ["vcard", "import", "export", "merge", "csv"] {
             assert!(!name.contains(word), "{name}");
+        }
+        // Photos metadata has its own read-only tools; no Contacts tool reads a photo.
+        assert!(
+            !name.contains("photo") || name.starts_with("photos_"),
+            "{name}"
+        );
+        if name.starts_with("contacts") {
+            assert!(!name.contains("photo"), "{name}");
         }
         if name.starts_with("contacts") {
             assert!(
