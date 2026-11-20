@@ -400,7 +400,7 @@ async fn tools_list_names_apple_icloud_drive_with_strict_read_only_schemas() {
     for tool in tools {
         let name = tool["name"].as_str().unwrap();
         for word in [
-            "download", "upload", "rename", "move", "delete", "trash", "file", "photos",
+            "download", "upload", "rename", "move", "delete", "trash", "file",
         ] {
             assert!(!name.contains(word), "{name}");
         }
@@ -1197,7 +1197,7 @@ async fn reads_and_writes_binds_each_drive_read_to_one_approval() {
     assert!(message.contains("/Documents"), "{message}");
     assert!(message.contains("nothing is sent"), "{message}");
     assert!(message.contains("no file contents"), "{message}");
-    for other in ["notes", "reminders", "contacts", "calendar"] {
+    for other in ["notes", "reminders", "contacts", "calendar", "photos"] {
         assert!(!message.contains(other), "{message}");
     }
     let reply = server

@@ -4,6 +4,7 @@ pub mod calendar;
 pub mod contacts;
 pub mod drive;
 pub mod login;
+pub mod photos;
 pub mod scheduler;
 pub mod state;
 pub mod sync;
@@ -272,6 +273,10 @@ fn needs_consent(mode: &str, name: &str) -> Result<bool, &'static str> {
         // Calendar content and its refresh are reads too.
         "calendar_calendars" | "calendar_events" | "calendar_search" | "calendar_get"
         | "calendar_refresh" => Ok(mode == "reads_and_writes"),
+        // Photos metadata and its refresh are reads too.
+        "photos_albums" | "photos_list" | "photos_search" | "photos_get" | "photos_refresh" => {
+            Ok(mode == "reads_and_writes")
+        }
         // Drive metadata and its refresh are reads too.
         "drive_list" | "drive_get" | "drive_search" | "drive_refresh" => {
             Ok(mode == "reads_and_writes")
@@ -466,6 +471,7 @@ impl Server {
         // Malformed Contacts arguments are refused before anyone is asked to approve them.
         contacts::validate(name, &params["arguments"])?;
         calendar::validate(name, &params["arguments"])?;
+        photos::validate(name, &params["arguments"])?;
         drive::validate(name, &params["arguments"])?;
         if !needs_consent(&p.mode, name)? {
             return Ok(None);
@@ -511,6 +517,7 @@ impl Server {
             Some("calendar_refresh") => {
                 Some(calendar::refresh_scope(&request["params"]["arguments"]))
             }
+            Some("photos_refresh") => Some(photos::refresh_scope()),
             Some("drive_refresh") => Some(drive::refresh_scope()),
             _ => None,
         };
@@ -944,6 +951,21 @@ impl Server {
                     return Err("login_required");
                 }
                 calendar::refresh(&dir, grant.is_some(), args).await
+            }
+            "photos_albums" => photos::albums(library, args),
+            "photos_list" => photos::list(library, args),
+            "photos_search" => photos::search(library, args),
+            "photos_get" => photos::get(library, args),
+            "photos_refresh" => {
+                photos::validate(name, &args)?;
+                if library
+                    .state(ACCOUNT_KEY)
+                    .map_err(|_| "library_unavailable")?
+                    .is_none()
+                {
+                    return Err("login_required");
+                }
+                photos::refresh(&dir, grant.is_some()).await
             }
             "drive_list" => drive::list(library, args),
             "drive_get" => drive::get(library, args),
@@ -1600,8 +1622,9 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
     }
 }
 
-const SERVER_TITLE: &str = "Skykeep: Apple iCloud Notes, Reminders, Contacts & Calendar";
-const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, and reads the user's Apple iCloud Contacts and Apple iCloud Calendar (read-only), and Apple iCloud Drive folder listings and file details (read-only; no file contents). Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, and Drive one folder at a time through drive_refresh. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode and are queued until sync sends them. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
+const SERVER_TITLE: &str =
+    "Skykeep: Apple iCloud Notes, Reminders, Contacts, Calendar, Photos & Drive";
+const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, and reads the user's Apple iCloud Contacts, Apple iCloud Calendar and Apple iCloud Photos metadata (read-only), and Apple iCloud Drive folder listings and file details (read-only; no file contents). Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode and are queued until sync sends them. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
 
 fn tools() -> Vec<Value> {
     // (name, description, parent property, parent required)
@@ -1684,6 +1707,17 @@ fn tools() -> Vec<Value> {
     tools.push(json!({"name":"calendar_search","description":"Search the user's cached Apple iCloud Calendar events by title, location or notes. At most 300 matches nearest today are kept. Read-only.","inputSchema":{"type":"object","properties":search,"required":["query"],"additionalProperties":false},"annotations":read}));
     tools.push(json!({"name":"calendar_get","description":"Read one cached Apple iCloud Calendar event with its notes and calendar. Not a complete event: attendees, alerts, the repeat rule and status are not included.","inputSchema":{"type":"object","properties":{"guid":guid},"required":["guid"],"additionalProperties":false},"annotations":read}));
     tools.push(json!({"name":"calendar_refresh","description":format!("Read the user's Apple iCloud Calendar from Apple into the local cache over a window (default: last month to three months ahead; at most {} days). Never changes events at Apple, never answers invitations and sends no queued changes. Never opens a login prompt.", calendar::MAX_REFRESH_DAYS),"inputSchema":{"type":"object","properties":{"from":day("First day, YYYY-MM-DD (UTC)."),"to":day("Day after the last, YYYY-MM-DD (exclusive).")},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}));
+    let page = json!({"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":photos::MAX_LIMIT,"default":25}});
+    let id = json!({"type":"string","minLength":1,"maxLength":photos::MAX_ID_BYTES});
+    tools.push(json!({"name":"photos_albums","description":"List the albums and folders the user made in Apple iCloud Photos, from the local cache, with how many photos each shows. Read-only; refresh with photos_refresh.","inputSchema":{"type":"object","properties":page,"additionalProperties":false},"annotations":read}));
+    let mut list = page.clone();
+    list["album_id"] = json!({"type":"string","minLength":1,"maxLength":photos::MAX_ID_BYTES,"description":"Album id from photos_albums; omit for the whole library."});
+    tools.push(json!({"name":"photos_list","description":"List the user's Apple iCloud Photos (personal library) from the local cache, newest first or in an album's order: dates, kind (image, video, Live Photo), size, filename, title, caption and keywords. No pictures, places or faces. Read-only.","inputSchema":{"type":"object","properties":list,"additionalProperties":false},"annotations":read}));
+    let mut search = page.clone();
+    search["query"] = json!({"type":"string","minLength":1,"maxLength":photos::MAX_QUERY_BYTES,"description":"Words matched against title, filename, caption, keywords, and the year or month taken. At most 256 UTF-8 bytes."});
+    tools.push(json!({"name":"photos_search","description":"Search the user's cached Apple iCloud Photos (personal library) by title, filename, caption, keyword or the year or month taken. Read-only.","inputSchema":{"type":"object","properties":search,"required":["query"],"additionalProperties":false},"annotations":read}));
+    tools.push(json!({"name":"photos_get","description":"Read one cached Apple iCloud Photos item's details, with a longer caption. Not the picture itself: no image, video, thumbnail, place or faces.","inputSchema":{"type":"object","properties":{"id":id},"required":["id"],"additionalProperties":false},"annotations":read}));
+    tools.push(json!({"name":"photos_refresh","description":"Read the user's Apple iCloud Photos metadata (personal library) from Apple into the local cache, a bounded batch at a time; a large library takes several calls. Never downloads pictures, never changes photos or albums at Apple and sends no queued changes. Never opens a login prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}));
     let page = json!({"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":drive::MAX_LIMIT,"default":25}});
     let cloud_path = json!({"type":"string","minLength":1,"maxLength":drive::MAX_PATH_BYTES,"description":format!("Cloud path in Apple iCloud Drive, such as /Documents/Taxes. / is the top. Names are matched as Apple lists them; ., .., empty names and control characters are refused. At most {} names.", drive::MAX_DEPTH)});
     let id = json!({"type":"string","minLength":1,"maxLength":drive::MAX_ID_BYTES,"description":"Item id from drive_list, drive_get or drive_search. At most 512 UTF-8 bytes."});
