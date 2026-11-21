@@ -1219,11 +1219,18 @@ async fn an_unknown_lock_state_is_reported_as_unknown_and_a_found_entry_needs_no
         storage::KeyringState::Unknown
     );
     let report = skykeep_mcp::status::check(storage::env(), &dir).render();
-    assert!(report.contains("can't tell whether it is locked"), "{report}");
+    assert!(
+        report.contains("can't tell whether it is locked"),
+        "{report}"
+    );
     // Setup asks for nothing from Apple while the lock state is unknown.
     let mut script = Script::new(vec![Ask(""), Ask("2")]);
     assert_eq!(run(&mut script, &dir, &server).await, Ok(Outcome::Quit));
-    assert!(!script.screen.contains("Apple Account"), "{}", script.screen);
+    assert!(
+        !script.screen.contains("Apple Account"),
+        "{}",
+        script.screen
+    );
     // An entry that reads back means the keyring answered: ready, no lock question needed.
     let canonical = dir.canonicalize().unwrap();
     {

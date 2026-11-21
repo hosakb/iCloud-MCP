@@ -381,7 +381,9 @@ pub fn keyring_state(env: &Env, dir: &Path) -> KeyringState {
     }
     match store.try_load() {
         // An entry read back: the keyring answered, unlocked.
-        Ok(session) if session.apple_id.is_some() || session.dsid.is_some() || session.is_resumable() => {
+        Ok(session)
+            if session.apple_id.is_some() || session.dsid.is_some() || session.is_resumable() =>
+        {
             KeyringState::Ready
         }
         // A missing entry reads as empty even in a locked collection: ask the lock itself.
