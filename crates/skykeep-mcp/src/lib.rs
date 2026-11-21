@@ -6,6 +6,7 @@ pub mod drive;
 pub mod keyhold;
 pub mod login;
 pub mod photos;
+mod preserve;
 pub mod scheduler;
 pub mod setup;
 pub mod state;
@@ -1052,9 +1053,12 @@ impl Server {
                 let detail = library
                     .reminder_detail(&args.guid)
                     .map_err(|_| "library_unavailable")?;
-                Ok(
-                    json!({"source":"local_cache","item":item,"detail":detail,"complete_representation":false}),
-                )
+                let mut reply = preserve::reminder_report(library, &item)?;
+                reply["source"] = json!("local_cache");
+                reply["item"] = json!(item);
+                reply["detail"] = json!(detail);
+                reply["complete_representation"] = json!(false);
+                Ok(reply)
             }
             "reminders_lists" => {
                 let args: Page = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -1090,9 +1094,12 @@ impl Server {
                     .map(serde_json::from_str)
                     .transpose()
                     .map_err(|_| "invalid_cached_runs")?;
-                Ok(
-                    json!({"source":"local_cache","item":item,"runs":runs,"complete_representation":false}),
-                )
+                let mut reply = preserve::note_report(library, &item, item.runs.as_deref())?;
+                reply["source"] = json!("local_cache");
+                reply["item"] = json!(item);
+                reply["runs"] = json!(runs);
+                reply["complete_representation"] = json!(false);
+                Ok(reply)
             }
             "reminders_search" => {
                 let args: Search = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -1485,6 +1492,16 @@ fn enqueue_note(library: &mut Library, args: NoteWrite) -> Result<Value, &'stati
                 .map_err(|_| "library_unavailable")?
                 .map(|raw| serde_json::from_str(&raw).map_err(|_| "invalid_cached_runs"))
                 .transpose()?;
+            preserve::check_note_save(&base, base_runs.as_deref(), &body, runs.as_deref())?;
+            if let Some(sent_from) = preserve::send_base(library, &guid)? {
+                preserve::keeps_attachment_marks(&sent_from, &body)?;
+            }
+            let kept_attachments = body.chars().filter(|&c| c == '\u{FFFC}').count();
+            let formatting = if runs.is_some() {
+                "restyled_from_runs"
+            } else {
+                "kept_from_apple"
+            };
             quince_sync::notes::record_note_save(
                 library,
                 &guid,
@@ -1494,7 +1511,9 @@ fn enqueue_note(library: &mut Library, args: NoteWrite) -> Result<Value, &'stati
                 base_runs,
             )
             .map_err(|_| "write_refused")?;
-            Ok(json!({"guid":guid,"status":"queued","remote_verified":false}))
+            Ok(
+                json!({"guid":guid,"status":"queued","remote_verified":false,"kept_attachments":kept_attachments,"formatting":formatting}),
+            )
         }
         NoteWrite::Delete { guid, base_etag } => {
             let note = library
@@ -1522,6 +1541,26 @@ fn enqueue_note(library: &mut Library, args: NoteWrite) -> Result<Value, &'stati
     }
 }
 
+/// `Option<Option<T>>` kept whole through JSON: absent is `None`, null is `Some(None)`.
+mod present {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S: Serializer, T: Serialize>(
+        v: &Option<Option<T>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(inner) => inner.serialize(s),
+            None => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+        d: D,
+    ) -> Result<Option<Option<T>>, D::Error> {
+        Option::<T>::deserialize(d).map(Some)
+    }
+}
+
 #[derive(Deserialize, serde::Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum ReminderWrite {
@@ -1535,6 +1574,9 @@ enum ReminderWrite {
     Edit {
         guid: String,
         patch: Value,
+        /// Absent: not checked. Present: must be the cached change tag, `null` for none.
+        #[serde(default, skip_serializing_if = "Option::is_none", with = "present")]
+        base_etag: Option<Option<String>>,
     },
     Create {
         list_guid: String,
@@ -1572,30 +1614,37 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
             .map_err(|_| "write_refused")?;
             Ok(json!({"guid":guid,"status":"queued","remote_verified":false}))
         }
-        ReminderWrite::Edit { guid, patch } => {
+        ReminderWrite::Edit {
+            guid,
+            patch,
+            base_etag,
+        } => {
             let reminder = library
                 .reminder(&guid)
                 .map_err(|_| "library_unavailable")?
                 .ok_or("not_found")?;
+            if base_etag.as_ref().is_some_and(|tag| *tag != reminder.etag) {
+                return Err("conflict");
+            }
             let mut fields = patch.as_object().cloned().ok_or("invalid_patch")?;
             if fields.is_empty()
-                || fields.keys().any(|k| {
-                    ![
-                        "title",
-                        "notes",
-                        "due_at",
-                        "all_day",
-                        "flagged",
-                        "completed",
-                        "priority",
-                        "list_guid",
-                        "parent_guid",
-                    ]
-                    .contains(&k.as_str())
-                })
+                || fields
+                    .keys()
+                    .any(|k| !preserve::REMINDER_FIELDS.contains(&k.as_str()))
             {
                 return Err("invalid_patch");
             }
+            preserve::check_reminder_edit(&reminder, &fields)?;
+            let changed: Vec<&str> = preserve::REMINDER_FIELDS
+                .into_iter()
+                .filter(|f| fields.contains_key(*f))
+                .collect();
+            let alarms = preserve::reminder_alarm_effect(&fields);
+            let conflict_check = if base_etag.is_some() {
+                "base_etag"
+            } else {
+                "none"
+            };
             fields.insert("from_list".into(), json!(reminder.list_guid));
             let e: quince_sync::reminders::Edit =
                 serde_json::from_value(Value::Object(fields)).map_err(|_| "invalid_patch")?;
@@ -1612,7 +1661,9 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
             };
             quince_sync::reminders::record_reminder_edit(library, &reminder, &edit)
                 .map_err(|_| "write_refused")?;
-            Ok(json!({"guid":guid,"status":"queued","remote_verified":false}))
+            Ok(
+                json!({"guid":guid,"status":"queued","remote_verified":false,"changed_fields":changed,"conflict_check":conflict_check,"alarms":alarms}),
+            )
         }
         ReminderWrite::Create {
             list_guid,
@@ -1702,7 +1753,7 @@ fn tools() -> Vec<Value> {
         tools.push(json!({"name":name,"description":format!("Search the user's {kind} in the local cache index."),"inputSchema":{"type":"object","properties":{"query":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}},"required":["query"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     }
     tools.push(json!({"name":"notes_write","description":"Queue a change to the user's Apple iCloud Notes (create, save, move, pin, delete). Follows the approval mode. Queued is not remote-verified.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","save","move","pin","delete"]},"body":{"type":"string"},"pinned":{"type":"boolean"},"runs":{"type":["array","null"],"items":{"type":"object"}},"folder_guid":{"type":["string","null"]},"guid":{"type":"string"},"base_etag":{"type":["string","null"]}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
-    tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). Deletions need local terminal approval. No field-level remote verification.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
+    tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). Deletions need local terminal approval. No field-level remote verification.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."},"base_etag":{"type":["string","null"],"description":"Edit only: the etag from reminders_get. A newer cached copy returns conflict."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
     tools.push(json!({"name":"reminders_get","description":"Read one cached Apple Reminders item and its supported details. Not a complete archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools.push(json!({"name":"notes_get","description":"Read one cached Apple iCloud Notes note. Not a complete preservation archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools.push(json!({"name":"sync","description":"Refresh Apple iCloud Notes and Apple Reminders and send approved queued changes. Queued/sent is not field-level remote verification. Never opens a login prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
