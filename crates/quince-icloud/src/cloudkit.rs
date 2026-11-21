@@ -341,16 +341,18 @@ impl<'a> ZoneClient<'a> {
     /// A longer ask is not sat out here and not capped either: the container is held off for
     /// all of it (`hold_off`), and until it passes every request is refused here, unsent.
     async fn post_json(&self, url: &str, body: &Value) -> Result<(reqwest::StatusCode, String)> {
-        if let Some(left) = held_off(&self.hold_key()) {
-            quiet!(
-                "cloudkit: held off for {}s more, as Apple asked",
-                left.as_secs()
-            );
-            return Err(Error::Busy(Some(left)));
-        }
         let mut tries = 0;
         loop {
             tries += 1;
+            // Checked before every send: a request run alongside this one may have been told
+            // to wait while this one slept between tries.
+            if let Some(left) = held_off(&self.hold_key()) {
+                quiet!(
+                    "cloudkit: held off for {}s more, as Apple asked",
+                    left.as_secs()
+                );
+                return Err(Error::Busy(Some(left)));
+            }
             let response = self
                 .http
                 .post(url)
@@ -2467,6 +2469,34 @@ mod trouble_tests {
             "{err:?}"
         );
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// A request sleeping out a short wait does not send again once a request run alongside it
+    /// has been told to hold the container off.
+    #[tokio::test]
+    async fn a_retry_checks_a_hold_placed_while_it_slept() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/changes/zone$"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({ "retryAfter": 1 })))
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let uri = server.uri();
+        let _unheld = Unheld(format!("{uri}/com.apple.notes"));
+        let notes = client(&http, &uri, "com.apple.notes");
+        let walk = notes.all_records("Notes", None);
+        let parallel = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            container_busy(&uri, "com.apple.notes", "", Some("1800"));
+        };
+        let (walk, ()) = tokio::join!(walk, parallel);
+        let err = walk.err().expect("held off");
+        assert!(
+            matches!(err, Error::Busy(Some(w)) if w.as_secs() > 1790),
+            "{err:?}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]
