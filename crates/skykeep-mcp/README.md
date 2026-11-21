@@ -1,10 +1,10 @@
 # skykeep-mcp
 
-A local MCP server for Apple Notes, Reminders, Contacts, Calendar, Photos and iCloud Drive, built on the Skykeep engine. It speaks newline-delimited JSON-RPC over stdio, keeps its own private library directory and has no network listener. Notes and Reminders can be changed; Contacts, Calendar, Photos and Drive are read-only, and Photos and Drive expose metadata only (no pictures, no file contents). Mail is not implemented.
+A local MCP server for Apple Notes, Reminders, Contacts, Calendar, Photos and iCloud Drive, built on the Skykeep engine. It speaks newline-delimited JSON-RPC over stdio, keeps its own private library directory and has no network listener. Notes, Reminders and Drive can be changed; Contacts, Calendar and Photos are read-only, and Photos exposes metadata only (no pictures). Drive file contents move only through one local exchange folder you set up. Mail is not implemented.
 
 ## Architecture
 
-![Skykeep MCP: Hermes talks to the MCP server over stdio, which syncs with Apple iCloud. Live today: Notes and Reminders (read and write), Contacts, Calendar, Photos and Drive (read-only). Planned with no route built yet: Mail, and repeating reminders with alerts](docs/architecture.webp)
+![Skykeep MCP: Hermes talks to the MCP server over stdio, which syncs with Apple iCloud. Live today: Notes, Reminders and Drive (read and write), Contacts, Calendar and Photos (read-only). Planned with no route built yet: Mail, and repeating reminders with alerts](docs/architecture.webp)
 
 Edit `docs/architecture.html` and re-export `docs/architecture.webp` whenever a route moves from planned to live.
 
@@ -126,12 +126,36 @@ Configure your MCP client to start that command. Stdout carries protocol message
 | `calendar_refresh` | Reads Calendar from Apple into the local cache over a bounded window, replacing it. Never writes to Apple, never answers invitations and never opens a sign-in prompt. |
 | `photos_albums`, `photos_list`, `photos_search`, `photos_get` | Read the cached metadata of your personal Photos library: dates, kind, size, filename, title, caption, keywords. No pictures, places or faces. Read-only. |
 | `photos_refresh` | Reads Photos metadata from Apple into the local cache, a bounded batch per call, so a large library takes several calls. Never downloads pictures and never changes photos or albums. |
-| `drive_list`, `drive_get`, `drive_search` | List a cached iCloud Drive folder, read one item's details, or search names. Paths look like `/Documents/Taxes`. Metadata only: no file contents, no downloads, no local paths. Read-only. |
+| `drive_list`, `drive_get`, `drive_search` | List a cached iCloud Drive folder, read one item's details, or search names. Paths look like `/Documents/Taxes`. Metadata only: no file contents and no local paths. Read-only. |
 | `drive_refresh` | Reads one Drive folder's item list (and those on its path) from Apple into the local cache. Never changes anything in Drive. |
+| `drive_write` | Changes Drive with one `action`: `create_folder`, `rename`, `move`, `trash`, `delete_forever`, `upload` or `download`. Runs against Apple once it is allowed; see "Drive changes" below. |
 
 Contacts, Calendar, Photos and Drive start empty: call their `*_refresh` tool once to fill the cache, and again whenever you want newer data. Their refresh is not part of `sync`.
 
-Reads come from the local cache and say so (`"source": "local_cache"`). A successful write means the change is queued in the library's durable outbox; `remote_verified` is always `false`, because the server does not read each field back from iCloud after sending.
+Reads come from the local cache and say so (`"source": "local_cache"`). A successful Notes or Reminders write means the change is queued in the library's durable outbox; `remote_verified` is always `false`, because the server does not read each field back from iCloud after sending. Drive changes are not queued: see the next section.
+
+## Drive changes
+
+`drive_write` finds its target in the local cache by cloud path or id, as `drive_get` does, so run `drive_refresh` on the folder first. Drive has no outbox here: an allowed change runs at once and the reply says what happened.
+
+- `"outcome": "done"` comes with `checked`, which says exactly what was confirmed. A rename, move, trash or delete forever is read back from Apple (`remote_verified: true`). An upload is checked against Apple's checksum of the bytes and read back at its size. A new folder is only what Apple's answer described, and a download only counts the bytes; both say `remote_verified: false`.
+- An error means it did not happen, or could not be confirmed. `drive_write_outcome_unknown_run_drive_refresh_before_retrying` means the connection ended before Apple answered: refresh the folder and look before trying again.
+- Retrying is safe. Before it adds a name, a change reads the folder from Apple and refuses a name already there (`name_taken`, compared without case), so a repeated upload or new folder never makes a second copy. A repeated rename says `already_has_this_name`, and a repeated move says `already_in_destination`. An item that changed at Apple since it was cached is left alone (`drive_item_changed_run_drive_refresh`).
+- Afterwards the folders the change touched read as not yet refreshed, until `drive_refresh` reads them again.
+
+Approvals. `trash` moves an item to Recently Deleted, where Apple keeps it about 30 days. `delete_forever` moves it there and then deletes it for good. Both always need your approval, and so does renaming or moving a folder with 20 or more items (or an unknown number). The approval shows a preview of what the change reaches: the item, its path, Apple's count of its items, how many are cached beneath it, and the first names. Under `reads_and_writes` and `writes_only`, every Drive change is approved in the MCP client's approval form. Under `yolo`, or in a folder with no approval mode, these changes return `approval_required` with a request ID, and you approve them with `skykeep-mcp approve --state-dir DIR` in your own terminal. That command runs the change and prints the outcome. A request is used once, and it is refused if the account, the approval mode, the folder or the cached item changed since it was made. In a folder with no approval mode, `require-approval` makes every Drive change wait for `approve`.
+
+### The exchange folder
+
+Uploads read from, and downloads write into, one local folder. Set it up in your own terminal:
+
+```sh
+skykeep-mcp exchange --state-dir ~/.local/share/skykeep-mcp
+```
+
+It creates `~/Skykeep-Exchange` (mode `0700`) if needed and prints the folder and the size limit. Nothing else changes. `--path DIR` picks another folder (its parent must exist) and `--max-mb N` changes the limit, 100 MB by default. No MCP argument can name the folder or change the limit. Until it is set up, `upload` and `download` are refused.
+
+The `local` argument names a file inside the folder as a relative path, such as `report.pdf` or `in/report.pdf`. Absolute paths, `..` and symbolic links anywhere on the way are refused; each name is opened with no-follow semantics, and the folder must still be the one you set up. An upload must be a regular file with no other hard link. A download never replaces an existing file: it arrives as a hidden partial file and takes its name only if the name is still free. Without `local`, a download takes the item's name with control and text-direction characters removed, and a name that could leave the folder is refused. The limit is checked while bytes are read or arrive, not afterwards, and a stopped transfer leaves nothing behind.
 
 ## Write approval
 

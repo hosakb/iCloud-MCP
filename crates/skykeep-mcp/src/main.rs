@@ -52,6 +52,9 @@ More commands (each needs --state-dir FOLDER):
                           folders without an approval mode: routine changes run again,
                           deletions still wait for approve
   skykeep-mcp quarantine  list and retire writes that were set aside
+  skykeep-mcp exchange --state-dir FOLDER [--path DIR] [--max-mb N]
+                          set up the one folder Drive uploads read from and downloads
+                          write into (default ~/Skykeep-Exchange, limit 100 MB) and print it
   skykeep-mcp --state-dir FOLDER
                           run the MCP server on stdin and stdout (your MCP client starts this)
 
@@ -175,6 +178,7 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
             "allow-routine",
             "policy",
             "quarantine",
+            "exchange",
         ]
         .iter()
         .any(|name| s == name)
@@ -197,6 +201,25 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
     } else {
         None
     };
+    let mut exchange_path = None;
+    let mut exchange_mb = None;
+    if command == "exchange" {
+        while let Some(flag) = args.next() {
+            if flag == "--path" && exchange_path.is_none() {
+                exchange_path = Some(PathBuf::from(args.next().ok_or("exchange_path_required")?));
+            } else if flag == "--max-mb" && exchange_mb.is_none() {
+                let mb: u64 = args
+                    .next()
+                    .and_then(|a| a.to_str().and_then(|a| a.parse().ok()))
+                    .ok_or("exchange_limit_out_of_range")?;
+                exchange_mb = Some(mb);
+            } else {
+                return Err(
+                    "usage: skykeep-mcp exchange --state-dir FOLDER [--path DIR] [--max-mb N]",
+                );
+            }
+        }
+    }
     if args.next().is_some() {
         return Err("unexpected_argument");
     }
@@ -245,6 +268,21 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
                 .map_err(|_| "terminal_unavailable")?;
             return Ok(());
         }
+        if command == "exchange" {
+            use std::io::Write;
+            let held = PrivateState::open(&dir)?;
+            let mut library =
+                quince_core::Library::open(&held.path).map_err(|_| "library_unavailable")?;
+            let exchange = skykeep_mcp::exchange::set_up(&mut library, exchange_path, exchange_mb)?;
+            writeln!(
+                tty,
+                "Drive exchange folder: {}\nSize limit: {} MB per upload or download.",
+                exchange.path.display(),
+                exchange.max_bytes / (1024 * 1024)
+            )
+            .map_err(|_| "terminal_unavailable")?;
+            return Ok(());
+        }
         if command == "approve" {
             use std::io::Write;
             let id = terminal::hidden(&mut tty, "Approval request ID: ", Duration::from_secs(180))?;
@@ -258,14 +296,21 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
             .map_err(|_| "terminal_unavailable")?;
             let answer = terminal::hidden(
                 &mut tty,
-                "Type approve to queue it, or Ctrl-C to cancel: ",
+                "Type approve to queue it (a Drive change runs now), or Ctrl-C to cancel: ",
                 Duration::from_secs(180),
             )?;
             if *answer != "approve" {
                 return Err("approval_cancelled");
             }
-            let result = server.approve(&id)?;
-            eprintln!("{}", result["status"].as_str().unwrap_or("unknown"));
+            let result = server.approve_any(&id).await?;
+            let status = result["status"]
+                .as_str()
+                .or_else(|| result["outcome"].as_str())
+                .unwrap_or("unknown");
+            match result["checked"].as_str() {
+                Some(checked) => eprintln!("{status}: {checked}"),
+                None => eprintln!("{status}"),
+            }
             return Ok(());
         }
         let held = PrivateState::open(&dir)?;

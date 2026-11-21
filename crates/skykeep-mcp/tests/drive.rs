@@ -366,7 +366,7 @@ async fn tools_list_names_apple_icloud_drive_with_strict_read_only_schemas() {
     let tools = list["result"]["tools"].as_array().unwrap();
     let drive: Vec<&Value> = tools
         .iter()
-        .filter(|t| t["name"].as_str().unwrap().starts_with("drive"))
+        .filter(|t| NAMES.contains(&t["name"].as_str().unwrap()))
         .collect();
     let found: Vec<&str> = drive.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(found, NAMES);
@@ -398,9 +398,12 @@ async fn tools_list_names_apple_icloud_drive_with_strict_read_only_schemas() {
         100
     );
     assert_eq!(drive[2]["inputSchema"]["required"], json!(["query"]));
-    // No tool downloads, uploads, renames, moves or deletes Drive items.
+    // Only drive_write downloads, uploads, renames, moves or deletes Drive items.
     for tool in tools {
         let name = tool["name"].as_str().unwrap();
+        if name == "drive_write" {
+            continue;
+        }
         for word in [
             "download", "upload", "rename", "move", "delete", "trash", "file",
         ] {
