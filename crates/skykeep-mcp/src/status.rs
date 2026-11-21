@@ -92,12 +92,13 @@ pub fn with_dir(text: &str, dir: &Path) -> String {
             "logout",
             "approve",
             "quarantine",
+            "permissions",
         ]
         .contains(&word.as_str());
         let tail = &after[word.len()..];
         out.push_str("skykeep-mcp ");
         out.push_str(&word);
-        let knows_default = ["setup", "status", "unlock"].contains(&word.as_str());
+        let knows_default = ["setup", "status", "unlock", "permissions"].contains(&word.as_str());
         if known && !(default && knows_default) && !tail.starts_with(" --state-dir") {
             out.push_str(&flag);
         }
@@ -223,7 +224,7 @@ pub fn check(env: &Env, dir: &Path) -> Report {
 
     let store = storage_lines(env, dir, &mut report);
 
-    let library = if dir.join("library.db").exists() {
+    let mut library = if dir.join("library.db").exists() {
         quince_core::Library::open(dir).ok()
     } else {
         None
@@ -303,6 +304,18 @@ pub fn check(env: &Env, dir: &Path) -> Report {
             "The approval mode setting can't be read.",
             "Run skykeep-mcp setup to choose it again.",
         ),
+    }
+    if let Some(library) = library.as_mut() {
+        let mode = crate::policy(library, dir)
+            .ok()
+            .flatten()
+            .map(|(p, _)| p.mode);
+        for (text, next) in crate::permissions::status(library, dir, mode.as_deref()) {
+            match next {
+                Some(next) => report.fix(text, next),
+                None => report.ok(text),
+            }
+        }
     }
     report
 }

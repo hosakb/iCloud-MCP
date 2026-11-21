@@ -44,13 +44,13 @@ fn negotiated_form_approves_exact_create_before_enqueue() {
     assert_eq!(form["method"], "elicitation/create");
     assert_eq!(
         form["params"]["requestedSchema"],
-        json!({"type":"object","properties":{}})
+        json!({"type":"object","properties":{"decision":{"type":"string","title":"Decision","oneOf":[{"const":"approve","title":"Approve this time"},{"const":"deny","title":"Deny"},{"const":"always_allow","title":"Always allow this action"}]}},"required":["decision"]})
     );
     assert_eq!(library.outbox_count().unwrap(), 0);
     writeln!(
         input,
         "{}",
-        json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}})
+        json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}})
     )
     .unwrap();
     let reply: Value = serde_json::from_str(&output.next().unwrap().unwrap()).unwrap();

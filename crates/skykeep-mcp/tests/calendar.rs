@@ -815,7 +815,7 @@ async fn reads_and_writes_binds_each_calendar_read_to_one_approval() {
         "approval_pending"
     );
     let accepted = server
-        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
         .await
         .unwrap();
     assert_eq!(text(&accepted)["event"]["title"], "Gym");

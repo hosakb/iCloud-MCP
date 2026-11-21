@@ -532,18 +532,18 @@ async fn reads_and_writes_binds_each_contacts_read_to_one_approval() {
         "approval_pending"
     );
     assert!(server
-        .handle(json!({"jsonrpc":"2.0","id":"other","result":{"action":"accept","content":{}}}))
+        .handle(json!({"jsonrpc":"2.0","id":"other","result":{"action":"accept","content":{"decision":"approve"}}}))
         .await
         .is_none());
     let accepted = server
-        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
         .await
         .unwrap();
     assert_eq!(accepted["id"], 3);
     assert_eq!(text(&accepted)["contact"]["last_name"], "Lovelace");
     // A replayed answer is not a second approval.
     assert!(server
-        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
         .await
         .is_none());
 
@@ -570,7 +570,7 @@ async fn reads_and_writes_binds_each_contacts_read_to_one_approval() {
         .unwrap();
     assert_eq!(text(&reply)["error"], "approval_cancelled");
     assert!(server
-        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
         .await
         .is_none());
     // A policy change between the prompt and the answer makes the approval stale.
@@ -580,7 +580,7 @@ async fn reads_and_writes_binds_each_contacts_read_to_one_approval() {
         .set_policy("reads_and_writes")
         .unwrap();
     let reply = server
-        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
         .await
         .unwrap();
     assert_eq!(text(&reply)["error"], "approval_policy_changed");

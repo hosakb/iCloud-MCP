@@ -186,10 +186,10 @@ fn stdio_discovers_and_reads_contacts_with_bound_approval() {
     assert_eq!(form["method"], "elicitation/create", "{form}");
     assert_eq!(
         form["params"]["requestedSchema"],
-        json!({"type":"object","properties":{}})
+        json!({"type":"object","properties":{"decision":{"type":"string","title":"Decision","oneOf":[{"const":"approve","title":"Approve this time"},{"const":"deny","title":"Deny"},{"const":"always_allow","title":"Always allow this action"}]}},"required":["decision"]})
     );
     let reply =
-        mcp.ask(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}));
+        mcp.ask(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}));
     assert_eq!(reply["id"], 3);
     assert_eq!(reply["result"]["isError"], false, "{reply}");
     assert_eq!(guids(&text(&reply)), ["C-ZOE"]);
