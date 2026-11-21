@@ -1544,8 +1544,9 @@ async fn set_repeat_inner(
     rule_id: Option<&str>,
 ) -> Result<()> {
     // Apple will not schedule a repeat with nothing to repeat from, and a reminder that
-    // repeats from no date would simply never come back.
-    if repeat.is_some() && reminder.due_at.is_none() {
+    // repeats from no date would simply never come back. A rule named beforehand goes by the
+    // date Apple holds, read below.
+    if rule_id.is_none() && repeat.is_some() && reminder.due_at.is_none() {
         return Err(Error::Protocol(
             "give this a date before asking it to repeat".into(),
         ));
@@ -1571,6 +1572,23 @@ async fn set_repeat_inner(
     // Sent before and pointed at already: nothing left to do, and nothing to retire.
     if rule_id.is_some_and(|id| existing.iter().any(|x| x.eq_ignore_ascii_case(id))) {
         return Ok(());
+    }
+    // A reminder made here, its repeat still to write, as Apple holds it now. A repeat set on
+    // a phone meanwhile is the person's, a date cleared leaves nothing to repeat from, and a
+    // date moved past the last day leaves no day to repeat on: nothing is written, and the
+    // rule an earlier try made for this one goes, so nothing is left that nothing points at.
+    if let Some(id) = rule_id {
+        let due = field::timestamp_seconds(&current, "DueDate");
+        let skip = !existing.is_empty()
+            || due.is_none()
+            || end_at.is_some_and(|end| due.is_some_and(|due| end < due));
+        if skip {
+            let name = format!("RecurrenceRule/{id}");
+            if client.lookup_record(ZONE, &name).await?.is_some() {
+                client.delete_record(ZONE, &name).await?;
+            }
+            return Ok(());
+        }
     }
 
     let wanted: Vec<String> = match repeat {

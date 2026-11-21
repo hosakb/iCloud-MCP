@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use skykeep_mcp::Server;
 use std::os::unix::fs::PermissionsExt;
 use wiremock::matchers::{method, path, path_regex};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// 9:00 on 7 March 2026 in New York, the day before its clocks go forward.
 const DUE: i64 = 1_772_892_000;
@@ -227,7 +227,11 @@ async fn combinations_that_cannot_work_are_refused_and_queue_nothing() {
     )
     .await;
     assert!(failed);
-    assert_eq!(result["error"], "early_alert_account_unavailable");
+    // The code says what to do: set one early alert on an Apple device, then sync.
+    assert_eq!(
+        result["error"],
+        "early_alert_account_unavailable_set_one_on_an_apple_device_then_sync"
+    );
     assert_eq!(library.outbox_count().unwrap(), 0);
     // The options belong to a create; an edit carrying one is not understood.
     let (_dir, mut server, _library) = setup(true);
@@ -353,6 +357,14 @@ async fn the_schema_describes_the_new_create_fields() {
         json!(["daily"])
     );
     assert_eq!(props["repeat"]["additionalProperties"], false);
+    // An all-day reminder's last day is read in UTC, a timed one's in its zone.
+    let until = props["repeat"]["properties"]["until"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(
+        until.contains("UTC") && until.contains("all-day"),
+        "{until}"
+    );
     assert_eq!(props["due_time_alert"]["type"], "boolean");
     assert_eq!(
         props["early_alert"]["properties"]["amount"]["maximum"],
@@ -445,4 +457,115 @@ async fn sync_names_only_writes_cloudkit_took_whole() {
     assert_eq!(waiting[0].record, repeating["guid"].as_str().unwrap());
     assert_eq!(waiting[0].tries, 1);
     assert!(!result.to_string().contains("SYNTHETIC-TOKEN"));
+}
+
+/// A pretend CloudKit that keeps the records written to it, so a create with options can be
+/// sent whole.
+#[derive(Clone, Default)]
+struct Records(std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Value>>>);
+
+impl Respond for Records {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let mut records = self.0.lock().unwrap();
+        let answer = |r: Value| ResponseTemplate::new(200).set_body_json(json!({"records":[r]}));
+        if request.url.path().ends_with("/records/lookup") {
+            let name = body["records"][0]["recordName"].as_str().unwrap();
+            return answer(
+                records
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| json!({"recordName":name,"serverErrorCode":"NOT_FOUND"})),
+            );
+        }
+        let op = &body["operations"][0];
+        let name = op["record"]["recordName"].as_str().unwrap().to_string();
+        let tag = format!("t{}", records.len() + 1);
+        match op["operationType"].as_str().unwrap() {
+            "create" => {
+                let mut r = op["record"].clone();
+                r["recordChangeTag"] = json!(tag);
+                records.insert(name, r.clone());
+                answer(r)
+            }
+            "update" => match records.get_mut(&name) {
+                None => {
+                    answer(json!({"recordName":name,"serverErrorCode":"NOT_FOUND","reason":"gone"}))
+                }
+                Some(r) => {
+                    for (k, v) in op["record"]["fields"].as_object().unwrap() {
+                        r["fields"][k] = v.clone();
+                    }
+                    r["recordChangeTag"] = json!(format!("{tag}u"));
+                    answer(r.clone())
+                }
+            },
+            _ => {
+                records.remove(&name);
+                answer(json!({"recordName":name}))
+            }
+        }
+    }
+}
+
+/// Apple holds what is written: a create with a repeat and an alert is sent whole, leaves the
+/// queue and is named accepted, the reminder pointing at the rule and alarm it was queued with.
+#[tokio::test]
+async fn sync_names_an_options_create_cloudkit_took_whole_as_accepted() {
+    let remote = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/setup/ws/1/validate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"dsInfo":{"dsid":"1234567890"},"webservices":{"ckdatabasews":{"url":remote.uri()}}}))).mount(&remote).await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/changes/zone$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"zones":[{"records":[],"syncToken":"synthetic","moreComing":false}]}),
+        ))
+        .mount(&remote)
+        .await;
+    let records = Records::default();
+    Mock::given(method("POST"))
+        .and(path_regex(".*/records/(lookup|modify)$"))
+        .respond_with(records.clone())
+        .mount(&remote)
+        .await;
+    let (dir, mut server, mut library) = setup(false);
+    library
+        .set_state("account", &quince_sync::queue::account_tag("1234567890"))
+        .unwrap();
+    server.set_policy("yolo").unwrap();
+    let (failed, made) = call(
+        &mut server,
+        json!({"action":"create","list_guid":"list","title":"Synthetic daily","due_at":DUE,
+               "timezone":"America/New_York","repeat":{"frequency":"daily"},"due_time_alert":true}),
+    )
+    .await;
+    assert!(!failed, "{made}");
+    let payload: Value =
+        serde_json::from_str(&library.outbox_pending("reminders").unwrap()[0].payload).unwrap();
+    let result =
+        skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+            .await
+            .unwrap();
+    let left = result["left_queue_this_sync"].as_array().unwrap();
+    assert_eq!(left.len(), 1, "{result}");
+    assert_eq!(left[0]["record"], made["guid"]);
+    assert_eq!(left[0]["outcome"], "cloudkit_accepted");
+    assert_eq!(result["remote_verified"], false);
+    assert!(library.outbox_pending("reminders").unwrap().is_empty());
+    // The reply says what accepted leaves out: options dropped on purpose, the list order.
+    let note = result["left_queue_note"].as_str().unwrap();
+    assert!(
+        note.contains("left out on purpose") && note.contains("list-order"),
+        "{note}"
+    );
+    let held = records.0.lock().unwrap();
+    let reminder = &held[made["guid"].as_str().unwrap()];
+    assert_eq!(
+        reminder["fields"]["RecurrenceRuleIDs"]["value"],
+        json!([payload["repeat"]["rule_id"]])
+    );
+    assert_eq!(
+        reminder["fields"]["AlarmIDs"]["value"],
+        json!([payload["alarm"]["alarm_id"]])
+    );
 }

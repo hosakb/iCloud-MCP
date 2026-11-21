@@ -555,6 +555,18 @@ pub fn apply(
 /// The step of a new reminder's send that writes its repeat (1 date, 2 repeat, 3 alarm).
 const REPEAT_STEP: u8 = 2;
 
+/// The note of a new reminder whose every step Apple has taken.
+const ALL_STEPS: u8 = 5;
+
+/// A change leaving the queue, sent, refused or discarded: the note of the steps a new
+/// reminder's sends took goes with it.
+pub fn settle(l: &mut Library, p: &Pending) -> quince_core::Result<()> {
+    if p.service == REMINDERS && p.kind == "create" {
+        l.forget_state(&create_progress_key(&p.record))?;
+    }
+    Ok(())
+}
+
 /// The library key holding how many of a new reminder's steps Apple has taken.
 fn create_progress_key(guid: &str) -> String {
     format!("reminders.create_steps.{guid}")
@@ -657,8 +669,9 @@ async fn send_create_options(
         )
         .await?;
     }
-    // Every step taken: the note has served its turn.
-    library.lock().await.set_state(&key, "")?;
+    // Every step taken. The note stays until the change leaves the queue ([`settle`]): sent
+    // again before then (the queue's own write failed), it writes nothing more.
+    took(ALL_STEPS).await?;
     Ok(())
 }
 

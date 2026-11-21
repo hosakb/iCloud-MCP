@@ -129,6 +129,7 @@ fn quarantine_unauthorized(library: &mut Library, dir: &Path) -> Result<(), &'st
             Err(reason) if QUARANTINABLE.contains(&reason) => library
                 .atomically(|library| -> quince_core::Result<()> {
                     library.outbox_refuse(p.id, &format!("mcp_quarantine:{reason}"))?;
+                    quince_sync::reminders::settle(library, &p)?;
                     library.set_state(&format!("mcp.authorization.{}", p.id), "")?;
                     library.set_state(&reread_key(&p.service), "1")
                 })
@@ -145,6 +146,9 @@ fn quarantine_unauthorized(library: &mut Library, dir: &Path) -> Result<(), &'st
 pub(crate) fn reread_key(service: &str) -> String {
     format!("mcp.full_reread.{service}")
 }
+
+/// What `cloudkit_accepted` in the sync reply does and does not say.
+const LEFT_QUEUE_NOTE: &str = "cloudkit_accepted: CloudKit took every write the sender made. A reminder's repeat or alert is left out on purpose when its date was cleared, moved past the repeat's last day or made all-day on another device, or a repeat was set there meanwhile. The list-order write is not checked.";
 
 /// Whether this write's sender answers done only when CloudKit took every write it makes: a
 /// reminder create with no date or flag (one write, made once), or one with a repeat or
@@ -455,6 +459,6 @@ async fn sync_pass(
         .map(refused_view)
         .collect();
     Ok(
-        json!({"services":services,"queued":waiting,"refused":refused.len(),"refused_this_sync":refused_now,"left_queue_this_sync":left,"remote_verified":false,"verification":"upstream sync and replay only; field-level read-back is not guaranteed"}),
+        json!({"services":services,"queued":waiting,"refused":refused.len(),"refused_this_sync":refused_now,"left_queue_this_sync":left,"left_queue_note":LEFT_QUEUE_NOTE,"remote_verified":false,"verification":"upstream sync and replay only; field-level read-back is not guaranteed"}),
     )
 }

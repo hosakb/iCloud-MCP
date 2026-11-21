@@ -593,9 +593,7 @@ async fn an_alarm_not_linked_yet_is_dropped_when_the_phone_leaves_no_time() {
     ] {
         let (server, cloud) = cloud().await;
         let mut l = library();
-        let mut c = create();
-        c.early_alert = None;
-        let guid = record_reminder_create(&mut l, &c).unwrap();
+        let guid = record_reminder_create(&mut l, &create()).unwrap();
         let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
         let lock = LibraryLock::new(l, None);
         cloud.fail_once("\"AlarmTrigger\"", fault);
@@ -614,6 +612,11 @@ async fn an_alarm_not_linked_yet_is_dropped_when_the_phone_leaves_no_time() {
             "{field}: trigger left behind"
         );
         assert_eq!(ids(&reminder, "RecurrenceRuleIDs"), ["RULE-1"]);
+        // No time to be early for either: the early alert is left out, and the create is done.
+        assert!(
+            reminder["fields"].get("DueDateDeltaAlertsData").is_none(),
+            "{field}: {reminder}"
+        );
     }
 }
 
@@ -792,4 +795,125 @@ async fn an_early_alert_still_to_write_is_not_added_to_an_all_day_reminder() {
         reminder["fields"].get("DueDateDeltaAlertsData").is_none(),
         "{reminder}"
     );
+}
+
+/// The repeat write fails, and the person sets a repeat of their own on a phone. The retry
+/// writes nothing over it: the phone's rule list stays, and the rule an earlier try made for
+/// this create is taken away, so nothing is left that nothing points at.
+#[tokio::test]
+async fn a_repeat_set_on_a_phone_meanwhile_is_kept_at_apple() {
+    for fault in [Fault::Before, Fault::AnswerLost] {
+        let (server, cloud) = cloud().await;
+        let mut l = library();
+        let guid = record_reminder_create(&mut l, &create()).unwrap();
+        let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+        let lock = LibraryLock::new(l, None);
+        cloud.fail_once("\"RecurrenceRule\"", fault);
+        assert!(send_one(&lock, &server.uri(), &p).await.is_err());
+        cloud.phone_sets(&guid, "RecurrenceRuleIDs", json!(["PHONE-RULE"]));
+        send_one(&lock, &server.uri(), &p).await.unwrap();
+        let reminder = cloud.record(&guid).unwrap();
+        assert_eq!(ids(&reminder, "RecurrenceRuleIDs"), ["PHONE-RULE"]);
+        assert!(cloud.record("RecurrenceRule/RULE-1").is_none());
+        // The alerts still go on.
+        assert_eq!(ids(&reminder, "AlarmIDs"), ["ALARM-1"]);
+        assert_eq!(early_alerts(&reminder).len(), 1);
+    }
+}
+
+/// The repeat is still to write when the person clears the date, or moves it past the
+/// repeat's last day, on a phone. The repeat goes by the date Apple holds then: none is
+/// written, and a rule an earlier try made is taken away.
+#[tokio::test]
+async fn a_repeat_still_to_write_goes_by_the_date_apple_holds() {
+    // 9:00 on 21 March in New York, past the last day (20 March).
+    let past_end = DUE + 14 * 86_400 - 3_600;
+    for (due, fault) in [
+        (Value::Null, Fault::Before),
+        (Value::Null, Fault::AnswerLost),
+        (json!(past_end * 1000), Fault::AnswerLost),
+    ] {
+        let (server, cloud) = cloud().await;
+        let mut l = library();
+        let guid = record_reminder_create(&mut l, &create()).unwrap();
+        let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+        let lock = LibraryLock::new(l, None);
+        cloud.fail_once("\"RecurrenceRule\"", fault);
+        assert!(send_one(&lock, &server.uri(), &p).await.is_err());
+        cloud.phone_sets(&guid, "DueDate", due.clone());
+        send_one(&lock, &server.uri(), &p).await.unwrap();
+        let reminder = cloud.record(&guid).unwrap();
+        assert!(ids(&reminder, "RecurrenceRuleIDs").is_empty(), "{due}");
+        assert!(cloud.of_type("RecurrenceRule").is_empty(), "{due}");
+    }
+}
+
+/// Every step was taken, but the change was not taken off the queue (the library refused
+/// that write) and is sent again after the person moved the date on a phone. The send knows
+/// it finished and writes nothing to the reminder.
+#[tokio::test]
+async fn a_finished_create_sent_again_writes_nothing() {
+    let (server, cloud) = cloud().await;
+    let mut l = library();
+    let guid = record_reminder_create(&mut l, &create()).unwrap();
+    let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+    let lock = LibraryLock::new(l, None);
+    send_one(&lock, &server.uri(), &p).await.unwrap();
+    let moved = DUE + 2 * 86_400;
+    cloud.phone_moves_due(&guid, moved);
+    let updates = cloud.reminder_updates();
+    send_one(&lock, &server.uri(), &p).await.unwrap();
+    assert_eq!(cloud.reminder_updates(), updates);
+    assert_eq!(
+        cloud.record(&guid).unwrap()["fields"]["DueDate"]["value"],
+        moved * 1000
+    );
+}
+
+/// The note of steps taken goes with the change: when it leaves the queue, sent or refused,
+/// the library keeps no key for it.
+#[tokio::test]
+async fn the_note_of_steps_goes_when_the_change_leaves_the_queue() {
+    let key = |guid: &str| format!("reminders.create_steps.{guid}");
+    // Sent.
+    let (server, _cloud) = cloud().await;
+    let mut l = library();
+    let guid = record_reminder_create(&mut l, &create()).unwrap();
+    let lock = LibraryLock::new(l, None);
+    let pass = tokio::sync::Mutex::new(());
+    let uri = server.uri();
+    let report = crate::queue::drain(&lock, REMINDERS, &pass, |p| {
+        let (lock, uri) = (&lock, uri.clone());
+        async move { send_one(lock, &uri, &p).await }
+    })
+    .await;
+    assert!(report.sent);
+    assert!(lock
+        .lock()
+        .await
+        .outbox_pending(REMINDERS)
+        .unwrap()
+        .is_empty());
+    assert_eq!(lock.lock().await.state(&key(&guid)).unwrap(), None);
+    // Refused after a step was taken: a failed repeat write waits for the next pass, then
+    // Apple refuses the change outright.
+    let (server, cloud) = cloud().await;
+    let mut l = library();
+    let guid = record_reminder_create(&mut l, &create()).unwrap();
+    let lock = LibraryLock::new(l, None);
+    let uri = server.uri();
+    cloud.fail_once("\"RecurrenceRule\"", Fault::Before);
+    let report = crate::queue::drain(&lock, REMINDERS, &pass, |p| {
+        let (lock, uri) = (&lock, uri.clone());
+        async move { send_one(lock, &uri, &p).await }
+    })
+    .await;
+    assert!(!report.sent && report.refused.is_empty());
+    assert!(lock.lock().await.state(&key(&guid)).unwrap().is_some());
+    let report = crate::queue::drain(&lock, REMINDERS, &pass, |_| async {
+        Err(Error::Refused("synthetic refusal".into()))
+    })
+    .await;
+    assert_eq!(report.refused.len(), 1);
+    assert_eq!(lock.lock().await.state(&key(&guid)).unwrap(), None);
 }

@@ -134,6 +134,7 @@ where
             }
         };
         let (id, tries, record) = (p.id, p.tries, p.record.clone());
+        let left = p.clone();
         // A panic while sending one change is that change refused, said with the rest — never
         // the whole queue stopped behind it, retried for ever, its edit laid back over the
         // screen each time (an empty note's formatting once did this).
@@ -149,7 +150,10 @@ where
         };
         match sent {
             Ok(()) => {
-                let _ = library.lock().await.outbox_done(id);
+                let mut l = library.lock().await;
+                if l.outbox_done(id).is_ok() {
+                    let _ = crate::reminders::settle(&mut l, &left);
+                }
                 report.sent = true;
             }
             Err(e) if transient(&e, tries) => {
@@ -158,7 +162,10 @@ where
                 return report;
             }
             Err(e) => {
-                let _ = library.lock().await.outbox_refuse(id, &e.to_string());
+                let mut l = library.lock().await;
+                if l.outbox_refuse(id, &e.to_string()).is_ok() {
+                    let _ = crate::reminders::settle(&mut l, &left);
+                }
                 report.refused.push((record, e.to_string()));
             }
         }
