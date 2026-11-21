@@ -102,7 +102,7 @@ pub(crate) fn note_report(
     if !list.is_empty() {
         incomplete.push("attachment_contents_not_included");
     }
-    if has_pending(library, &note.guid)? {
+    if has_pending(library, "notes", &note.guid)? {
         incomplete.push("local_changes_not_sent");
     }
     let edit_text = !note.locked && note.editable && body.is_some();
@@ -122,8 +122,12 @@ pub(crate) fn note_report(
     }))
 }
 
-fn has_pending(library: &Library, guid: &str) -> Result<bool, &'static str> {
-    Ok(crate::sync::pending_operations(library)?
+/// Whether a change to this item waits to be sent. Read straight from the queue, without the
+/// send's limit on how many changes go at once: a long queue must not stop a read.
+fn has_pending(library: &Library, service: &str, guid: &str) -> Result<bool, &'static str> {
+    Ok(library
+        .outbox_pending(service)
+        .map_err(|_| "library_unavailable")?
         .iter()
         .any(|p| p.record == guid))
 }
@@ -197,16 +201,40 @@ pub(crate) fn send_base(library: &Library, guid: &str) -> Result<Option<String>,
     })
 }
 
-/// Whether `body` holds lines of the note's Markdown export that its own text does not: a
-/// heading mark, a list mark or an emphasis mark where Apple keeps formatting instead.
+/// Whether `body` is the note's Markdown export, whole or edited, rather than its own text:
+/// its lines follow the export more closely than they follow the note. A line of Markdown
+/// typed into the note's own text keeps it closer to the note, and is accepted as text.
 fn from_markdown_export(base: &str, base_runs: Option<&[Run]>, body: &str) -> bool {
     let markdown = quince_icloud::markdown::note_to_markdown(base, base_runs.unwrap_or(&[]));
-    let own: std::collections::HashSet<&str> = base.lines().collect();
-    let sent: std::collections::HashSet<&str> = body.lines().collect();
-    markdown
-        .lines()
-        .filter(|l| !l.trim().is_empty() && !own.contains(l))
-        .any(|l| sent.contains(l))
+    let lines = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let (own, export, sent) = (lines(base), lines(&markdown), lines(body));
+    if export == own {
+        return false;
+    }
+    common_lines(&sent, &export) > common_lines(&sent, &own)
+}
+
+/// How many lines `a` and `b` have in common in the same order (longest common subsequence).
+fn common_lines(a: &[String], b: &[String]) -> usize {
+    let mut row = vec![0usize; b.len() + 1];
+    for x in a {
+        let mut diagonal = 0;
+        for (j, y) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = if x == y {
+                diagonal + 1
+            } else {
+                above.max(row[j])
+            };
+            diagonal = above;
+        }
+    }
+    row[b.len()]
 }
 
 /// What the send does to the reminder's date alarm for this patch: a new date moves it, no
@@ -263,7 +291,7 @@ pub(crate) fn reminder_report(
     if reminder.etag.is_none() {
         incomplete.push("not_yet_read_from_apple");
     }
-    if has_pending(library, &reminder.guid)? {
+    if has_pending(library, "reminders", &reminder.guid)? {
         incomplete.push("local_changes_not_sent");
     }
     Ok(json!({

@@ -227,6 +227,26 @@ async fn note_save_typing_markdown_into_a_plain_note_is_text() {
 }
 
 #[tokio::test]
+async fn note_save_typing_a_heading_line_into_a_plain_note_is_text() {
+    let (_dir, mut server, mut library) = setup();
+    // The export makes the title a heading; the same line typed under the title is the
+    // user's own text, not the export written back.
+    put_note(&mut library, "Trip\nToday", None, "etag-1");
+    let result = call(&mut server, "notes_write", save("Trip\n# Trip\nToday")).await;
+    assert_eq!(result["status"], "queued", "{result}");
+}
+
+#[tokio::test]
+async fn note_save_of_a_plain_note_s_markdown_export_is_refused() {
+    let (_dir, mut server, mut library) = setup();
+    put_note(&mut library, "Trip\nToday", None, "etag-1");
+    let markdown = quince_icloud::markdown::note_to_markdown("Trip\nToday", &[]);
+    let result = call(&mut server, "notes_write", save(&markdown)).await;
+    assert_eq!(result["error"], "lossy_markdown_overwrite", "{result}");
+    assert_eq!(library.outbox_count().unwrap(), 0);
+}
+
+#[tokio::test]
 async fn note_save_after_a_newer_sync_reports_conflict() {
     let (_dir, mut server, mut library) = setup();
     rich_note(&mut library);
@@ -655,5 +675,31 @@ async fn reminders_get_reports_a_reminder_not_yet_read_from_apple() {
         result["incomplete_reads"],
         json!(["not_yet_read_from_apple"]),
         "{result}"
+    );
+}
+
+#[tokio::test]
+async fn reads_still_work_with_more_changes_waiting_than_one_send_takes() {
+    let (_dir, mut server, mut library) = setup();
+    rich_note(&mut library);
+    rich_reminder(&mut library);
+    // More waiting changes than a sync sends at once, none of them for these two items.
+    for i in 0..130 {
+        library
+            .outbox_push("notes", &format!("other-{i}"), "pin", "{}")
+            .unwrap();
+    }
+    library.outbox_push("reminders", "r", "done", "{}").unwrap();
+    let note = call(&mut server, "notes_get", json!({"guid":"note"})).await;
+    assert_eq!(note["item"]["guid"], "note", "{note}");
+    assert_eq!(
+        note["incomplete_reads"],
+        json!(["attachment_contents_not_included"])
+    );
+    let reminder = call(&mut server, "reminders_get", json!({"guid":"r"})).await;
+    assert_eq!(reminder["item"]["guid"], "r", "{reminder}");
+    assert_eq!(
+        reminder["incomplete_reads"],
+        json!(["local_changes_not_sent"])
     );
 }
