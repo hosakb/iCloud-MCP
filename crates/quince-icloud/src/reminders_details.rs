@@ -956,6 +956,7 @@ pub fn early_alert_added_json(
 /// Add one early alert to a reminder under an id chosen before it is sent, keeping any it has:
 /// [`set_early_alert_cloudkit`]'s checks and account id, for a reminder made here with its
 /// alert. Sent again after a lost answer or a restart, it finds its alert and writes nothing.
+/// A reminder Apple now holds as all-day gets none: there is no time to be early for.
 pub async fn add_early_alert_named_cloudkit(
     http: &reqwest::Client,
     root: &str,
@@ -977,6 +978,11 @@ pub async fn add_early_alert_named_cloudkit(
         return Err(Error::Refused(
             "Give this a date before asking to be reminded early.".into(),
         ));
+    }
+    // Made all-day on a phone since it was queued: there is no time to be early for, and a
+    // create would refuse an early alert on an all-day reminder, so none is added.
+    if field::flag(&reminder, "AllDay") {
+        return Ok(());
     }
     let account = early_alert_blob(&reminder)
         .and_then(|b| {

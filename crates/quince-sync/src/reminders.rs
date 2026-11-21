@@ -290,7 +290,16 @@ pub fn record_reminder_create(
 }
 
 fn lay_create(l: &mut Library, guid: &str, c: &Create) -> quince_core::Result<()> {
-    if l.reminder(guid)?.is_some() {
+    if let Some(shown) = l.reminder(guid)? {
+        // Apple's copy, stored by a pass after the reminder reached Apple but before its
+        // repeat was written, has no repeat yet: the queued one is laid back over it while its
+        // write is unfinished, so a tick still moves it on. A repeat Apple already has, set on
+        // a phone meanwhile, is Apple's and stays.
+        if let Some(r) = &c.repeat {
+            if shown.recur_frequency.is_none() && create_steps(l, guid)? < REPEAT_STEP {
+                l.set_reminder_repeat(guid, r.frequency, r.interval)?;
+            }
+        }
         return Ok(());
     }
     // A list deleted since has nowhere to show it.
@@ -549,6 +558,13 @@ const REPEAT_STEP: u8 = 2;
 /// The library key holding how many of a new reminder's steps Apple has taken.
 fn create_progress_key(guid: &str) -> String {
     format!("reminders.create_steps.{guid}")
+}
+
+/// How many of a new reminder's steps Apple has taken, as noted by its sends.
+fn create_steps(l: &Library, guid: &str) -> quince_core::Result<u8> {
+    Ok(l.state(&create_progress_key(guid))?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0))
 }
 
 /// The rest of a reminder made here with a repeat or alerts, once the reminder itself is at

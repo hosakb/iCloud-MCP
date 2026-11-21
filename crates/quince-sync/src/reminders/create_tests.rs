@@ -708,3 +708,88 @@ fn a_fetched_rule_with_no_end_is_a_repeat_for_ever() {
     assert_eq!(after.completed_at, None, "moved on, not completed");
     assert_eq!(after.due_at, Some(DUE + 23 * 3600));
 }
+
+/// What a pass stores for the reminder Apple holds: its date, and no repeat yet.
+fn fetched_without_repeat(l: &Library, guid: &str) -> quince_core::reminders::Reminder {
+    let mut r = l.reminder(guid).unwrap().unwrap();
+    r.recur_frequency = None;
+    r.recur_interval = None;
+    r.raw = Some(json!({ "recordName": guid, "fields": {} }).to_string());
+    r
+}
+
+/// The reminder and its date reach Apple, the repeat write fails, and a pass then stores
+/// Apple's copy, which has no repeat yet. The queued repeat is laid back over it, so the
+/// reminder still shows repeating and a tick moves it on rather than closing it.
+#[tokio::test]
+async fn a_repeat_still_to_write_is_laid_back_over_a_pass() {
+    let (server, cloud) = cloud().await;
+    let mut l = library();
+    let guid = record_reminder_create(&mut l, &create()).unwrap();
+    let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+    let lock = LibraryLock::new(l, None);
+    cloud.fail_once("\"RecurrenceRule\"", Fault::Before);
+    assert!(send_one(&lock, &server.uri(), &p).await.is_err());
+    let mut l = lock.lock().await;
+    let fetched = fetched_without_repeat(&l, &guid);
+    l.put_reminders(&[fetched]).unwrap();
+    assert_eq!(l.reminder(&guid).unwrap().unwrap().recur_frequency, None);
+    replay(&mut l).unwrap();
+    let shown = l.reminder(&guid).unwrap().unwrap();
+    assert_eq!(
+        (shown.recur_frequency, shown.recur_interval),
+        (Some(0), Some(1))
+    );
+    record_reminder_tick(&mut l, &shown, true, DUE + 60).unwrap();
+    let kinds: Vec<String> = l
+        .outbox_pending(REMINDERS)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.kind)
+        .collect();
+    assert_eq!(kinds, ["create", "advance"]);
+}
+
+/// A repeat a pass brought from Apple is Apple's: the queued one is not laid over it.
+#[tokio::test]
+async fn a_repeat_fetched_from_apple_is_not_replaced_by_the_queued_one() {
+    let (server, cloud) = cloud().await;
+    let mut l = library();
+    let guid = record_reminder_create(&mut l, &create()).unwrap();
+    let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+    let lock = LibraryLock::new(l, None);
+    cloud.fail_once("\"RecurrenceRule\"", Fault::Before);
+    assert!(send_one(&lock, &server.uri(), &p).await.is_err());
+    let mut l = lock.lock().await;
+    // Set on a phone meanwhile: every two days.
+    let mut fetched = fetched_without_repeat(&l, &guid);
+    fetched.recur_frequency = Some(0);
+    fetched.recur_interval = Some(2);
+    l.put_reminders(&[fetched]).unwrap();
+    replay(&mut l).unwrap();
+    let shown = l.reminder(&guid).unwrap().unwrap();
+    assert_eq!(
+        (shown.recur_frequency, shown.recur_interval),
+        (Some(0), Some(2))
+    );
+}
+
+/// The early alert fails, and the person makes the reminder all-day on a phone. The retry
+/// adds no early alert, as a create would refuse one for an all-day reminder.
+#[tokio::test]
+async fn an_early_alert_still_to_write_is_not_added_to_an_all_day_reminder() {
+    let (server, cloud) = cloud().await;
+    let mut l = library();
+    let guid = record_reminder_create(&mut l, &create()).unwrap();
+    let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+    let lock = LibraryLock::new(l, None);
+    cloud.fail_once("DueDateDeltaAlertsData", Fault::Before);
+    assert!(send_one(&lock, &server.uri(), &p).await.is_err());
+    cloud.phone_sets(&guid, "AllDay", json!(1));
+    send_one(&lock, &server.uri(), &p).await.unwrap();
+    let reminder = cloud.record(&guid).unwrap();
+    assert!(
+        reminder["fields"].get("DueDateDeltaAlertsData").is_none(),
+        "{reminder}"
+    );
+}
