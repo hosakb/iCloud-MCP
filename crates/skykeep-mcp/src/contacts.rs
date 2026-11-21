@@ -506,7 +506,7 @@ impl Stop {
     fn error(self) -> quince_icloud::Error {
         match self {
             Stop::Reauth => quince_icloud::Error::ReauthRequired,
-            Stop::Busy => quince_icloud::Error::Busy,
+            Stop::Busy => quince_icloud::Error::Busy(None),
             other => quince_icloud::Error::Protocol(other.code().into()),
         }
     }
@@ -607,7 +607,7 @@ async fn changed(
 }
 
 /// Bytes one card takes as JSON, counted without building the text.
-fn card_bytes(card: &Value) -> usize {
+pub(crate) fn card_bytes(card: &Value) -> usize {
     struct Count(usize);
     impl std::io::Write for Count {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
