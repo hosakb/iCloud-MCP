@@ -114,12 +114,12 @@ Configure your MCP client to start that command. Stdout carries protocol message
 | Tool | What it does |
 |---|---|
 | `auth_status` | Whether the folder is bound to an account, whether the protected file is locked, and how to sign in. Takes no arguments and never accepts secrets. |
-| `sync` | Refreshes Notes and Reminders, then sends queued changes. Nothing is sent when the refresh fails. |
+| `sync` | Refreshes Notes and Reminders, then sends queued changes. Nothing is sent when the refresh fails. `left_queue_this_sync` lists each write that left the queue, with outcome `cloudkit_accepted` or `finished_unconfirmed` (see Reminders below). |
 | `sync_status` | Last refresh per service, whether the last pass failed, and counts of pending and refused changes. No network access. |
 | `notes_list`, `notes_folders`, `notes_search`, `notes_get` | Read the local cache. `notes_get` returns the plain text and the native formatting runs. |
 | `notes_write` | Queues `create`, `save`, `move`, `pin` or `delete`. Edits to an existing note need the `base_etag` you read, and are refused for locked or read-only notes. |
 | `reminders_lists`, `reminders_list`, `reminders_search`, `reminders_get` | Read the local cache. |
-| `reminders_write` | Queues `create`, `edit`, `tick` (complete or reopen) or `delete`. An `edit` changes only the fields in `patch`; moving a reminder is an edit of `list_guid`. |
+| `reminders_write` | Queues `create`, `edit`, `tick` (complete or reopen) or `delete`. An `edit` changes only the fields in `patch`; moving a reminder is an edit of `list_guid`. A `create` can also take `repeat`, `due_time_alert`, `early_alert` and `timezone` (see Reminders below). |
 | `contacts_list`, `contacts_search`, `contacts_get` | Read the local Contacts cache. Read-only. |
 | `contacts_refresh` | Reads Contacts from Apple into the local cache, replacing it. Never writes to Apple and never opens a sign-in prompt. |
 | `calendar_calendars`, `calendar_events`, `calendar_search`, `calendar_get` | Read the local Calendar cache. Read-only. |
@@ -156,6 +156,23 @@ skykeep-mcp exchange --state-dir ~/.local/share/skykeep-mcp
 It creates `~/Skykeep-Exchange` (mode `0700`) if needed and prints the folder and the size limit. Nothing else changes. `--path DIR` picks another folder (its parent must exist) and `--max-mb N` changes the limit, 100 MB by default. No MCP argument can name the folder or change the limit. Until it is set up, `upload` and `download` are refused.
 
 The `local` argument names a file inside the folder as a relative path, such as `report.pdf` or `in/report.pdf`. Absolute paths, `..` and symbolic links anywhere on the way are refused; each name is opened with no-follow semantics, and the folder must still be the one you set up. An upload must be a regular file with no other hard link. A download never replaces an existing file: it arrives as a hidden partial file and takes its name only if the name is still free. Without `local`, a download takes the item's name with control and text-direction characters removed, and a name that could leave the folder is refused. The limit is checked while bytes are read or arrive, not afterwards, and a stopped transfer leaves nothing behind; a partial download left by a crash is removed by the next download into that folder once it is ten minutes old. Every folder on the way must be yours and not writable by others. One upload or download may take two minutes plus one second per 256 KB of the limit, about nine minutes at 100 MB; past that it stops and keeps nothing.
+
+### Reminders: repeat and alerts on create
+
+A `reminders_write` `create` takes four optional fields:
+
+| Field | Meaning |
+|---|---|
+| `repeat` | `{"frequency":"daily"}`, repeating from `due_at` for ever, or with `"until":"YYYY-MM-DD"`, the last day it repeats. Needs `due_at`. Only daily, every day, is supported. |
+| `due_time_alert` | `true` adds an alert at `due_at`. Needs a timed (not all-day) `due_at`. |
+| `early_alert` | `{"amount":15,"unit":"minutes"}` alerts that long before `due_at`. Units: `minutes`, `hours`, `days`, `weeks`, `months`; amount 1 to 10000. Needs a timed `due_at`, and an early alert already set on one of your reminders from an Apple device, because Apple writes an account id inside each one. |
+| `timezone` | IANA zone the timed `due_at` and its alerts are kept in, such as `Europe/Berlin`. Without it, a timed create with any of the fields above is kept in this computer's zone as it was when queued, or in UTC when this computer's zone has no IANA name. UTC is also the zone an all-day `until` is read in. |
+
+Combinations that cannot work are refused with a code and nothing is queued: `due_time_alert_requires_due_at`, `early_alert_requires_due_at`, `all_day_cannot_have_timed_alert`, `timezone_requires_timed_due_at`, `unknown_timezone`, `repeat_requires_due_at`, `invalid_repeat_end`, `repeat_end_before_due`, `invalid_early_alert` and `early_alert_account_unavailable_set_one_on_an_apple_device_then_sync` (set one early alert on any reminder from an iPhone, iPad or Mac, run `sync`, then try again). `until` is read in `timezone` for a timed `due_at`, and in UTC for an all-day one. The options wait for approval with the rest of the create.
+
+Each option is its own record at Apple. The queued create keeps the record ids they will have, and `sync` writes them one step at a time after the reminder: date, repeat, alert at the due time, then early alert. A step that fails keeps the whole create queued. The next sync, after a retry or a restart, takes only the steps still to do, reusing any record an earlier try made, so it makes no second rule or alert and leaves none unattached. A date set or moved on a phone in between is kept, with whatever flag and zone Apple holds beside it, and the alert rings at the date Apple holds when it is written. A flag changed on a phone before the date is written is not kept: the date step writes the queued flag with the date. If the reminder has meanwhile become all-day or lost its date, no alert or early alert is added, and the alarm records this create made are removed. If its date was cleared or moved past the repeat's last day, or a repeat was set on a phone, no repeat is written and the phone's repeat stays. Alarms and early alerts set elsewhere are kept.
+
+The create reply says `queued: true`, `cloudkit_accepted: false` and `remote_verified: false`, and `options` repeats what was queued: `timezone` (the zone given, or the one chosen; `null` for an all-day or dateless create, or a timed one with none of these options), `repeat` (`frequency` and `ends_at`, the last second of `until` in Unix seconds, or `null` for ever), `due_time_alert` (`true` or `false`) and `early_alert` (`amount` and `unit`, or `null`). It holds no record ids or account id. In the `sync` reply, `left_queue_this_sync` gives `cloudkit_accepted` only for creates whose every write must succeed (one with no date or flag, or one with these options); every other write that left the queue is `finished_unconfirmed`. `cloudkit_accepted` still covers an option left out on purpose for one of the reasons above, and the write that adds a new reminder to its list's order is not checked; `left_queue_note` in the reply says so. Nothing reads the repeat or alerts back from Apple. Whether Apple's apps show them and a device actually rings has not been checked against a real account.
 
 ## Write approval
 

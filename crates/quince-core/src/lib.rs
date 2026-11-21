@@ -541,6 +541,15 @@ impl Library {
         Ok(())
     }
 
+    /// Forget something remembered by name. Nothing kept under it is nothing to do.
+    pub fn forget_state(&mut self, key: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM app_state WHERE key = ?1",
+            rusqlite::params![key],
+        )?;
+        Ok(())
+    }
+
     /// Everything learned from an account let go of — every reminder, note, event, contact,
     /// file and photo, every sync position — for another account to start clean. Kept: this
     /// computer's own choices (`settings.*`, which folders are on and where).
