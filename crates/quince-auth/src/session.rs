@@ -6,6 +6,8 @@
 //! resumes instead of re-prompting.
 
 use crate::sealed::{self, Key};
+
+mod given;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -226,6 +228,8 @@ enum Backend {
     /// The keyring entry's name: one per state directory.
     Keyring(String),
     File(PathBuf),
+    /// Secrets kept by the caller ([`Store::with_secrets`]), under this entry name.
+    Given(Box<dyn PlatformSecrets>, String),
 }
 
 pub struct Store {
@@ -307,6 +311,10 @@ trait Secrets {
     fn get(&self, name: &str) -> Result<Option<String>, String>;
     fn set(&self, name: &str, value: &str) -> Result<(), String>;
     fn delete(&self, name: &str) -> Result<(), String>;
+    /// Whether the store is locked, without unlocking it. A store with no lock says no.
+    fn locked(&self) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 /// The system keyring, under one service name.
@@ -340,6 +348,10 @@ pub trait PlatformSecrets: Send + Sync {
     fn get(&self, service: &str, name: &str) -> Result<Option<String>, String>;
     fn set(&self, service: &str, name: &str, value: &str) -> Result<(), String>;
     fn delete(&self, service: &str, name: &str) -> Result<(), String>;
+    /// Whether the store is locked, without unlocking it. A store with no lock says no.
+    fn locked(&self, _service: &str) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 static PLATFORM_SECRETS: std::sync::OnceLock<Box<dyn PlatformSecrets>> = std::sync::OnceLock::new();
@@ -405,6 +417,9 @@ impl Secrets for SystemKeyring {
     }
     fn delete(&self, name: &str) -> Result<(), String> {
         secret_service::delete(self.0, name)
+    }
+    fn locked(&self) -> Result<bool, String> {
+        secret_service::collection_locked()
     }
 }
 
@@ -536,6 +551,13 @@ mod secret_service {
             )?;
             Ok(())
         })
+    }
+
+    /// Whether the default collection, where new entries go, is locked. Asked, never unlocked:
+    /// a first sign-in into a locked collection would otherwise read "nothing stored", ask for
+    /// the password and code, and fail only at the first write.
+    pub(super) fn collection_locked() -> Result<bool, String> {
+        with(|ss| ss.get_default_collection()?.is_locked())
     }
 
     pub(super) fn delete(service: &str, user: &str) -> Result<(), String> {
@@ -861,6 +883,24 @@ impl Store {
         Ok(store)
     }
 
+    /// Secrets in a store the caller keeps, such as a passphrase-protected file. Like
+    /// [`Self::isolated_keyring`]: never an account password, never another folder's entries.
+    /// The caller must validate and exclusively lock the private state directory first.
+    pub fn with_secrets(
+        state_dir: &Path,
+        secrets: Box<dyn PlatformSecrets>,
+    ) -> std::io::Result<Self> {
+        let mut store = Self::isolated_keyring(state_dir)?;
+        let name = store.name().to_string();
+        store.backend = Backend::Given(secrets, name);
+        // A sign-out owed to the system keyring is that keyring's: a given store never
+        // finishes it (and so never erases the note while the keyring still holds a session).
+        store.sign_out_path = store
+            .sign_out_path
+            .with_file_name(format!("{SIGN_OUT_PENDING}.given"));
+        Ok(store)
+    }
+
     fn current(&self) -> Result<SystemKeyring, String> {
         match self.service {
             Some(service) => Ok(SystemKeyring(service)),
@@ -967,6 +1007,7 @@ impl Store {
             Backend::Keyring(name) => name.as_str(),
             Backend::File(_) => KEYRING_ENTRY,
             Backend::Memory(_) => "skykeep-mcp-memory",
+            Backend::Given(_, name) => name.as_str(),
         }
     }
 
@@ -987,6 +1028,7 @@ impl Store {
                 f(&now, &name)
             }
             Backend::File(path) => f(&KeyFile(path.with_file_name("cookie-key")), &name),
+            Backend::Given(given, _) => f(&given::Given(given.as_ref()), &name),
             Backend::Memory(_) => Err("Secret persistence is disabled".into()),
         }
         .map_err(crate::Error::Keyring)
@@ -1023,6 +1065,7 @@ impl Store {
                 &KeyFile(path.with_file_name(format!("account-{id}"))),
                 &name,
             ),
+            Backend::Given(given, _) => f(&given::Given(given.as_ref()), &name),
             Backend::Memory(_) => Err("Secret persistence is disabled".into()),
         }
         .map_err(crate::Error::Keyring)
@@ -1091,6 +1134,11 @@ impl Store {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Session::default()),
                 Err(e) => return Err(crate::Error::Keyring(e.to_string())),
             },
+            Backend::Given(given, name) => match read_secret(&given::Given(given.as_ref()), name) {
+                Ok(Some(j)) => j,
+                Ok(None) => return Ok(Session::default()),
+                Err(e) => return Err(crate::Error::Keyring(e)),
+            },
         };
         let mut session: Session = serde_json::from_str(&json).unwrap_or_default();
         if self.passwordless {
@@ -1141,6 +1189,7 @@ impl Store {
                 Ok(())
             }
             Backend::File(path) => Ok(std::fs::write(path, json)?),
+            Backend::Given(given, name) => given::save(given.as_ref(), name, &json),
             Backend::Memory(_) => Ok(()),
         }
     }
@@ -1173,6 +1222,21 @@ impl Store {
         // would make signing out a way to wipe the wait and start hammering again, which is
         // exactly what it exists to prevent.
         Ok(())
+    }
+
+    /// Whether the store where sessions are kept is locked, asked without unlocking it. An
+    /// error: it would not answer at all.
+    pub fn is_locked(&self) -> Result<bool, crate::Error> {
+        match &self.backend {
+            Backend::Keyring(_) => self
+                .current()
+                .and_then(|now| now.locked())
+                .map_err(crate::Error::Keyring),
+            Backend::Given(given, _) => given::Given(given.as_ref())
+                .locked()
+                .map_err(crate::Error::Keyring),
+            Backend::File(_) | Backend::Memory(_) => Ok(false),
+        }
     }
 
     /// Whether a sign-out has not yet reached the keyring: while it has not, no stored session
@@ -1213,6 +1277,9 @@ impl Store {
                     Err(e) => note(Err(crate::Error::Keyring(e))),
                 }
             }
+            Backend::Given(given, name) => note(
+                delete_secret(&given::Given(given.as_ref()), name).map_err(crate::Error::Keyring),
+            ),
             Backend::File(path) => note(match std::fs::remove_file(path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
                 _ => Ok(()),

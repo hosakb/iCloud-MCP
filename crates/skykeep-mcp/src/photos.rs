@@ -10,7 +10,7 @@
 //! laid over what Apple returned.
 use crate::account::{binding, Binding};
 use crate::contacts::{encoded_len, gate, owner, read_capped, record_timeout_of};
-use quince_auth::{Client, Endpoints, Store};
+use quince_auth::{Client, Endpoints};
 use quince_core::photos::{Album, Kind, Photo, Source, View};
 use quince_core::Library;
 use quince_icloud::cloudkit;
@@ -1115,7 +1115,7 @@ async fn fetch(
 /// Caller holds the private directory's exclusive operation lock.
 pub(crate) async fn refresh(dir: &Path, approved: bool) -> Result<Value, &'static str> {
     gate(dir, approved)?;
-    let store = Store::isolated_keyring(dir).map_err(|_| "secure_storage_unavailable")?;
+    let store = crate::storage::open_store(dir)?;
     let session = store
         .try_load()
         .map_err(|_| "login_required_unlock_secure_storage")?;

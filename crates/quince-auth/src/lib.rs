@@ -29,6 +29,7 @@ mod sealed;
 pub mod session;
 pub mod srp;
 pub mod state;
+pub mod vault;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 pub use keep::Kept;

@@ -3,11 +3,15 @@ pub mod account;
 pub mod calendar;
 pub mod contacts;
 pub mod drive;
+pub mod keyhold;
 pub mod login;
 pub mod photos;
 mod preserve;
 pub mod scheduler;
+pub mod setup;
 pub mod state;
+pub mod status;
+pub mod storage;
 pub mod sync;
 pub mod terminal;
 use quince_core::Library;
@@ -557,6 +561,17 @@ impl Server {
     /// Human CLI only. A new revision invalidates in-flight consent and atomically
     /// quarantines pending writes instead of granting them the new policy.
     pub fn set_policy(&mut self, mode: &str) -> Result<Value, &'static str> {
+        self.set_policy_if(mode, None)
+    }
+
+    /// [`Self::set_policy`], refused with `pending_changed` unless the waiting writes are
+    /// exactly `expected` (their ids, oldest first) under the same lock that sets them aside:
+    /// a person who agreed to set aside N changes never sets aside more.
+    pub fn set_policy_if(
+        &mut self,
+        mode: &str,
+        expected: Option<&[i64]>,
+    ) -> Result<Value, &'static str> {
         if !["reads_and_writes", "writes_only", "yolo"].contains(&mode) {
             return Err("invalid_policy_mode");
         }
@@ -569,6 +584,9 @@ impl Server {
         let pending = library
             .outbox_all_pending()
             .map_err(|_| "policy_unavailable")?;
+        if expected.is_some_and(|ids| !pending.iter().map(|p| p.id).eq(ids.iter().copied())) {
+            return Err("pending_changed");
+        }
         library
             .atomically(|library| -> quince_core::Result<()> {
                 for p in &pending {
@@ -1014,8 +1032,16 @@ impl Server {
                     .state(ACCOUNT_KEY)
                     .map_err(|_| "library_unavailable")?
                     .is_some();
+                // Every follow-up names this folder, so it can be typed as shown.
+                let here = status::with_dir("skykeep-mcp setup", &self.dir);
+                if let Some(closed) = storage::protected_problem(&self.dir) {
+                    let text = status::with_dir(storage::tool_text(&closed), &self.dir);
+                    return Ok(
+                        json!({"status":if closed == storage::Closed::Locked {"locked"} else {"storage_problem"},"instructions":format!("{text}. Open your own trusted terminal, outside agent/tool capture, and type any passphrase there. Never send passwords, codes or passphrases to MCP or chat."),"session_checked":false}),
+                    );
+                }
                 Ok(
-                    json!({"status":if bound {"session_unverified"} else {"login_required"},"instructions":"Run skykeep-mcp login --state-dir PRIVATE_DIRECTORY in your own trusted terminal, outside agent/tool capture. Never send passwords or codes to MCP or chat.","session_checked":false}),
+                    json!({"status":if bound {"session_unverified"} else {"login_required"},"instructions":format!("Run {here} in your own trusted terminal, outside agent/tool capture. Never send passwords or codes to MCP or chat."),"session_checked":false}),
                 )
             }
             "reminders_get" => {
