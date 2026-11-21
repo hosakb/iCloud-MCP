@@ -870,8 +870,8 @@ async fn a_finished_create_sent_again_writes_nothing() {
     );
 }
 
-/// The note of steps taken goes with the change: when it leaves the queue, sent or refused,
-/// the library keeps no key for it.
+/// The note of steps taken goes with the change once it is sent. A refused change keeps it:
+/// sent again from the refused list, it takes only the steps still to do.
 #[tokio::test]
 async fn the_note_of_steps_goes_when_the_change_leaves_the_queue() {
     let key = |guid: &str| format!("reminders.create_steps.{guid}");
@@ -915,5 +915,9 @@ async fn the_note_of_steps_goes_when_the_change_leaves_the_queue() {
     })
     .await;
     assert_eq!(report.refused.len(), 1);
-    assert_eq!(lock.lock().await.state(&key(&guid)).unwrap(), None);
+    assert_eq!(
+        lock.lock().await.state(&key(&guid)).unwrap().as_deref(),
+        Some("1"),
+        "kept for a resend"
+    );
 }

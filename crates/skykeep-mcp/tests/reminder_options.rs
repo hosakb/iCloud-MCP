@@ -569,3 +569,111 @@ async fn sync_names_an_options_create_cloudkit_took_whole_as_accepted() {
         json!([payload["alarm"]["alarm_id"]])
     );
 }
+
+fn steps_key(guid: &str) -> String {
+    format!("reminders.create_steps.{guid}")
+}
+
+/// The refused row whose record is `guid`, and why.
+fn refused_for(library: &quince_core::Library, guid: &str) -> (i64, String) {
+    let r = library
+        .outbox_refused()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.change.record == guid)
+        .expect("refused");
+    (r.change.id, r.reason)
+}
+
+/// A quarantined create keeps the note of its steps, as a refused one does, so one put back
+/// takes only the steps still to do. The human's discard in the terminal takes it away.
+async fn kept_until_discarded(
+    server: &mut Server,
+    library: &quince_core::Library,
+    guid: &str,
+    reason: &str,
+) {
+    let (id, why) = refused_for(library, guid);
+    assert_eq!(why, reason);
+    assert_eq!(
+        library.state(&steps_key(guid)).unwrap().as_deref(),
+        Some("2")
+    );
+    assert_eq!(server.retire_quarantined(&[id]).unwrap(), 1);
+    assert_eq!(library.state(&steps_key(guid)).unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_create_quarantined_by_sync_keeps_its_step_note_until_discarded() {
+    let remote = MockServer::start().await;
+    let (dir, mut server, mut library) = setup(false);
+    library
+        .set_state("account", &quince_sync::queue::account_tag("1234567890"))
+        .unwrap();
+    server.set_policy("yolo").unwrap();
+    let guid = "Reminder/SYNTHETIC-UNAPPROVED";
+    library
+        .outbox_append("reminders", guid, "create", "{}")
+        .unwrap();
+    library.set_state(&steps_key(guid), "2").unwrap();
+    // No routes: the pass fails after the local gate has quarantined the write. The session
+    // file is kept apart, so the private folder holds only what the server writes there.
+    let session = tempfile::tempdir().unwrap();
+    assert!(skykeep_mcp::sync::with_client(
+        dir.path(),
+        saved_client(session.path(), &remote.uri())
+    )
+    .await
+    .is_err());
+    kept_until_discarded(
+        &mut server,
+        &library,
+        guid,
+        "mcp_quarantine:legacy_write_quarantined",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_create_quarantined_by_a_policy_change_keeps_its_step_note_until_discarded() {
+    let (_dir, mut server, mut library) = setup(false);
+    let (failed, made) = call(
+        &mut server,
+        json!({"action":"create","list_guid":"list","title":"Synthetic","due_at":DUE,"repeat":{"frequency":"daily"}}),
+    )
+    .await;
+    assert!(!failed, "{made}");
+    let guid = made["guid"].as_str().unwrap();
+    library.set_state(&steps_key(guid), "2").unwrap();
+    server.set_policy("yolo").unwrap();
+    kept_until_discarded(
+        &mut server,
+        &library,
+        guid,
+        "mcp_policy_migration_quarantine",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_create_superseded_by_a_deletion_keeps_its_step_note_until_discarded() {
+    let (_dir, mut server, mut library) = setup(false);
+    server.set_policy("yolo").unwrap();
+    let (failed, made) = call(
+        &mut server,
+        json!({"action":"create","list_guid":"list","title":"Synthetic","due_at":DUE,"repeat":{"frequency":"daily"}}),
+    )
+    .await;
+    assert!(!failed, "{made}");
+    let guid = made["guid"].as_str().unwrap();
+    library.set_state(&steps_key(guid), "2").unwrap();
+    let (failed, gone) = call(&mut server, json!({"action":"delete","guid":guid})).await;
+    assert!(!failed, "{gone}");
+    kept_until_discarded(
+        &mut server,
+        &library,
+        guid,
+        "superseded_by_approved_deletion",
+    )
+    .await;
+}

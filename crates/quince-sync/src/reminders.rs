@@ -558,8 +558,8 @@ const REPEAT_STEP: u8 = 2;
 /// The note of a new reminder whose every step Apple has taken.
 const ALL_STEPS: u8 = 5;
 
-/// A change leaving the queue, sent, refused or discarded: the note of the steps a new
-/// reminder's sends took goes with it.
+/// A change leaving the queue for good, sent or discarded: the note of the steps a new
+/// reminder's sends took goes with it. A refused change keeps it, for a resend.
 pub fn settle(l: &mut Library, p: &Pending) -> quince_core::Result<()> {
     if p.service == REMINDERS && p.kind == "create" {
         l.forget_state(&create_progress_key(&p.record))?;
@@ -626,6 +626,9 @@ async fn send_create_options(
         r::edit_cloudkit(http, root, params.clone(), &made, &edit).await?;
         took(1).await?;
     }
+    // One narrow case is not covered: the rule is linked at Apple but saving the step 2 note
+    // here fails, and a phone then takes the repeat away before the retry. The retry sees no
+    // rule listed, as if its own write had never landed, and puts the repeat back.
     if let Some(rep) = c.repeat.as_ref().filter(|_| done < REPEAT_STEP) {
         let repeat = r::Repeat {
             frequency: rep.frequency,

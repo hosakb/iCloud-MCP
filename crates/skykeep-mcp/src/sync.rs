@@ -129,7 +129,6 @@ fn quarantine_unauthorized(library: &mut Library, dir: &Path) -> Result<(), &'st
             Err(reason) if QUARANTINABLE.contains(&reason) => library
                 .atomically(|library| -> quince_core::Result<()> {
                     library.outbox_refuse(p.id, &format!("mcp_quarantine:{reason}"))?;
-                    quince_sync::reminders::settle(library, &p)?;
                     library.set_state(&format!("mcp.authorization.{}", p.id), "")?;
                     library.set_state(&reread_key(&p.service), "1")
                 })
@@ -458,7 +457,10 @@ async fn sync_pass(
         .take(MAX_PENDING)
         .map(refused_view)
         .collect();
-    Ok(
-        json!({"services":services,"queued":waiting,"refused":refused.len(),"refused_this_sync":refused_now,"left_queue_this_sync":left,"left_queue_note":LEFT_QUEUE_NOTE,"remote_verified":false,"verification":"upstream sync and replay only; field-level read-back is not guaranteed"}),
-    )
+    let mut reply = json!({"services":services,"queued":waiting,"refused":refused.len(),"refused_this_sync":refused_now,"left_queue_this_sync":left,"remote_verified":false,"verification":"upstream sync and replay only; field-level read-back is not guaranteed"});
+    // Said only when there is something for it to explain.
+    if !left.is_empty() {
+        reply["left_queue_note"] = json!(LEFT_QUEUE_NOTE);
+    }
+    Ok(reply)
 }

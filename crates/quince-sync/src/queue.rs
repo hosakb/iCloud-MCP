@@ -152,7 +152,11 @@ where
             Ok(()) => {
                 let mut l = library.lock().await;
                 if l.outbox_done(id).is_ok() {
-                    let _ = crate::reminders::settle(&mut l, &left);
+                    // Left behind, the note says every step was taken: a stale key, never a
+                    // reason to write again, so it is logged rather than failing the pass.
+                    if let Err(e) = crate::reminders::settle(&mut l, &left) {
+                        crate::quiet!("outbox: a sent change's step note stayed: {e}");
+                    }
                 }
                 report.sent = true;
             }
@@ -162,10 +166,9 @@ where
                 return report;
             }
             Err(e) => {
-                let mut l = library.lock().await;
-                if l.outbox_refuse(id, &e.to_string()).is_ok() {
-                    let _ = crate::reminders::settle(&mut l, &left);
-                }
+                // A refused change keeps its step note: sent again from the refused list, it
+                // takes only the steps still to do. Discarding it takes the note away.
+                let _ = library.lock().await.outbox_refuse(id, &e.to_string());
                 report.refused.push((record, e.to_string()));
             }
         }
