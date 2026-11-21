@@ -247,6 +247,38 @@ async fn note_save_of_a_plain_note_s_markdown_export_is_refused() {
 }
 
 #[tokio::test]
+async fn note_save_over_a_very_long_note_finishes_without_comparing_every_line() {
+    let (_dir, mut server, mut library) = setup();
+    // An imported note far longer than one request, replaced by a short new text: comparing
+    // every line with every line took billions of steps while the state was locked.
+    let long: String = (0..400_000).map(|i| format!("l{i}\n")).collect();
+    put_note(&mut library, &long, None, "etag-1");
+    let short: String = (0..4_500).map(|i| format!("x{i}\n")).collect();
+    let started = std::time::Instant::now();
+    let result = call(&mut server, "notes_write", save(&short)).await;
+    let took = started.elapsed();
+    assert_eq!(result["status"], "queued", "{result}");
+    assert!(took < std::time::Duration::from_secs(2), "took {took:?}");
+}
+
+#[tokio::test]
+async fn note_save_over_a_very_long_note_with_an_export_line_is_refused() {
+    let (_dir, mut server, mut library) = setup();
+    let long: String = (0..400_000).map(|i| format!("l{i}\n")).collect();
+    put_note(&mut library, &long, None, "etag-1");
+    // Too long to compare line by line: the export's heading for the title is enough to
+    // refuse, as before the closer comparison.
+    let short: String = std::iter::once("# l0\n".to_string())
+        .chain((0..4_500).map(|i| format!("x{i}\n")))
+        .collect();
+    let started = std::time::Instant::now();
+    let result = call(&mut server, "notes_write", save(&short)).await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(result["error"], "lossy_markdown_overwrite", "{result}");
+    assert_eq!(library.outbox_count().unwrap(), 0);
+}
+
+#[tokio::test]
 async fn note_save_after_a_newer_sync_reports_conflict() {
     let (_dir, mut server, mut library) = setup();
     rich_note(&mut library);

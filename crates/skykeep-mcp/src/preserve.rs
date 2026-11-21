@@ -204,6 +204,9 @@ pub(crate) fn send_base(library: &Library, guid: &str) -> Result<Option<String>,
 /// Whether `body` is the note's Markdown export, whole or edited, rather than its own text:
 /// its lines follow the export more closely than they follow the note. A line of Markdown
 /// typed into the note's own text keeps it closer to the note, and is accepted as text.
+///
+/// Too large to compare line by line within [`LINE_BUDGET`], the save is held to the stricter
+/// test instead: any line of the export that the note's own text lacks counts as the export.
 fn from_markdown_export(base: &str, base_runs: Option<&[Run]>, body: &str) -> bool {
     let markdown = quince_icloud::markdown::note_to_markdown(base, base_runs.unwrap_or(&[]));
     let lines = |text: &str| -> Vec<String> {
@@ -216,11 +219,34 @@ fn from_markdown_export(base: &str, base_runs: Option<&[Run]>, body: &str) -> bo
     if export == own {
         return false;
     }
-    common_lines(&sent, &export) > common_lines(&sent, &own)
+    match (common_lines(&sent, &export), common_lines(&sent, &own)) {
+        (Some(to_export), Some(to_own)) => to_export > to_own,
+        _ => {
+            let own: std::collections::HashSet<&String> = own.iter().collect();
+            let sent: std::collections::HashSet<&String> = sent.iter().collect();
+            export.iter().any(|l| !own.contains(l) && sent.contains(l))
+        }
+    }
 }
 
-/// How many lines `a` and `b` have in common in the same order (longest common subsequence).
-fn common_lines(a: &[String], b: &[String]) -> usize {
+/// The most line pairs [`common_lines`] compares, the bound the send's own text diff keeps.
+const LINE_BUDGET: usize = 4_000_000;
+
+/// How many lines `a` and `b` have in common in the same order (longest common subsequence),
+/// or `None` when the lines left between their shared start and end are too many to compare.
+fn common_lines(a: &[String], b: &[String]) -> Option<usize> {
+    let pre = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let (a, b) = (&a[pre..], &b[pre..]);
+    let suf = a
+        .iter()
+        .rev()
+        .zip(b.iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let (a, b) = (&a[..a.len() - suf], &b[..b.len() - suf]);
+    if a.len().saturating_mul(b.len()) > LINE_BUDGET {
+        return None;
+    }
     let mut row = vec![0usize; b.len() + 1];
     for x in a {
         let mut diagonal = 0;
@@ -234,7 +260,7 @@ fn common_lines(a: &[String], b: &[String]) -> usize {
             diagonal = above;
         }
     }
-    row[b.len()]
+    Some(pre + suf + row[b.len()])
 }
 
 /// What the send does to the reminder's date alarm for this patch: a new date moves it, no
