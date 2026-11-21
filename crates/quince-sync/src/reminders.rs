@@ -422,18 +422,30 @@ fn lay_advance(l: &mut Library, guid: &str, a: &Advance) -> quince_core::Result<
     l.put_reminder_local(&r)
 }
 
-/// When a reminder's repeat ends: Apple's rule, or, for one made here and not sent yet, the
-/// end it was queued with, so a tick before the first send ends the series as the phone would.
+/// When a reminder's repeat ends: Apple's rule, as a pass stored it, or, for one made here
+/// whose rule no pass has brought back yet, the end it was queued with, so a tick before then
+/// ends the series as the phone would. "Not fetched yet" and "no end" are told apart by the
+/// rule itself: once the queued rule is in the library, Apple's copy alone says, and no end
+/// there is a repeat for ever (an end taken away on a phone), not one to fill from the queue.
 fn repeat_end(l: &Library, guid: &str) -> quince_core::Result<Option<i64>> {
     if let Some(end) = l.reminder_repeat_end(guid)? {
         return Ok(Some(end));
     }
-    Ok(l.outbox_pending(REMINDERS)?
+    let Some(queued) = l
+        .outbox_pending(REMINDERS)?
         .into_iter()
         .filter(|p| p.record == guid && p.kind == "create")
         .find_map(|p| serde_json::from_str::<Create>(&p.payload).ok())
         .and_then(|c| c.repeat)
-        .and_then(|r| r.end_at))
+    else {
+        return Ok(None);
+    };
+    let rule = format!("RecurrenceRule/{}", queued.rule_id);
+    let fetched = l
+        .reminder_parts(guid)?
+        .iter()
+        .any(|part| part.kind == "RecurrenceRule" && part.name.eq_ignore_ascii_case(&rule));
+    Ok(if fetched { None } else { queued.end_at })
 }
 
 /// A reminder ticked or unticked here at `at`. A repeating one ticked moves on to its next date
@@ -531,6 +543,9 @@ pub fn apply(
 
 // --- Sending: the queue's half.
 
+/// The step of a new reminder's send that writes its repeat (1 date, 2 repeat, 3 alarm).
+const REPEAT_STEP: u8 = 2;
+
 /// The library key holding how many of a new reminder's steps Apple has taken.
 fn create_progress_key(guid: &str) -> String {
     format!("reminders.create_steps.{guid}")
@@ -583,7 +598,7 @@ async fn send_create_options(
         r::edit_cloudkit(http, root, params.clone(), &made, &edit).await?;
         took(1).await?;
     }
-    if let Some(rep) = c.repeat.as_ref().filter(|_| done < 2) {
+    if let Some(rep) = c.repeat.as_ref().filter(|_| done < REPEAT_STEP) {
         let repeat = r::Repeat {
             frequency: rep.frequency,
             interval: rep.interval,
@@ -599,7 +614,7 @@ async fn send_create_options(
             &rep.rule_id,
         )
         .await?;
-        took(2).await?;
+        took(REPEAT_STEP).await?;
     }
     if let Some(alarm) = c.alarm.as_ref().filter(|_| done < 3) {
         r::add_alarm_named_cloudkit(

@@ -64,6 +64,15 @@ impl Cloud {
         r["fields"]["DueDate"] = json!({ "type": "TIMESTAMP", "value": due * 1000 });
         r["recordChangeTag"] = json!(tag);
     }
+    /// A phone sets one field of the reminder (`Value::Null` clears it, as CloudKit sends).
+    fn phone_sets(&self, guid: &str, field: &str, value: Value) {
+        let mut s = self.0.lock().unwrap();
+        s.tag += 1;
+        let tag = s.tag.to_string();
+        let r = s.records.get_mut(guid).unwrap();
+        r["fields"][field]["value"] = value;
+        r["recordChangeTag"] = json!(tag);
+    }
     /// How many writes the reminder record itself has had.
     fn reminder_updates(&self) -> usize {
         self.0.lock().unwrap().updates
@@ -569,4 +578,133 @@ fn a_new_repeat_ending_today_ticked_offline_completes() {
         l.reminder(&guid).unwrap().unwrap().completed_at,
         Some(DUE + 60)
     );
+}
+
+/// The alarm is not linked yet when the person makes the reminder all-day, or clears its date,
+/// on a phone. The retry rings nothing at midnight or at no time: it links no alarm, and takes
+/// away the alarm and trigger it made, so nothing is left that nothing points at.
+#[tokio::test]
+async fn an_alarm_not_linked_yet_is_dropped_when_the_phone_leaves_no_time() {
+    for (field, value, fault) in [
+        ("AllDay", json!(1), Fault::Before),
+        ("AllDay", json!(1), Fault::AnswerLost),
+        ("DueDate", Value::Null, Fault::Before),
+        ("DueDate", Value::Null, Fault::AnswerLost),
+    ] {
+        let (server, cloud) = cloud().await;
+        let mut l = library();
+        let mut c = create();
+        c.early_alert = None;
+        let guid = record_reminder_create(&mut l, &c).unwrap();
+        let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+        let lock = LibraryLock::new(l, None);
+        cloud.fail_once("\"AlarmTrigger\"", fault);
+        assert!(send_one(&lock, &server.uri(), &p).await.is_err());
+        assert_eq!(cloud.of_type("Alarm").len(), 1, "{field}");
+        cloud.phone_sets(&guid, field, value);
+        send_one(&lock, &server.uri(), &p).await.unwrap();
+        let reminder = cloud.record(&guid).unwrap();
+        assert!(ids(&reminder, "AlarmIDs").is_empty(), "{field}");
+        assert!(
+            cloud.of_type("Alarm").is_empty(),
+            "{field}: alarm left behind"
+        );
+        assert!(
+            cloud.of_type("AlarmTrigger").is_empty(),
+            "{field}: trigger left behind"
+        );
+        assert_eq!(ids(&reminder, "RecurrenceRuleIDs"), ["RULE-1"]);
+    }
+}
+
+/// Apple made the trigger and the answer was lost; the person then moves the date on a phone.
+/// The retry sets that trigger to the date Apple holds before linking it.
+#[tokio::test]
+async fn a_trigger_made_before_the_date_moved_is_set_to_the_new_time() {
+    let (server, cloud) = cloud().await;
+    let mut l = library();
+    let guid = record_reminder_create(&mut l, &create()).unwrap();
+    let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+    let lock = LibraryLock::new(l, None);
+    cloud.fail_once("\"AlarmTrigger\"", Fault::AnswerLost);
+    assert!(send_one(&lock, &server.uri(), &p).await.is_err());
+    // 10:30 on 9 March in New York (EDT).
+    let moved = 1_773_066_600;
+    cloud.phone_moves_due(&guid, moved);
+    send_one(&lock, &server.uri(), &p).await.unwrap();
+    let trigger = cloud.record("AlarmTrigger/TRIGGER-1").unwrap();
+    let raw = trigger["fields"]["DateComponentsData"]["value"]
+        .as_str()
+        .unwrap();
+    let parts: Value = serde_json::from_slice(&b64(raw)).unwrap();
+    assert_eq!(
+        (&parts["day"], &parts["hour"], &parts["minute"]),
+        (&json!(9), &json!(10), &json!(30))
+    );
+    assert_eq!(ids(&cloud.record(&guid).unwrap(), "AlarmIDs"), ["ALARM-1"]);
+    assert_eq!(cloud.of_type("AlarmTrigger").len(), 1);
+}
+
+/// A new repeat ending today, written at Apple but not read back by a pass yet: the cache
+/// knows no rule, which is "not fetched yet", not "no end". The queued end still holds, so a
+/// tick ends the series.
+#[tokio::test]
+async fn a_repeat_written_but_not_fetched_yet_keeps_its_queued_end() {
+    let (server, cloud) = cloud().await;
+    let mut l = library();
+    let mut c = create();
+    c.repeat.as_mut().unwrap().end_at = end_of_day("2026-03-07", "America/New_York");
+    let guid = record_reminder_create(&mut l, &c).unwrap();
+    let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+    let lock = LibraryLock::new(l, None);
+    // The repeat is written; the alarm fails, so the create stays queued.
+    cloud.fail_once("\"Alarm\"", Fault::Before);
+    assert!(send_one(&lock, &server.uri(), &p).await.is_err());
+    assert!(cloud.record("RecurrenceRule/RULE-1").is_some());
+    let mut l = lock.lock().await;
+    let shown = l.reminder(&guid).unwrap().unwrap();
+    record_reminder_tick(&mut l, &shown, true, DUE + 60).unwrap();
+    assert_eq!(
+        l.reminder(&guid).unwrap().unwrap().completed_at,
+        Some(DUE + 60)
+    );
+}
+
+/// Once a pass has read Apple's rule for the queued repeat, that rule alone says when it ends:
+/// the person took its end away on a phone, so no end means for ever, and a tick moves the
+/// series on rather than ending it at the end that was queued.
+#[test]
+fn a_fetched_rule_with_no_end_is_a_repeat_for_ever() {
+    let mut l = library();
+    let mut c = create();
+    c.repeat.as_mut().unwrap().end_at = end_of_day("2026-03-07", "America/New_York");
+    let guid = record_reminder_create(&mut l, &c).unwrap();
+    // What a pass stores: the reminder pointing at its rule, and the rule, with no EndDate.
+    let mut fetched = l.reminder(&guid).unwrap().unwrap();
+    fetched.raw = Some(
+        json!({ "recordName": guid, "fields": {
+            "RecurrenceRuleIDs": { "type": "STRING_LIST", "value": ["RULE-1"] } } })
+        .to_string(),
+    );
+    l.put_reminders(&[fetched]).unwrap();
+    l.set_reminder_repeat(&guid, 0, 1).unwrap();
+    l.put_reminder_parts(
+        &[quince_core::reminders::ReminderPart {
+            name: "RecurrenceRule/RULE-1".into(),
+            reminder_guid: Some(guid.clone()),
+            kind: "RecurrenceRule".into(),
+            raw: json!({ "recordName": "RecurrenceRule/RULE-1", "fields": {
+                "Frequency": { "type": "NUMBER_INT64", "value": 0 } } })
+            .to_string(),
+        }],
+        &[],
+        false,
+    )
+    .unwrap();
+    assert_eq!(l.reminder_repeat_end(&guid).unwrap(), None);
+    let shown = l.reminder(&guid).unwrap().unwrap();
+    record_reminder_tick(&mut l, &shown, true, DUE + 60).unwrap();
+    let after = l.reminder(&guid).unwrap().unwrap();
+    assert_eq!(after.completed_at, None, "moved on, not completed");
+    assert_eq!(after.due_at, Some(DUE + 23 * 3600));
 }

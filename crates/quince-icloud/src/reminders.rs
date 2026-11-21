@@ -5187,9 +5187,10 @@ pub async fn set_alarm_cloudkit(
 /// Add one alert at a reminder's due time, as Apple holds the due date when the alarm is
 /// written (a date moved on a phone since the reminder was queued is the one it rings at), under
 /// alarm and trigger ids chosen before it is sent (bare ids), and leave every other alarm it
-/// has as it is. A reminder Apple holds with no due date gets no alarm: nothing to ring at. For a reminder made here
-/// with its alert: a send repeated after a lost answer or a restart finds the records it made
-/// and finishes the job, so it never adds a second alert or leaves one nothing points at.
+/// has as it is. A reminder Apple holds with no due date, or all-day, gets no alarm: nothing to
+/// ring at. For a reminder made here with its alert: a send repeated after a lost answer or a
+/// restart finds the records it made and finishes the job, so it never adds a second alert or
+/// leaves one nothing points at.
 ///
 /// The same three records as [`set_alarm_cloudkit`], in the same order: the alarm, its
 /// trigger, then the reminder's list of alarms, which is read and written over the exact
@@ -5224,11 +5225,22 @@ pub async fn add_alarm_named_cloudkit(
     if listed(&current) {
         return Ok(());
     }
-    let Some(at_seconds) = field::timestamp_seconds(&current, "DueDate") else {
+    let alarm = format!("Alarm/{alarm_id}");
+    let trigger = format!("AlarmTrigger/{trigger_id}");
+    // No time to ring at any more (the date cleared, or made all-day, on a phone since): no
+    // alarm is linked, and what an earlier send made for it goes, trigger first, so nothing
+    // is left that nothing points at. Only these two names: every other alarm stays.
+    let due =
+        field::timestamp_seconds(&current, "DueDate").filter(|_| !field::flag(&current, "AllDay"));
+    let Some(at_seconds) = due else {
+        for name in [&trigger, &alarm] {
+            if client.lookup_record(ZONE, name).await?.is_some() {
+                client.delete_record(ZONE, name).await?;
+            }
+        }
         return Ok(());
     };
     let components = date_components(at_seconds, timezone)?;
-    let alarm = format!("Alarm/{alarm_id}");
     if client.lookup_record(ZONE, &alarm).await?.is_none() {
         client
             .create_record(
@@ -5245,7 +5257,6 @@ pub async fn add_alarm_named_cloudkit(
             )
             .await?;
     }
-    let trigger = format!("AlarmTrigger/{trigger_id}");
     if client.lookup_record(ZONE, &trigger).await?.is_none() {
         client
             .create_record(
@@ -5260,6 +5271,20 @@ pub async fn add_alarm_named_cloudkit(
                     "Imported": { "type": "NUMBER_INT64", "value": 0 },
                 }),
             )
+            .await?;
+    } else {
+        // Made by an earlier send whose answer was lost: set to the date Apple holds now,
+        // which a phone may have moved since, before anything points at it.
+        client
+            .edit_record(ZONE, &trigger, "AlarmTrigger", |t| {
+                let same = t.pointer("/fields/DateComponentsData/value")
+                    == Some(&Value::String(components.clone()));
+                (!same).then(|| {
+                    serde_json::json!({
+                        "DateComponentsData": { "type": "BYTES", "value": components },
+                    })
+                })
+            })
             .await?;
     }
     client
