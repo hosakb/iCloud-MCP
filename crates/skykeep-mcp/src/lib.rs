@@ -205,6 +205,15 @@ fn gate_for(
             }
         },
     };
+    let removes = permissions::removal(name, args) != permissions::Removal::None;
+    let gate = match (gate, mode) {
+        // Without an approval mode, deletions always wait for skykeep-mcp approve: a rule
+        // can make them stricter, never looser.
+        (Gate::Run | Gate::Client, None) if removes => Gate::Terminal,
+        // A broken file with no earlier valid rules: every deletion asks.
+        (Gate::Run, Some(_)) if removes && active.strict => Gate::Client,
+        (gate, _) => gate,
+    };
     Ok((gate, explicit))
 }
 
@@ -241,6 +250,7 @@ fn terminal_proposal(
     args: &Value,
     policy: Option<&str>,
     identity: (u64, u64),
+    rules: &str,
 ) -> Result<Value, &'static str> {
     let account = library
         .state(ACCOUNT_KEY)
@@ -248,7 +258,7 @@ fn terminal_proposal(
         .ok_or("login_required")?;
     let id = uuid::Uuid::new_v4().to_string();
     let proposal = json!({"tool":name,"args":args,"account":account,
-        "binding":{"policy":policy,"state_identity":identity}});
+        "binding":{"policy":policy,"state_identity":identity,"rules":rules}});
     library
         .set_state(&format!("mcp.approval.{id}"), &proposal.to_string())
         .map_err(|_| "library_unavailable")?;
@@ -267,6 +277,7 @@ fn terminal_check(
     args: &Value,
     policy: Option<&str>,
     identity: (u64, u64),
+    rules: &str,
 ) -> Result<(), &'static str> {
     let raw = library
         .state(&format!("mcp.approval.{id}"))
@@ -280,7 +291,7 @@ fn terminal_check(
     if value["tool"] != name
         || value["args"] != *args
         || value["account"] != json!(account)
-        || value["binding"] != json!({"policy":policy,"state_identity":identity})
+        || value["binding"] != json!({"policy":policy,"state_identity":identity,"rules":rules})
     {
         return Err("approval_policy_changed");
     }
@@ -1105,6 +1116,21 @@ impl Server {
         }
         uuid::Uuid::parse_str(id).map_err(|_| "invalid_request_id")?;
         let key = format!("mcp.approval.{id}");
+        // A request made before the permissions file said deny is refused too.
+        {
+            let library = self.ready(&held)?;
+            let request: Value = library
+                .state(&key)
+                .map_err(|_| "library_unavailable")?
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or(Value::Null);
+            if let Some(tool) = request["tool"].as_str() {
+                let active = permissions::load(library, &held.path, None)?;
+                if gate_for(library, None, &active, tool, &request["args"])?.0 == Gate::Deny {
+                    return Err(DENIED);
+                }
+            }
+        }
         self.ready(&held)?
             .atomically(|library| {
                 let raw = library.state(&key)?.ok_or_else(|| {
@@ -1198,6 +1224,7 @@ impl Server {
                     &args,
                     policy_raw.as_deref(),
                     current.identity,
+                    &active.fingerprint,
                 )?;
                 true
             }
@@ -1221,7 +1248,14 @@ impl Server {
                     &args,
                     policy_raw.as_deref(),
                     current.identity,
-                );
+                    &active.fingerprint,
+                )
+                .map(|mut reply| {
+                    if let Some(text) = active.fallback() {
+                        reply["permissions_file"] = json!(text);
+                    }
+                    reply
+                });
             }
             _ => {}
         }
@@ -1229,13 +1263,13 @@ impl Server {
         let approved = grant.is_some() || terminal_approved || gate == Gate::Run;
         // The older no-mode behaviour applies only where no rule decided.
         let legacy = gate == Gate::Legacy && !terminal_approved;
-        if explicit == Some(permissions::Effect::Allow)
+        // A deletion that runs only because the file allows it is logged once it ran.
+        let logged = (gate == Gate::Run
+            && explicit == Some(permissions::Effect::Allow)
             && grant.is_none()
             && !terminal_approved
-            && permissions::removal(name, &args) != permissions::Removal::None
-        {
-            permissions::log_allowed(&dir, name, args["action"].as_str().unwrap_or_default())?;
-        }
+            && permissions::removal(name, &args) != permissions::Removal::None)
+            .then(|| args["action"].as_str().unwrap_or_default().to_string());
         let result = match name {
             "sync" => {
                 let _: Empty = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -1523,6 +1557,17 @@ impl Server {
                     .map_err(|_| "library_unavailable")?;
             }
         }
+        let mut result = result;
+        if let Some(value) = result.as_mut().ok().filter(|v| v.is_object()) {
+            if let Some(action) = &logged {
+                if let Err(error) = permissions::log_allowed(&dir, name, action) {
+                    value["permissions_log"] = json!(format!("The deletion ran, but it could not be written to the permissions log: {error}."));
+                }
+            }
+            if let Some(text) = active.fallback() {
+                value["permissions_file"] = json!(text);
+            }
+        }
         result
     }
 }
@@ -1617,7 +1662,10 @@ fn setup(path: &Path) -> Result<Library, &'static str> {
     use std::os::unix::fs::PermissionsExt;
     for file in std::fs::read_dir(path).map_err(|_| "state_unavailable")? {
         let file = file.map_err(|_| "state_unavailable")?;
-        if file.file_type().map_err(|_| "state_unavailable")?.is_file() {
+        // The permissions file keeps the mode its owner gave it; its reader reports a shared one.
+        if file.file_type().map_err(|_| "state_unavailable")?.is_file()
+            && file.file_name() != permissions::FILE_NAME
+        {
             std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600))
                 .map_err(|_| "state_unavailable")?;
         }

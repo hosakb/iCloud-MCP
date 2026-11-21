@@ -157,13 +157,16 @@ fn every_valid_name_takes_every_effect_and_names_come_from_the_tool_list() {
 #[test]
 fn unknown_names_and_bad_values_are_refused_with_a_plain_message() {
     let error = permissions::parse("rules:\n  notes_write.explode: allow\n").unwrap_err();
+    assert!(error.starts_with("line 2: notes_write.explode is not a Skykeep tool or action. The closest valid name is notes_write"), "{error}");
     assert!(
-        error.starts_with(
-            "line 2: notes_write.explode is not a Skykeep tool or action. Valid names: "
-        ),
+        error.ends_with(". skykeep-mcp permissions show lists every valid name"),
         "{error}"
     );
-    assert!(error.contains("reminders_write.create"), "{error}");
+    let error = permissions::parse("rules:\n  reminder_write.creat: allow\n").unwrap_err();
+    assert!(
+        error.contains("closest valid name is reminders_write.create"),
+        "{error}"
+    );
     for (text, part) in [
         (
             "rules:\n  notes_write.delete: ask: terminal\n",
@@ -434,71 +437,302 @@ async fn ask_terminal_waits_for_skykeep_approve_with_and_without_an_approval_mod
 }
 
 #[tokio::test]
-async fn edits_count_at_the_next_call_and_an_invalid_file_falls_back_to_the_mode() {
+async fn edits_count_at_the_next_call_and_an_unusable_file_keeps_the_last_valid_rules() {
     let mut f = folder(Some("writes_only"), true).await;
     let lists = |id| call(id, "reminders_lists", json!({}));
     assert_eq!(body(&f.server.handle(lists(1)).await.unwrap())["total"], 1);
+    write_rules(f.path(), "rules:\n  reminders_lists: {ask: client}\n");
+    let form = f.server.handle(lists(2)).await.unwrap();
+    assert_eq!(form["method"], "elicitation/create");
+    f.server
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"cancel"}}))
+        .await;
     write_rules(f.path(), "rules:\n  reminders_lists: deny\n");
     assert_eq!(
-        body(&f.server.handle(lists(2)).await.unwrap())["error"],
+        body(&f.server.handle(lists(3)).await.unwrap())["error"],
         "denied_by_permissions"
     );
-    write_rules(f.path(), "rules:\n  reminders_lists: {ask: client}\n");
-    assert_eq!(
-        f.server.handle(lists(3)).await.unwrap()["method"],
-        "elicitation/create"
-    );
-    let mut f = folder(Some("writes_only"), true).await;
-    for broken in [
-        "rules:\n  reminders_lists: deny\n  nonsense\n",
-        "rules:\n  reminders_lists: deny\n  notes_write.explode: allow\n",
-    ] {
-        write_rules(f.path(), broken);
-        // The deny inside the broken file does not count: the mode decides.
-        assert_eq!(body(&f.server.handle(lists(4)).await.unwrap())["total"], 1);
+    let path = f.path().join(permissions::FILE_NAME);
+    let d = f.path().to_path_buf();
+    let outside = tempfile::tempdir().unwrap();
+    let unusable: Vec<Box<dyn Fn()>> = vec![
+        Box::new(|| write_rules(&d, "rules:\n  reminders_lists: allow\n  nonsense\n")),
+        Box::new(|| {
+            write_rules(
+                &d,
+                "rules:\n  reminders_lists: allow\n  notes_write.explode: allow\n",
+            )
+        }),
+        Box::new(|| write_rules(&d, "rules:\n\treminders_lists: allow\n")),
+        Box::new(|| {
+            write_rules(&d, "rules:\n  reminders_lists: allow\n");
+            std::fs::write(&path, b"rules:\n  reminders_lists: allow \xff\n").unwrap();
+        }),
+        Box::new(|| {
+            write_rules(
+                &d,
+                &format!("rules:\n  reminders_lists: allow\n#{}\n", "x".repeat(70000)),
+            )
+        }),
+        Box::new(|| {
+            write_rules(&d, "rules:\n  reminders_lists: allow\n");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        }),
+        Box::new(|| {
+            std::fs::remove_file(&path).unwrap();
+            let elsewhere = outside.path().join("elsewhere.txt");
+            std::fs::write(&elsewhere, "rules:\n  reminders_lists: allow\n").unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        }),
+    ];
+    for (n, make) in unusable.iter().enumerate() {
+        make();
+        // The deny from the last valid file still counts: an unusable file never loosens.
+        let reply = f.server.handle(lists(10 + n as i64)).await.unwrap();
+        assert_eq!(
+            body(&reply)["error"],
+            "denied_by_permissions",
+            "case {n}: {reply}"
+        );
+        let _ = std::fs::remove_file(&path);
+        write_rules(f.path(), "rules:\n  reminders_lists: deny\n");
+        f.server.handle(lists(30)).await;
     }
+    // A shared file does not stop the folder, and the fix names the exact command.
+    write_rules(f.path(), "rules:\n  reminders_lists: allow\n");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+    let reply = f
+        .server
+        .handle(call(40, "sync_status", json!({})))
+        .await
+        .unwrap();
+    let result = body(&reply);
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
     let dir = f.path().canonicalize().unwrap();
-    let lines = permissions::status(&mut f.library, &dir, Some("writes_only"));
+    let chmod = format!("chmod 600 {}", dir.join(permissions::FILE_NAME).display());
     assert!(
-        lines
-            .iter()
-            .any(|(t, n)| t.contains("can't be used") && n.is_some()),
+        result["permissions_file"]
+            .as_str()
+            .unwrap()
+            .contains(&chmod),
+        "{result}"
+    );
+    assert!(result["permissions_file"]
+        .as_str()
+        .unwrap()
+        .contains("keeps the last valid rules"));
+    let lines = permissions::status(&f.library, &dir, Some("writes_only"));
+    assert!(
+        lines.iter().any(|(t, n)| t.contains(&chmod) && n.is_some()),
         "{lines:?}"
     );
     let shown = permissions::show(&dir, false).unwrap();
     assert!(
-        shown.contains("The file can't be used: line 3: notes_write.explode"),
+        shown.contains("Last valid rules, still in use:\n  reminders_lists: deny"),
         "{shown}"
     );
-    // A file others may change, a link and an oversized file are ignored.
-    write_rules(f.path(), "rules:\n  reminders_lists: deny\n");
-    let path = f.path().join(permissions::FILE_NAME);
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o620)).unwrap();
-    assert!(
-        f.server.handle(lists(5)).await.unwrap()["result"]["isError"] == true,
-        "the folder check refuses the file"
-    );
-    std::fs::remove_file(&path).unwrap();
-    let elsewhere = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(elsewhere.path(), "rules:\n  reminders_lists: deny\n").unwrap();
-    let other = tempfile::tempdir().unwrap();
-    std::os::unix::fs::symlink(elsewhere.path(), other.path().join(permissions::FILE_NAME))
+}
+
+#[tokio::test]
+async fn a_broken_file_with_no_earlier_rules_makes_every_deletion_ask() {
+    // yolo never asks, but not while the file is broken and nothing valid came before.
+    let mut f = folder(Some("yolo"), true).await;
+    write_rules(f.path(), "rules:\n\treminders_write.delete: allow\n");
+    let delete = json!({"action":"delete","guid":"R-1"});
+    let form = f
+        .server
+        .handle(call(1, "reminders_write", delete.clone()))
+        .await
         .unwrap();
-    assert!(matches!(
-        permissions::read(other.path()).0,
-        permissions::Source::Invalid(_)
-    ));
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+    f.server
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"cancel"}}))
+        .await;
+    assert_eq!(f.library.outbox_count().unwrap(), 0);
+    // Everything else follows the mode and says why.
+    let reply = f
+        .server
+        .handle(call(2, "reminders_write", create_reminder()))
+        .await
+        .unwrap();
+    let result = body(&reply);
+    assert_eq!(result["status"], "queued");
+    assert!(result["permissions_file"]
+        .as_str()
+        .unwrap()
+        .contains("asks before every deletion"));
+    // A tab line under yolo after a valid deny: the deny stays.
+    let mut f = folder(Some("yolo"), true).await;
+    write_rules(f.path(), "rules:\n  reminders_write.delete: deny\n");
+    f.server.handle(call(1, "reminders_lists", json!({}))).await;
+    write_rules(f.path(), "rules:\n\treminders_write.delete: allow\n");
+    let reply = f
+        .server
+        .handle(call(2, "reminders_write", delete))
+        .await
+        .unwrap();
+    assert_eq!(body(&reply)["error"], "denied_by_permissions");
+    assert_eq!(f.library.outbox_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn without_an_approval_mode_deletions_wait_for_the_terminal_whatever_the_file_says() {
+    let mut f = folder(None, true).await;
+    let delete = json!({"action":"delete","guid":"R-1"});
+    for rule in ["allow", "{ask: client}"] {
+        write_rules(
+            f.path(),
+            &format!("rules:\n  reminders_write.delete: {rule}\n"),
+        );
+        let reply = f
+            .server
+            .handle(call(1, "reminders_write", delete.clone()))
+            .await
+            .unwrap();
+        let result = body(&reply);
+        assert_eq!(result["status"], "approval_required", "{rule}: {reply}");
+        assert_eq!(result["approval"], "terminal");
+        assert_eq!(f.library.outbox_count().unwrap(), 0);
+    }
+    assert!(!f.path().join(permissions::LOG_NAME).exists());
+    // Routine changes still follow the rule.
+    write_rules(f.path(), "rules:\n  reminders_write.create: allow\n");
+    let reply = f
+        .server
+        .handle(call(2, "reminders_write", create_reminder()))
+        .await
+        .unwrap();
+    assert_eq!(body(&reply)["status"], "queued");
+}
+
+#[tokio::test]
+async fn terminal_requests_go_stale_when_the_file_changes_and_older_ones_respect_deny() {
+    let mut f = folder(Some("yolo"), false).await;
     write_rules(
         f.path(),
-        &format!("rules:\n  reminders_lists: deny\n#{}\n", "x".repeat(70000)),
+        "rules:\n  reminders_write.create: {ask: terminal}\n",
     );
-    assert_eq!(body(&f.server.handle(lists(6)).await.unwrap())["total"], 1);
-    // A file that only others can't change, but anyone can read, is used.
-    write_rules(f.path(), "rules:\n  reminders_lists: deny\n");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let reply = f
+        .server
+        .handle(call(1, "reminders_write", create_reminder()))
+        .await
+        .unwrap();
+    let id = body(&reply)["request_id"].as_str().unwrap().to_string();
+    write_rules(
+        f.path(),
+        "# edited\nrules:\n  reminders_write.create: {ask: terminal}\n",
+    );
     assert_eq!(
-        body(&f.server.handle(lists(7)).await.unwrap())["error"],
-        "denied_by_permissions"
+        f.server.approve_request(&id).await,
+        Err("approval_policy_changed")
+    );
+    assert_eq!(f.library.outbox_count().unwrap(), 0);
+    // A request from before the permissions file, in a folder without an approval mode.
+    let mut f = folder(None, false).await;
+    let reply = f
+        .server
+        .handle(call(
+            1,
+            "reminders_write",
+            json!({"action":"delete","guid":"R-1"}),
+        ))
+        .await
+        .unwrap();
+    let id = body(&reply)["request_id"].as_str().unwrap().to_string();
+    write_rules(f.path(), "rules:\n  reminders_write.delete: deny\n");
+    assert_eq!(
+        f.server.approve_request(&id).await,
+        Err("denied_by_permissions")
+    );
+    assert_eq!(f.server.approve(&id), Err("denied_by_permissions"));
+    assert_eq!(f.library.outbox_count().unwrap(), 0);
+    std::fs::remove_file(f.path().join(permissions::FILE_NAME)).unwrap();
+    assert_eq!(
+        f.server.approve_request(&id).await.unwrap()["status"],
+        "queued"
+    );
+}
+
+#[tokio::test]
+async fn status_reads_without_writing_and_counts_rules_in_plain_words() {
+    let mut f = folder(Some("writes_only"), true).await;
+    let dir = f.path().canonicalize().unwrap();
+    write_rules(
+        f.path(),
+        "rules:\n  reminders_write.delete: {ask: terminal}\n",
+    );
+    f.server.handle(call(1, "reminders_lists", json!({}))).await;
+    permissions::show(&dir, true).unwrap();
+    let recorded = f.library.state("mcp.permissions.loaded").unwrap();
+    let lines = permissions::status(&f.library, &dir, Some("writes_only"));
+    assert!(
+        lines.iter().any(|(t, _)| t
+            == "Permissions file: 1 rule in use. Everything else follows the approval mode."),
+        "{lines:?}"
+    );
+    // Two looser edits the server hasn't loaded: reported, newest first, nothing written.
+    write_rules(
+        f.path(),
+        "rules:\n  reminders_write.delete: {ask: terminal}\n  reminders_write.create: allow\n",
+    );
+    f.server.handle(call(2, "reminders_lists", json!({}))).await;
+    write_rules(
+        f.path(),
+        "rules:\n  reminders_write.delete: allow\n  reminders_write.create: allow\n",
+    );
+    let recorded = f
+        .library
+        .state("mcp.permissions.loaded")
+        .unwrap()
+        .filter(|r| Some(r) != recorded.as_ref())
+        .unwrap();
+    let lines = permissions::status(&f.library, &dir, Some("writes_only"));
+    let notice = &lines
+        .iter()
+        .find(|(t, _)| t.contains("became looser"))
+        .unwrap()
+        .0;
+    assert!(
+        notice.contains("most recently reminders_write.delete:"),
+        "{notice}"
+    );
+    assert!(notice.contains("(and 1 earlier)"), "{notice}");
+    assert_eq!(
+        f.library.state("mcp.permissions.loaded").unwrap(),
+        Some(recorded)
+    );
+}
+
+#[tokio::test]
+async fn permissions_show_in_a_folder_that_never_had_a_file_reports_no_change() {
+    let mut f = folder(Some("writes_only"), true).await;
+    f.server.handle(call(1, "reminders_lists", json!({}))).await;
+    let shown = permissions::show(&f.path().canonicalize().unwrap(), true).unwrap();
+    assert!(shown.contains("There is no permissions file."), "{shown}");
+    assert!(
+        shown.contains("No changes since you last looked."),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains("removed") && !shown.contains("Last change loaded"),
+        "{shown}"
+    );
+    // A folder that isn't set up gets a pointer to setup, and nothing is created.
+    let empty = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(empty.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        permissions::show(empty.path(), false),
+        Err("permissions_setup_required")
+    );
+    assert_eq!(std::fs::read_dir(empty.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn commands_name_the_folder_after_permissions_show() {
+    let dir = Path::new("/srv/sky");
+    assert_eq!(
+        skykeep_mcp::status::with_dir("Run skykeep-mcp permissions show to see it.", dir),
+        "Run skykeep-mcp permissions show --state-dir /srv/sky to see it."
     );
 }
 
@@ -512,14 +746,12 @@ async fn a_looser_change_is_reported_until_the_person_looks() {
     );
     f.server.handle(call(1, "reminders_lists", json!({}))).await;
     permissions::show(&dir, true).unwrap();
-    assert!(
-        permissions::status(&mut f.library, &dir, Some("writes_only"))
-            .iter()
-            .all(|(_, next)| next.is_none())
-    );
+    assert!(permissions::status(&f.library, &dir, Some("writes_only"))
+        .iter()
+        .all(|(_, next)| next.is_none()));
     write_rules(f.path(), "rules:\n  reminders_write.delete: allow\n");
     f.server.handle(call(2, "reminders_lists", json!({}))).await;
-    let lines = permissions::status(&mut f.library, &dir, Some("writes_only"));
+    let lines = permissions::status(&f.library, &dir, Some("writes_only"));
     let looser = lines
         .iter()
         .find(|(t, _)| t.contains("became looser"))
@@ -529,11 +761,9 @@ async fn a_looser_change_is_reported_until_the_person_looks() {
     let shown = permissions::show(&dir, true).unwrap();
     assert!(shown.contains("looser: reminders_write.delete"), "{shown}");
     assert!(shown.contains("Last change loaded: "), "{shown}");
-    assert!(
-        permissions::status(&mut f.library, &dir, Some("writes_only"))
-            .iter()
-            .all(|(t, _)| !t.contains("became looser"))
-    );
+    assert!(permissions::status(&f.library, &dir, Some("writes_only"))
+        .iter()
+        .all(|(t, _)| !t.contains("became looser")));
     // Removing the file is a change too.
     std::fs::remove_file(f.path().join(permissions::FILE_NAME)).unwrap();
     let shown = permissions::show(&dir, false).unwrap();
@@ -544,6 +774,18 @@ async fn a_looser_change_is_reported_until_the_person_looks() {
 async fn deletions_allowed_by_the_file_are_logged_without_content() {
     let mut f = folder(Some("writes_only"), true).await;
     write_rules(f.path(), "rules:\n  reminders_write.delete: allow\n");
+    // A deletion that fails is not logged: only what ran.
+    let reply = f
+        .server
+        .handle(call(
+            1,
+            "reminders_write",
+            json!({"action":"delete","guid":"missing"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    assert!(!f.path().join(permissions::LOG_NAME).exists());
     let reply = f
         .server
         .handle(call(

@@ -452,7 +452,10 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client
     }
     assert!(screen.contains(&format!("Create {}? [Y/n]", dir.display())));
     assert!(screen.contains("1. Ask me before every read and every change. Recommended."));
-    assert!(screen.contains("approval forms. Hermes can."), "{screen}");
+    assert!(
+        screen.contains("Hermes should show them; if no card appears there, choose 4"),
+        "{screen}"
+    );
     assert!(!screen.contains("Hermes can't"), "{screen}");
     assert!(
         screen.contains("Signed in as f***@e***.invalid"),

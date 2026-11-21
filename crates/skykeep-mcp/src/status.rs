@@ -40,7 +40,7 @@ pub struct Report {
 /// can't show approval forms. Only setup and status read it; it changes no policy.
 pub const NO_MODE_KEY: &str = "mcp.setup.no_approval_mode";
 
-fn quoted(path: &Path) -> String {
+pub(crate) fn quoted(path: &Path) -> String {
     let text = path.to_string_lossy();
     if text
         .chars()
@@ -95,9 +95,16 @@ pub fn with_dir(text: &str, dir: &Path) -> String {
             "permissions",
         ]
         .contains(&word.as_str());
-        let tail = &after[word.len()..];
+        // `permissions show` is one command: the folder goes after both words.
+        let sub = if word == "permissions" && after[word.len()..].starts_with(" show") {
+            " show"
+        } else {
+            ""
+        };
+        let tail = &after[word.len() + sub.len()..];
         out.push_str("skykeep-mcp ");
         out.push_str(&word);
+        out.push_str(sub);
         let knows_default = ["setup", "status", "unlock", "permissions"].contains(&word.as_str());
         if known && !(default && knows_default) && !tail.starts_with(" --state-dir") {
             out.push_str(&flag);
@@ -224,7 +231,7 @@ pub fn check(env: &Env, dir: &Path) -> Report {
 
     let store = storage_lines(env, dir, &mut report);
 
-    let mut library = if dir.join("library.db").exists() {
+    let library = if dir.join("library.db").exists() {
         quince_core::Library::open(dir).ok()
     } else {
         None
@@ -305,7 +312,8 @@ pub fn check(env: &Env, dir: &Path) -> Report {
             "Run skykeep-mcp setup to choose it again.",
         ),
     }
-    if let Some(library) = library.as_mut() {
+    // Read only: status never records a load; the server does that at its next tool call.
+    if let Some(library) = library.as_ref() {
         let mode = crate::policy(library, dir)
             .ok()
             .flatten()

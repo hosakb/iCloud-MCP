@@ -33,6 +33,14 @@ fn create_reminder() -> Value {
 fn permissions_show_runs_from_any_terminal_and_never_asks() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    drop(quince_core::Library::open(dir.path()).unwrap());
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        std::fs::set_permissions(
+            entry.unwrap().path(),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
     write_rules(dir.path(), "rules:\n  notes_list: deny\n");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_skykeep-mcp"))
         .args(["permissions", "show", "--state-dir"])

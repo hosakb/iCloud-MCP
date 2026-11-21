@@ -44,14 +44,12 @@ impl PrivateState {
         for entry in std::fs::read_dir(&absolute).map_err(|_| "state_unavailable")? {
             let entry = entry.map_err(|_| "state_unavailable")?;
             let m = std::fs::symlink_metadata(entry.path()).map_err(|_| "state_unavailable")?;
-            // The permissions file may be readable by others, as editors and agents often
-            // save it, but never changeable by them. It holds no secret.
-            let private = if entry.file_name() == crate::permissions::FILE_NAME {
-                0o022
-            } else {
-                0o077
-            };
-            if m.file_type().is_symlink() || m.uid() != meta.uid() || m.mode() & private != 0 {
+            // The permissions file holds no secret. Editors and agents often save it shared
+            // or as a link; its own reader refuses it then, and the folder stays usable.
+            if entry.file_name() == crate::permissions::FILE_NAME {
+                continue;
+            }
+            if m.file_type().is_symlink() || m.uid() != meta.uid() || m.mode() & 0o077 != 0 {
                 return Err("unsafe_state_contents");
             }
         }

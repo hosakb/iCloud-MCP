@@ -357,9 +357,9 @@ pub fn parse(text: &str) -> Result<Rules, String> {
         let line = lines_of.get(name).copied().unwrap_or(0);
         let Some(target) = valid.iter().find(|t| &t.name == name) else {
             return Err(format!(
-                "line {line}: {} is not a Skykeep tool or action. Valid names: {}",
+                "line {line}: {} is not a Skykeep tool or action. The closest valid name is {}. skykeep-mcp permissions show lists every valid name",
                 shown(name),
-                names().join(", ")
+                closest(name)
             ));
         };
         if *effect == Effect::AskTerminal && !changes(&target.tool) {
@@ -370,6 +370,31 @@ pub fn parse(text: &str) -> Result<Rules, String> {
         }
     }
     Ok(rules)
+}
+
+/// The valid name with the fewest single-character edits from `name`.
+fn closest(name: &str) -> String {
+    let distance = |a: &str, b: &str| {
+        let b: Vec<char> = b.chars().collect();
+        let mut row: Vec<usize> = (0..=b.len()).collect();
+        for (i, ca) in a.chars().enumerate() {
+            let mut prev = row[0];
+            row[0] = i + 1;
+            for (j, cb) in b.iter().enumerate() {
+                let next = (row[j + 1] + 1)
+                    .min(row[j] + 1)
+                    .min(prev + usize::from(ca != *cb));
+                prev = row[j + 1];
+                row[j + 1] = next;
+            }
+        }
+        row[b.len()]
+    };
+    let name: String = name.chars().take(200).collect();
+    names()
+        .into_iter()
+        .min_by_key(|n| distance(&name, n))
+        .unwrap_or_default()
 }
 
 /// The rule for one call: `tool.action` first, then the tool's own entry.
@@ -411,7 +436,7 @@ pub enum Source {
 
 /// The file's bytes from `dir`, `None` when there is none: a regular file owned by this
 /// user, never through a link, no one else able to change it, at most 64 KiB.
-fn read_bytes(dir: &Path) -> Result<Option<Vec<u8>>, &'static str> {
+fn read_bytes(dir: &Path) -> Result<Option<Vec<u8>>, String> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let file = std::fs::OpenOptions::new()
@@ -422,22 +447,27 @@ fn read_bytes(dir: &Path) -> Result<Option<Vec<u8>>, &'static str> {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-            return Err("the file is a link; Skykeep reads only a real file in its folder")
+            return Err("the file is a link; Skykeep reads only a real file in its folder".into())
         }
-        Err(_) => return Err("the file can't be opened"),
+        Err(_) => return Err("the file can't be opened".into()),
     };
-    let meta = file.metadata().map_err(|_| "the file can't be read")?;
+    let meta = file
+        .metadata()
+        .map_err(|_| "the file can't be read".to_string())?;
     if !meta.is_file() {
-        return Err("it is not a regular file");
+        return Err("it is not a regular file".into());
     }
     if meta.uid() != unsafe { libc::geteuid() } {
-        return Err("the file belongs to another user");
+        return Err("the file belongs to another user".into());
     }
     if meta.mode() & 0o022 != 0 {
-        return Err("other users may change the file; run chmod 600 on it");
+        return Err(format!(
+            "other users may change the file; run: chmod 600 {}",
+            crate::status::quoted(&dir.join(FILE_NAME))
+        ));
     }
     if meta.len() > MAX_FILE_BYTES {
-        return Err("the file is larger than 64 KiB");
+        return Err("the file is larger than 64 KiB".into());
     }
     let mut bytes = Vec::new();
     if file
@@ -446,7 +476,7 @@ fn read_bytes(dir: &Path) -> Result<Option<Vec<u8>>, &'static str> {
         .is_err()
         || bytes.len() as u64 > MAX_FILE_BYTES
     {
-        return Err("the file can't be read");
+        return Err("the file can't be read".into());
     }
     Ok(Some(bytes))
 }
@@ -456,7 +486,7 @@ pub fn read(dir: &Path) -> (Source, String) {
     let bytes = match read_bytes(dir) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return (Source::Missing, "missing".into()),
-        Err(problem) => return invalid(problem),
+        Err(problem) => return invalid(&problem),
     };
     let print = fingerprint(&bytes);
     let Ok(text) = String::from_utf8(bytes) else {
@@ -486,11 +516,33 @@ fn fingerprint(bytes: &[u8]) -> String {
 
 /// The rules in force for one call.
 pub struct Active {
-    /// Empty when the file is missing or invalid.
+    /// The file's rules; while the file is unusable, the last valid rules loaded, if any.
     pub rules: Rules,
     /// Changes whenever the file's bytes change; binds approvals to the rules they saw.
     pub fingerprint: String,
     pub problem: Option<String>,
+    /// When the rules in use were loaded, while the file is unusable and older rules stand in.
+    pub kept_from: Option<u64>,
+    /// The file is unusable and there are no earlier valid rules: every deletion asks.
+    pub strict: bool,
+}
+
+impl Active {
+    /// A sentence on what Skykeep does while the file can't be used, for tool results.
+    pub fn fallback(&self) -> Option<String> {
+        let problem = self.problem.as_deref()?;
+        Some(match self.kept_from {
+            Some(at) => format!(
+                "The permissions file can't be used ({}). Skykeep keeps the last valid rules, loaded {}.",
+                shown_problem(problem),
+                when(at)
+            ),
+            None => format!(
+                "The permissions file can't be used ({}). Skykeep follows the approval mode and asks before every deletion until the file is fixed.",
+                shown_problem(problem)
+            ),
+        })
+    }
 }
 
 fn now() -> u64 {
@@ -539,6 +591,12 @@ fn diff(
         let default = default_effect(mode, require_all, &t.tool, action);
         let before = rule_for(old, &t.tool, action).unwrap_or(default);
         let after = rule_for(new, &t.tool, action).unwrap_or(default);
+        // Without an approval mode a deletion never gets looser than the terminal.
+        let floor = |e: Effect| match (mode, action) {
+            (None, Some(a)) if is_deletion(&t.tool, a) => e.max(Effect::AskTerminal),
+            _ => e,
+        };
+        let (before, after) = (floor(before), floor(after));
         let change = json!({"name":t.name,"from":before.as_str(),"to":after.as_str()});
         if after < before {
             looser.push(change);
@@ -558,36 +616,72 @@ fn require_all(library: &Library) -> bool {
         == Some("true")
 }
 
-/// Reads the file and, when its bytes changed since the last load, records the load and what
-/// it made looser or stricter. Fails only when the library can't record it.
-pub fn load(library: &mut Library, dir: &Path, mode: Option<&str>) -> Result<Active, &'static str> {
+/// A load that changes the record: the new record, and the history entry it adds.
+type Change = (Value, Option<Value>);
+
+/// What the file means right now, read without writing anything, and the record a load
+/// would write when the file's bytes changed since the last load.
+fn evaluate(
+    library: &Library,
+    dir: &Path,
+    mode: Option<&str>,
+) -> Result<(Active, Option<Change>), &'static str> {
     let (source, print) = read(dir);
-    let (rules, problem) = match source {
-        Source::Missing => (Rules::new(), None),
-        Source::Rules(rules) => (rules, None),
-        Source::Invalid(problem) => (Rules::new(), Some(problem)),
-    };
     let stored: Value = library
         .state(LOADED_KEY)
         .map_err(|_| "library_unavailable")?
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or(Value::Null);
-    if stored["fingerprint"].as_str() != Some(print.as_str()) {
-        let old = rules_from(&stored["rules"]);
-        let (looser, stricter) = diff(&old, &rules, mode, require_all(library));
-        let seq = stored["seq"].as_u64().unwrap_or(0);
-        let at = now();
-        let record = json!({"fingerprint":print,"rules":rules_value(&rules),"problem":problem,
-            "loaded_at":at,"seq":seq + 1});
-        let mut history: Vec<Value> = library
-            .state(HISTORY_KEY)
-            .map_err(|_| "library_unavailable")?
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default();
-        history.push(
-            json!({"seq":seq + 1,"at":at,"looser":looser,"stricter":stricter,
-            "problem":problem,"missing":print == "missing"}),
-        );
+    let changed = stored["fingerprint"].as_str() != Some(print.as_str());
+    let at = now();
+    // The last valid rules from a file, kept while a later file can't be used.
+    let last_valid = stored["valid"].clone();
+    let (rules, problem, valid) = match source {
+        Source::Missing => (Rules::new(), None, Value::Null),
+        Source::Rules(rules) => {
+            let valid = if changed {
+                json!({"rules":rules_value(&rules),"at":at})
+            } else {
+                last_valid
+            };
+            (rules, None, valid)
+        }
+        Source::Invalid(problem) => (rules_from(&last_valid["rules"]), Some(problem), last_valid),
+    };
+    let kept_from = problem.as_ref().and(valid["at"].as_u64());
+    let active = Active {
+        strict: problem.is_some() && valid.is_null(),
+        rules,
+        fingerprint: print.clone(),
+        problem,
+        kept_from,
+    };
+    if !changed {
+        return Ok((active, None));
+    }
+    let first = stored.is_null();
+    let old = rules_from(&stored["rules"]);
+    let (looser, stricter) = diff(&old, &active.rules, mode, require_all(library));
+    let seq = stored["seq"].as_u64().unwrap_or(0) + 1;
+    // A folder that never had a file has nothing to report.
+    let quiet = first && print == "missing";
+    let record = json!({"fingerprint":print,"rules":rules_value(&active.rules),
+        "problem":active.problem,"loaded_at":if quiet { Value::Null } else { json!(at) },
+        "seq":if quiet { seq - 1 } else { seq },"valid":valid});
+    let event = (!quiet).then(|| {
+        json!({"seq":seq,"at":at,"looser":looser,"stricter":stricter,
+            "problem":active.problem,"kept":active.kept_from,"missing":print == "missing"})
+    });
+    Ok((active, Some((record, event))))
+}
+
+/// Reads the file and, when its bytes changed since the last load, records the load and what
+/// it made looser or stricter. Fails only when the library can't record it.
+pub fn load(library: &mut Library, dir: &Path, mode: Option<&str>) -> Result<Active, &'static str> {
+    let (active, change) = evaluate(library, dir, mode)?;
+    if let Some((record, event)) = change {
+        let mut history = history(library);
+        history.extend(event);
         let keep = history.len().saturating_sub(MAX_HISTORY);
         history.drain(..keep);
         library
@@ -597,11 +691,7 @@ pub fn load(library: &mut Library, dir: &Path, mode: Option<&str>) -> Result<Act
             })
             .map_err(|_| "library_unavailable")?;
     }
-    Ok(Active {
-        rules,
-        fingerprint: print,
-        problem,
-    })
+    Ok(active)
 }
 
 /// Records that a deletion ran without asking because the file allowed it: tool, action and
@@ -694,26 +784,20 @@ fn change_line(c: &Value) -> String {
     )
 }
 
-/// Status lines for the permissions file. Loads it the way the server does.
-pub fn status(
-    library: &mut Library,
-    dir: &Path,
-    mode: Option<&str>,
-) -> Vec<(String, Option<String>)> {
+/// Status lines for the permissions file, read the way the server reads it. Writes nothing:
+/// a change the server has not loaded yet is reported as if it had.
+pub fn status(library: &Library, dir: &Path, mode: Option<&str>) -> Vec<(String, Option<String>)> {
     let mut out = Vec::new();
-    let active = match load(library, dir, mode) {
-        Ok(active) => active,
-        Err(_) => {
-            out.push((
-                "Skykeep couldn't record the permissions file it read.".into(),
-                Some("Run skykeep-mcp status again in a moment.".into()),
-            ));
-            return out;
-        }
+    let Ok((active, change)) = evaluate(library, dir, mode) else {
+        out.push((
+            "Skykeep couldn't read what it recorded about the permissions file.".into(),
+            Some("Run skykeep-mcp status again in a moment.".into()),
+        ));
+        return out;
     };
-    match (&active.problem, active.fingerprint.as_str()) {
-        (Some(problem), _) => out.push((
-            format!("The permissions file can't be used ({}), so Skykeep ignores all of it and follows the approval mode.", shown_problem(problem)),
+    match (active.fallback(), active.fingerprint.as_str()) {
+        (Some(text), _) => out.push((
+            text,
             Some("Fix the file, then run skykeep-mcp permissions show.".into()),
         )),
         (None, "missing") => out.push((
@@ -722,25 +806,32 @@ pub fn status(
         )),
         (None, _) => out.push((
             format!(
-                "Permissions file: {} rules in use. Everything else follows the approval mode.",
-                active.rules.len()
+                "Permissions file: {} in use. Everything else follows the approval mode.",
+                match active.rules.len() {
+                    1 => "1 rule".to_string(),
+                    n => format!("{n} rules"),
+                }
             ),
             None,
         )),
     }
-    let looser: Vec<Value> = unseen(library)
+    let mut events = unseen(library);
+    events.extend(change.and_then(|(_, event)| event));
+    let looser: Vec<Value> = events
         .iter()
         .flat_map(|e| e["looser"].as_array().cloned().unwrap_or_default())
         .collect();
-    if !looser.is_empty() {
-        let first = change_line(&looser[0]);
+    if let Some(newest) = looser.last() {
         let more = if looser.len() > 1 {
-            format!(" and {} more", looser.len() - 1)
+            format!(" (and {} earlier)", looser.len() - 1)
         } else {
             String::new()
         };
         out.push((
-            format!("The permissions changed since you last looked and some actions became looser: {first}{more}."),
+            format!(
+                "The permissions changed since you last looked and some actions became looser, most recently {}{more}.",
+                change_line(newest)
+            ),
             Some("Run skykeep-mcp permissions show to see every change.".into()),
         ));
     }
@@ -757,6 +848,10 @@ fn shown_problem(problem: &str) -> String {
 
 /// `skykeep-mcp permissions show`. With `mark_seen`, the changes shown count as seen.
 pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
+    // Never creates a folder or a library: a folder that isn't set up gets a pointer to setup.
+    if !dir.join("library.db").is_file() {
+        return Err("permissions_setup_required");
+    }
     let held = crate::state::PrivateState::open(dir)?;
     let dir = held.path.as_path();
     let mut library = crate::setup(dir)?;
@@ -785,12 +880,27 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
     if let Some(at) = loaded["loaded_at"].as_u64() {
         out.push_str(&format!("Last change loaded: {}\n", when(at)));
     }
+    if let (Some(text), Some(problem)) = (active.fallback(), &active.problem) {
+        out.push_str(&format!("\n{text}\n"));
+        if problem.contains("is not a Skykeep tool or action") {
+            out.push_str(&format!("Valid names: {}\n", names().join(", ")));
+        }
+    }
     match (&active.problem, active.fingerprint.as_str()) {
-        (Some(problem), _) => out.push_str(&format!(
-            "\nThe file can't be used: {}\nSkykeep ignores the whole file and follows the approval mode until it is fixed.\n",
-            shown_problem(problem)
-        )),
-        (None, "missing") => out.push_str("\nThere is no permissions file. The approval mode decides everything.\n"),
+        (Some(_), _) if active.rules.is_empty() => {}
+        (Some(_), _) => {
+            out.push_str("\nLast valid rules, still in use:\n");
+            for (name, effect) in &active.rules {
+                out.push_str(&format!(
+                    "  {name}: {}, {}\n",
+                    effect.as_str(),
+                    effect.sentence()
+                ));
+            }
+        }
+        (None, "missing") => {
+            out.push_str("\nThere is no permissions file. The approval mode decides everything.\n")
+        }
         (None, _) if active.rules.is_empty() => out.push_str("\nThe file lists no rules.\n"),
         (None, _) => {
             out.push_str("\nRules in use:\n");
@@ -807,7 +917,11 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
                     ),
                     _ => String::new(),
                 };
-                out.push_str(&format!("  {name}: {}, {}{from}\n", effect.as_str(), effect.sentence()));
+                out.push_str(&format!(
+                    "  {name}: {}, {}{from}\n",
+                    effect.as_str(),
+                    effect.sentence()
+                ));
             }
         }
     }
@@ -824,8 +938,13 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
             let looser = event["looser"].as_array().cloned().unwrap_or_default();
             let stricter = event["stricter"].as_array().cloned().unwrap_or_default();
             if let Some(problem) = event["problem"].as_str() {
+                let then = if event["kept"].is_u64() {
+                    "the last valid rules stayed in use"
+                } else {
+                    "the approval mode decided, and every deletion asked"
+                };
                 out.push_str(&format!(
-                    "  {at}: the file became unusable ({}), so the approval mode decides.\n",
+                    "  {at}: the file became unusable ({}), so {then}.\n",
                     shown_problem(problem)
                 ));
             } else if event["missing"] == true {
@@ -1077,8 +1196,7 @@ pub fn save_allow(dir: &Path, name: &str, expected: &str) -> Result<(), String> 
         write_atomic(dir, BACKUP_NAME, bytes)?;
     }
     // Last check right before the rename: an edit that landed meanwhile wins.
-    let now_print = read_bytes(dir)
-        .map_err(String::from)?
+    let now_print = read_bytes(dir)?
         .as_deref()
         .map_or_else(|| "missing".to_string(), fingerprint);
     if now_print != print {

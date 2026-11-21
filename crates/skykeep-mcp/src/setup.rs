@@ -97,6 +97,7 @@ pub fn plain(code: &'static str) -> &'static str {
         "unsafe_state_contents" => "A file in that folder can be read by others, or is a link. Choose another folder.",
         "unsafe_state_path" => "That folder path goes through a link or '..'. Use the folder's real path.",
         "state_unavailable" | "library_unavailable" => "Setup can't open that folder. Check that its parent folder exists and belongs to you.",
+        "permissions_setup_required" => "This folder isn't set up yet. Run skykeep-mcp setup first.",
         "permissions_file_unavailable" => "Setup couldn't write the permissions file. Run skykeep-mcp status to see why.",
         "policy_unavailable" => "Setup couldn't read or save the approval mode. Run skykeep-mcp status to see why.",
         "authentication_unavailable" => "Sign-in didn't finish. Check your internet connection, then run skykeep-mcp setup again.",
@@ -441,7 +442,7 @@ async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcom
         done.push_str(" After each restart of this computer, run skykeep-mcp unlock once.");
     }
     match mode.as_str() {
-        "reads_and_writes" | "writes_only" => done.push_str(" Your approval mode asks on a card in your MCP client, which must be able to show Skykeep's approval forms. Hermes can. For a client or session without forms, set those actions to ask: terminal in the permissions file, or run skykeep-mcp setup --state-dir NEW_FOLDER and choose 4 there."),
+        "reads_and_writes" | "writes_only" => done.push_str(" Your approval mode asks on a card in your MCP client, which must be able to show Skykeep's approval forms. Hermes should show it. If no card appears, set those actions to ask: terminal in the permissions file, or run skykeep-mcp setup --state-dir NEW_FOLDER and choose 4 there."),
         "none" => {
             let held = PrivateState::open(&dir)?;
             done.push(' ');
@@ -820,7 +821,7 @@ async fn step_sign_in(
 
 /// Step 4. Runs after the sign-in: a policy saved before sign-in is bound to no account.
 fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str> {
-    console.say("\nStep 4 of 5: Approval mode\nThis decides when the assistant has to ask you before it acts. Choices 1 and 2 ask on a card in your MCP client, so the client must be able to show Skykeep's approval forms. Hermes can. Choice 4 is for clients without them.")?;
+    console.say("\nStep 4 of 5: Approval mode\nThis decides when the assistant has to ask you before it acts. Choices 1 and 2 ask on a card in your MCP client, so the client must be able to show Skykeep's approval forms. Hermes should show them; if no card appears there, choose 4, or later set those actions to ask: terminal in the permissions file.")?;
     let held = PrivateState::open(dir)?;
     let library = crate::setup(&held.path)?;
     if library
