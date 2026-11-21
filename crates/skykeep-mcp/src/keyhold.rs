@@ -137,11 +137,16 @@ impl KeyHolder for KernelKeyring {
         }
         let ok = |r: libc::c_long| if r < 0 { Err(refused(errno())) } else { Ok(()) };
         let setup = ok(unsafe { libc::syscall(libc::SYS_keyctl, KEYCTL_SETPERM, id, PERMISSIONS) })
-            .and_then(|()| match seconds {
-                Some(s) => ok(unsafe {
-                    libc::syscall(libc::SYS_keyctl, KEYCTL_SET_TIMEOUT, id, s as libc::c_long)
-                }),
-                None => Ok(()),
+            // Always set: replacing a key keeps its old expiry otherwise. 0 means none.
+            .and_then(|()| {
+                ok(unsafe {
+                    libc::syscall(
+                        libc::SYS_keyctl,
+                        KEYCTL_SET_TIMEOUT,
+                        id,
+                        seconds.unwrap_or(0) as libc::c_long,
+                    )
+                })
             });
         if setup.is_err() {
             // A key with the wrong permissions or no timeout is not left behind.
@@ -172,6 +177,8 @@ pub struct MemoryHolder {
     keys: std::sync::Mutex<std::collections::HashMap<String, Zeroizing<Vec<u8>>>>,
     /// Behave like a system that blocks the kernel key storage.
     pub blocked: std::sync::atomic::AtomicBool,
+    /// The timeout each key was last put with, for tests to check.
+    pub timeouts: std::sync::Mutex<std::collections::HashMap<String, Option<u32>>>,
 }
 
 impl MemoryHolder {
@@ -190,10 +197,11 @@ impl KeyHolder for MemoryHolder {
         }
         Ok(self.keys.lock().unwrap().get(name).cloned())
     }
-    fn put(&self, name: &str, key: &[u8], _: Option<u32>) -> Result<(), HoldError> {
+    fn put(&self, name: &str, key: &[u8], seconds: Option<u32>) -> Result<(), HoldError> {
         if self.blocked() {
             return Err(HoldError::Unavailable);
         }
+        self.timeouts.lock().unwrap().insert(name.into(), seconds);
         self.keys
             .lock()
             .unwrap()

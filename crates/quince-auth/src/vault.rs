@@ -91,9 +91,15 @@ impl Params {
     #[must_use]
     pub fn derive(&self, passphrase: &[u8]) -> Key {
         let mut key = [0u8; 32];
-        pbkdf2::pbkdf2::<Hmac<Sha256>>(passphrase, &self.salt, self.iterations, &mut key)
-            .expect("pbkdf2 with a 32-byte output never fails");
+        self.derive_into(passphrase, &mut key);
         key
+    }
+
+    /// [`Self::derive`], written straight into `key`, so no copy is left on the stack for a
+    /// caller that keeps its key in memory it clears.
+    pub fn derive_into(&self, passphrase: &[u8], key: &mut Key) {
+        pbkdf2::pbkdf2::<Hmac<Sha256>>(passphrase, &self.salt, self.iterations, key)
+            .expect("pbkdf2 with a 32-byte output never fails");
     }
 
     fn header(&self) -> Vec<u8> {

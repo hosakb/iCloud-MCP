@@ -32,6 +32,64 @@ pub struct Line {
 #[derive(Default)]
 pub struct Report {
     pub lines: Vec<Line>,
+    /// The folder checked, named in every command the report prints.
+    pub dir: Option<std::path::PathBuf>,
+}
+
+/// Library key: setup chose to leave the folder without an approval mode, for MCP clients that
+/// can't show approval forms. Only setup and status read it; it changes no policy.
+pub const NO_MODE_KEY: &str = "mcp.setup.no_approval_mode";
+
+fn quoted(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if text
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-+,:@".contains(c))
+    {
+        text.into_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// `text` with `--state-dir DIR` added to every `skykeep-mcp` command in it, unless `dir` is
+/// the default folder, where no flag is needed.
+pub fn with_dir(text: &str, dir: &Path) -> String {
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    if crate::setup::default_dir().is_some_and(|d| canonical(&d) == canonical(dir)) {
+        return text.to_string();
+    }
+    let flag = format!(" --state-dir {}", quoted(dir));
+    let mut out = String::with_capacity(text.len() + flag.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("skykeep-mcp ") {
+        let (before, from) = rest.split_at(at);
+        out.push_str(before);
+        let after = &from["skykeep-mcp ".len()..];
+        let word: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+            .collect();
+        let known = [
+            "setup",
+            "status",
+            "unlock",
+            "login",
+            "logout",
+            "approve",
+            "quarantine",
+        ]
+        .contains(&word.as_str());
+        let tail = &after[word.len()..];
+        out.push_str("skykeep-mcp ");
+        out.push_str(&word);
+        if known && !tail.starts_with(" --state-dir") {
+            out.push_str(&flag);
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
 }
 
 impl Report {
@@ -63,7 +121,10 @@ impl Report {
                 }
             }
         }
-        out
+        match &self.dir {
+            Some(dir) => with_dir(&out, dir),
+            None => out,
+        }
     }
 }
 
@@ -94,7 +155,10 @@ pub fn mask(account: &str) -> String {
 
 /// Everything status checks for `dir`. Takes the folder's lock while it reads.
 pub fn check(env: &Env, dir: &Path) -> Report {
-    let mut report = Report::default();
+    let mut report = Report {
+        dir: Some(dir.to_path_buf()),
+        ..Report::default()
+    };
     let shown = dir.display().to_string();
     if !dir.exists() {
         report.fix(
@@ -133,6 +197,7 @@ pub fn check(env: &Env, dir: &Path) -> Report {
         }
     };
     let dir = held.path.as_path();
+    report.dir = Some(dir.to_path_buf());
     report.ok(format!("Folder: {} (private to you)", dir.display()));
 
     let store = storage_lines(env, dir, &mut report);
@@ -177,6 +242,15 @@ pub fn check(env: &Env, dir: &Path) -> Report {
     match library.as_ref().map(|l| crate::policy(l, dir)) {
         Some(Ok(Some((policy, _)))) => {
             report.ok(format!("Approval mode: {}", describe_mode(&policy.mode)))
+        }
+        Some(Ok(None))
+            if library
+                .as_ref()
+                .and_then(|l| l.state(NO_MODE_KEY).ok().flatten())
+                .as_deref()
+                == Some("1") =>
+        {
+            report.ok("Approval mode: none, for MCP clients without approval forms. Routine changes run without asking; deletions wait until you approve them with skykeep-mcp approve.")
         }
         None | Some(Ok(None)) => report.fix(
             "No approval mode chosen.",
@@ -229,14 +303,18 @@ fn storage_lines(env: &Env, dir: &Path, report: &mut Report) -> Option<quince_au
                 KeyringState::Locked => {
                     report.fix(
                         "Sign-in storage: system keyring, locked.",
-                        "Unlock your keyring (log in to your desktop), then run status again.",
+                        "Unlock your keyring (log in to your desktop session), then run skykeep-mcp status again.",
                     );
                     None
                 }
                 KeyringState::Missing => {
                     report.fix(
                         "Sign-in storage: system keyring, not reachable.",
-                        "Start your desktop's keyring, or run skykeep-mcp setup to use a protected file.",
+                        if env.holder.available() {
+                            "Log in to your desktop session so the keyring starts, or run skykeep-mcp setup to use a protected file instead."
+                        } else {
+                            "Log in to your desktop session so the keyring starts. If you are inside Docker or a similar container, run Skykeep directly on the computer."
+                        },
                     );
                     None
                 }

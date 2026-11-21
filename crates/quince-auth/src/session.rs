@@ -311,6 +311,10 @@ trait Secrets {
     fn get(&self, name: &str) -> Result<Option<String>, String>;
     fn set(&self, name: &str, value: &str) -> Result<(), String>;
     fn delete(&self, name: &str) -> Result<(), String>;
+    /// Whether the store is locked, without unlocking it. A store with no lock says no.
+    fn locked(&self) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 /// The system keyring, under one service name.
@@ -344,6 +348,10 @@ pub trait PlatformSecrets: Send + Sync {
     fn get(&self, service: &str, name: &str) -> Result<Option<String>, String>;
     fn set(&self, service: &str, name: &str, value: &str) -> Result<(), String>;
     fn delete(&self, service: &str, name: &str) -> Result<(), String>;
+    /// Whether the store is locked, without unlocking it. A store with no lock says no.
+    fn locked(&self, _service: &str) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 static PLATFORM_SECRETS: std::sync::OnceLock<Box<dyn PlatformSecrets>> = std::sync::OnceLock::new();
@@ -409,6 +417,9 @@ impl Secrets for SystemKeyring {
     }
     fn delete(&self, name: &str) -> Result<(), String> {
         secret_service::delete(self.0, name)
+    }
+    fn locked(&self) -> Result<bool, String> {
+        secret_service::collection_locked()
     }
 }
 
@@ -529,6 +540,13 @@ mod secret_service {
             )?;
             Ok(())
         })
+    }
+
+    /// Whether the default collection, where new entries go, is locked. Asked, never unlocked:
+    /// a first sign-in into a locked collection would otherwise read "nothing stored", ask for
+    /// the password and code, and fail only at the first write.
+    pub(super) fn collection_locked() -> Result<bool, String> {
+        with(|ss| ss.get_default_collection()?.is_locked())
     }
 
     pub(super) fn delete(service: &str, user: &str) -> Result<(), String> {
@@ -864,6 +882,11 @@ impl Store {
         let mut store = Self::isolated_keyring(state_dir)?;
         let name = store.name().to_string();
         store.backend = Backend::Given(secrets, name);
+        // A sign-out owed to the system keyring is that keyring's: a given store never
+        // finishes it (and so never erases the note while the keyring still holds a session).
+        store.sign_out_path = store
+            .sign_out_path
+            .with_file_name(format!("{SIGN_OUT_PENDING}.given"));
         Ok(store)
     }
 
@@ -1188,6 +1211,21 @@ impl Store {
         // would make signing out a way to wipe the wait and start hammering again, which is
         // exactly what it exists to prevent.
         Ok(())
+    }
+
+    /// Whether the store where sessions are kept is locked, asked without unlocking it. An
+    /// error: it would not answer at all.
+    pub fn is_locked(&self) -> Result<bool, crate::Error> {
+        match &self.backend {
+            Backend::Keyring(_) => self
+                .current()
+                .and_then(|now| now.locked())
+                .map_err(crate::Error::Keyring),
+            Backend::Given(given, _) => given::Given(given.as_ref())
+                .locked()
+                .map_err(crate::Error::Keyring),
+            Backend::File(_) | Backend::Memory(_) => Ok(false),
+        }
     }
 
     /// Whether a sign-out has not yet reached the keyring: while it has not, no stored session

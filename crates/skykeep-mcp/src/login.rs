@@ -161,7 +161,7 @@ where
                     &if attempt == 0 {
                         format!("Apple verification code (hidden{back}): ")
                     } else {
-                        format!("Code incorrect or expired. New code (hidden{back}): ")
+                        format!("That code didn't match or has expired. Type the new code (hidden{back}): ")
                     },
                     Echo::Hidden,
                 )?;

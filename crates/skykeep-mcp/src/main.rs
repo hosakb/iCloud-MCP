@@ -11,11 +11,45 @@ async fn main() {
     unsafe {
         libc::umask(0o077);
     }
-    if let Err(error) = run().await {
+    let mut all: Vec<_> = std::env::args_os().skip(1).collect();
+    let first = all.first().and_then(|c| c.to_str()).map(str::to_string);
+    if matches!(first.as_deref(), Some("--help" | "-h" | "help")) {
+        print!("{HELP}");
+        return;
+    }
+    if let Some(command) = first.filter(|c| ["setup", "status", "unlock"].contains(&c.as_str())) {
+        all.remove(0);
+        if let Err(error) = guided(&command, all).await {
+            eprintln!("skykeep-mcp: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Err(error) = run(all).await {
         eprintln!("skykeep-mcp: {error}");
         std::process::exit(1);
     }
 }
+
+const HELP: &str = "skykeep-mcp: an MCP server for Apple iCloud Notes, Reminders, Contacts, Calendar, Photos and Drive.
+
+Start here, in a terminal window you opened yourself:
+  skykeep-mcp setup [--state-dir FOLDER]    guided setup: folder, sign-in storage, Apple sign-in, approval mode
+  skykeep-mcp status [--state-dir FOLDER]   check this computer's setup; no network, no passwords
+  skykeep-mcp unlock [--state-dir FOLDER] [--hours N]
+                                            after a restart, open the protected file with its passphrase
+
+More commands (each needs --state-dir FOLDER):
+  skykeep-mcp login       sign in to Apple again
+  skykeep-mcp logout      sign out and forget the saved sign-in
+  skykeep-mcp policy MODE set the approval mode: reads_and_writes, writes_only or yolo
+  skykeep-mcp approve     approve one queued deletion by its request ID
+  skykeep-mcp quarantine  list and retire writes that were set aside
+  skykeep-mcp --state-dir FOLDER
+                          run the MCP server on stdin and stdout (your MCP client starts this)
+
+FOLDER defaults to ~/.local/share/skykeep-mcp for setup, status and unlock.
+";
 
 /// The person's own terminal, as setup and unlock talk to it.
 struct Tty(std::fs::File);
@@ -34,11 +68,15 @@ impl setup::Console for Tty {
 }
 
 /// `setup`, `status` and `unlock`: `[--state-dir DIR]`, and `[--hours N]` for unlock.
-async fn guided(command: &str, args: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
+async fn guided(command: &str, args: Vec<std::ffi::OsString>) -> Result<(), String> {
     let mut dir = None;
     let mut hours = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
+        if arg == "--help" || arg == "-h" {
+            print!("{HELP}");
+            return Ok(());
+        }
         if arg == "--state-dir" && dir.is_none() {
             dir = Some(PathBuf::from(
                 args.next().ok_or("state_directory_required")?,
@@ -55,14 +93,18 @@ async fn guided(command: &str, args: Vec<std::ffi::OsString>) -> Result<(), &'st
                 "unlock" => "usage: skykeep-mcp unlock [--state-dir FOLDER] [--hours N]",
                 "status" => "usage: skykeep-mcp status [--state-dir FOLDER]",
                 _ => "usage: skykeep-mcp setup [--state-dir FOLDER]",
-            });
+            }
+            .into());
         }
     }
+    let dir = dir
+        .map(|d| std::path::absolute(d).map_err(|_| "state_unavailable"))
+        .transpose()?;
     let env = storage::env();
     if command == "status" {
         let dir = match dir.or_else(setup::default_dir) {
-            Some(dir) => std::path::absolute(dir).map_err(|_| "state_unavailable")?,
-            None => return Err("status can't find your home folder: add --state-dir FOLDER"),
+            Some(dir) => dir,
+            None => return Err("status can't find your home folder: add --state-dir FOLDER".into()),
         };
         let report = skykeep_mcp::status::check(env, &dir);
         print!("{}", report.render());
@@ -73,14 +115,20 @@ async fn guided(command: &str, args: Vec<std::ffi::OsString>) -> Result<(), &'st
         return Ok(());
     }
     if terminal::agent_marked(|name| std::env::var_os(name)) {
-        return Err("this command refuses to run in an AI agent's terminal, because what you type there can end up in a transcript: open your own terminal window and run it there");
+        return Err("this command refuses to run in an AI agent's terminal, because what you type there can end up in a transcript: open your own terminal window and run it there".into());
     }
     if unsafe { libc::isatty(0) } != 1 || unsafe { libc::isatty(1) } != 1 {
         return Err(if command == "setup" {
             "setup needs a real terminal: open a terminal window and run skykeep-mcp setup there, not through a pipe or another program"
         } else {
             "unlock needs a real terminal: open a terminal window and run skykeep-mcp unlock there, not through a pipe or another program"
-        });
+        }
+        .into());
+    }
+    // Passwords, codes and passphrases pass through this process: no core dumps of it, and
+    // no other process of this user may read its memory through ptrace.
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
     }
     let mut tty = Tty(terminal::controlling().map_err(|_| {
         "this command needs a real terminal: open a terminal window and run it there"
@@ -104,21 +152,12 @@ async fn guided(command: &str, args: Vec<std::ffi::OsString>) -> Result<(), &'st
         setup::Outcome::Quit => {
             use setup::Console;
             tty.say("Setup stopped. Run skykeep-mcp setup again at any time.")
+                .map_err(String::from)
         }
     }
 }
 
-async fn run() -> Result<(), &'static str> {
-    let mut all: Vec<_> = std::env::args_os().skip(1).collect();
-    if let Some(command) = all
-        .first()
-        .and_then(|c| c.to_str())
-        .filter(|c| ["setup", "status", "unlock"].contains(c))
-        .map(str::to_string)
-    {
-        all.remove(0);
-        return guided(&command, all).await;
-    }
+async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
     let mut args = all.into_iter().peekable();
     let command = if args.peek().is_some_and(|s| {
         [

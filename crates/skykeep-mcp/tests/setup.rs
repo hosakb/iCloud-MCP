@@ -4,7 +4,7 @@
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use quince_auth::{Endpoints, PlatformSecrets, Store};
 use serde_json::{json, Value};
-use skykeep_mcp::keyhold::{KeyHolder, MemoryHolder};
+use skykeep_mcp::keyhold::{HoldError, KeyHolder, MemoryHolder};
 use skykeep_mcp::setup::{self, Console, Options, Outcome};
 use skykeep_mcp::storage::{self, Env, Kind};
 use std::collections::{HashMap, VecDeque};
@@ -45,16 +45,20 @@ fn fakes() -> MutexGuard<'static, Fakes> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// A Secret Service as it answers: an entry that isn't there reads as nothing even in a locked
+/// collection; one that is there is refused while locked; writes need it unlocked.
 struct FakeKeyring(PathBuf);
 
 impl FakeKeyring {
-    fn check(&self) -> Result<(), String> {
-        match fakes()
+    fn mode(&self) -> Keyring {
+        fakes()
             .modes
             .get(&self.0)
             .copied()
             .unwrap_or(Keyring::Ready)
-        {
+    }
+    fn check(&self) -> Result<(), String> {
+        match self.mode() {
             Keyring::Ready => Ok(()),
             Keyring::Locked => Err("Secret Service: object locked".into()),
             Keyring::Missing => Err("no Secret Service on the session bus".into()),
@@ -64,8 +68,12 @@ impl FakeKeyring {
 
 impl PlatformSecrets for FakeKeyring {
     fn get(&self, _: &str, name: &str) -> Result<Option<String>, String> {
+        let found = fakes().entries.get(&(self.0.clone(), name.into())).cloned();
+        if self.mode() == Keyring::Locked && found.is_none() {
+            return Ok(None);
+        }
         self.check()?;
-        Ok(fakes().entries.get(&(self.0.clone(), name.into())).cloned())
+        Ok(found)
     }
     fn set(&self, _: &str, name: &str, value: &str) -> Result<(), String> {
         self.check()?;
@@ -79,6 +87,17 @@ impl PlatformSecrets for FakeKeyring {
         fakes().entries.remove(&(self.0.clone(), name.into()));
         Ok(())
     }
+    fn locked(&self, _: &str) -> Result<bool, String> {
+        match self.mode() {
+            Keyring::Ready => Ok(false),
+            Keyring::Locked => Ok(true),
+            Keyring::Missing => Err("no Secret Service on the session bus".into()),
+        }
+    }
+}
+
+fn keyring_entries(dir: &Path) -> usize {
+    fakes().entries.keys().filter(|(d, _)| d == dir).count()
 }
 
 /// The holder the environment uses, shared so tests can simulate a restart or a block.
@@ -87,18 +106,13 @@ impl KeyHolder for Shared {
     fn available(&self) -> bool {
         self.0.available()
     }
-    fn get(&self, n: &str) -> Result<Option<Zeroizing<Vec<u8>>>, skykeep_mcp::keyhold::HoldError> {
+    fn get(&self, n: &str) -> Result<Option<Zeroizing<Vec<u8>>>, HoldError> {
         self.0.get(n)
     }
-    fn put(
-        &self,
-        n: &str,
-        k: &[u8],
-        s: Option<u32>,
-    ) -> Result<(), skykeep_mcp::keyhold::HoldError> {
+    fn put(&self, n: &str, k: &[u8], s: Option<u32>) -> Result<(), HoldError> {
         self.0.put(n, k, s)
     }
-    fn forget(&self, n: &str) -> Result<(), skykeep_mcp::keyhold::HoldError> {
+    fn forget(&self, n: &str) -> Result<(), HoldError> {
         self.0.forget(n)
     }
 }
@@ -139,8 +153,14 @@ enum Answer {
     Ask(&'static str),
     Secret(&'static str),
     Cancel,
+    /// A shown answer, typed after something else happened meanwhile.
+    AskAfter(&'static str, Box<dyn FnOnce() + Send>),
 }
-use Answer::{Ask, Cancel, Secret};
+use Answer::{Ask, AskAfter, Cancel, Secret};
+
+fn leak(text: String) -> &'static str {
+    Box::leak(text.into_boxed_str())
+}
 
 #[derive(Default)]
 struct Script {
@@ -182,16 +202,19 @@ impl Console for Script {
     }
     fn ask(&mut self, label: &str) -> Result<String, &'static str> {
         self.screen.push_str(label);
-        match self.answers.pop_front() {
-            Some(Ask(a)) => {
-                self.screen.push_str(a);
-                self.screen.push('\n');
-                Ok(a.into())
+        let answer = match self.answers.pop_front() {
+            Some(Ask(a)) => a,
+            Some(AskAfter(a, meanwhile)) => {
+                meanwhile();
+                a
             }
-            Some(Cancel) => Err("input_cancelled"),
+            Some(Cancel) => return Err("input_cancelled"),
             Some(Secret(_)) => panic!("expected a hidden prompt at {label:?}\n{}", self.screen),
             None => panic!("unexpected prompt {label:?}\n{}", self.screen),
-        }
+        };
+        self.screen.push_str(answer);
+        self.screen.push('\n');
+        Ok(answer.into())
     }
     fn secret(&mut self, label: &str) -> Result<Zeroizing<String>, &'static str> {
         self.screen.push_str(label);
@@ -199,7 +222,9 @@ impl Console for Script {
         match self.answers.pop_front() {
             Some(Secret(a)) => Ok(Zeroizing::new(a.into())),
             Some(Cancel) => Err("input_cancelled"),
-            Some(Ask(_)) => panic!("expected a shown prompt at {label:?}\n{}", self.screen),
+            Some(Ask(_)) | Some(AskAfter(..)) => {
+                panic!("expected a shown prompt at {label:?}\n{}", self.screen)
+            }
             None => panic!("unexpected prompt {label:?}\n{}", self.screen),
         }
     }
@@ -219,6 +244,19 @@ async fn apple() -> MockServer {
     server
 }
 
+/// Apple refuses the saved sign-in once: the check before the menu sees a dead session.
+async fn reject_saved_sign_in(server: &MockServer) {
+    for endpoint in ["/setup/ws/1/validate", "/setup/ws/1/accountLogin"] {
+        Mock::given(method("POST"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(421))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(server)
+            .await;
+    }
+}
+
 fn options(dir: &Path, server: &MockServer) -> Options {
     Options {
         state_dir: Some(dir.to_path_buf()),
@@ -236,23 +274,29 @@ fn folder() -> (tempfile::TempDir, PathBuf) {
     (parent, dir)
 }
 
+fn made(dir: &Path) {
+    std::fs::create_dir(dir).unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 fn sign_in_answers() -> Vec<Answer> {
     vec![Secret(ACCOUNT), Secret(PASSWORD), Ask("1"), Secret(CODE)]
 }
 
-async fn run(
-    script: &mut Script,
-    dir: &Path,
-    server: &MockServer,
-) -> Result<Outcome, &'static str> {
+/// The folder prompt, and the "Create it?" prompt when the folder isn't there yet.
+fn folder_answers(dir: &Path) -> Vec<Answer> {
+    if dir.exists() {
+        vec![Ask("")]
+    } else {
+        vec![Ask(""), Ask("")]
+    }
+}
+
+async fn run(script: &mut Script, dir: &Path, server: &MockServer) -> Result<Outcome, String> {
     setup::run(script, storage::env(), &options(dir, server)).await
 }
 
-/// The whole first run on a computer with a working keyring, with defaults everywhere.
-async fn first_run_with_keyring(dir: &Path, server: &MockServer) -> Script {
-    let mut answers = vec![Ask(""), Ask("")];
-    answers.extend(sign_in_answers());
-    answers.push(Ask(""));
+async fn ready(answers: Vec<Answer>, dir: &Path, server: &MockServer) -> Script {
     let mut script = Script::new(answers);
     assert_eq!(
         run(&mut script, dir, server).await,
@@ -264,9 +308,26 @@ async fn first_run_with_keyring(dir: &Path, server: &MockServer) -> Script {
     script
 }
 
+/// The whole first run on a computer with a working keyring, with defaults everywhere.
+async fn first_run_with_keyring(dir: &Path, server: &MockServer) -> Script {
+    let mut answers = folder_answers(dir);
+    answers.push(Ask(""));
+    answers.extend(sign_in_answers());
+    answers.push(Ask(""));
+    ready(answers, dir, server).await
+}
+
 fn policy(dir: &Path) -> Value {
     let library = quince_core::Library::open(dir).unwrap();
     serde_json::from_str(&library.state("mcp.policy").unwrap().unwrap()).unwrap()
+}
+
+fn policy_missing(dir: &Path) -> bool {
+    quince_core::Library::open(dir)
+        .unwrap()
+        .state("mcp.policy")
+        .unwrap()
+        .is_none()
 }
 
 /// No file in the folder holds a secret in the clear, and every file and the folder are private.
@@ -307,7 +368,7 @@ async fn tool(dir: &Path, name: &str) -> Value {
 }
 
 #[tokio::test]
-async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_the_client_line() {
+async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client_forms() {
     let _one = serial().await;
     let server = apple().await;
     let (_parent, dir) = folder();
@@ -317,7 +378,9 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_the_client_
     for step in 1..=5 {
         assert!(screen.contains(&format!("Step {step} of 5")), "{screen}");
     }
+    assert!(screen.contains(&format!("Create {}? [Y/n]", dir.display())));
     assert!(screen.contains("1. Ask me before every read and every change. Recommended."));
+    assert!(screen.contains("Hermes can't yet"), "{screen}");
     assert!(
         screen.contains("Signed in as f***@e***.invalid"),
         "{screen}"
@@ -327,6 +390,12 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_the_client_
         dir.display()
     );
     assert!(screen.contains(&line), "{screen}");
+    let hermes = format!(
+        "mcp_servers:\n  skykeep:\n    command: \"/opt/skykeep/skykeep-mcp\"\n    args:\n      - \"--state-dir\"\n      - \"{}\"\n    enabled: true\n    sampling:\n      enabled: false",
+        dir.display()
+    );
+    assert!(screen.contains(&hermes), "{screen}");
+    assert!(screen.contains("choose 4 there"), "{screen}");
     assert_eq!(storage::kind(&dir).unwrap(), Some(Kind::SystemKeyring));
     let saved = policy(&dir);
     assert_eq!(saved["mode"], "reads_and_writes");
@@ -339,21 +408,17 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_the_client_
 }
 
 #[tokio::test]
-async fn a_rerun_asks_only_keep_switch_or_quit_and_keeps_everything() {
+async fn a_rerun_checks_the_sign_in_and_asks_keep_sign_in_again_switch_or_quit() {
     let _one = serial().await;
     let server = apple().await;
     let (_parent, dir) = folder();
     first_run_with_keyring(&dir, &server).await;
     let revision = policy(&dir)["revision"].clone();
-    let mut script = Script::new(vec![Ask(""), Ask("")]);
-    assert_eq!(
-        run(&mut script, &dir, &server).await,
-        Ok(Outcome::Ready(dir.clone()))
-    );
-    script.done();
+    let script = ready(vec![Ask(""), Ask("")], &dir, &server).await;
     assert!(script
         .screen
-        .contains("1. Keep this setup\n  2. Switch to another Apple Account\n  3. Quit"));
+        .contains("Checking the saved sign-in with Apple"));
+    assert!(script.screen.contains("1. Keep this setup\n  2. Sign in again in this folder (same Apple Account)\n  3. Switch to another Apple Account\n  4. Quit"));
     assert!(!script.screen.contains("Step 3 of 5"), "no new sign-in");
     assert_eq!(
         policy(&dir)["revision"],
@@ -361,8 +426,56 @@ async fn a_rerun_asks_only_keep_switch_or_quit_and_keeps_everything() {
         "the mode was not saved again"
     );
 
-    let mut script = Script::new(vec![Ask(""), Ask("3")]);
+    let mut script = Script::new(vec![Ask(""), Ask("4")]);
     assert_eq!(run(&mut script, &dir, &server).await, Ok(Outcome::Quit));
+    script.done();
+}
+
+/// Apple refused the saved sign-in: setup says so and signs in again in the same folder.
+#[tokio::test]
+async fn a_sign_in_apple_rejected_is_renewed_in_the_same_folder() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    first_run_with_keyring(&dir, &server).await;
+    reject_saved_sign_in(&server).await;
+    let mut answers = vec![Ask("")];
+    answers.extend(sign_in_answers());
+    answers.push(Ask(""));
+    let script = ready(answers, &dir, &server).await;
+    assert!(
+        script
+            .screen
+            .contains("Apple no longer accepts the sign-in saved in this folder"),
+        "{}",
+        script.screen
+    );
+    assert!(!script.screen.contains("1. Keep this setup"));
+    assert!(!script.screen.contains("Already signed in"));
+}
+
+#[tokio::test]
+async fn signing_in_again_on_request_keeps_the_account_and_refuses_another() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    first_run_with_keyring(&dir, &server).await;
+    let mut answers = vec![Ask(""), Ask("2")];
+    answers.extend(sign_in_answers());
+    answers.push(Ask(""));
+    let script = ready(answers, &dir, &server).await;
+    assert!(script.screen.contains("Type your Apple Account"));
+
+    let mut script = Script::new(vec![
+        Ask(""),
+        Ask("2"),
+        Secret("someone-else@example.invalid"),
+    ]);
+    let refused = run(&mut script, &dir, &server).await.unwrap_err();
+    assert!(
+        refused.starts_with("This folder belongs to a different Apple Account"),
+        "{refused}"
+    );
     script.done();
 }
 
@@ -372,11 +485,11 @@ async fn switching_account_sets_up_a_new_folder_and_leaves_the_old_one_signed_in
     let server = apple().await;
     let (_parent, dir) = folder();
     first_run_with_keyring(&dir, &server).await;
-    let mut answers = vec![Ask(""), Ask("2"), Ask(""), Ask("")];
+    let new = PathBuf::from(format!("{}-2", dir.display()));
+    let mut answers = vec![Ask(""), Ask("3"), Ask(""), Ask(""), Ask("")];
     answers.extend(sign_in_answers());
     answers.push(Ask(""));
     let mut script = Script::new(answers);
-    let new = PathBuf::from(format!("{}-2", dir.display()));
     assert_eq!(
         run(&mut script, &dir, &server).await,
         Ok(Outcome::Ready(new.clone())),
@@ -384,6 +497,14 @@ async fn switching_account_sets_up_a_new_folder_and_leaves_the_old_one_signed_in
         script.screen
     );
     script.done();
+    assert!(
+        script.screen.contains(&format!(
+            "To sign it out later, run: skykeep-mcp logout --state-dir {}",
+            dir.display()
+        )),
+        "{}",
+        script.screen
+    );
     assert!(skykeep_mcp::status::check(storage::env(), &dir).ready());
     assert!(skykeep_mcp::status::check(storage::env(), &new).ready());
 }
@@ -393,34 +514,59 @@ async fn an_interrupted_setup_continues_where_it_stopped() {
     let _one = serial().await;
     let server = apple().await;
     let (_parent, dir) = folder();
-    let mut script = Script::new(vec![Ask(""), Ask(""), Secret(ACCOUNT), Cancel]);
+    let mut script = Script::new(vec![Ask(""), Ask(""), Ask(""), Secret(ACCOUNT), Cancel]);
     let stopped = run(&mut script, &dir, &server).await.unwrap_err();
-    assert!(stopped.starts_with("Setup stopped."), "{stopped}");
+    assert_eq!(
+        stopped,
+        format!(
+            "Setup stopped. Run skykeep-mcp setup --state-dir {} again to continue where you left off.",
+            dir.display()
+        )
+    );
     script.done();
     assert!(policy_missing(&dir));
     // Storage was chosen already: the next run goes on with the sign-in.
     let mut answers = vec![Ask("")];
     answers.extend(sign_in_answers());
     answers.push(Ask(""));
-    let mut script = Script::new(answers);
-    assert_eq!(
-        run(&mut script, &dir, &server).await,
-        Ok(Outcome::Ready(dir.clone())),
-        "{}",
-        script.screen
-    );
-    script.done();
+    let script = ready(answers, &dir, &server).await;
     assert!(script
         .screen
         .contains("Kept in your system keyring. Nothing to change."));
 }
 
-fn policy_missing(dir: &Path) -> bool {
-    quince_core::Library::open(dir)
-        .unwrap()
-        .state("mcp.policy")
-        .unwrap()
-        .is_none()
+#[tokio::test]
+async fn the_folder_prompt_takes_quotes_refuses_relative_paths_and_asks_before_creating() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    let quoted = leak(format!("  \"{}\"  ", dir.display()));
+    let mut script = Script::new(vec![
+        Ask("relative/folder"),
+        Ask(quoted),
+        Ask("n"),
+        Ask(quoted),
+        Ask("y"),
+        Cancel,
+    ]);
+    assert!(run(&mut script, &dir, &server).await.is_err());
+    script.done();
+    assert!(
+        script
+            .screen
+            .contains("Type the full path, starting with / or ~. \"relative/folder\" would be a folder inside"),
+        "{}",
+        script.screen
+    );
+    assert!(!PathBuf::from("relative").exists());
+    assert!(dir.is_dir(), "made after the yes");
+    assert_eq!(
+        script
+            .screen
+            .matches(&format!("Create {}? [Y/n]", dir.display()))
+            .count(),
+        2
+    );
 }
 
 /// First run with no usable keyring: the protected file, its passphrase checks, and a restart.
@@ -429,8 +575,7 @@ async fn without_a_keyring_the_protected_file_survives_a_restart_after_unlock() 
     let _one = serial().await;
     let server = apple().await;
     let (_parent, dir) = folder();
-    std::fs::create_dir(&dir).unwrap();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    made(&dir);
     set_keyring(&dir, Keyring::Missing);
     let mut answers = vec![
         Ask(""),
@@ -442,27 +587,24 @@ async fn without_a_keyring_the_protected_file_survives_a_restart_after_unlock() 
     ];
     answers.extend(sign_in_answers());
     answers.push(Ask(""));
-    let mut script = Script::new(answers);
-    assert_eq!(
-        run(&mut script, &dir, &server).await,
-        Ok(Outcome::Ready(dir.clone())),
-        "{}",
-        script.screen
-    );
-    script.done();
+    let script = ready(answers, &dir, &server).await;
     script.assert_no_secrets();
     assert!(script.screen.contains("shorter than 12 characters"));
     assert!(script
         .screen
         .contains("The two passphrases were different."));
-    assert!(script.screen.contains("run skykeep-mcp unlock once"));
+    assert!(
+        script.screen.contains(&format!(
+            "run skykeep-mcp unlock --state-dir {} once",
+            dir.display()
+        )),
+        "{}",
+        script.screen
+    );
     assert_eq!(storage::kind(&dir).unwrap(), Some(Kind::ProtectedFile));
     assert!(dir.join(storage::PROTECTED_FILE).exists());
     assert!(!dir.join("session.json").exists());
-    assert!(
-        fakes().entries.keys().all(|(d, _)| d != &dir),
-        "nothing went to the keyring"
-    );
+    assert_eq!(keyring_entries(&dir), 0, "nothing went to the keyring");
     assert_folder_private_and_sealed(&dir);
 
     // A restart: the kernel forgets the key. The server says so and never guesses.
@@ -472,7 +614,10 @@ async fn without_a_keyring_the_protected_file_survives_a_restart_after_unlock() 
     assert!(status["instructions"]
         .as_str()
         .unwrap()
-        .starts_with(storage::LOCKED));
+        .starts_with(&format!(
+            "locked: run skykeep-mcp unlock --state-dir {} in a terminal",
+            dir.display()
+        )));
     // Reads without a consent form, so the tool reaches the storage.
     skykeep_mcp::Server::open(&dir)
         .unwrap()
@@ -483,9 +628,10 @@ async fn without_a_keyring_the_protected_file_survives_a_restart_after_unlock() 
     let report = skykeep_mcp::status::check(storage::env(), &dir);
     assert!(!report.ready());
     assert!(
-        report
-            .render()
-            .contains("Next step: Run skykeep-mcp unlock."),
+        report.render().contains(&format!(
+            "Next step: Run skykeep-mcp unlock --state-dir {}.",
+            dir.display()
+        )),
         "{}",
         report.render()
     );
@@ -505,22 +651,31 @@ async fn without_a_keyring_the_protected_file_survives_a_restart_after_unlock() 
         .screen
         .contains("Unlocked until this computer restarts."));
     script.assert_no_secrets();
+    let name = storage::key_name(&dir).unwrap();
+    assert_eq!(holder().timeouts.lock().unwrap()[&name], None);
     assert_eq!(
         tool(&dir, "auth_status").await["status"],
         "session_unverified"
     );
     assert!(skykeep_mcp::status::check(storage::env(), &dir).ready());
 
-    // Unlocking again asks nothing.
+    // Unlocking again asks nothing; with --hours it asks once and sets the timeout.
     let mut script = Script::new(vec![]);
     assert_eq!(
         setup::unlock(&mut script, storage::env(), &dir, None),
         Ok(())
     );
     assert!(script.screen.contains("Already unlocked."));
+    let mut script = Script::new(vec![Secret(PASSPHRASE)]);
+    assert_eq!(
+        setup::unlock(&mut script, storage::env(), &dir, Some(2)),
+        Ok(())
+    );
+    assert_eq!(holder().timeouts.lock().unwrap()[&name], Some(7200));
+    assert!(script.screen.contains("Unlocked for 2 hours"));
 
     // Three wrong tries stop, with the same one answer each time.
-    holder().forget(&storage::key_name(&dir).unwrap()).unwrap();
+    holder().forget(&name).unwrap();
     let mut script = Script::new(vec![
         Secret("SYNTHETIC-WRONG-1"),
         Secret("SYNTHETIC-WRONG-2"),
@@ -531,26 +686,27 @@ async fn without_a_keyring_the_protected_file_survives_a_restart_after_unlock() 
         refused.starts_with("Wrong passphrase or damaged file"),
         "{refused}"
     );
+    assert!(refused.contains(&format!("skykeep-mcp unlock --state-dir {}", dir.display())));
     script.done();
-    assert!(storage::locked(&dir));
+    assert_eq!(
+        storage::protected_problem(&dir),
+        Some(storage::Closed::Locked)
+    );
 
     // A re-run while locked offers the unlock in place.
-    let mut script = Script::new(vec![Ask(""), Ask("1"), Secret(PASSPHRASE), Ask("")]);
-    assert_eq!(
-        run(&mut script, &dir, &server).await,
-        Ok(Outcome::Ready(dir.clone())),
-        "{}",
-        script.screen
-    );
-    script.done();
+    ready(
+        vec![Ask(""), Ask("1"), Secret(PASSPHRASE), Ask("")],
+        &dir,
+        &server,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn a_damaged_file_gives_the_same_answer_as_a_wrong_passphrase_and_never_opens() {
     let _one = serial().await;
     let (_parent, dir) = folder();
-    std::fs::create_dir(&dir).unwrap();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    made(&dir);
     {
         let held = skykeep_mcp::state::PrivateState::open(&dir).unwrap();
         storage::set_kind(&held.path, Kind::ProtectedFile).unwrap();
@@ -580,7 +736,50 @@ async fn a_damaged_file_gives_the_same_answer_as_a_wrong_passphrase_and_never_op
             .count(),
         3
     );
-    assert!(storage::locked(&dir));
+    // A cut header is damage the server can name without any passphrase.
+    std::fs::write(&file, b"SKPF").unwrap();
+    let status = tool(&dir, "auth_status").await;
+    assert_eq!(status["status"], "storage_problem");
+    assert!(status["instructions"]
+        .as_str()
+        .unwrap()
+        .starts_with("protected file damaged"));
+}
+
+#[tokio::test]
+async fn unlock_says_what_is_missing_before_asking_for_a_passphrase() {
+    let _one = serial().await;
+    let (_parent, dir) = folder();
+    made(&dir);
+    let mut script = Script::new(vec![]);
+    let refused = setup::unlock(&mut script, storage::env(), &dir, None).unwrap_err();
+    assert_eq!(
+        refused,
+        format!(
+            "Setup is not finished for this folder. Run skykeep-mcp setup --state-dir {}.",
+            dir.display()
+        )
+    );
+    {
+        let held = skykeep_mcp::state::PrivateState::open(&dir).unwrap();
+        storage::set_kind(&held.path, Kind::ProtectedFile).unwrap();
+    }
+    let refused = setup::unlock(&mut script, storage::env(), &dir, None).unwrap_err();
+    assert!(refused.starts_with("No protected file yet"), "{refused}");
+    let status = tool(&dir, "auth_status").await;
+    assert_eq!(status["status"], "storage_problem");
+    assert!(status["instructions"]
+        .as_str()
+        .unwrap()
+        .starts_with("sign-in storage not ready"));
+    holder().blocked.store(true, Ordering::SeqCst);
+    let status = tool(&dir, "auth_status").await;
+    holder().blocked.store(false, Ordering::SeqCst);
+    assert!(status["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("kernel key storage"));
+    script.done();
 }
 
 #[tokio::test]
@@ -588,15 +787,18 @@ async fn an_expired_session_signs_in_again_and_a_policy_set_before_sign_in_is_ch
     let _one = serial().await;
     let server = apple().await;
     let (_parent, dir) = folder();
-    std::fs::create_dir(&dir).unwrap();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    made(&dir);
     // A policy saved before any sign-in is bound to no account.
     skykeep_mcp::Server::open(&dir)
         .unwrap()
         .set_policy("yolo")
         .unwrap();
     assert!(policy(&dir)["account"].is_null());
-    first_run_with_keyring(&dir, &server).await;
+    let script = first_run_with_keyring(&dir, &server).await;
+    assert!(
+        !script.screen.contains("  4. No approval mode"),
+        "a folder that had a mode is not offered none"
+    );
     let saved = policy(&dir);
     assert_eq!(saved["mode"], "reads_and_writes");
     assert!(saved["account"].is_string());
@@ -615,14 +817,7 @@ async fn an_expired_session_signs_in_again_and_a_policy_set_before_sign_in_is_ch
     let mut answers = vec![Ask("")];
     answers.extend(sign_in_answers());
     answers.push(Ask(""));
-    let mut script = Script::new(answers);
-    assert_eq!(
-        run(&mut script, &dir, &server).await,
-        Ok(Outcome::Ready(dir.clone())),
-        "{}",
-        script.screen
-    );
-    script.done();
+    let script = ready(answers, &dir, &server).await;
     assert!(script.screen.contains("Your saved sign-in has expired."));
     assert!(script
         .screen
@@ -634,8 +829,7 @@ async fn a_folder_of_another_account_refuses_the_sign_in_and_keeps_nothing() {
     let _one = serial().await;
     let server = apple().await;
     let (_parent, dir) = folder();
-    std::fs::create_dir(&dir).unwrap();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    made(&dir);
     quince_core::Library::open(&dir)
         .unwrap()
         .set_state("account", "synthetic-other-account-tag")
@@ -655,6 +849,37 @@ async fn a_folder_of_another_account_refuses_the_sign_in_and_keeps_nothing() {
         .try_load()
         .unwrap()
         .is_resumable());
+}
+
+/// A locked collection with no entry yet reads as empty: setup must still see the lock, and
+/// say so before asking for any Apple credentials.
+#[tokio::test]
+async fn a_locked_keyring_on_a_first_run_is_named_before_any_credential_is_asked() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    made(&dir);
+    set_keyring(&dir, Keyring::Locked);
+    assert_eq!(
+        storage::keyring_state(storage::env(), &dir),
+        storage::KeyringState::Locked
+    );
+    let mut script = Script::new(vec![Ask(""), Ask("2")]);
+    assert_eq!(run(&mut script, &dir, &server).await, Ok(Outcome::Quit));
+    script.done();
+    assert!(script.screen.contains("Your system keyring is locked"));
+    assert!(script.screen.contains("unlock the keyring first"));
+    assert!(
+        !script.screen.contains("Apple Account"),
+        "{}",
+        script.screen
+    );
+
+    let mut answers = vec![Ask(""), Ask("1"), Secret(PASSPHRASE), Secret(PASSPHRASE)];
+    answers.extend(sign_in_answers());
+    answers.push(Ask(""));
+    ready(answers, &dir, &server).await;
+    assert_eq!(storage::kind(&dir).unwrap(), Some(Kind::ProtectedFile));
 }
 
 #[tokio::test]
@@ -688,17 +913,55 @@ async fn a_locked_keyring_is_never_switched_away_from_and_a_missing_one_switches
     ];
     answers.extend(sign_in_answers());
     answers.push(Ask(""));
+    let script = ready(answers, &dir, &server).await;
+    assert_eq!(storage::kind(&dir).unwrap(), Some(Kind::ProtectedFile));
+    assert!(script.screen.contains("may stay there"));
+    assert_folder_private_and_sealed(&dir);
+}
+
+/// The reviewers' reproduction: a sign-out owed to an unreachable keyring must not come back
+/// as "Already signed in" when the folder later switches back to that keyring.
+#[tokio::test]
+async fn switching_back_to_the_keyring_never_resumes_the_session_left_there() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    first_run_with_keyring(&dir, &server).await;
+    set_keyring(&dir, Keyring::Missing);
+    let mut answers = vec![
+        Ask(""),
+        Ask("1"),
+        Ask("switch"),
+        Secret(PASSPHRASE),
+        Secret(PASSPHRASE),
+    ];
+    answers.extend(sign_in_answers());
+    answers.push(Ask(""));
+    ready(answers, &dir, &server).await;
+    assert!(
+        keyring_entries(&dir) > 0,
+        "the old entries were out of reach"
+    );
+
+    set_keyring(&dir, Keyring::Ready);
+    holder().blocked.store(true, Ordering::SeqCst);
+    let mut answers = vec![Ask(""), Ask("1"), Ask("switch")];
+    answers.extend(sign_in_answers());
+    answers.push(Ask(""));
     let mut script = Script::new(answers);
+    let outcome = run(&mut script, &dir, &server).await;
+    holder().blocked.store(false, Ordering::SeqCst);
     assert_eq!(
-        run(&mut script, &dir, &server).await,
+        outcome,
         Ok(Outcome::Ready(dir.clone())),
         "{}",
         script.screen
     );
     script.done();
-    assert_eq!(storage::kind(&dir).unwrap(), Some(Kind::ProtectedFile));
-    assert!(script.screen.contains("may stay there"));
-    assert_folder_private_and_sealed(&dir);
+    assert!(!script.screen.contains("Already signed in"));
+    assert!(script.screen.contains("Type your Apple Account"));
+    assert_eq!(storage::kind(&dir).unwrap(), Some(Kind::SystemKeyring));
+    assert!(!dir.join(storage::PROTECTED_FILE).exists());
 }
 
 #[tokio::test]
@@ -706,8 +969,7 @@ async fn switching_from_the_protected_file_removes_it() {
     let _one = serial().await;
     let server = apple().await;
     let (_parent, dir) = folder();
-    std::fs::create_dir(&dir).unwrap();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    made(&dir);
     {
         let held = skykeep_mcp::state::PrivateState::open(&dir).unwrap();
         storage::set_kind(&held.path, Kind::ProtectedFile).unwrap();
@@ -732,21 +994,23 @@ async fn switching_from_the_protected_file_removes_it() {
 }
 
 #[tokio::test]
-async fn with_no_secure_storage_at_all_setup_stops_and_writes_nothing() {
+async fn with_no_secure_storage_at_all_setup_stops_in_plain_words_and_writes_nothing() {
     let _one = serial().await;
     let server = apple().await;
     let (_parent, dir) = folder();
-    std::fs::create_dir(&dir).unwrap();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    made(&dir);
     set_keyring(&dir, Keyring::Missing);
     holder().blocked.store(true, Ordering::SeqCst);
     let mut script = Script::new(vec![Ask("")]);
     let refused = run(&mut script, &dir, &server).await.unwrap_err();
+    let report = skykeep_mcp::status::check(storage::env(), &dir).render();
     holder().blocked.store(false, Ordering::SeqCst);
     assert!(
-        refused.starts_with("This computer has no usable secure storage"),
+        refused.starts_with("Setup can't find a safe place on this computer to keep your sign-in. If you are inside Docker or a similar container, run Skykeep directly on the computer."),
         "{refused}"
     );
+    assert!(!report.contains("protected file instead"), "{report}");
+    assert!(report.contains("Docker"), "{report}");
     assert_eq!(storage::kind(&dir).unwrap(), None);
     assert!(!dir.join(storage::PROTECTED_FILE).exists());
 }
@@ -756,25 +1020,116 @@ async fn never_asking_needs_a_typed_confirmation() {
     let _one = serial().await;
     let server = apple().await;
     let (_parent, dir) = folder();
-    let mut answers = vec![Ask(""), Ask("")];
+    let mut answers = folder_answers(&dir);
+    answers.push(Ask(""));
     answers.extend(sign_in_answers());
     answers.extend([Ask("3"), Ask("no"), Ask("3"), Ask("confirm")]);
-    let mut script = Script::new(answers);
-    assert_eq!(
-        run(&mut script, &dir, &server).await,
-        Ok(Outcome::Ready(dir.clone())),
-        "{}",
-        script.screen
-    );
-    script.done();
+    ready(answers, &dir, &server).await;
     assert_eq!(policy(&dir)["mode"], "yolo");
 }
 
+/// For a client without approval forms: no policy at all, the old behaviour, chosen on purpose.
+#[tokio::test]
+async fn no_approval_mode_leaves_the_folder_without_a_policy_and_counts_as_done() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    let mut answers = folder_answers(&dir);
+    answers.push(Ask(""));
+    answers.extend(sign_in_answers());
+    answers.push(Ask("4"));
+    let script = ready(answers, &dir, &server).await;
+    assert!(script.screen.contains("  4. No approval mode, for MCP clients that can't show approval forms (such as Hermes today)."));
+    assert!(script
+        .screen
+        .contains("approve deletions in a terminal with skykeep-mcp approve --state-dir"));
+    assert!(policy_missing(&dir));
+    let report = skykeep_mcp::status::check(storage::env(), &dir);
+    assert!(report.ready(), "{}", report.render());
+    assert!(report.render().contains("Approval mode: none"));
+    let script = ready(vec![Ask(""), Ask("")], &dir, &server).await;
+    assert!(script.screen.contains("approval mode: none"));
+}
+
+/// The count the person agreed to is checked again under the lock that sets changes aside.
+#[tokio::test]
+async fn changes_queued_during_the_confirmation_are_asked_about_again() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    made(&dir);
+    quince_core::Library::open(&dir)
+        .unwrap()
+        .outbox_push("notes", "synthetic-note-1", "save", "{}")
+        .unwrap();
+    let queued = dir.clone();
+    let mut answers = vec![Ask(""), Ask("")];
+    answers.extend(sign_in_answers());
+    answers.push(Ask(""));
+    answers.push(AskAfter(
+        "confirm",
+        Box::new(move || {
+            quince_core::Library::open(&queued)
+                .unwrap()
+                .outbox_push("notes", "synthetic-note-2", "save", "{}")
+                .unwrap();
+        }),
+    ));
+    answers.push(Ask("confirm"));
+    let script = ready(answers, &dir, &server).await;
+    assert!(script.screen.contains("1 changes are waiting"));
+    assert!(script
+        .screen
+        .contains("More changes were queued while you were answering."));
+    assert!(script.screen.contains("2 changes are waiting"));
+    assert_eq!(policy(&dir)["mode"], "reads_and_writes");
+}
+
 #[test]
-fn status_masks_the_account() {
+fn set_policy_refuses_when_the_waiting_writes_are_not_the_ones_agreed_to() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut server = skykeep_mcp::Server::open(dir.path()).unwrap();
+    let id = quince_core::Library::open(dir.path())
+        .unwrap()
+        .outbox_push("notes", "synthetic-note", "save", "{}")
+        .unwrap();
+    assert_eq!(
+        server.set_policy_if("writes_only", Some(&[])).err(),
+        Some("pending_changed")
+    );
+    assert!(server.set_policy_if("writes_only", Some(&[id])).is_ok());
+}
+
+#[test]
+fn status_masks_the_account_and_names_the_folder_in_commands() {
     assert_eq!(
         skykeep_mcp::status::mask("fixture@example.invalid"),
         "f***@e***.invalid"
     );
     assert_eq!(skykeep_mcp::status::mask("+00 555 0123"), "***23");
+    let odd = Path::new("/srv/my folder/it's");
+    assert_eq!(
+        skykeep_mcp::status::with_dir("Run skykeep-mcp unlock, then skykeep-mcp status.", odd),
+        "Run skykeep-mcp unlock --state-dir '/srv/my folder/it'\\''s', then skykeep-mcp status --state-dir '/srv/my folder/it'\\''s'."
+    );
+    assert_eq!(
+        skykeep_mcp::status::with_dir("skykeep-mcp setup --state-dir NEW_FOLDER", odd),
+        "skykeep-mcp setup --state-dir NEW_FOLDER"
+    );
+    if let Some(default) = setup::default_dir() {
+        assert_eq!(
+            skykeep_mcp::status::with_dir("Run skykeep-mcp unlock.", &default),
+            "Run skykeep-mcp unlock."
+        );
+    }
+}
+
+#[test]
+fn weak_passphrases_are_refused_in_plain_words() {
+    assert!(setup::weak_passphrase("short").is_some());
+    assert!(setup::weak_passphrase("aaaaaaaaaaaaaaaa").is_some());
+    assert!(setup::weak_passphrase("abababababababab").is_some());
+    assert!(setup::weak_passphrase("abcdabcdabcdabcd").is_some());
+    assert!(setup::weak_passphrase("correct horse battery").is_none());
 }

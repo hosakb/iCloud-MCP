@@ -182,7 +182,7 @@ impl Closed {
             Closed::Locked => "The protected file is locked: run skykeep-mcp unlock in a terminal.",
             Closed::WrongOrDamaged => "Wrong passphrase or damaged file.",
             Closed::Newer => "The protected file was written by a newer skykeep-mcp: update skykeep-mcp.",
-            Closed::HolderUnavailable => "This computer blocks the kernel key storage that the protected file needs, so it can't be unlocked here. Use the system keyring instead, or run skykeep-mcp outside this container.",
+            Closed::HolderUnavailable => "This computer blocks the kernel key storage that the protected file needs, so it can't be unlocked here. If you are inside Docker or a similar container, run Skykeep directly on the computer.",
             Closed::Failed => "The protected file could not be read or written.",
         }
     }
@@ -239,12 +239,12 @@ impl ProtectedFile {
             Err(HoldError::Unavailable) => return Err(Closed::HolderUnavailable),
             Err(HoldError::Failed) => return Err(Closed::Failed),
         };
-        let key: vault::Key = held.as_slice().try_into().map_err(|_| Closed::Locked)?;
-        let file = Self {
-            path,
-            params,
-            key: Zeroizing::new(key),
-        };
+        if held.len() != 32 {
+            return Err(Closed::Locked);
+        }
+        let mut key = Zeroizing::new([0u8; 32]);
+        key.copy_from_slice(&held);
+        let file = Self { path, params, key };
         if vault::open(&file.key, &bytes).is_err() {
             return Err(Closed::Locked);
         }
@@ -278,7 +278,8 @@ pub fn create_protected(env: &Env, dir: &Path, passphrase: &str) -> Result<(), C
         return Err(Closed::HolderUnavailable);
     }
     let params = Params::new().map_err(|_| Closed::Failed)?;
-    let key = Zeroizing::new(params.derive(passphrase.as_bytes()));
+    let mut key = Zeroizing::new([0u8; 32]);
+    params.derive_into(passphrase.as_bytes(), &mut key);
     let file = ProtectedFile {
         path: dir.join(PROTECTED_FILE),
         params,
@@ -314,7 +315,8 @@ pub fn unlock_with(
         Err(Unopened::Version(_)) => return Err(Closed::Newer),
         Err(Unopened::Damaged) => return Err(Closed::WrongOrDamaged),
     };
-    let key = Zeroizing::new(params.derive(passphrase.as_bytes()));
+    let mut key = Zeroizing::new([0u8; 32]);
+    params.derive_into(passphrase.as_bytes(), &mut key);
     let plain = Zeroizing::new(vault::open(&key, &bytes).map_err(|_| Closed::WrongOrDamaged)?);
     serde_json::from_slice::<Entries>(&plain).map_err(|_| Closed::WrongOrDamaged)?;
     hold(env, dir, &key, seconds)
@@ -360,7 +362,12 @@ pub fn keyring_state(env: &Env, dir: &Path) -> KeyringState {
         return KeyringState::Ready;
     }
     match store.try_load() {
-        Ok(_) => KeyringState::Ready,
+        // A missing entry reads as empty even in a locked collection: ask the lock itself.
+        Ok(_) => match store.is_locked() {
+            Ok(false) => KeyringState::Ready,
+            Ok(true) => KeyringState::Locked,
+            Err(_) => KeyringState::Missing,
+        },
         Err(quince_auth::Error::Keyring(message))
             if message.to_ascii_lowercase().contains("locked") =>
         {
@@ -375,15 +382,8 @@ pub fn open_store_in(env: &Env, dir: &Path) -> Result<Store, &'static str> {
     match effective_kind(dir)? {
         Kind::SystemKeyring => (env.keyring)(dir).map_err(|_| "secure_storage_unavailable"),
         Kind::ProtectedFile => {
-            let file = ProtectedFile::unlocked(dir, env.holder.as_ref()).map_err(|c| match c {
-                Closed::Missing => NOT_SET_UP,
-                Closed::Locked => LOCKED,
-                Closed::HolderUnavailable => {
-                    "locked: this computer blocks the kernel key storage the protected file needs"
-                }
-                Closed::Newer => "protected file written by a newer skykeep-mcp",
-                Closed::WrongOrDamaged | Closed::Failed => LOCKED,
-            })?;
+            let file =
+                ProtectedFile::unlocked(dir, env.holder.as_ref()).map_err(|c| tool_text(&c))?;
             Store::with_secrets(dir, Box::new(file)).map_err(|_| "secure_storage_unavailable")
         }
     }
@@ -394,7 +394,23 @@ pub fn open_store(dir: &Path) -> Result<Store, &'static str> {
     open_store_in(env(), dir)
 }
 
-/// Whether the protected file is chosen and cannot be opened now. Never asks for anything.
-pub fn locked(dir: &Path) -> bool {
-    matches!(effective_kind(dir), Ok(Kind::ProtectedFile)) && protected_state(env(), dir).is_err()
+/// What a tool answers for each reason the protected file is closed. Codes, not secrets.
+pub fn tool_text(closed: &Closed) -> &'static str {
+    match closed {
+        Closed::Missing => NOT_SET_UP,
+        Closed::Locked => LOCKED,
+        Closed::WrongOrDamaged => "protected file damaged: run skykeep-mcp setup in a terminal",
+        Closed::HolderUnavailable => "protected file unusable here: this computer blocks the kernel key storage it needs; run skykeep-mcp status in a terminal",
+        Closed::Newer => "protected file written by a newer skykeep-mcp: update skykeep-mcp",
+        Closed::Failed => "protected file unreadable: run skykeep-mcp status in a terminal",
+    }
+}
+
+/// Why the chosen protected file can't be opened now, if it is chosen and can't. Never asks
+/// for anything.
+pub fn protected_problem(dir: &Path) -> Option<Closed> {
+    if !matches!(effective_kind(dir), Ok(Kind::ProtectedFile)) {
+        return None;
+    }
+    protected_state(env(), dir).err()
 }

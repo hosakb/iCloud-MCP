@@ -6,7 +6,7 @@
 //! stops part way picks up where it left off.
 use crate::login::{self, Echo};
 use crate::state::PrivateState;
-use crate::status::{self, MODES};
+use crate::status::{self, MODES, NO_MODE_KEY};
 use crate::storage::{self, Closed, Env, KeyringState, Kind};
 use quince_auth::{Client, Endpoints};
 use std::path::{Path, PathBuf};
@@ -21,13 +21,43 @@ pub trait Console {
     fn secret(&mut self, label: &str) -> Result<Zeroizing<String>, &'static str>;
 }
 
+/// A console that names the chosen folder in every `skykeep-mcp` command it prints.
+struct Scoped<'a> {
+    inner: &'a mut dyn Console,
+    dir: Option<PathBuf>,
+}
+
+impl Scoped<'_> {
+    fn scope(&self, text: &str) -> String {
+        match &self.dir {
+            Some(dir) => status::with_dir(text, dir),
+            None => text.to_string(),
+        }
+    }
+}
+
+impl Console for Scoped<'_> {
+    fn say(&mut self, text: &str) -> Result<(), &'static str> {
+        let text = self.scope(text);
+        self.inner.say(&text)
+    }
+    fn ask(&mut self, label: &str) -> Result<String, &'static str> {
+        let label = self.scope(label);
+        self.inner.ask(&label)
+    }
+    fn secret(&mut self, label: &str) -> Result<Zeroizing<String>, &'static str> {
+        let label = self.scope(label);
+        self.inner.secret(&label)
+    }
+}
+
 pub struct Options {
     /// The folder given with `--state-dir`, if any.
     pub state_dir: Option<PathBuf>,
     /// The folder suggested when none was given.
     pub default_dir: Option<PathBuf>,
     pub endpoints: Endpoints,
-    /// This program, for the client configuration line.
+    /// This program, for the client configuration lines.
     pub command: PathBuf,
 }
 
@@ -37,7 +67,8 @@ pub enum Outcome {
     Quit,
 }
 
-const NO_SECURE_STORAGE: &str = "This computer has no usable secure storage: the system keyring is not reachable and the kernel key storage is blocked, so setup can't keep you signed in. Start a system keyring, or run skykeep-mcp on a computer that allows the kernel key storage.";
+const NO_SECURE_STORAGE: &str = "Setup can't find a safe place on this computer to keep your sign-in. If you are inside Docker or a similar container, run Skykeep directly on the computer. On a desktop, log in to the desktop session first, then run skykeep-mcp setup again.";
+const LOCKED_KEYRING: &str = "Your system keyring is locked. Unlock it (log in to your desktop session), then run skykeep-mcp setup again.";
 
 /// `~/.local/share/skykeep-mcp`.
 pub fn default_dir() -> Option<PathBuf> {
@@ -51,20 +82,24 @@ pub fn plain(code: &'static str) -> &'static str {
         "credentials_rejected" => "Apple didn't accept that Apple Account or password. Run skykeep-mcp setup again to retry.",
         "code_incorrect_or_expired" => "The verification code was wrong or expired three times. Run skykeep-mcp setup again to get a new code.",
         "auth_cooldown_try_later" => "Apple asked to wait before the next sign-in attempt. Try again later.",
-        "account_locked_visit_account_website" => "Apple has locked this Apple Account. Unlock it at iforgot.apple.com, then run setup again.",
+        "account_locked_visit_account_website" => "Apple has locked this Apple Account. Unlock it at iforgot.apple.com, then run skykeep-mcp setup again.",
         "secure_storage_unavailable" => "The sign-in could not be saved in the chosen storage. Run skykeep-mcp status to see why.",
         "regional_login_retry_required" => "Apple asked to sign in again. Run skykeep-mcp setup again.",
         "account_mismatch_use_new_state_directory" => "This folder belongs to a different Apple Account. Run setup again and choose a new folder for this account.",
         "security_key_sign_in_unsupported" => "This account signs in with a security key, which skykeep-mcp can't use yet.",
-        "too_many_code_requests_try_later" => "Setup already asked Apple for several codes. Wait a while, then run setup again.",
+        "too_many_code_requests_try_later" => "Setup already asked Apple for several codes. Wait a while, then run skykeep-mcp setup again.",
         "input_cancelled" => "Setup stopped. Run skykeep-mcp setup again to continue where you left off.",
         "input_timeout" => "Setup waited three minutes without an answer and stopped. Run skykeep-mcp setup again to continue.",
-        "state_busy_retry" => "The server is using the folder right now. Run setup again in a moment.",
+        "invalid_input" => "That answer had characters setup can't read. Run skykeep-mcp setup again and type plain text.",
+        "state_busy_retry" => "The server is using the folder right now. Run skykeep-mcp setup again in a moment.",
         "state_must_be_owned_and_private" => "That folder is not private to you. Choose another folder, or make it yours and run chmod 700 on it.",
         "unsafe_state_contents" => "A file in that folder can be read by others, or is a link. Choose another folder.",
         "unsafe_state_path" => "That folder path goes through a link or '..'. Use the folder's real path.",
         "state_unavailable" | "library_unavailable" => "Setup can't open that folder. Check that its parent folder exists and belongs to you.",
-        "login_incomplete" | "authentication_unavailable" | "login_required" => "Sign-in didn't finish. Run skykeep-mcp setup again.",
+        "policy_unavailable" => "Setup couldn't read or save the approval mode. Run skykeep-mcp status to see why.",
+        "authentication_unavailable" => "Sign-in didn't finish. Check your internet connection, then run skykeep-mcp setup again.",
+        "login_incomplete" | "login_required" => "Sign-in didn't finish. Run skykeep-mcp setup again.",
+        "foreground_terminal_required" => "Setup must run in the foreground of your terminal. Run it again without & at the end.",
         "interactive_terminal_required" | "terminal_unavailable" => "Setup lost the terminal. Run it again in a terminal window.",
         other => other,
     }
@@ -74,18 +109,20 @@ fn choose(
     console: &mut dyn Console,
     label: &str,
     count: usize,
-    default: usize,
+    default: Option<usize>,
 ) -> Result<usize, &'static str> {
     let mut retry = false;
     loop {
         let answer = console.ask(&if retry {
-            format!("Please type a number from 1 to {count}. {label}")
+            format!("Please type a number from 1 to {count}.\n{label}")
         } else {
             label.to_string()
         })?;
         let answer = answer.trim();
         if answer.is_empty() {
-            return Ok(default);
+            if let Some(default) = default {
+                return Ok(default);
+            }
         }
         match answer.parse::<usize>() {
             Ok(n) if (1..=count).contains(&n) => return Ok(n),
@@ -94,14 +131,38 @@ fn choose(
     }
 }
 
-fn expand(answer: &str) -> Result<PathBuf, &'static str> {
-    let answer = answer.trim();
-    let path = if let Some(rest) = answer.strip_prefix("~/") {
-        PathBuf::from(std::env::var_os("HOME").ok_or("state_unavailable")?).join(rest)
-    } else {
-        PathBuf::from(answer)
+/// A typed folder: spaces around it and one pair of matching quotes removed, `~` expanded.
+/// `Err` holds the sentence for a path that is not absolute.
+fn folder_answer(answer: &str) -> Result<PathBuf, String> {
+    let mut text = answer.trim();
+    for quote in ['"', '\''] {
+        if text.len() >= 2 && text.starts_with(quote) && text.ends_with(quote) {
+            text = text[1..text.len() - 1].trim();
+            break;
+        }
+    }
+    let home = || {
+        std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from)
     };
-    std::path::absolute(path).map_err(|_| "state_unavailable")
+    if text == "~" {
+        return home().ok_or_else(|| "Setup can't find your home folder.".to_string());
+    }
+    if let Some(rest) = text.strip_prefix("~/") {
+        return home()
+            .map(|h| h.join(rest))
+            .ok_or_else(|| "Setup can't find your home folder.".to_string());
+    }
+    if text.starts_with('/') {
+        return Ok(PathBuf::from(text));
+    }
+    let here = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|_| "the folder this terminal is in".into());
+    Err(format!(
+        "Type the full path, starting with / or ~. \"{text}\" would be a folder inside {here}, where this terminal is now."
+    ))
 }
 
 /// Makes and checks the folder. Missing parents are made private to this user.
@@ -128,18 +189,36 @@ fn prepare(path: &Path) -> Result<PathBuf, &'static str> {
 
 fn step_folder(console: &mut dyn Console, suggested: &Path) -> Result<PathBuf, &'static str> {
     console.say("\nStep 1 of 5: Folder\nSkykeep keeps its private data in one folder: its cache, its settings and the choice of where your sign-in is kept.")?;
-    let answer = console.ask(&format!(
-        "Folder: {}\nPress Enter to use it, or type another folder: ",
-        suggested.display()
-    ))?;
-    let path = if answer.trim().is_empty() {
-        suggested.to_path_buf()
-    } else {
-        expand(&answer)?
-    };
-    let dir = prepare(&path)?;
-    console.say(&format!("Using {}.", dir.display()))?;
-    Ok(dir)
+    loop {
+        let answer = console.ask(&format!(
+            "Folder: {}\nPress Enter to use it, or type another folder: ",
+            suggested.display()
+        ))?;
+        let path = if answer.trim().is_empty() {
+            suggested.to_path_buf()
+        } else {
+            match folder_answer(&answer) {
+                Ok(path) => path,
+                Err(sentence) => {
+                    console.say(&sentence)?;
+                    continue;
+                }
+            }
+        };
+        if !path.exists() {
+            let create = console.ask(&format!("Create {}? [Y/n] ", path.display()))?;
+            if matches!(create.trim().to_ascii_lowercase().as_str(), "n" | "no") {
+                continue;
+            }
+        }
+        match prepare(&path) {
+            Ok(dir) => {
+                console.say(&format!("Using {}.", dir.display()))?;
+                return Ok(dir);
+            }
+            Err(code) => console.say(plain(code))?,
+        }
+    }
 }
 
 /// What is already done in a folder.
@@ -147,13 +226,18 @@ struct Found {
     storage_ready: bool,
     kind: Kind,
     account: Option<String>,
-    policy: Option<String>,
+    /// The approval mode, or `none` when setup left the folder without one on purpose.
+    mode: Option<String>,
 }
 
 impl Found {
     fn complete(&self) -> bool {
-        self.storage_ready && self.account.is_some() && self.policy.is_some()
+        self.storage_ready && self.account.is_some() && self.mode.is_some()
     }
+}
+
+fn no_mode_chosen(library: &quince_core::Library) -> bool {
+    library.state(NO_MODE_KEY).ok().flatten().as_deref() == Some("1")
 }
 
 fn survey(env: &Env, dir: &Path) -> Result<Found, &'static str> {
@@ -186,16 +270,50 @@ fn survey(env: &Env, dir: &Path) -> Result<Found, &'static str> {
             }
         }
     }
-    let policy = match crate::policy(&library, dir) {
+    let mode = match crate::policy(&library, dir) {
         Ok(Some((p, _))) => Some(p.mode),
+        Ok(None) if no_mode_chosen(&library) => Some("none".into()),
         _ => None,
     };
     Ok(Found {
         storage_ready,
         kind,
         account,
-        policy,
+        mode,
     })
+}
+
+fn describe(mode: &str) -> &'static str {
+    if mode == "none" {
+        "none (for MCP clients without approval forms)"
+    } else {
+        status::describe_mode(mode)
+    }
+}
+
+/// What Apple says about the saved sign-in.
+enum Checked {
+    Valid,
+    Rejected,
+    Unreachable,
+}
+
+/// Asks Apple whether the saved sign-in still works. Never asks for a password or a code.
+async fn check_sign_in(env: &Env, dir: &Path, endpoints: &Endpoints) -> Checked {
+    let Ok(held) = PrivateState::open(dir) else {
+        return Checked::Unreachable;
+    };
+    let Ok(store) = storage::open_store_in(env, &held.path) else {
+        return Checked::Unreachable;
+    };
+    let Ok(mut client) = Client::with(&held.path, endpoints.clone(), store) else {
+        return Checked::Unreachable;
+    };
+    match client.resume().await {
+        Ok(true) => Checked::Valid,
+        Ok(false) => Checked::Rejected,
+        Err(_) => Checked::Unreachable,
+    }
 }
 
 fn next_free(dir: &Path) -> PathBuf {
@@ -208,76 +326,116 @@ fn next_free(dir: &Path) -> PathBuf {
     dir.with_file_name("skykeep-mcp-new")
 }
 
-/// The whole guided flow.
+/// A YAML scalar: JSON's double-quoted string is valid YAML.
+fn yaml(text: &str) -> String {
+    serde_json::to_string(text).unwrap_or_default()
+}
+
+/// The whole guided flow. Every message names the chosen folder in its commands.
 pub async fn run(
     console: &mut dyn Console,
     env: &Env,
     options: &Options,
-) -> Result<Outcome, &'static str> {
-    console.say("Skykeep setup: five short steps. You can stop at any time with Ctrl-C and run setup again later; it continues where it stopped.")?;
+) -> Result<Outcome, String> {
+    let mut c = Scoped {
+        inner: console,
+        dir: None,
+    };
+    let outcome = flow(&mut c, env, options).await;
+    outcome.map_err(|code| c.scope(plain(code)))
+}
+
+async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcome, &'static str> {
+    c.say("Skykeep setup: five short steps. You can stop at any time with Ctrl-C and run setup again later; it continues where it stopped.")?;
     let suggested = options
         .state_dir
         .clone()
         .or_else(|| options.default_dir.clone())
         .ok_or("Setup can't find your home folder. Run it again with --state-dir FOLDER.")?;
-    let mut dir = step_folder(console, &suggested).map_err(plain)?;
+    let mut dir = step_folder(c, &suggested)?;
+    c.dir = Some(dir.clone());
+    let mut again = false;
     let keep = loop {
-        let found = survey(env, &dir).map_err(plain)?;
+        let found = survey(env, &dir)?;
         if !found.complete() {
             break false;
         }
-        console.say(&format!(
+        c.say("Checking the saved sign-in with Apple...")?;
+        match check_sign_in(env, &dir, &options.endpoints).await {
+            Checked::Valid => {}
+            Checked::Rejected => {
+                c.say("Apple no longer accepts the sign-in saved in this folder. Sign in again with the same Apple Account.")?;
+                again = true;
+                break false;
+            }
+            Checked::Unreachable => c.say(
+                "Setup couldn't reach Apple to check the saved sign-in, so it is kept as it is.",
+            )?,
+        }
+        c.say(&format!(
             "\nThis folder is already set up. Sign-in kept in the {}, signed in as {}, approval mode: {}",
             found.kind.describe(),
             found.account.as_deref().unwrap_or_default(),
-            status::describe_mode(found.policy.as_deref().unwrap_or_default()),
+            describe(found.mode.as_deref().unwrap_or_default()),
         ))?;
         match choose(
-            console,
-            "  1. Keep this setup\n  2. Switch to another Apple Account\n  3. Quit\nChoose 1, 2 or 3 (Enter keeps it): ",
-            3,
-            1,
-        )
-        .map_err(plain)?
-        {
+            c,
+            "  1. Keep this setup\n  2. Sign in again in this folder (same Apple Account)\n  3. Switch to another Apple Account\n  4. Quit\nChoose 1, 2, 3 or 4 (Enter keeps it): ",
+            4,
+            Some(1),
+        )? {
             1 => break true,
             2 => {
-                console.say("A folder belongs to one Apple Account, so the other account gets a new folder. This folder stays as it is and stays signed in; to sign it out later, run skykeep-mcp logout --state-dir with this folder.")?;
-                dir = step_folder(console, &next_free(&dir)).map_err(plain)?;
+                again = true;
+                break false;
+            }
+            3 => {
+                let old = dir.clone();
+                c.say(&format!(
+                    "A folder belongs to one Apple Account, so the other account gets a new folder. This folder stays as it is and stays signed in. To sign it out later, run: {}",
+                    status::with_dir("skykeep-mcp logout", &old)
+                ))?;
+                dir = step_folder(c, &next_free(&old))?;
+                c.dir = Some(dir.clone());
             }
             _ => return Ok(Outcome::Quit),
         }
     };
     if !keep {
-        if !step_storage(console, env, &dir).map_err(plain)? {
+        if !step_storage(c, env, &dir)? {
             return Ok(Outcome::Quit);
         }
-        step_sign_in(console, env, &dir, &options.endpoints)
-            .await
-            .map_err(plain)?;
-        step_policy(console, &dir).map_err(plain)?;
+        step_sign_in(c, env, &dir, &options.endpoints, again).await?;
+        step_policy(c, &dir)?;
     }
-    console.say("\nStep 5 of 5: Check")?;
+    c.say("\nStep 5 of 5: Check")?;
     let report = status::check(env, &dir);
-    console.say(report.render().trim_end())?;
+    c.say(report.render().trim_end())?;
+    let command = options.command.to_string_lossy();
+    let folder = dir.to_string_lossy();
     let config = serde_json::json!({
-        "command": options.command.to_string_lossy(),
-        "args": ["--state-dir", dir.to_string_lossy()],
+        "command": command,
+        "args": ["--state-dir", folder],
     });
-    console.say(&format!(
-        "\nAdd this line to the list of servers in your MCP client's settings:\n\"skykeep\": {config}"
+    c.say(&format!(
+        "\nMost MCP clients: add this line to the list of servers in the client's settings:\n\"skykeep\": {config}\n\nHermes: add this to config.yaml (if it already has mcp_servers:, add only the skykeep part under it):\nmcp_servers:\n  skykeep:\n    command: {}\n    args:\n      - \"--state-dir\"\n      - {}\n    enabled: true\n    sampling:\n      enabled: false",
+        yaml(&command),
+        yaml(&folder),
     ))?;
     if !report.ready() {
         return Err("Some checks above need fixing. Follow the next step shown, then run skykeep-mcp status.");
     }
-    console.say(&format!(
-        "\nSetup is complete.{}",
-        if storage::effective_kind(&dir) == Ok(Kind::ProtectedFile) {
-            " After each restart of this computer, run skykeep-mcp unlock once."
-        } else {
-            ""
-        }
-    ))?;
+    let mode = survey(env, &dir)?.mode.unwrap_or_default();
+    let mut done = String::from("\nSetup is complete.");
+    if storage::effective_kind(&dir) == Ok(Kind::ProtectedFile) {
+        done.push_str(" After each restart of this computer, run skykeep-mcp unlock once.");
+    }
+    match mode.as_str() {
+        "reads_and_writes" | "writes_only" => done.push_str(" Your approval mode asks in your MCP client, which must be able to show Skykeep's approval forms. Hermes can't yet: with it every request that needs approval fails. For such a client, run skykeep-mcp setup --state-dir NEW_FOLDER and choose 4 there."),
+        "none" => done.push_str(" Routine changes run without asking; approve deletions in a terminal with skykeep-mcp approve."),
+        _ => {}
+    }
+    c.say(&done)?;
     Ok(Outcome::Ready(dir))
 }
 
@@ -298,42 +456,44 @@ fn step_storage(console: &mut dyn Console, env: &Env, dir: &Path) -> Result<bool
     let current = chosen.or(history.then_some(Kind::SystemKeyring));
     let holder = env.holder.available();
     match current {
-        Some(Kind::SystemKeyring) => match storage::keyring_state(env, dir) {
-            KeyringState::Ready => {
-                if chosen.is_none() {
-                    storage::set_kind(dir, Kind::SystemKeyring)?;
+        Some(Kind::SystemKeyring) => {
+            match storage::keyring_state(env, dir) {
+                KeyringState::Ready => {
+                    if chosen.is_none() {
+                        storage::set_kind(dir, Kind::SystemKeyring)?;
+                    }
+                    console.say("Kept in your system keyring. Nothing to change.")?;
+                    Ok(true)
                 }
-                console.say("Kept in your system keyring. Nothing to change.")?;
-                Ok(true)
+                KeyringState::Locked => Err(LOCKED_KEYRING),
+                KeyringState::Missing => {
+                    if !holder {
+                        return Err(NO_SECURE_STORAGE);
+                    }
+                    console.say("Setup can't reach your system keyring, where this folder's sign-in was kept.")?;
+                    if choose(
+                        console,
+                        "  1. Switch to a protected file\n  2. Quit\nChoose 1 or 2: ",
+                        2,
+                        None,
+                    )? != 1
+                        || !confirm_switch(console, Kind::SystemKeyring)?
+                    {
+                        return Ok(false);
+                    }
+                    // The sign-out stays owed to the keyring (its own note), and is finished, or
+                    // demanded, before this folder ever uses the keyring again.
+                    if let Ok(old) = (env.keyring)(dir) {
+                        let _ = old.clear();
+                    }
+                    let _ = std::fs::remove_file(dir.join("cookies.json"));
+                    console.say("Setup could not reach the system keyring, so an older sign-in may stay there under the name skykeep-mcp. Nothing of it is used from now on.")?;
+                    storage::set_kind(dir, Kind::ProtectedFile)?;
+                    new_protected(console, env, dir)?;
+                    Ok(true)
+                }
             }
-            KeyringState::Locked => Err("Your system keyring is locked. Unlock it (log in to your desktop), then run skykeep-mcp setup again."),
-            KeyringState::Missing => {
-                if !holder {
-                    return Err(NO_SECURE_STORAGE);
-                }
-                console.say("Setup can't reach your system keyring, where this folder's sign-in was kept.")?;
-                if choose(
-                    console,
-                    "  1. Switch to a protected file\n  2. Quit\nChoose 1 or 2: ",
-                    2,
-                    2,
-                )? != 1
-                {
-                    return Ok(false);
-                }
-                if !confirm_switch(console, Kind::SystemKeyring)? {
-                    return Ok(false);
-                }
-                if let Ok(old) = (env.keyring)(dir) {
-                    let _ = old.clear();
-                }
-                let _ = std::fs::remove_file(dir.join("cookies.json"));
-                console.say("Setup could not reach the system keyring, so an older sign-in may stay there under the name skykeep-mcp. Nothing of it is used from now on.")?;
-                storage::set_kind(dir, Kind::ProtectedFile)?;
-                new_protected(console, env, dir)?;
-                Ok(true)
-            }
-        },
+        }
         Some(Kind::ProtectedFile) => match storage::protected_state(env, dir) {
             Ok(()) => {
                 console.say("Kept in the protected file, which is unlocked. Nothing to change.")?;
@@ -350,7 +510,7 @@ fn step_storage(console: &mut dyn Console, env: &Env, dir: &Path) -> Result<bool
                     console,
                     "  1. Unlock it with my passphrase\n  2. Start over with a new passphrase (you sign in to Apple again)\n  3. Quit\nChoose 1, 2 or 3: ",
                     3,
-                    1,
+                    Some(1),
                 )? {
                     1 => {
                         unlock_tries(console, env, dir, None)?;
@@ -368,19 +528,27 @@ fn step_storage(console: &mut dyn Console, env: &Env, dir: &Path) -> Result<bool
                 }
             }
             Err(Closed::HolderUnavailable) => {
-                if storage::keyring_state(env, dir) != KeyringState::Ready {
-                    return Err(NO_SECURE_STORAGE);
+                match storage::keyring_state(env, dir) {
+                    KeyringState::Ready => {}
+                    KeyringState::Locked => return Err(LOCKED_KEYRING),
+                    KeyringState::Missing => return Err(NO_SECURE_STORAGE),
                 }
                 console.say("This computer blocks the kernel key storage the protected file needs, but your system keyring works.")?;
                 if choose(
                     console,
                     "  1. Switch to the system keyring\n  2. Quit\nChoose 1 or 2: ",
                     2,
-                    2,
+                    None,
                 )? != 1
                     || !confirm_switch(console, Kind::ProtectedFile)?
                 {
                     return Ok(false);
+                }
+                // Whatever the keyring still holds for this folder is older than the protected
+                // file: erased first, and the switch waits until it is.
+                let keyring = (env.keyring)(dir).map_err(|_| NO_SECURE_STORAGE)?;
+                if keyring.clear().is_err() || keyring.sign_out_pending() {
+                    return Err("Setup couldn't remove an older sign-in from the system keyring. Unlock the keyring, then run skykeep-mcp setup again.");
                 }
                 storage::remove_protected(env, dir)?;
                 let _ = std::fs::remove_file(dir.join("cookies.json"));
@@ -398,7 +566,7 @@ fn step_storage(console: &mut dyn Console, env: &Env, dir: &Path) -> Result<bool
                         console,
                         "  1. My computer's password store (the system keyring). Recommended.\n  2. A protected file in the Skykeep folder, opened with a passphrase you choose. After each restart you run skykeep-mcp unlock once.\nChoose 1 or 2 (Enter picks 1): ",
                         2,
-                        1,
+                        Some(1),
                     )?;
                     if n == 1 {
                         Kind::SystemKeyring
@@ -408,27 +576,30 @@ fn step_storage(console: &mut dyn Console, env: &Env, dir: &Path) -> Result<bool
                 }
                 (KeyringState::Ready, false) => Kind::SystemKeyring,
                 (KeyringState::Locked, true) => {
-                    console.say("Your system keyring is locked.")?;
+                    console.say("Your system keyring is locked, so setup can't keep the sign-in there right now.")?;
                     if choose(
                         console,
-                        "  1. Use a protected file instead, opened with a passphrase you choose. After each restart you run skykeep-mcp unlock once.\n  2. Quit, so I can unlock the keyring and run setup again\nChoose 1 or 2: ",
+                        "  1. Use a protected file instead, opened with a passphrase you choose. After each restart you run skykeep-mcp unlock once.\n  2. Quit, so I can unlock the keyring first (log in to the desktop session) and run setup again\nChoose 1 or 2: ",
                         2,
-                        2,
+                        None,
                     )? != 1
                     {
                         return Ok(false);
                     }
                     Kind::ProtectedFile
                 }
+                (KeyringState::Locked, false) => return Err(LOCKED_KEYRING),
                 (KeyringState::Missing, true) => {
                     console.say("This computer has no system keyring setup can use, so the sign-in goes in a protected file. You choose its passphrase, and after each restart you run skykeep-mcp unlock once.")?;
                     Kind::ProtectedFile
                 }
-                (_, false) => return Err(NO_SECURE_STORAGE),
+                (KeyringState::Missing, false) => return Err(NO_SECURE_STORAGE),
             };
             storage::set_kind(dir, kind)?;
             match kind {
-                Kind::SystemKeyring => console.say("Your sign-in will be kept in the system keyring.")?,
+                Kind::SystemKeyring => {
+                    console.say("Your sign-in will be kept in the system keyring.")?
+                }
                 Kind::ProtectedFile => new_protected(console, env, dir)?,
             }
             Ok(true)
@@ -444,19 +615,33 @@ fn confirm_switch(console: &mut dyn Console, old: Kind) -> Result<bool, &'static
     Ok(answer.trim() == "switch")
 }
 
+/// Why a new passphrase is refused, if it is.
+pub fn weak_passphrase(passphrase: &str) -> Option<String> {
+    if passphrase.chars().count() < storage::MIN_PASSPHRASE {
+        return Some(format!(
+            "That passphrase is shorter than {} characters.",
+            storage::MIN_PASSPHRASE
+        ));
+    }
+    let distinct: std::collections::BTreeSet<char> = passphrase.chars().collect();
+    if distinct.len() < 5 {
+        return Some(
+            "That passphrase is too easy to guess. Use at least 5 different characters.".into(),
+        );
+    }
+    None
+}
+
 /// Asks for a new passphrase twice and creates the protected file with it.
 fn new_protected(console: &mut dyn Console, env: &Env, dir: &Path) -> Result<(), &'static str> {
     console.say(&format!(
-        "Choose a passphrase for the protected file: at least {} characters. Nothing is shown as you type. Skykeep can't recover it; if you lose it, run setup again and start over.",
+        "Choose a passphrase for the protected file: at least {} characters. Nothing is shown as you type. Skykeep can't recover it; if you lose it, run skykeep-mcp setup again and start over.",
         storage::MIN_PASSPHRASE
     ))?;
     for _ in 0..3 {
         let first = console.secret("New passphrase (hidden): ")?;
-        if first.chars().count() < storage::MIN_PASSPHRASE {
-            console.say(&format!(
-                "That passphrase is shorter than {} characters.",
-                storage::MIN_PASSPHRASE
-            ))?;
+        if let Some(reason) = weak_passphrase(&first) {
+            console.say(&reason)?;
             continue;
         }
         let second = console.secret("Type it again (hidden): ")?;
@@ -486,11 +671,25 @@ fn unlock_tries(
             Err(other) => return Err(other.sentence()),
         }
     }
-    Err("Wrong passphrase or damaged file, three times. Run the command again to try again.")
+    Err("Wrong passphrase or damaged file, three times. Run skykeep-mcp unlock again to try again.")
 }
 
-/// `skykeep-mcp unlock`.
+/// `skykeep-mcp unlock`. Every message names the folder in its commands.
 pub fn unlock(
+    console: &mut dyn Console,
+    env: &Env,
+    dir: &Path,
+    hours: Option<u32>,
+) -> Result<(), String> {
+    let mut c = Scoped {
+        inner: console,
+        dir: Some(dir.to_path_buf()),
+    };
+    let result = unlock_in(&mut c, env, dir, hours);
+    result.map_err(|text| c.scope(text))
+}
+
+fn unlock_in(
     console: &mut dyn Console,
     env: &Env,
     dir: &Path,
@@ -499,30 +698,43 @@ pub fn unlock(
     if !dir.exists() {
         return Err("No Skykeep folder there yet. Run skykeep-mcp setup first.");
     }
-    let held = PrivateState::open(dir).map_err(plain)?;
+    let held = PrivateState::open(dir).map_err(|code| match code {
+        "state_busy_retry" => {
+            "The server is using the folder right now. Run skykeep-mcp unlock again in a moment."
+        }
+        other => plain(other),
+    })?;
     let dir = held.path.as_path();
-    if storage::effective_kind(dir)? != Kind::ProtectedFile {
-        return Err(
+    match storage::kind(dir)? {
+        None => return Err("Setup is not finished for this folder. Run skykeep-mcp setup."),
+        Some(Kind::SystemKeyring) => return Err(
             "This folder keeps its sign-in in the system keyring, so there is nothing to unlock.",
-        );
+        ),
+        Some(Kind::ProtectedFile) => {}
     }
-    if hours.is_none() && storage::protected_state(env, dir).is_ok() {
-        console.say("Already unlocked.")?;
-        return Ok(());
+    match storage::protected_state(env, dir) {
+        Ok(()) if hours.is_none() => {
+            console.say("Already unlocked.")?;
+            return Ok(());
+        }
+        Ok(()) | Err(Closed::Locked) | Err(Closed::WrongOrDamaged) => {}
+        Err(other) => return Err(other.sentence()),
     }
-    unlock_tries(console, env, dir, hours.map(|h| h * 3600)).map_err(plain)?;
+    unlock_tries(console, env, dir, hours.map(|h| h * 3600))?;
     console.say(&match hours {
         Some(h) => format!("Unlocked for {h} hours, or until this computer restarts."),
         None => "Unlocked until this computer restarts.".into(),
     })
 }
 
-/// Step 3.
+/// Step 3. `again`: sign in even when a saved sign-in looks usable here (Apple refused it, or
+/// the person asked). The account binding still refuses another account.
 async fn step_sign_in(
     console: &mut dyn Console,
     env: &Env,
     dir: &Path,
     endpoints: &Endpoints,
+    again: bool,
 ) -> Result<(), &'static str> {
     console.say("\nStep 3 of 5: Apple sign-in")?;
     let held = PrivateState::open(dir)?;
@@ -530,7 +742,7 @@ async fn step_sign_in(
     let store = storage::open_store_in(env, dir)?;
     let session = store.try_load().map_err(|_| "secure_storage_unavailable")?;
     let library = crate::setup(dir)?;
-    if session.is_resumable() {
+    if session.is_resumable() && !again {
         let binding = session
             .dsid
             .as_deref()
@@ -553,7 +765,7 @@ async fn step_sign_in(
             }
             _ => {}
         }
-    } else if session.apple_id.is_some() {
+    } else if session.apple_id.is_some() && !again {
         console.say("Your saved sign-in has expired. Sign in again.")?;
     }
     drop(library);
@@ -577,9 +789,9 @@ async fn step_sign_in(
     Ok(())
 }
 
-/// Step 4. Signs in first: a policy saved before sign-in is bound to no account.
+/// Step 4. Runs after the sign-in: a policy saved before sign-in is bound to no account.
 fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str> {
-    console.say("\nStep 4 of 5: Approval mode\nThis decides when the assistant has to ask you before it acts. Approval happens in your MCP client, never by typing a password.")?;
+    console.say("\nStep 4 of 5: Approval mode\nThis decides when the assistant has to ask you before it acts. Choices 1 and 2 ask in your MCP client, so the client must be able to show Skykeep's approval forms. Hermes can't yet: with it, every request that needs approval fails. Choice 4 is for such clients.")?;
     let held = PrivateState::open(dir)?;
     let library = crate::setup(&held.path)?;
     if library
@@ -589,11 +801,21 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
     {
         return Err("login_required");
     }
-    match crate::policy(&library, &held.path) {
+    let existing = crate::policy(&library, &held.path);
+    match &existing {
         Ok(Some((policy, _))) => {
             let answer = console.ask(&format!(
                 "Current mode: {}\nPress Enter to keep it, or type change: ",
                 status::describe_mode(&policy.mode)
+            ))?;
+            if answer.trim().is_empty() {
+                return Ok(());
+            }
+        }
+        Ok(None) if no_mode_chosen(&library) => {
+            let answer = console.ask(&format!(
+                "Current mode: {}\nPress Enter to keep it, or type change: ",
+                describe("none")
             ))?;
             if answer.trim().is_empty() {
                 return Ok(());
@@ -604,12 +826,25 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
         )?,
         _ => {}
     }
-    let menu = format!(
-        "  1. {} Recommended.\n  2. {}\n  3. {}\nChoose 1, 2 or 3 (Enter picks 1): ",
+    // An approval mode can't be removed again, so the no-mode choice is offered only to a
+    // folder that never had one.
+    let raw = library
+        .state("mcp.policy")
+        .map_err(|_| "policy_unavailable")?;
+    let offer_none = raw.is_none();
+    let mut menu = format!(
+        "  1. {} Recommended.\n  2. {}\n  3. {}\n",
         MODES[0].1, MODES[1].1, MODES[2].1
     );
+    if offer_none {
+        menu.push_str("  4. No approval mode, for MCP clients that can't show approval forms (such as Hermes today). Routine changes then run without asking; only deletions wait until you approve them in a terminal with skykeep-mcp approve. Once you pick 1, 2 or 3, this folder can't go back to 4.\nChoose 1, 2, 3 or 4 (Enter picks 1): ");
+    } else {
+        console.say("This folder has had an approval mode, so there is no choice without one. For a client without approval forms, set up a new folder with skykeep-mcp setup --state-dir NEW_FOLDER.")?;
+        menu.push_str("Choose 1, 2 or 3 (Enter picks 1): ");
+    }
+    let count = if offer_none { 4 } else { 3 };
     let mode = loop {
-        let n = choose(console, &menu, 3, 1)?;
+        let n = choose(console, &menu, count, Some(1))?;
         if n == 3
             && console
                 .ask("The assistant could then change and delete notes and reminders without asking. Type confirm to allow that: ")?
@@ -618,27 +853,56 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
         {
             continue;
         }
-        break MODES[n - 1].0;
+        if n == 4 {
+            break None;
+        }
+        break Some(MODES[n - 1].0);
     };
-    let pending = library
-        .outbox_all_pending()
-        .map_err(|_| "library_unavailable")?
-        .len();
+    let Some(mode) = mode else {
+        let mut library = library;
+        library
+            .set_state(NO_MODE_KEY, "1")
+            .map_err(|_| "policy_unavailable")?;
+        return console.say("Approval mode: none. Routine changes run without asking; approve deletions with skykeep-mcp approve.");
+    };
     drop(library);
     drop(held);
-    if pending > 0
-        && console
-            .ask(&format!(
-                "{pending} changes are waiting to be sent. Saving a mode sets them aside, and they will not be sent; skykeep-mcp quarantine lists them. Type confirm to continue: "
-            ))?
-            .trim()
-            != "confirm"
-    {
-        return Err("Approval mode not changed. Run skykeep-mcp setup again when you are ready.");
+    // The count the person agrees to is checked again under the lock that sets the changes
+    // aside; anything queued meanwhile means asking again.
+    loop {
+        let ids: Vec<i64> = {
+            let held = PrivateState::open(dir)?;
+            crate::setup(&held.path)?
+                .outbox_all_pending()
+                .map_err(|_| "library_unavailable")?
+                .iter()
+                .map(|p| p.id)
+                .collect()
+        };
+        if !ids.is_empty()
+            && console
+                .ask(&format!(
+                    "{} changes are waiting to be sent. Saving a mode sets them aside, and they will not be sent; skykeep-mcp quarantine lists them. Type confirm to continue: ",
+                    ids.len()
+                ))?
+                .trim()
+                != "confirm"
+        {
+            return Err("Approval mode not changed. Run skykeep-mcp setup again when you are ready.");
+        }
+        match crate::Server::open(dir)?.set_policy_if(mode, Some(&ids)) {
+            Ok(saved) => {
+                let held = PrivateState::open(dir)?;
+                let _ = crate::setup(&held.path)?.set_state(NO_MODE_KEY, "");
+                return console.say(&format!(
+                    "Approval mode saved: {}",
+                    status::describe_mode(saved["mode"].as_str().unwrap_or_default())
+                ));
+            }
+            Err("pending_changed") => {
+                console.say("More changes were queued while you were answering.")?
+            }
+            Err(other) => return Err(other),
+        }
     }
-    let saved = crate::Server::open(dir)?.set_policy(mode)?;
-    console.say(&format!(
-        "Approval mode saved: {}",
-        status::describe_mode(saved["mode"].as_str().unwrap_or_default())
-    ))
 }

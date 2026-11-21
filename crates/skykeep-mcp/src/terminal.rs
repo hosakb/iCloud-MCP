@@ -64,7 +64,8 @@ pub fn hidden(
         .map_err(|_| "terminal_unavailable")?;
     tty.flush().map_err(|_| "terminal_unavailable")?;
     let deadline = Instant::now() + timeout;
-    let mut bytes = Zeroizing::new(Vec::new());
+    // Room for the longest answer up front: a growing buffer would leave copies behind.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(1024));
     let result = loop {
         let Some(left) = deadline.checked_duration_since(Instant::now()) else {
             break Err("input_timeout");
@@ -149,11 +150,43 @@ pub fn visible(tty: &mut File, label: &str, timeout: Duration) -> Result<String,
         }
         match byte[0] {
             b'\r' | b'\n' => {
-                return String::from_utf8(bytes).map_err(|_| "invalid_input");
+                // Escape alone cancels; arrow keys and other escape sequences are dropped.
+                if bytes == [27] {
+                    return Err("input_cancelled");
+                }
+                return String::from_utf8(without_escapes(&bytes)).map_err(|_| "invalid_input");
             }
-            3 | 4 | 27 => return Err("input_cancelled"),
+            3 | 4 => return Err("input_cancelled"),
             b if bytes.len() < 4096 => bytes.push(b),
             _ => return Err("invalid_input"),
         }
     }
+}
+
+/// A typed line without terminal escape sequences (arrow keys, Home, Delete) or other control
+/// bytes.
+pub fn without_escapes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            27 => {
+                i += 1;
+                if matches!(bytes.get(i), Some(b'[') | Some(b'O')) {
+                    i += 1;
+                    // Parameters, then one final byte from @ to ~.
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                }
+                i += 1;
+            }
+            b if b < 32 || b == 127 => i += 1,
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out
 }

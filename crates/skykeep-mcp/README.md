@@ -14,11 +14,18 @@ Edit `docs/architecture.html` and re-export `docs/architecture.webp` whenever a 
 cargo build --release -p skykeep-mcp
 ```
 
-The workspace's default member is this crate, so `cargo build` and `cargo test` without `-p` also build only the headless server. The desktop and mobile apps stay in the workspace and build with their own `-p` flags. Linux needs `pkg-config` and the D-Bus development headers for the Secret Service client.
+The workspace's default member is this crate, so `cargo build` and `cargo test` without `-p` also build only the headless server. The desktop and mobile apps stay in the workspace and build with their own `-p` flags. Linux needs `pkg-config` and the D-Bus development headers for the Secret Service client: on Debian or Ubuntu `sudo apt install pkg-config libdbus-1-dev`, on Fedora `sudo dnf install pkgconf-pkg-config dbus-devel`, on Arch `sudo pacman -S pkgconf dbus`. Rust itself comes from [rustup.rs](https://rustup.rs).
 
 ## Get started
 
-After the build, the program is at `target/release/skykeep-mcp`. Copy it to `~/.local/bin` (or another folder your terminal finds programs in), or type its full path wherever this guide says `skykeep-mcp`.
+After the build, the program is at `target/release/skykeep-mcp`. Install it where your terminal finds programs:
+
+```sh
+mkdir -p ~/.local/bin
+install -m 755 target/release/skykeep-mcp ~/.local/bin/
+```
+
+If your terminal then says it can't find `skykeep-mcp`, type `~/.local/bin/skykeep-mcp` wherever this guide says `skykeep-mcp`. `skykeep-mcp --help` lists every command.
 
 You need a terminal window that you open yourself. Don't run these commands through an AI assistant or chat: what you type there can end up in a transcript.
 
@@ -30,13 +37,22 @@ You need a terminal window that you open yourself. Don't run these commands thro
 
    It walks you through five steps and tells you what each one does:
 
-   1. **Folder.** Where Skykeep keeps its private data. Press Enter to use the suggested folder, `~/.local/share/skykeep-mcp`, or type another one. To use another folder later, add `--state-dir FOLDER` to every command.
+   1. **Folder.** Where Skykeep keeps its private data. Press Enter to use the suggested folder, `~/.local/share/skykeep-mcp`, or type another one as a full path starting with `/` or `~`. Setup asks before it creates a folder. With another folder, add `--state-dir FOLDER` to every command; setup and status print each command with it already filled in.
    2. **Where your sign-in is kept.** Your computer's password store when it has one, otherwise a protected file (see below).
-   3. **Apple sign-in.** Your Apple Account, your password and then a verification code. Nothing you type is shown on screen. You choose where Apple sends the code: your Apple devices, or a text message to one of your phone numbers if Apple lists any. You can go back and pick the other way without typing your password again.
-   4. **Approval mode.** How the assistant asks before it reads or changes your data. The recommended choice asks you before every read and every change.
-   5. **Check.** Setup checks everything it set up and prints one line to paste into your MCP client's settings.
+   3. **Apple sign-in.** Your Apple Account, your password and then a verification code. Your account, password and code are not shown as you type. You pick a number for where Apple sends the code: your Apple devices, or a text message to one of your phone numbers if Apple lists any. At the code you can type `b` to go back and pick the other way without typing your password again.
+   4. **Approval mode.** When the assistant has to ask you before it acts:
 
-   You can run `setup` again at any time. It sees what is already done and asks whether to keep it, switch to another Apple Account, or quit. A folder belongs to one Apple Account, so switching sets up a new folder for the other account and leaves the first one as it is. If setup stopped part way, the next run continues with the first step that is not done.
+      | Choice | Reads and refreshes | Changes, including deletion |
+      | --- | --- | --- |
+      | 1. Ask before every read and every change (recommended, `reads_and_writes`) | Asks you in the MCP client | Asks you in the MCP client |
+      | 2. Read without asking, ask before every change (`writes_only`) | No question | Asks you in the MCP client |
+      | 3. Never ask, not even before deleting (`yolo`, you type `confirm`) | No question | No question |
+      | 4. No approval mode, for clients without approval forms | No question | Routine changes: no question. Deletions wait until you run `skykeep-mcp approve` in a terminal |
+
+      Choices 1 and 2 need an MCP client that can show Skykeep's approval forms. Hermes can't yet: with it, every request that needs approval fails with `approval_requires_form_client`. Use choice 4 for such a client. Once a folder has had choice 1, 2 or 3, it can't go back to 4; set up a new folder instead.
+   5. **Check.** Setup checks everything it set up and prints what to paste into your MCP client's settings: a JSON line for most clients, and a `config.yaml` block for Hermes.
+
+   You can run `setup` again at any time. It checks the saved sign-in with Apple, then asks whether to keep the setup, sign in again in the same folder (same Apple Account), switch to another Apple Account, or quit. If Apple no longer accepts the saved sign-in, setup says so and goes straight to signing in again. A folder belongs to one Apple Account, so switching sets up a new folder for the other account and leaves the first one as it is. If setup stopped part way, the next run continues with the first step that is not done.
 
 2. Check that everything is ready:
 
@@ -59,9 +75,9 @@ Skykeep never writes your sign-in to a plain file. There are two options:
 - **Your computer's password store** (the system keyring, such as GNOME Keyring or KWallet). Setup uses it when it is running and unlocked. Nothing more to do after a restart once you have logged in to your desktop.
 - **A protected file** in the Skykeep folder, for computers without a usable password store, such as a server you reach over SSH. You choose a passphrase of at least 12 characters, typed twice. The file is encrypted with it (AES-256-GCM, key derived with PBKDF2-HMAC-SHA256). After each restart, `skykeep-mcp unlock` asks for the passphrase once and gives the server the key through the Linux kernel's own key storage, so the server can read the file without a desktop. The key is never written to a file. Like the system keyring, it can be read by programs running as your user, and by nobody else. Until you unlock, the server's tools answer `locked: run skykeep-mcp unlock in a terminal`. To make the key expire earlier than the next restart, use `skykeep-mcp unlock --hours 8`.
 
-If neither is available, setup stops and says so instead of keeping the sign-in anywhere less safe. When the option you chose stops working (the keyring is gone, or the kernel key storage is blocked), setup offers the other one. Switching asks you to type `switch`, and removes the sign-in kept the old way; if the old keyring can't be reached at all, setup says that an older entry may stay there unused. A locked keyring is never switched away from: unlock it instead. If you forget the passphrase, run `setup` again and choose to start over with a new one; you then sign in to Apple again, and your cached data stays.
+If neither is available, setup stops and says so instead of keeping the sign-in anywhere less safe. If you are inside Docker or a similar container, run Skykeep directly on the computer; on a desktop, log in to the desktop session first. When the option you chose stops working (the keyring is gone, or the kernel key storage is blocked), setup offers the other one. Switching asks you to type `switch`, removes the sign-in kept the old way, and you sign in to Apple again. If the old keyring can't be reached at all, setup says that an older entry may stay there unused; before the folder ever uses that keyring again, setup erases it. A locked keyring is never switched away from: unlock it instead. If you forget the passphrase, run `setup` again and choose to start over with a new one; you then sign in to Apple again, and your cached data stays.
 
-Your Apple password is never stored. When Apple asks you to sign in again, run `setup` again.
+Your Apple password is never stored. When Apple asks you to sign in again, run `setup` again and choose to sign in again in this folder.
 
 ### Sign in and out by hand
 
@@ -74,7 +90,7 @@ skykeep-mcp logout --state-dir ~/.local/share/skykeep-mcp
 
 `login` asks for your Apple Account, password and verification code with echo turned off. It reads only from the terminal you opened, never from a pipe, an argument or an environment variable. It refuses to start when it sees markers that an agent runtime launched it (`HERMES_AGENT`, `AI_AGENT`, `HERMES_SESSION_ID`, `CODEX_SANDBOX`, `CLAUDECODE`), because an agent-owned terminal can copy what you type into a transcript. That check only catches runtimes that set those markers; an agent with shell access can unset them (see "Write approval" below).
 
-For the code you pick a number from a short list: one sends the code to your Apple devices, and each phone number Apple lists (shown as Apple masks it) gets a text message or a call. At the code prompt, type `b` to go back and pick another way. A wrong or expired code can be retried twice. Ctrl-C, Ctrl-D, Escape or three minutes without input cancel the sign-in and nothing is saved.
+For the code you pick a number from a short list: one sends the code to your Apple devices, and each phone number Apple lists (shown as Apple masks it) gets a text message or a call. At the code prompt, type `b` to go back and pick another way; one sign-in asks Apple for at most four codes. A wrong or expired code can be retried twice. Ctrl-C, Ctrl-D, Escape or three minutes without input cancel the sign-in and nothing is saved.
 
 What is kept afterwards:
 
@@ -91,7 +107,7 @@ The folder must be owned by you, mode `0700`, and contain no symlinks or files r
 skykeep-mcp --state-dir ~/.local/share/skykeep-mcp
 ```
 
-Configure your MCP client to start that command. Stdout carries protocol messages only. JSON-RPC batches are not supported and get an `Invalid Request` error. Several clients can share one directory: operations take turns on the lock, and a server that starts while another holds it still answers `initialize`, then returns `state_busy_retry` from each tool call until the lock is free. Setup prints the exact line to paste. The server never opens a keyring unlock dialog or a sign-in prompt; if the keyring is locked or the session has expired, tools return `login_required` with instructions, and with a protected file that is not unlocked they return `locked: run skykeep-mcp unlock in a terminal`. While running it refreshes Notes and Reminders every five minutes; a failed pass waits for the next interval rather than retrying.
+Configure your MCP client to start that command. Stdout carries protocol messages only. JSON-RPC batches are not supported and get an `Invalid Request` error. Several clients can share one directory: operations take turns on the lock, and a server that starts while another holds it still answers `initialize`, then returns `state_busy_retry` from each tool call until the lock is free. Setup prints the exact line to paste. The server never opens a keyring unlock dialog or a sign-in prompt; if the keyring is locked or the session has expired, tools return `login_required` with instructions, and with a protected file that is not unlocked they return `locked: run skykeep-mcp unlock in a terminal`. `auth_status` names the folder in that command, and says which other problem a protected file has, such as a damaged file or a blocked kernel key storage. While running it refreshes Notes and Reminders every five minutes; a failed pass waits for the next interval rather than retrying.
 
 ## Tools
 
@@ -119,7 +135,7 @@ Reads come from the local cache and say so (`"source": "local_cache"`). A succes
 
 ## Write approval
 
-`setup` sets the approval mode for you (see the `policy` modes under Limitations). The commands below are the older controls and still work.
+`setup` sets the approval mode for you (step 4 under "Get started"). The commands in this section apply only to a folder with no approval mode: one where you chose 4 in setup, or one set up before approval modes existed. In a folder with mode 1, 2 or 3, approval happens in your MCP client, and `require-approval` and `allow-routine` refuse to run.
 
 Deletions never run straight from MCP. A deletion here means `delete`, a `move` into Recently Deleted (that is how iCloud deletes a note), and a `save` that leaves the note body empty. Creating a note in Recently Deleted is refused. For any of these the tool returns `approval_required` with a request ID, and you approve in your own terminal:
 
@@ -135,12 +151,13 @@ What approval protects against: an agent that reaches this server only through M
 
 ## Limitations
 
-### Issue #7 staged implementation checkpoint
+### Approval modes in detail
 
-This candidate implements policy-controlled reads, Notes and Reminders mutations,
-and bounded sync. Missing policy retains legacy behavior. It is not ready for
-real-account rollout while the Hermes boolean-content and rendered-preview gates
-below remain open. No mode has been activated on real state.
+Setup's choices 1 to 3 are the policy modes `reads_and_writes`, `writes_only` and
+`yolo` (the table is under "Get started"). They control reads, Notes and Reminders
+changes, and sync. A folder with no policy (choice 4) keeps the older behaviour in
+"Write approval" above. MCP clients that can't answer the approval forms, Hermes
+among them today (see below), need choice 4.
 
 The human-only command is `skykeep-mcp policy --state-dir DIR MODE`, where MODE is
 `reads_and_writes`, `writes_only`, or `yolo`. It requires a user-owned terminal,
@@ -148,13 +165,8 @@ literal `confirm`, persists a fresh revision bound to the account and directory
 device/inode, and prints the saved record. It is never exposed as an MCP tool.
 Account changes or copied policies fail closed until the human explicitly migrates
 again. Existing terminal policy commands cannot override an activated new policy.
-No migration back to legacy is provided. No real state was migrated in development.
-
-| Mode | Content reads and refresh | Mutations, including deletion |
-| --- | --- | --- |
-| reads_and_writes | One-shot form approval | One-shot form approval |
-| writes_only | No prompt | One-shot form approval |
-| yolo | No prompt | No prompt |
+No migration back to legacy is provided. In each mode that asks, every approval is
+a one-shot form in the MCP client.
 
 2025-11-25 clients advertising `elicitation: {}` or `form: {}` receive standard
 `elicitation/create` with a required boolean. Only `accept` with exactly

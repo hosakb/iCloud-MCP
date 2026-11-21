@@ -72,7 +72,13 @@ fn status_reports_a_missing_folder_and_exits_non_zero_without_creating_it() {
     assert_eq!(out.status.code(), Some(1));
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("No Skykeep folder at"), "{text}");
-    assert!(text.contains("Next step: Run skykeep-mcp setup."), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Next step: Run skykeep-mcp setup --state-dir {}.",
+            missing.display()
+        )),
+        "{text}"
+    );
     assert!(!missing.exists());
 }
 
@@ -119,4 +125,34 @@ fn unlock_rejects_bad_hours_and_older_commands_keep_their_usage() {
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&out.stderr).contains("usage: skykeep-mcp status"));
+}
+
+#[test]
+fn help_lists_every_command_and_exits_zero() {
+    for args in [
+        vec!["--help"],
+        vec!["-h"],
+        vec!["help"],
+        vec!["setup", "--help"],
+        vec!["unlock", "--help"],
+    ] {
+        let out = program().args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        for command in [
+            "setup",
+            "status",
+            "unlock",
+            "login",
+            "logout",
+            "policy",
+            "approve",
+            "quarantine",
+        ] {
+            assert!(
+                text.contains(&format!("skykeep-mcp {command}")),
+                "{args:?} lacks {command}"
+            );
+        }
+    }
 }
