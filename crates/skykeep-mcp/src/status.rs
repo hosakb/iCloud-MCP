@@ -52,13 +52,27 @@ fn quoted(path: &Path) -> String {
     }
 }
 
-/// `text` with `--state-dir DIR` added to every `skykeep-mcp` command in it, unless `dir` is
-/// the default folder, where no flag is needed.
+/// What "no approval mode" means in a folder: the older behaviour, including an earlier
+/// `require-approval`, which setup never loosens.
+pub fn no_mode_effect(library: &quince_core::Library) -> &'static str {
+    if library
+        .state("mcp.require_write_approval")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("true")
+    {
+        "Every change waits until you approve it with skykeep-mcp approve, because this folder was set earlier to approve every change (skykeep-mcp require-approval)."
+    } else {
+        "Routine changes run without asking; deletions wait until you approve them with skykeep-mcp approve."
+    }
+}
+
+/// `text` with `--state-dir DIR` added to every `skykeep-mcp` command in it. For the default
+/// folder, only setup, status and unlock go without it: the other commands need the flag.
 pub fn with_dir(text: &str, dir: &Path) -> String {
     let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    if crate::setup::default_dir().is_some_and(|d| canonical(&d) == canonical(dir)) {
-        return text.to_string();
-    }
+    let default = crate::setup::default_dir().is_some_and(|d| canonical(&d) == canonical(dir));
     let flag = format!(" --state-dir {}", quoted(dir));
     let mut out = String::with_capacity(text.len() + flag.len());
     let mut rest = text;
@@ -83,7 +97,8 @@ pub fn with_dir(text: &str, dir: &Path) -> String {
         let tail = &after[word.len()..];
         out.push_str("skykeep-mcp ");
         out.push_str(&word);
-        if known && !tail.starts_with(" --state-dir") {
+        let knows_default = ["setup", "status", "unlock"].contains(&word.as_str());
+        if known && !(default && knows_default) && !tail.starts_with(" --state-dir") {
             out.push_str(&flag);
         }
         rest = tail;
@@ -250,7 +265,10 @@ pub fn check(env: &Env, dir: &Path) -> Report {
                 .as_deref()
                 == Some("1") =>
         {
-            report.ok("Approval mode: none, for MCP clients without approval forms. Routine changes run without asking; deletions wait until you approve them with skykeep-mcp approve.")
+            report.ok(format!(
+                "Approval mode: none, for MCP clients without approval forms. {}",
+                library.as_ref().map(no_mode_effect).unwrap_or_default()
+            ))
         }
         None | Some(Ok(None)) => report.fix(
             "No approval mode chosen.",

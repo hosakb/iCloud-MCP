@@ -432,7 +432,11 @@ async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcom
     }
     match mode.as_str() {
         "reads_and_writes" | "writes_only" => done.push_str(" Your approval mode asks in your MCP client, which must be able to show Skykeep's approval forms. Hermes can't yet: with it every request that needs approval fails. For such a client, run skykeep-mcp setup --state-dir NEW_FOLDER and choose 4 there."),
-        "none" => done.push_str(" Routine changes run without asking; approve deletions in a terminal with skykeep-mcp approve."),
+        "none" => {
+            let held = PrivateState::open(&dir)?;
+            done.push(' ');
+            done.push_str(status::no_mode_effect(&crate::setup(&held.path)?));
+        }
         _ => {}
     }
     c.say(&done)?;
@@ -837,7 +841,7 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
         MODES[0].1, MODES[1].1, MODES[2].1
     );
     if offer_none {
-        menu.push_str("  4. No approval mode, for MCP clients that can't show approval forms (such as Hermes today). Routine changes then run without asking; only deletions wait until you approve them in a terminal with skykeep-mcp approve. Once you pick 1, 2 or 3, this folder can't go back to 4.\nChoose 1, 2, 3 or 4 (Enter picks 1): ");
+        menu.push_str(&format!("  4. No approval mode, for MCP clients that can't show approval forms (such as Hermes today). {} Once you pick 1, 2 or 3, this folder can't go back to 4.\nChoose 1, 2, 3 or 4 (Enter picks 1): ", status::no_mode_effect(&library)));
     } else {
         console.say("This folder has had an approval mode, so there is no choice without one. For a client without approval forms, set up a new folder with skykeep-mcp setup --state-dir NEW_FOLDER.")?;
         menu.push_str("Choose 1, 2 or 3 (Enter picks 1): ");
@@ -863,7 +867,8 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
         library
             .set_state(NO_MODE_KEY, "1")
             .map_err(|_| "policy_unavailable")?;
-        return console.say("Approval mode: none. Routine changes run without asking; approve deletions with skykeep-mcp approve.");
+        let effect = status::no_mode_effect(&library);
+        return console.say(&format!("Approval mode: none. {effect}"));
     };
     drop(library);
     drop(held);

@@ -1042,7 +1042,7 @@ async fn no_approval_mode_leaves_the_folder_without_a_policy_and_counts_as_done(
     assert!(script.screen.contains("  4. No approval mode, for MCP clients that can't show approval forms (such as Hermes today)."));
     assert!(script
         .screen
-        .contains("approve deletions in a terminal with skykeep-mcp approve --state-dir"));
+        .contains("deletions wait until you approve them with skykeep-mcp approve --state-dir"));
     assert!(policy_missing(&dir));
     let report = skykeep_mcp::status::check(storage::env(), &dir);
     assert!(report.ready(), "{}", report.render());
@@ -1132,4 +1132,60 @@ fn weak_passphrases_are_refused_in_plain_words() {
     assert!(setup::weak_passphrase("abababababababab").is_some());
     assert!(setup::weak_passphrase("abcdabcdabcdabcd").is_some());
     assert!(setup::weak_passphrase("correct horse battery").is_none());
+}
+
+/// Only setup, status and unlock know the default folder; every other command needs the flag.
+#[test]
+fn the_default_folder_flag_is_left_out_only_for_commands_that_know_the_default() {
+    let Some(default) = setup::default_dir() else {
+        return;
+    };
+    let with = |command: &str| {
+        skykeep_mcp::status::with_dir(&format!("Run skykeep-mcp {command}."), &default)
+    };
+    for command in ["setup", "status", "unlock"] {
+        assert_eq!(with(command), format!("Run skykeep-mcp {command}."));
+    }
+    for command in ["approve", "logout", "login", "quarantine"] {
+        assert!(
+            with(command).starts_with(&format!("Run skykeep-mcp {command} --state-dir /")),
+            "{}",
+            with(command)
+        );
+    }
+}
+
+/// A folder that ran require-approval earlier keeps it under "no approval mode": setup and
+/// status say every change waits for approval, not that routine changes run without asking.
+#[tokio::test]
+async fn no_approval_mode_tells_the_truth_about_an_earlier_require_approval() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    made(&dir);
+    quince_core::Library::open(&dir)
+        .unwrap()
+        .set_state("mcp.require_write_approval", "true")
+        .unwrap();
+    let mut answers = vec![Ask(""), Ask("")];
+    answers.extend(sign_in_answers());
+    answers.push(Ask("4"));
+    let script = ready(answers, &dir, &server).await;
+    assert!(
+        !script.screen.contains("Routine changes run without asking"),
+        "{}",
+        script.screen
+    );
+    assert!(script.screen.contains("Every change waits until you approve it"));
+    let report = skykeep_mcp::status::check(storage::env(), &dir).render();
+    assert!(report.contains("Every change waits until you approve it"), "{report}");
+    assert_eq!(
+        quince_core::Library::open(&dir)
+            .unwrap()
+            .state("mcp.require_write_approval")
+            .unwrap()
+            .as_deref(),
+        Some("true"),
+        "setup never loosens the older setting"
+    );
 }
