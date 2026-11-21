@@ -32,7 +32,7 @@ async fn trusted_device_login_persists_only_completed_passwordless_session() {
     let mut inputs = [
         "fixture@example.invalid",
         "SYNTHETIC-PASSWORD",
-        "0",
+        "1",
         "123456",
     ]
     .into_iter();
@@ -84,7 +84,7 @@ async fn wrong_code_retries_without_restarting_or_retaining_password() {
     let mut inputs = [
         "fixture@example.invalid",
         "SYNTHETIC-PASSWORD",
-        "0",
+        "1",
         "111111",
         "123456",
     ]
@@ -121,7 +121,7 @@ async fn sms_route_uses_only_an_offered_phone_id() {
     let mut inputs = [
         "fixture@example.invalid",
         "SYNTHETIC-PASSWORD",
-        "7",
+        "2",
         "123456",
     ]
     .into_iter();
@@ -284,6 +284,8 @@ fn sms_only_options() -> serde_json::Value {
 }
 
 const ZERO_DEVICE_NOTE: &str = "Apple reported no trusted devices";
+const DEVICES: &str = "1. Send the code to my Apple devices";
+const INVALID: &str = "That is not one of the choices";
 
 #[tokio::test]
 async fn malformed_routes_retry_sms_without_new_credentials() {
@@ -295,7 +297,8 @@ async fn malformed_routes_retry_sms_without_new_credentials() {
             Ok("not-a-route"),
             Ok("18446744073709551616"),
             Ok("99"),
-            Ok("7"),
+            Ok("0"),
+            Ok("2"),
             Ok("123456"),
         ],
         Ok(()),
@@ -303,19 +306,23 @@ async fn malformed_routes_retry_sms_without_new_credentials() {
     )
     .await;
     for label in &labels[2..labels.len() - 1] {
-        assert!(label.contains("0 for trusted device"), "{label}");
-        assert!(label.contains("[7]"), "{label}");
+        assert!(label.contains(DEVICES), "{label}");
+        // Apple gave no number for this phone, so none is made up.
+        assert!(
+            label.contains("2. Send a text message to trusted phone number 1"),
+            "{label}"
+        );
     }
     assert!(labels[2].contains(ZERO_DEVICE_NOTE), "{}", labels[2]);
-    assert!(labels[3].contains("Invalid or unavailable code route"));
+    assert!(labels[3].contains(INVALID));
 }
 
 // Apple's count is not a reliable gate: a live account reported zero trusted devices while a
 // code still arrived on its trusted device. The original app always offers that route.
 #[tokio::test]
 async fn trusted_device_route_works_when_apple_reports_zero_devices() {
-    let labels = route_case(sms_only_options(), &[Ok("0"), Ok("123456")], Ok(()), None).await;
-    assert!(labels[2].contains("0 for trusted device"), "{}", labels[2]);
+    let labels = route_case(sms_only_options(), &[Ok("1"), Ok("123456")], Ok(()), None).await;
+    assert!(labels[2].contains(DEVICES), "{}", labels[2]);
     assert!(labels[2].contains(ZERO_DEVICE_NOTE), "{}", labels[2]);
 }
 
@@ -323,12 +330,13 @@ async fn trusted_device_route_works_when_apple_reports_zero_devices() {
 async fn trusted_device_route_works_with_zero_devices_and_no_phones() {
     let labels = route_case(
         json!({"trustedDeviceCount": 0, "trustedPhoneNumbers": []}),
-        &[Ok("0"), Ok("123456")],
+        &[Ok("1"), Ok("123456")],
         Ok(()),
         None,
     )
     .await;
-    assert!(labels[2].contains("0 for trusted device"), "{}", labels[2]);
+    assert!(labels[2].contains(DEVICES), "{}", labels[2]);
+    assert!(!labels[2].contains("2."), "{}", labels[2]);
     assert!(labels[2].contains(ZERO_DEVICE_NOTE), "{}", labels[2]);
 }
 
@@ -336,7 +344,7 @@ async fn trusted_device_route_works_with_zero_devices_and_no_phones() {
 async fn reported_trusted_devices_omit_zero_device_note() {
     let labels = route_case(
         json!({"trustedDeviceCount": 1, "trustedPhoneNumbers": []}),
-        &[Ok("0"), Ok("123456")],
+        &[Ok("1"), Ok("123456")],
         Ok(()),
         None,
     )
@@ -349,12 +357,12 @@ async fn malformed_route_can_retry_an_existing_sms_route() {
     let labels = route_case(
         json!({"trustedDeviceCount": 1,
         "trustedPhoneNumbers": [{"id": 7}]}),
-        &[Ok("bad"), Ok("7"), Ok("123456")],
+        &[Ok("bad"), Ok("2"), Ok("123456")],
         Ok(()),
         Some(7),
     )
     .await;
-    assert!(labels[2].contains("0 for trusted device"));
+    assert!(labels[2].contains(DEVICES));
 }
 
 // A security-key-only answer offers no code at all; the original app shows its security-key
@@ -384,32 +392,40 @@ async fn route_retry_preserves_cancellation_and_timeout() {
 }
 
 #[tokio::test]
-async fn sms_zero_is_selectable_with_and_without_trusted_devices() {
+async fn phone_id_zero_is_selectable_with_and_without_trusted_devices() {
     for devices in [0, 1] {
         let labels = route_case(
             json!({"trustedDeviceCount": devices, "trustedPhoneNumbers": [{"id": 0}]}),
-            &[Ok("bad"), Ok("sms:0"), Ok("123456")],
+            &[Ok("bad"), Ok("2"), Ok("123456")],
             Ok(()),
             Some(0),
         )
         .await;
-        assert!(labels[2].contains("sms:0"), "{}", labels[2]);
-        assert!(labels[2].contains("0 for trusted device"), "{}", labels[2]);
+        assert!(
+            labels[2].contains("2. Send a text message"),
+            "{}",
+            labels[2]
+        );
+        assert!(labels[2].contains(DEVICES), "{}", labels[2]);
     }
 }
 
 #[tokio::test]
-async fn trusted_zero_remains_distinct_from_sms_zero() {
+async fn trusted_devices_remain_distinct_from_phone_id_zero() {
     for devices in [0, 1] {
         let labels = route_case(
             json!({"trustedDeviceCount": devices, "trustedPhoneNumbers": [{"id": 0}]}),
-            &[Ok("0"), Ok("123456")],
+            &[Ok("1"), Ok("123456")],
             Ok(()),
             None,
         )
         .await;
-        assert!(labels[2].contains("0 for trusted device"), "{}", labels[2]);
-        assert!(labels[2].contains("sms:0"), "{}", labels[2]);
+        assert!(labels[2].contains(DEVICES), "{}", labels[2]);
+        assert!(
+            labels[2].contains("2. Send a text message"),
+            "{}",
+            labels[2]
+        );
     }
 }
 
@@ -429,16 +445,87 @@ async fn zero_phone_route_retries_preserve_cancellation_and_timeout() {
 }
 
 #[tokio::test]
-async fn unadvertised_sms_zero_retries_an_offered_positive_phone_id() {
+async fn a_choice_that_is_not_listed_retries_an_offered_one() {
     let labels = route_case(
         sms_only_options(),
-        &[Ok("sms:0"), Ok("7"), Ok("123456")],
+        &[Ok("3"), Ok("2"), Ok("123456")],
         Ok(()),
         Some(7),
     )
     .await;
-    assert!(!labels[2].contains("sms:0"));
-    assert!(labels[3].contains("Invalid or unavailable code route"));
+    assert!(!labels[2].contains("3."));
+    assert!(labels[3].contains(INVALID));
+}
+
+#[tokio::test]
+async fn apple_masked_numbers_are_shown_as_apple_sent_them_and_calls_say_so() {
+    let labels = route_case(
+        json!({"trustedDeviceCount": 1, "trustedPhoneNumbers": [
+            {"id": 7, "numberWithDialCode": "+00 \u{2022}\u{2022}\u{2022}23", "pushMode": "sms"},
+            {"id": 8, "numberWithDialCode": "+00 \u{2022}\u{2022}\u{2022}45\u{202e}\u{1b}[2J", "pushMode": "voice"}
+        ]}),
+        &[Ok("2"), Ok("123456")],
+        Ok(()),
+        Some(7),
+    )
+    .await;
+    assert!(
+        labels[2].contains("2. Send a text message to +00 \u{2022}\u{2022}\u{2022}23"),
+        "{}",
+        labels[2]
+    );
+    assert!(
+        labels[2].contains("3. Call me at +00 \u{2022}\u{2022}\u{2022}45"),
+        "{}",
+        labels[2]
+    );
+    assert!(!labels[2].contains('\u{202e}') && !labels[2].contains('\u{1b}'));
+    // Apple's answer names no devices, so none are named.
+    assert!(labels[2].contains(DEVICES));
+}
+
+#[tokio::test]
+async fn going_back_from_the_code_switches_route_without_new_credentials() {
+    let labels = route_case(
+        sms_only_options(),
+        &[Ok("1"), Ok("b"), Ok("2"), Ok("123456")],
+        Ok(()),
+        Some(7),
+    )
+    .await;
+    assert!(
+        labels[3].contains("type b to choose another way"),
+        "{}",
+        labels[3]
+    );
+    assert!(
+        labels[4].starts_with("Where should Apple send"),
+        "{}",
+        labels[4]
+    );
+}
+
+#[tokio::test]
+async fn code_sends_are_bounded_and_the_last_code_prompt_offers_no_way_back() {
+    let labels = route_case(
+        json!({"trustedDeviceCount": 1, "trustedPhoneNumbers": []}),
+        &[
+            Ok("1"),
+            Ok("b"),
+            Ok("1"),
+            Ok("b"),
+            Ok("1"),
+            Ok("b"),
+            Ok("1"),
+            Ok("123456"),
+        ],
+        Ok(()),
+        None,
+    )
+    .await;
+    let last = &labels[labels.len() - 1];
+    assert!(last.starts_with("Apple verification code"), "{last}");
+    assert!(!last.contains("type b"), "{last}");
 }
 
 #[tokio::test]
@@ -475,4 +562,40 @@ async fn different_account_is_rejected_before_network() {
         authenticate(&mut client, &mut prompt).await,
         Err("account_mismatch_use_new_state_directory")
     );
+}
+
+/// Choosing Apple devices again after going back asks Apple for a fresh device code.
+#[tokio::test]
+async fn choosing_devices_again_requests_a_fresh_device_code() {
+    async fn device_pushes(answers: &[&str]) -> usize {
+        let server = MockServer::start().await;
+        mock_auth(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = Client::with(
+            dir.path(),
+            Endpoints::at(&server.uri()),
+            Store::file(dir.path()).unwrap().without_passwords(),
+        )
+        .unwrap();
+        let mut inputs = ["fixture@example.invalid", "SYNTHETIC-PASSWORD"]
+            .iter()
+            .chain(answers.iter());
+        let result = authenticate(&mut client, &mut |_| {
+            Ok(Zeroizing::new(inputs.next().unwrap().to_string()))
+        })
+        .await;
+        assert_eq!(result, Ok(()));
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.method == "PUT" && r.url.path().ends_with("/verify/trusteddevice/securitycode")
+            })
+            .count()
+    }
+    let once = device_pushes(&["1", "123456"]).await;
+    let twice = device_pushes(&["1", "b", "1", "123456"]).await;
+    assert_eq!(twice, once + 1, "a second push for the second choice");
 }

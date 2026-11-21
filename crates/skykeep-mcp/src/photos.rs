@@ -10,9 +10,10 @@
 //! laid over what Apple returned.
 use crate::account::{binding, Binding};
 use crate::contacts::{encoded_len, gate, owner, read_capped, record_timeout_of};
-use quince_auth::{Client, Endpoints, Store};
+use quince_auth::{Client, Endpoints};
 use quince_core::photos::{Album, Kind, Photo, Source, View};
 use quince_core::Library;
+use quince_icloud::cloudkit;
 use quince_icloud::photos::{self as apple, PhotosFetch, Readiness};
 use quince_sync::{library_lock::LibraryLock, pass};
 use serde::Deserialize;
@@ -265,6 +266,7 @@ fn view(p: &Photo, cuts: Cuts) -> Value {
         "caption",
         &mut shortened,
     );
+    let file_type = cut(p.uti.as_deref(), cuts.text, "file_type", &mut shortened);
     let mut keyword_cut = p.keywords.len() > cuts.keywords;
     let keywords: Vec<String> = p
         .keywords
@@ -295,7 +297,7 @@ fn view(p: &Photo, cuts: Cuts) -> Value {
         "keywords_total": p.keywords.len(),
         "favorite": p.favorite,
         "rating": p.rating,
-        "file_type": p.uti,
+        "file_type": file_type,
         "size_bytes": p.size,
         "live_photo_video_bytes": p.live_size,
         "shortened": shortened,
@@ -308,14 +310,14 @@ fn item(p: &Photo) -> Value {
     if p.id.len() > MAX_ID_BYTES {
         return json!({"id":null,"unsupported":"id_too_long","id_bytes":p.id.len()});
     }
-    let mut shown = Value::Null;
     for cuts in LIST_LEVELS {
-        shown = view(p, cuts);
+        let shown = view(p, cuts);
         if encoded_len(&shown) <= MAX_ITEM_BYTES {
-            break;
+            return shown;
         }
     }
-    shown
+    // Every text is bounded, so this is not reached; it keeps a page from stalling if it were.
+    json!({"id":p.id,"unsupported":"item_too_large","shortened":["all"]})
 }
 
 fn shortened(item: &Value) -> bool {
@@ -425,20 +427,70 @@ fn photo_page(
     )
 }
 
-/// Albums as listed, each with how many photos it shows.
-type Counted = Vec<(Album, i64)>;
+/// Reads an album from a row of `id, name, position, folder, parent`. A closure, so the row's
+/// type is inferred: this crate does not name the engine's SQLite crate.
+macro_rules! album_row {
+    () => {
+        |r| {
+            Ok(Album {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                position: r.get(2)?,
+                change_tag: None,
+                folder: r.get::<_, i64>(3)? != 0,
+                parent: r.get(4)?,
+            })
+        }
+    };
+}
 
-/// The albums as listed, at most `MAX_ALBUMS`, with whether there were more.
-fn album_index(library: &Library) -> Result<(Counted, bool), &'static str> {
-    let mut all: Vec<(Album, i64)> = library
-        .albums_counted()
+/// The albums as listed, at most `MAX_ALBUMS`, with whether there were more. The cap is in the
+/// query, with one row more to tell whether more exist, so a larger table is never read whole.
+/// Counts are left to [`album_count`], for the albums a page shows.
+fn album_index(library: &Library) -> Result<(Vec<Album>, bool), &'static str> {
+    let sql = format!(
+        "SELECT id, name, position, folder, parent FROM photo_albums
+         ORDER BY position, name LIMIT {}",
+        MAX_ALBUMS + 1
+    );
+    let mut stmt = library
+        .conn()
+        .prepare(&sql)
+        .map_err(|_| "library_unavailable")?;
+    let mut all: Vec<Album> = stmt
+        .query_map([], album_row!())
         .map_err(|_| "library_unavailable")?
-        .into_iter()
-        .map(|(a, n, _)| (a, n))
-        .collect();
+        .collect::<Result<_, _>>()
+        .map_err(|_| "library_unavailable")?;
     let capped = all.len() > MAX_ALBUMS;
     all.truncate(MAX_ALBUMS);
     Ok((all, capped))
+}
+
+/// One album, by id.
+fn album_by_id(library: &Library, id: &str) -> Result<Option<Album>, &'static str> {
+    let mut stmt = library
+        .conn()
+        .prepare("SELECT id, name, position, folder, parent FROM photo_albums WHERE id = ?1")
+        .map_err(|_| "library_unavailable")?;
+    let mut rows = stmt
+        .query_map([id], album_row!())
+        .map_err(|_| "library_unavailable")?;
+    rows.next().transpose().map_err(|_| "library_unavailable")
+}
+
+/// How many photos an album shows in `photos_list`: the personal library's, neither hidden nor
+/// deleted.
+fn album_count(library: &Library, id: &str) -> Result<i64, &'static str> {
+    library
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM photo_album_items i JOIN photos p ON p.id = i.asset
+             WHERE i.album = ?1 AND p.deleted = 0 AND p.hidden = 0 AND p.zone IS NULL",
+            [id],
+            |r| r.get(0),
+        )
+        .map_err(|_| "library_unavailable")
 }
 
 fn album_item(album: &Album, count: i64) -> Value {
@@ -477,7 +529,15 @@ pub(crate) fn albums(library: &Library, args: Value) -> Result<Value, &'static s
         all.len(),
         args.offset,
         limit,
-        |at| Ok(Some(album_item(&all[at].0, all[at].1))),
+        |at| {
+            let album = &all[at];
+            let count = if album.id.len() > MAX_ID_BYTES {
+                0
+            } else {
+                album_count(library, &album.id)?
+            };
+            Ok(Some(album_item(album, count)))
+        },
         |items, _, _, _| {
             json!({
                 "source": "local_cache",
@@ -487,7 +547,7 @@ pub(crate) fn albums(library: &Library, args: Value) -> Result<Value, &'static s
                 "album_index_cap": MAX_ALBUMS,
                 "unsupported_items": items.iter().filter(|i| i["id"].is_null()).count(),
                 "items_shortened": items.iter().filter(|i| shortened(i)).count(),
-                "photo_count": "photos the album shows; hidden and deleted ones are not counted",
+                "photo_count": "photos photos_list shows for the album: the personal library's, without hidden or deleted ones",
                 "complete_representation": false,
                 "cache": cache,
                 "remote_verified": false,
@@ -505,12 +565,7 @@ pub(crate) fn list(library: &Library, args: Value) -> Result<Value, &'static str
             json!({"order":"newest taken first, then by id"}),
         ),
         Some(id) => {
-            let album = library
-                .albums()
-                .map_err(|_| "library_unavailable")?
-                .into_iter()
-                .find(|a| a.id == id)
-                .ok_or("album_not_found")?;
+            let album = album_by_id(library, &id)?.ok_or("album_not_found")?;
             if album.folder {
                 return Err("album_is_folder");
             }
@@ -659,7 +714,7 @@ impl Stop {
     fn error(self) -> quince_icloud::Error {
         match self {
             Stop::Reauth => quince_icloud::Error::ReauthRequired,
-            Stop::Busy => quince_icloud::Error::Busy,
+            Stop::Busy => quince_icloud::Error::Busy(None),
             Stop::Locked => quince_icloud::Error::NeedsDeviceApproval,
             other => quince_icloud::Error::Protocol(other.code().into()),
         }
@@ -687,24 +742,49 @@ fn query(client: &Client) -> Vec<(String, String)> {
 /// refusal's body is read only to recognise Advanced Data Protection's words.
 async fn post(
     client: &Client,
-    url: &str,
+    root: &str,
+    operation: &str,
     body: &Value,
     cap: usize,
     budget: &mut usize,
 ) -> Result<Value, Stop> {
+    // Apple asked for the container to be left alone (`cloudkit::container_busy`): nothing
+    // is sent until then, by this refresh or the engine's own clients.
+    if cloudkit::container_held_off(root, apple::CONTAINER).is_some() {
+        return Err(Stop::Busy);
+    }
     let response = client
         .http()
-        .post(url)
+        .post(url(root, operation))
         .query(&query(client))
         .json(body)
         .send()
         .await
         .map_err(|_| Stop::Failed)?;
     let status = response.status().as_u16();
-    let bytes = read_capped!(response, cap, budget)?;
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(ToString::to_string);
+    let busy = matches!(status, 429 | 503);
+    let bytes = match read_capped!(response, cap, budget) {
+        Ok(bytes) => bytes,
+        // A busy answer whose body is too large or cut off still holds for its header's wait.
+        Err(stop) => {
+            if busy {
+                cloudkit::container_busy(root, apple::CONTAINER, "", retry_after.as_deref());
+            }
+            return Err(stop);
+        }
+    };
     if !(200..300).contains(&status) {
-        if quince_icloud::locked_by_data_protection(&String::from_utf8_lossy(&bytes)) {
+        let text = String::from_utf8_lossy(&bytes);
+        if quince_icloud::locked_by_data_protection(&text) {
             return Err(Stop::Locked);
+        }
+        if busy {
+            cloudkit::container_busy(root, apple::CONTAINER, &text, retry_after.as_deref());
         }
         return Err(match status {
             401 | 421 | 450 => Stop::Reauth,
@@ -720,7 +800,7 @@ async fn post(
 }
 
 /// A zone-level refusal inside a 200 answer, as the engine reads one (`cloudkit::trouble_with`).
-fn zone_trouble(result: &Value) -> Option<Stop> {
+fn zone_trouble(root: &str, result: &Value) -> Option<Stop> {
     let code = result.get("serverErrorCode").and_then(Value::as_str);
     let reason = result.get("reason").and_then(Value::as_str);
     match code {
@@ -735,7 +815,10 @@ fn zone_trouble(result: &Value) -> Option<Stop> {
         {
             Some(Stop::StaleToken)
         }
-        Some("THROTTLED" | "TRY_AGAIN_LATER" | "ZONE_BUSY") => Some(Stop::Busy),
+        Some("THROTTLED" | "TRY_AGAIN_LATER" | "ZONE_BUSY") => {
+            cloudkit::container_busy(root, apple::CONTAINER, &result.to_string(), None);
+            Some(Stop::Busy)
+        }
         Some("AUTHENTICATION_FAILED" | "AUTHENTICATION_REQUIRED") => Some(Stop::Reauth),
         _ => Some(Stop::Failed),
     }
@@ -751,7 +834,8 @@ async fn library_zone(
 ) -> Result<String, Stop> {
     let list = post(
         client,
-        &url(root, "zones/list"),
+        root,
+        "zones/list",
         &json!({}),
         limits.max_small_bytes,
         budget,
@@ -767,7 +851,9 @@ async fn library_zone(
             continue;
         };
         if zone.get("serverErrorCode").is_some() {
-            if name.starts_with(apple::DEFAULT_ZONE) && zone_trouble(zone) == Some(Stop::Locked) {
+            if name.starts_with(apple::DEFAULT_ZONE)
+                && zone_trouble(root, zone) == Some(Stop::Locked)
+            {
                 return Err(Stop::Locked);
             }
             continue;
@@ -794,13 +880,14 @@ async fn ready(
 ) -> Result<(), Stop> {
     let answer = post(
         client,
-        &url(root, "records/query"),
+        root,
+        "records/query",
         &json!({"query":{"recordType":"CheckIndexingState"},"zoneID":zone_id(zone)}),
         limits.max_small_bytes,
         budget,
     )
     .await?;
-    if let Some(stop) = zone_trouble(&answer) {
+    if let Some(stop) = zone_trouble(root, &answer) {
         return Err(stop);
     }
     let records = answer
@@ -872,7 +959,8 @@ async fn feed_page(
     }
     let mut answer = post(
         client,
-        &url(root, "changes/zone"),
+        root,
+        "changes/zone",
         &json!({"zones":[zone_body]}),
         limits.max_response_bytes,
         budget,
@@ -883,7 +971,7 @@ async fn feed_page(
         .and_then(Value::as_array_mut)
         .and_then(|zones| zones.first_mut())
         .ok_or(Stop::Failed)?;
-    if let Some(stop) = zone_trouble(result) {
+    if let Some(stop) = zone_trouble(root, result) {
         return Err(stop);
     }
     let records = match result.get_mut("records").map(Value::take) {
@@ -1027,7 +1115,7 @@ async fn fetch(
 /// Caller holds the private directory's exclusive operation lock.
 pub(crate) async fn refresh(dir: &Path, approved: bool) -> Result<Value, &'static str> {
     gate(dir, approved)?;
-    let store = Store::isolated_keyring(dir).map_err(|_| "secure_storage_unavailable")?;
+    let store = crate::storage::open_store(dir)?;
     let session = store
         .try_load()
         .map_err(|_| "login_required_unlock_secure_storage")?;

@@ -13,7 +13,7 @@
 //! reported in UTC, in its own zone and in the zone the caller asked about.
 use crate::account::{binding, Binding};
 use crate::contacts::{cut, encoded_len, gate, owner, read_capped, record_timeout_of};
-use quince_auth::{Client, Endpoints, Store};
+use quince_auth::{Client, Endpoints};
 use quince_core::calendar::{floats, instant_of, wall_clock, Calendar, Event};
 use quince_core::Library;
 use quince_icloud::calendar::{is_occurrence, parse_snapshot, series_of, Snapshot};
@@ -994,7 +994,7 @@ impl Stop {
     fn error(self) -> quince_icloud::Error {
         match self {
             Stop::Reauth => quince_icloud::Error::ReauthRequired,
-            Stop::Busy => quince_icloud::Error::Busy,
+            Stop::Busy => quince_icloud::Error::Busy(None),
             other => quince_icloud::Error::Protocol(other.code().into()),
         }
     }
@@ -1161,7 +1161,7 @@ pub(crate) async fn refresh(
 ) -> Result<Value, &'static str> {
     let window = refresh_window(&args)?;
     gate(dir, approved)?;
-    let store = Store::isolated_keyring(dir).map_err(|_| "secure_storage_unavailable")?;
+    let store = crate::storage::open_store(dir)?;
     let session = store
         .try_load()
         .map_err(|_| "login_required_unlock_secure_storage")?;

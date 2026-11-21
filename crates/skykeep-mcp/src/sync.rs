@@ -1,5 +1,5 @@
 //! Only Notes and Reminders run here. Reuse upstream passes and queue/crash semantics.
-use quince_auth::{Client, Endpoints, Store};
+use quince_auth::{Client, Endpoints};
 use quince_core::Library;
 use quince_sync::{library_lock::LibraryLock, pass, queue};
 use serde_json::{json, Value};
@@ -274,7 +274,7 @@ fn refresh_gate(dir: &Path, approved: bool) -> Result<bool, &'static str> {
 pub(crate) async fn run_authorized(dir: &Path, approved: bool) -> Result<Value, &'static str> {
     let before = refused_ids(dir)?;
     refresh_gate(dir, approved)?;
-    let store = Store::isolated_keyring(dir).map_err(|_| "secure_storage_unavailable")?;
+    let store = crate::storage::open_store(dir)?;
     let session = store
         .try_load()
         .map_err(|_| "login_required_unlock_secure_storage")?;

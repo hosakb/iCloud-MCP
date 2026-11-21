@@ -3,7 +3,7 @@
 //! sends queued changes. The engine crates own the parsing and the cache; the refresh's
 //! requests are made here so every response is read under a byte limit.
 use crate::account::{binding, Binding};
-use quince_auth::{Client, Endpoints, Store};
+use quince_auth::{Client, Endpoints};
 use quince_core::contacts::{Card, ContactMethod, PostalAddress};
 use quince_core::Library;
 use quince_icloud::contacts::{self as apple, Tokens};
@@ -506,7 +506,7 @@ impl Stop {
     fn error(self) -> quince_icloud::Error {
         match self {
             Stop::Reauth => quince_icloud::Error::ReauthRequired,
-            Stop::Busy => quince_icloud::Error::Busy,
+            Stop::Busy => quince_icloud::Error::Busy(None),
             other => quince_icloud::Error::Protocol(other.code().into()),
         }
     }
@@ -607,7 +607,7 @@ async fn changed(
 }
 
 /// Bytes one card takes as JSON, counted without building the text.
-fn card_bytes(card: &Value) -> usize {
+pub(crate) fn card_bytes(card: &Value) -> usize {
     struct Count(usize);
     impl std::io::Write for Count {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -746,7 +746,7 @@ async fn fetch(
 /// Caller holds the private directory's exclusive operation lock.
 pub(crate) async fn refresh(dir: &Path, approved: bool) -> Result<Value, &'static str> {
     gate(dir, approved)?;
-    let store = Store::isolated_keyring(dir).map_err(|_| "secure_storage_unavailable")?;
+    let store = crate::storage::open_store(dir)?;
     let session = store
         .try_load()
         .map_err(|_| "login_required_unlock_secure_storage")?;

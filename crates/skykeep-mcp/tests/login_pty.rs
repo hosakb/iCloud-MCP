@@ -46,7 +46,7 @@ async fn terminal_login_transcript_never_shows_synthetic_secrets() {
         for answer in [
             "fixture@example.invalid",
             "SYNTHETIC-PASSWORD-SENTINEL",
-            "0",
+            "1",
             "424242",
         ] {
             // Answer only once a whole prompt is shown; TCSAFLUSH discards early typing.

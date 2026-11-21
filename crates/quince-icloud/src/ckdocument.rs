@@ -416,7 +416,8 @@ fn utf16_change(old: &str, new: &str) -> (u64, u64, u64) {
 ///
 /// Compared character by character, so no edit splits a surrogate pair; a stretch too large
 /// to compare cheaply is one edit, as before.
-fn utf16_hunks(old: &str, new: &str) -> Vec<(u64, u64, u64)> {
+#[must_use]
+pub fn utf16_hunks(old: &str, new: &str) -> Vec<(u64, u64, u64)> {
     let a: Vec<char> = old.chars().collect();
     let b: Vec<char> = new.chars().collect();
     let pre = a.iter().zip(&b).take_while(|(x, y)| x == y).count();

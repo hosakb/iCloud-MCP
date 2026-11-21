@@ -29,6 +29,7 @@ mod sealed;
 pub mod session;
 pub mod srp;
 pub mod state;
+pub mod vault;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 pub use keep::Kept;
@@ -186,6 +187,45 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+impl Error {
+    /// Apple has said no to this account itself, met while a lapsed session signs back in with
+    /// the kept password: only the person, at the sign-in screen, can bring the session back.
+    ///
+    /// Everything else says nothing about whether the session is over. Apple's `/signin/init`
+    /// sometimes answers `400` with service error -900007 and the message "unknown", then
+    /// takes the same sign-in a moment later (steilerDev/icloud-photos-sync#1237); read as a
+    /// sign-out, one such answer ended the session for good. Every variant is named here, so a
+    /// new one is decided on rather than ending sessions by default.
+    #[must_use]
+    pub fn ends_session(&self) -> bool {
+        match self {
+            // The password was changed elsewhere, the account is locked, or Apple wants
+            // something finished on it first, or a code; or the account signs in a way
+            // Skykeep doesn't speak, which no later pass changes and the sign-in screen says:
+            // none of these passes by waiting.
+            Error::BadCredentials
+            | Error::AccountLocked
+            | Error::RepairNeeded
+            | Error::CodeAgain
+            | Error::UnsupportedAccount(_) => true,
+            // Not reaching Apple, Apple busy or asking to wait, an answer not understood, or
+            // this computer failing (its keyring, its disk): tried again later.
+            Error::Network(_)
+            | Error::Unavailable(_)
+            | Error::RateLimited
+            | Error::CoolingDown { .. }
+            | Error::Protocol(_)
+            | Error::NoTrustToken
+            | Error::ReauthRequired
+            | Error::Moved
+            | Error::BadCode
+            | Error::Keyring(_)
+            | Error::Io(_)
+            | Error::Json(_) => false,
+        }
+    }
+}
+
 /// What a keyring that would not answer means to the person in front of it.
 #[cfg(windows)]
 pub const KEYRING_WORDS: &str = "Windows Credential Manager didn’t answer. Try again in a moment.";
@@ -259,6 +299,35 @@ fn apple_error(context: &str, status: StatusCode, body: &str) -> Error {
         .collect::<String>()
         .replace('\n', " ");
     Error::Protocol(format!("{context}: HTTP {status} {snippet}"))
+}
+
+/// Apple's map of the account's services, with what it has just said taken in key by key.
+///
+/// Apple sometimes answers `/validate` and `accountLogin` with `"webservices": {}`, or with
+/// only some of them, for accounts with a beta-OS device (icloudpd#1390, #1361, #1387). Taken
+/// as it came, the empty map was saved over the good one and every service after it found no
+/// address, with the session itself fine. So a service Apple names is taken, new or changed,
+/// and one it leaves out keeps the address it had.
+fn merge_services(known: Option<Value>, answer: &Value) -> Value {
+    match (known, answer.as_object()) {
+        (Some(Value::Object(mut known)), Some(answer)) => {
+            for (name, service) in answer {
+                known.insert(name.clone(), service.clone());
+            }
+            Value::Object(known)
+        }
+        // Not a map at all: nothing in it to take over what is known.
+        (Some(known @ Value::Object(_)), None) => known,
+        // Nothing known yet: the first answer is what there is.
+        _ => answer.clone(),
+    }
+}
+
+/// An answer that carries the services map, empty or not a map: Apple not answering properly.
+/// One without the key says nothing about them.
+fn answered_without_services(data: &Value) -> bool {
+    data.get("webservices")
+        .is_some_and(|ws| ws.as_object().is_none_or(serde_json::Map::is_empty))
 }
 
 /// Apple turning the password down (a 401, or a 403 before the password was even tried) —
@@ -903,7 +972,14 @@ impl Client {
     /// would not answer at the start is not asked to replace it either.
     fn keep(&mut self) {
         self.keyring_error = None;
-        // Never an empty jar written over cookies the keyring could not open at the start.
+        self.save();
+    }
+
+    /// Writes the session as it stands. Every path calls this, not only the one after Apple
+    /// accepted the session: a pass refused for the network, a cool-down, a move to regional
+    /// servers. It never writes an empty jar over cookies the keyring could not open at the
+    /// start, and a failed write is reported through [`Self::unsaved`] instead of dropped.
+    fn save(&mut self) {
         self.read_cookies_again();
         match self.persist() {
             Ok(()) => self.unsaved = None,
@@ -1020,12 +1096,11 @@ impl Client {
     pub async fn reopen(&mut self) -> Result<Reopen> {
         let resumed = match self.resume().await {
             Ok(resumed) => resumed,
-            Err(
-                Error::Network(_)
-                | Error::Unavailable(_)
-                | Error::RateLimited
-                | Error::CoolingDown { .. },
-            ) if self.has_stored_session() => true,
+            // A keyring that would not answer is said as that: it is what holds the session.
+            Err(e @ Error::Keyring(_)) => return Err(e),
+            // Anything that is not Apple ending the session (offline, Apple busy, an answer
+            // not understood) opens what was kept; the next pass signs back in.
+            Err(e) if !e.ends_session() && self.has_stored_session() => true,
             Err(e) => return Err(e),
         };
         Ok(if resumed {
@@ -1074,6 +1149,15 @@ impl Client {
             Ok(data) => {
                 self.absorb(&data);
                 self.keep();
+                // Apple has answered `/validate` 200 with `"webservices": {}` for some accounts
+                // with a beta-OS device, now and then and then not (icloudpd#1390): Apple not
+                // answering properly, not the session changing. The services known stay (see
+                // `merge_services`) and the pass is left to the next look, as away.
+                if answered_without_services(&data) {
+                    return Err(Error::Protocol(
+                        "Apple answered without the account's services".into(),
+                    ));
+                }
                 return Ok(true);
             }
             Err(e) => e,
@@ -1119,20 +1203,6 @@ impl Client {
             // "Allow sign-in?" and a code on their phone while they were nowhere near Skykeep.
             match self.sign_in_as(&apple_id, &password, Code::Wait).await {
                 Ok(SignInOutcome::Complete) => return Ok(true),
-                // Lost the network part way, or Apple busy, down or asking to wait: not a
-                // refusal. What was kept is put back as it was and the next try is left to
-                // later — read as signed out, an outage told the person "Apple signed you
-                // out" and dropped the session token.
-                Err(
-                    e @ (Error::Network(_)
-                    | Error::Unavailable(_)
-                    | Error::RateLimited
-                    | Error::CoolingDown { .. }),
-                ) => {
-                    self.session = before;
-                    let _ = self.persist();
-                    return Err(e);
-                }
                 Ok(SignInOutcome::NeedsTwoFactor) => {
                     self.sign.wants_code(true);
                     return Ok(false);
@@ -1142,7 +1212,18 @@ impl Client {
                     self.session.password = None;
                     self.keep();
                 }
-                Err(_) => {}
+                // The account locked, or a step Apple wants finished on it: the session ends.
+                Err(e) if e.ends_session() => {}
+                // Lost the network part way, Apple busy, down or asking to wait, or an answer
+                // not understood (signin/init's sporadic 400 with -900007, see
+                // `Error::ends_session`). None is a refusal. The kept session is put back as it
+                // was, and the next try waits behind the sign-in's own cooldown. Read as a
+                // sign-out, one odd answer dropped the session token for good.
+                Err(e) => {
+                    self.session = before;
+                    self.save();
+                    return Err(e);
+                }
             }
         }
 
@@ -1267,7 +1348,7 @@ impl Client {
             consecutive_failures: self.session.consecutive_failures,
             retry_after: self.session.retry_after,
         });
-        let _ = self.persist();
+        self.save();
         outcome
     }
 
@@ -1951,7 +2032,7 @@ impl Client {
         }
         open_regional(regional);
         self.session.domain = regional.then(|| REGIONAL_DOMAIN.to_string());
-        let _ = self.persist();
+        self.save();
         Ok(())
     }
 
@@ -1996,7 +2077,7 @@ impl Client {
             };
         }
         if let Some(ws) = data.get("webservices") {
-            self.session.webservices = Some(ws.clone());
+            self.session.webservices = Some(merge_services(self.session.webservices.take(), ws));
         }
         if let Some(d) = data.pointer("/dsInfo/dsid").and_then(|v| v.as_str()) {
             self.session.dsid = Some(d.to_string());
@@ -2872,6 +2953,22 @@ mod sealed_jar_tests {
             "no plaintext left behind"
         );
         nothing_but(dir.path(), &["cookie-key"]);
+    }
+
+    /// Every write of the session, not only `keep`'s, says when the keyring would not take it.
+    #[test]
+    fn a_session_that_could_not_be_written_is_said_on_every_path() {
+        let dir = tempfile::tempdir().unwrap();
+        no_keyring(dir.path());
+        let mut c = holding_a_cookie(dir.path());
+        assert!(c.unsaved().is_none());
+        c.save();
+        assert!(c.unsaved().is_some(), "said: kept in memory only");
+        assert!(
+            !cookies_file(dir.path()).exists(),
+            "and never written in the clear"
+        );
+        assert!(has_the_cookie(&c));
     }
 
     /// No keyring: the cookies are not written at all — never in the clear — and saying so is

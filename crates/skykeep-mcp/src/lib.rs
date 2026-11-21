@@ -2,10 +2,16 @@
 pub mod account;
 pub mod calendar;
 pub mod contacts;
+pub mod drive;
+pub mod keyhold;
 pub mod login;
 pub mod photos;
+mod preserve;
 pub mod scheduler;
+pub mod setup;
 pub mod state;
+pub mod status;
+pub mod storage;
 pub mod sync;
 pub mod terminal;
 use quince_core::Library;
@@ -276,6 +282,10 @@ fn needs_consent(mode: &str, name: &str) -> Result<bool, &'static str> {
         "photos_albums" | "photos_list" | "photos_search" | "photos_get" | "photos_refresh" => {
             Ok(mode == "reads_and_writes")
         }
+        // Drive metadata and its refresh are reads too.
+        "drive_list" | "drive_get" | "drive_search" | "drive_refresh" => {
+            Ok(mode == "reads_and_writes")
+        }
         _ => Err("unknown_tool"),
     }
 }
@@ -467,6 +477,7 @@ impl Server {
         contacts::validate(name, &params["arguments"])?;
         calendar::validate(name, &params["arguments"])?;
         photos::validate(name, &params["arguments"])?;
+        drive::validate(name, &params["arguments"])?;
         if !needs_consent(&p.mode, name)? {
             return Ok(None);
         }
@@ -512,6 +523,7 @@ impl Server {
                 Some(calendar::refresh_scope(&request["params"]["arguments"]))
             }
             Some("photos_refresh") => Some(photos::refresh_scope()),
+            Some("drive_refresh") => Some(drive::refresh_scope()),
             _ => None,
         };
         let params = json!({"operation":request["params"],"existing_item":binding.snapshot,"read_preview_only":binding.preview_read,"refresh_scope":refresh});
@@ -549,6 +561,17 @@ impl Server {
     /// Human CLI only. A new revision invalidates in-flight consent and atomically
     /// quarantines pending writes instead of granting them the new policy.
     pub fn set_policy(&mut self, mode: &str) -> Result<Value, &'static str> {
+        self.set_policy_if(mode, None)
+    }
+
+    /// [`Self::set_policy`], refused with `pending_changed` unless the waiting writes are
+    /// exactly `expected` (their ids, oldest first) under the same lock that sets them aside:
+    /// a person who agreed to set aside N changes never sets aside more.
+    pub fn set_policy_if(
+        &mut self,
+        mode: &str,
+        expected: Option<&[i64]>,
+    ) -> Result<Value, &'static str> {
         if !["reads_and_writes", "writes_only", "yolo"].contains(&mode) {
             return Err("invalid_policy_mode");
         }
@@ -561,6 +584,9 @@ impl Server {
         let pending = library
             .outbox_all_pending()
             .map_err(|_| "policy_unavailable")?;
+        if expected.is_some_and(|ids| !pending.iter().map(|p| p.id).eq(ids.iter().copied())) {
+            return Err("pending_changed");
+        }
         library
             .atomically(|library| -> quince_core::Result<()> {
                 for p in &pending {
@@ -960,6 +986,20 @@ impl Server {
                 }
                 photos::refresh(&dir, grant.is_some()).await
             }
+            "drive_list" => drive::list(library, args),
+            "drive_get" => drive::get(library, args),
+            "drive_search" => drive::search(library, args),
+            "drive_refresh" => {
+                drive::validate(name, &args)?;
+                if library
+                    .state(ACCOUNT_KEY)
+                    .map_err(|_| "library_unavailable")?
+                    .is_none()
+                {
+                    return Err("login_required");
+                }
+                drive::refresh(&dir, grant.is_some(), args).await
+            }
             "sync_status" => {
                 let _: Empty = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
                 let health = library.sync_health().map_err(|_| "library_unavailable")?;
@@ -992,8 +1032,16 @@ impl Server {
                     .state(ACCOUNT_KEY)
                     .map_err(|_| "library_unavailable")?
                     .is_some();
+                // Every follow-up names this folder, so it can be typed as shown.
+                let here = status::with_dir("skykeep-mcp setup", &self.dir);
+                if let Some(closed) = storage::protected_problem(&self.dir) {
+                    let text = status::with_dir(storage::tool_text(&closed), &self.dir);
+                    return Ok(
+                        json!({"status":if closed == storage::Closed::Locked {"locked"} else {"storage_problem"},"instructions":format!("{text}. Open your own trusted terminal, outside agent/tool capture, and type any passphrase there. Never send passwords, codes or passphrases to MCP or chat."),"session_checked":false}),
+                    );
+                }
                 Ok(
-                    json!({"status":if bound {"session_unverified"} else {"login_required"},"instructions":"Run skykeep-mcp login --state-dir PRIVATE_DIRECTORY in your own trusted terminal, outside agent/tool capture. Never send passwords or codes to MCP or chat.","session_checked":false}),
+                    json!({"status":if bound {"session_unverified"} else {"login_required"},"instructions":format!("Run {here} in your own trusted terminal, outside agent/tool capture. Never send passwords or codes to MCP or chat."),"session_checked":false}),
                 )
             }
             "reminders_get" => {
@@ -1005,9 +1053,12 @@ impl Server {
                 let detail = library
                     .reminder_detail(&args.guid)
                     .map_err(|_| "library_unavailable")?;
-                Ok(
-                    json!({"source":"local_cache","item":item,"detail":detail,"complete_representation":false}),
-                )
+                let mut reply = preserve::reminder_report(library, &item)?;
+                reply["source"] = json!("local_cache");
+                reply["item"] = json!(item);
+                reply["detail"] = json!(detail);
+                reply["complete_representation"] = json!(false);
+                Ok(reply)
             }
             "reminders_lists" => {
                 let args: Page = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -1043,9 +1094,12 @@ impl Server {
                     .map(serde_json::from_str)
                     .transpose()
                     .map_err(|_| "invalid_cached_runs")?;
-                Ok(
-                    json!({"source":"local_cache","item":item,"runs":runs,"complete_representation":false}),
-                )
+                let mut reply = preserve::note_report(library, &item, item.runs.as_deref())?;
+                reply["source"] = json!("local_cache");
+                reply["item"] = json!(item);
+                reply["runs"] = json!(runs);
+                reply["complete_representation"] = json!(false);
+                Ok(reply)
             }
             "reminders_search" => {
                 let args: Search = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -1438,6 +1492,16 @@ fn enqueue_note(library: &mut Library, args: NoteWrite) -> Result<Value, &'stati
                 .map_err(|_| "library_unavailable")?
                 .map(|raw| serde_json::from_str(&raw).map_err(|_| "invalid_cached_runs"))
                 .transpose()?;
+            preserve::check_note_save(&base, base_runs.as_deref(), &body, runs.as_deref())?;
+            if let Some(sent_from) = preserve::send_base(library, &guid)? {
+                preserve::keeps_attachment_marks(&sent_from, &body)?;
+            }
+            let kept_attachments = body.chars().filter(|&c| c == '\u{FFFC}').count();
+            let formatting = if runs.is_some() {
+                "restyled_from_runs"
+            } else {
+                "kept_from_apple"
+            };
             quince_sync::notes::record_note_save(
                 library,
                 &guid,
@@ -1447,7 +1511,9 @@ fn enqueue_note(library: &mut Library, args: NoteWrite) -> Result<Value, &'stati
                 base_runs,
             )
             .map_err(|_| "write_refused")?;
-            Ok(json!({"guid":guid,"status":"queued","remote_verified":false}))
+            Ok(
+                json!({"guid":guid,"status":"queued","remote_verified":false,"kept_attachments":kept_attachments,"formatting":formatting}),
+            )
         }
         NoteWrite::Delete { guid, base_etag } => {
             let note = library
@@ -1475,6 +1541,26 @@ fn enqueue_note(library: &mut Library, args: NoteWrite) -> Result<Value, &'stati
     }
 }
 
+/// `Option<Option<T>>` kept whole through JSON: absent is `None`, null is `Some(None)`.
+mod present {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S: Serializer, T: Serialize>(
+        v: &Option<Option<T>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(inner) => inner.serialize(s),
+            None => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+        d: D,
+    ) -> Result<Option<Option<T>>, D::Error> {
+        Option::<T>::deserialize(d).map(Some)
+    }
+}
+
 #[derive(Deserialize, serde::Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum ReminderWrite {
@@ -1488,6 +1574,9 @@ enum ReminderWrite {
     Edit {
         guid: String,
         patch: Value,
+        /// Absent: not checked. Present: must be the cached change tag, `null` for none.
+        #[serde(default, skip_serializing_if = "Option::is_none", with = "present")]
+        base_etag: Option<Option<String>>,
     },
     Create {
         list_guid: String,
@@ -1717,30 +1806,37 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
             .map_err(|_| "write_refused")?;
             Ok(json!({"guid":guid,"status":"queued","remote_verified":false}))
         }
-        ReminderWrite::Edit { guid, patch } => {
+        ReminderWrite::Edit {
+            guid,
+            patch,
+            base_etag,
+        } => {
             let reminder = library
                 .reminder(&guid)
                 .map_err(|_| "library_unavailable")?
                 .ok_or("not_found")?;
+            if base_etag.as_ref().is_some_and(|tag| *tag != reminder.etag) {
+                return Err("conflict");
+            }
             let mut fields = patch.as_object().cloned().ok_or("invalid_patch")?;
             if fields.is_empty()
-                || fields.keys().any(|k| {
-                    ![
-                        "title",
-                        "notes",
-                        "due_at",
-                        "all_day",
-                        "flagged",
-                        "completed",
-                        "priority",
-                        "list_guid",
-                        "parent_guid",
-                    ]
-                    .contains(&k.as_str())
-                })
+                || fields
+                    .keys()
+                    .any(|k| !preserve::REMINDER_FIELDS.contains(&k.as_str()))
             {
                 return Err("invalid_patch");
             }
+            preserve::check_reminder_edit(&reminder, &fields)?;
+            let changed: Vec<&str> = preserve::REMINDER_FIELDS
+                .into_iter()
+                .filter(|f| fields.contains_key(*f))
+                .collect();
+            let alarms = preserve::reminder_alarm_effect(&fields);
+            let conflict_check = if base_etag.is_some() {
+                "base_etag"
+            } else {
+                "none"
+            };
             fields.insert("from_list".into(), json!(reminder.list_guid));
             let e: quince_sync::reminders::Edit =
                 serde_json::from_value(Value::Object(fields)).map_err(|_| "invalid_patch")?;
@@ -1758,7 +1854,9 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
             };
             quince_sync::reminders::record_reminder_edit(library, &reminder, &edit)
                 .map_err(|_| "write_refused")?;
-            Ok(json!({"guid":guid,"status":"queued","remote_verified":false}))
+            Ok(
+                json!({"guid":guid,"status":"queued","remote_verified":false,"changed_fields":changed,"conflict_check":conflict_check,"alarms":alarms}),
+            )
         }
         ReminderWrite::Create {
             list_guid,
@@ -1813,8 +1911,9 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
     }
 }
 
-const SERVER_TITLE: &str = "Skykeep: Apple iCloud Notes, Reminders, Contacts, Calendar & Photos";
-const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, and reads the user's Apple iCloud Contacts, Apple iCloud Calendar and Apple iCloud Photos metadata (read-only). Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, and Photos only through photos_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode and are queued until sync sends them. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
+const SERVER_TITLE: &str =
+    "Skykeep: Apple iCloud Notes, Reminders, Contacts, Calendar, Photos & iCloud Drive";
+const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, and reads the user's Apple iCloud Contacts, Apple iCloud Calendar and Apple iCloud Photos metadata (read-only), and Apple iCloud Drive folder listings and file details (read-only; no file contents). Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode and are queued until sync sends them. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
 
 fn tools() -> Vec<Value> {
     // (name, description, parent property, parent required)
@@ -1866,7 +1965,7 @@ fn tools() -> Vec<Value> {
         tools.push(json!({"name":name,"description":format!("Search the user's {kind} in the local cache index."),"inputSchema":{"type":"object","properties":{"query":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}},"required":["query"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     }
     tools.push(json!({"name":"notes_write","description":"Queue a change to the user's Apple iCloud Notes (create, save, move, pin, delete). Follows the approval mode. Queued is not remote-verified.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","save","move","pin","delete"]},"body":{"type":"string"},"pinned":{"type":"boolean"},"runs":{"type":["array","null"],"items":{"type":"object"}},"folder_guid":{"type":["string","null"]},"guid":{"type":"string"},"base_etag":{"type":["string","null"]}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
-    tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). A create can also repeat daily and alert at or before its due time. Deletions need local terminal approval. Queued is not CloudKit-accepted; sync reports accepted writes. No field-level remote verification.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."},"repeat":{"type":"object","description":"Create only. Repeats daily from due_at, until the end of the given day or for ever. Needs due_at.","properties":{"frequency":{"enum":["daily"]},"until":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"YYYY-MM-DD, the last day it repeats, read in timezone."}},"required":["frequency"],"additionalProperties":false},"due_time_alert":{"type":"boolean","description":"Create only. Alert at due_at. Needs a timed (not all-day) due_at."},"early_alert":{"type":"object","description":"Create only. Alert this long before due_at. Needs a timed due_at and an early alert already set on one of the user's reminders from an Apple device.","properties":{"amount":{"type":"integer","minimum":1,"maximum":10000},"unit":{"enum":["minutes","hours","days","weeks","months"]}},"required":["amount","unit"],"additionalProperties":false},"timezone":{"type":"string","maxLength":64,"description":"Create only. IANA zone the timed due_at and its alerts are kept in, such as Europe/Berlin. Default: this computer's zone."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
+    tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). A create can also repeat daily and alert at or before its due time. Deletions need local terminal approval. Queued is not CloudKit-accepted; sync reports accepted writes. No field-level remote verification.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."},"base_etag":{"type":["string","null"],"description":"Edit only: the etag from reminders_get. A newer cached copy returns conflict."},"repeat":{"type":"object","description":"Create only. Repeats daily from due_at, until the end of the given day or for ever. Needs due_at.","properties":{"frequency":{"enum":["daily"]},"until":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"YYYY-MM-DD, the last day it repeats, read in timezone."}},"required":["frequency"],"additionalProperties":false},"due_time_alert":{"type":"boolean","description":"Create only. Alert at due_at. Needs a timed (not all-day) due_at."},"early_alert":{"type":"object","description":"Create only. Alert this long before due_at. Needs a timed due_at and an early alert already set on one of the user's reminders from an Apple device.","properties":{"amount":{"type":"integer","minimum":1,"maximum":10000},"unit":{"enum":["minutes","hours","days","weeks","months"]}},"required":["amount","unit"],"additionalProperties":false},"timezone":{"type":"string","maxLength":64,"description":"Create only. IANA zone the timed due_at and its alerts are kept in, such as Europe/Berlin. Default: this computer's zone."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
     tools.push(json!({"name":"reminders_get","description":"Read one cached Apple Reminders item and its supported details. Not a complete archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools.push(json!({"name":"notes_get","description":"Read one cached Apple iCloud Notes note. Not a complete preservation archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools.push(json!({"name":"sync","description":"Refresh Apple iCloud Notes and Apple Reminders and send approved queued changes. Queued/sent is not field-level remote verification. Never opens a login prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
@@ -1908,6 +2007,18 @@ fn tools() -> Vec<Value> {
     tools.push(json!({"name":"photos_search","description":"Search the user's cached Apple iCloud Photos (personal library) by title, filename, caption, keyword or the year or month taken. Read-only.","inputSchema":{"type":"object","properties":search,"required":["query"],"additionalProperties":false},"annotations":read}));
     tools.push(json!({"name":"photos_get","description":"Read one cached Apple iCloud Photos item's details, with a longer caption. Not the picture itself: no image, video, thumbnail, place or faces.","inputSchema":{"type":"object","properties":{"id":id},"required":["id"],"additionalProperties":false},"annotations":read}));
     tools.push(json!({"name":"photos_refresh","description":"Read the user's Apple iCloud Photos metadata (personal library) from Apple into the local cache, a bounded batch at a time; a large library takes several calls. Never downloads pictures, never changes photos or albums at Apple and sends no queued changes. Never opens a login prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}));
+    let page = json!({"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":drive::MAX_LIMIT,"default":25}});
+    let cloud_path = json!({"type":"string","minLength":1,"maxLength":drive::MAX_PATH_BYTES,"description":format!("Cloud path in Apple iCloud Drive, such as /Documents/Taxes. / is the top. Names are matched as Apple lists them; ., .., empty names and control characters are refused. At most {} names.", drive::MAX_DEPTH)});
+    let id = json!({"type":"string","minLength":1,"maxLength":drive::MAX_ID_BYTES,"description":"Item id from drive_list, drive_get or drive_search. At most 512 UTF-8 bytes."});
+    let mut folder = page.clone();
+    folder["path"] = cloud_path.clone();
+    folder["id"] = id.clone();
+    tools.push(json!({"name":"drive_list","description":"List one Apple iCloud Drive folder from the local cache: names, kinds, sizes and dates, folders first. Give path or id; the top folder by default. Says whether drive_refresh has read the folder. No file contents. Read-only.","inputSchema":{"type":"object","properties":folder,"additionalProperties":false},"annotations":read}));
+    tools.push(json!({"name":"drive_get","description":"Read one cached Apple iCloud Drive item's details by path or id: name, kind, size, dates, parent and cloud path. No file contents. Read-only.","inputSchema":{"type":"object","properties":{"path":cloud_path.clone(),"id":id.clone()},"additionalProperties":false},"annotations":read}));
+    let mut search = page.clone();
+    search["query"] = json!({"type":"string","minLength":1,"maxLength":drive::MAX_QUERY_BYTES,"description":"Words matched against item names, ignoring case and accents. At most 256 UTF-8 bytes."});
+    tools.push(json!({"name":"drive_search","description":"Search the names of cached Apple iCloud Drive items in folders drive_refresh has read. At most 1000 matches, most recently changed first. Read-only.","inputSchema":{"type":"object","properties":search,"required":["query"],"additionalProperties":false},"annotations":read}));
+    tools.push(json!({"name":"drive_refresh","description":"Read one Apple iCloud Drive folder's item list from Apple into the local cache, with each folder on its path. Give path or a cached folder id; the top folder by default. Reads names, kinds, sizes and dates only: never file contents, and never uploads, renames, moves or deletes. Sends no queued changes. Never opens a login prompt.","inputSchema":{"type":"object","properties":{"path":cloud_path,"id":id},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}));
     tools.push(json!({"name":"auth_status","description":"Apple iCloud sign-in status and setup instructions. Never accepts secrets or opens a prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools
 }
