@@ -428,6 +428,13 @@ mod secret_service {
 
     static SERVICE: Mutex<Option<SecretService>> = Mutex::new(None);
 
+    /// Seconds to wait for an answer to a keyring unlock prompt. Without a limit the Secret
+    /// Service crate waits a year, so a prompt that never appeared, or sat unseen at login,
+    /// blocked the first session read with nothing on screen. Past this limit the keyring
+    /// reads as not answering and is asked again on the next sync. `skykeep-mcp` never opens
+    /// the prompt at all (see [`super::may_unlock`]).
+    const PROMPT_SECONDS: u64 = 60;
+
     /// `f` over the one connection, opened if it is not yet; when a call fails, once more over
     /// a new one, for a daemon that restarted since.
     fn with<T>(
@@ -439,13 +446,17 @@ mod secret_service {
         if let Some(ss) = held.as_ref() {
             match f(ss) {
                 Ok(v) => return Ok(v),
-                // A refusal the daemon meant (a locked keyring the person dismissed) is said as
-                // it is; anything else may be a connection gone stale.
-                Err(e @ dbus_secret_service::Error::Locked) => return Err(e.to_string()),
+                // A refusal the daemon meant (a locked keyring, a prompt dismissed or left
+                // unanswered) is returned as it is. Anything else may be a stale connection.
+                // Retrying an unanswered prompt would wait on it twice.
+                Err(
+                    e @ (dbus_secret_service::Error::Locked | dbus_secret_service::Error::Prompt),
+                ) => return Err(e.to_string()),
                 Err(_) => *held = None,
             }
         }
-        let ss = SecretService::connect(EncryptionType::Dh).map_err(|e| e.to_string())?;
+        let ss = SecretService::connect_with_max_prompt_timeout(EncryptionType::Dh, PROMPT_SECONDS)
+            .map_err(|e| e.to_string())?;
         let out = f(&ss).map_err(|e| e.to_string());
         *held = Some(ss);
         out
