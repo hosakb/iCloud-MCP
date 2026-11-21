@@ -1,6 +1,12 @@
 # skykeep-mcp
 
-A local MCP server for Apple Notes and Reminders, built on the Skykeep engine. It speaks newline-delimited JSON-RPC over stdio, keeps its own private library directory and has no network listener. No other iCloud service is synced or contacted.
+A local MCP server for Apple Notes, Reminders, Contacts, Calendar, Photos and iCloud Drive, built on the Skykeep engine. It speaks newline-delimited JSON-RPC over stdio, keeps its own private library directory and has no network listener. Notes and Reminders can be changed; Contacts, Calendar, Photos and Drive are read-only, and Photos and Drive expose metadata only (no pictures, no file contents). Mail is not implemented.
+
+## Architecture
+
+![Skykeep MCP: Hermes talks to the MCP server over stdio, which syncs with Apple iCloud. Live today: Notes and Reminders (read and write), Contacts, Calendar, Photos and Drive (read-only). Planned with no route built yet: Mail, and repeating reminders with alerts](docs/architecture.webp)
+
+Edit `docs/architecture.html` and re-export `docs/architecture.webp` whenever a route moves from planned to live.
 
 ## Build
 
@@ -57,6 +63,16 @@ Configure your MCP client to start that command. Stdout carries protocol message
 | `notes_write` | Queues `create`, `save`, `move`, `pin` or `delete`. Edits to an existing note need the `base_etag` you read, and are refused for locked or read-only notes. |
 | `reminders_lists`, `reminders_list`, `reminders_search`, `reminders_get` | Read the local cache. |
 | `reminders_write` | Queues `create`, `edit`, `tick` (complete or reopen) or `delete`. An `edit` changes only the fields in `patch`; moving a reminder is an edit of `list_guid`. |
+| `contacts_list`, `contacts_search`, `contacts_get` | Read the local Contacts cache. Read-only. |
+| `contacts_refresh` | Reads Contacts from Apple into the local cache, replacing it. Never writes to Apple and never opens a sign-in prompt. |
+| `calendar_calendars`, `calendar_events`, `calendar_search`, `calendar_get` | Read the local Calendar cache. Read-only. |
+| `calendar_refresh` | Reads Calendar from Apple into the local cache over a bounded window, replacing it. Never writes to Apple, never answers invitations and never opens a sign-in prompt. |
+| `photos_albums`, `photos_list`, `photos_search`, `photos_get` | Read the cached metadata of your personal Photos library: dates, kind, size, filename, title, caption, keywords. No pictures, places or faces. Read-only. |
+| `photos_refresh` | Reads Photos metadata from Apple into the local cache, a bounded batch per call, so a large library takes several calls. Never downloads pictures and never changes photos or albums. |
+| `drive_list`, `drive_get`, `drive_search` | List a cached iCloud Drive folder, read one item's details, or search names. Paths look like `/Documents/Taxes`. Metadata only: no file contents, no downloads, no local paths. Read-only. |
+| `drive_refresh` | Reads one Drive folder's item list (and those on its path) from Apple into the local cache. Never changes anything in Drive. |
+
+Contacts, Calendar, Photos and Drive start empty: call their `*_refresh` tool once to fill the cache, and again whenever you want newer data. Their refresh is not part of `sync`.
 
 Reads come from the local cache and say so (`"source": "local_cache"`). A successful write means the change is queued in the library's durable outbox; `remote_verified` is always `false`, because the server does not read each field back from iCloud after sending.
 
