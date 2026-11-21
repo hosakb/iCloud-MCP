@@ -29,6 +29,8 @@ enum Keyring {
     Ready,
     Locked,
     Missing,
+    /// Entries answer, but the lock state can't be read.
+    Unknown,
 }
 
 #[derive(Default)]
@@ -59,7 +61,7 @@ impl FakeKeyring {
     }
     fn check(&self) -> Result<(), String> {
         match self.mode() {
-            Keyring::Ready => Ok(()),
+            Keyring::Ready | Keyring::Unknown => Ok(()),
             Keyring::Locked => Err("Secret Service: object locked".into()),
             Keyring::Missing => Err("no Secret Service on the session bus".into()),
         }
@@ -91,7 +93,9 @@ impl PlatformSecrets for FakeKeyring {
         match self.mode() {
             Keyring::Ready => Ok(false),
             Keyring::Locked => Ok(true),
-            Keyring::Missing => Err("no Secret Service on the session bus".into()),
+            Keyring::Missing | Keyring::Unknown => {
+                Err("no Secret Service on the session bus".into())
+            }
         }
     }
 }
@@ -673,6 +677,14 @@ async fn without_a_keyring_the_protected_file_survives_a_restart_after_unlock() 
     );
     assert_eq!(holder().timeouts.lock().unwrap()[&name], Some(7200));
     assert!(script.screen.contains("Unlocked for 2 hours"));
+    // A plain unlock afterwards removes that time limit without asking anything.
+    let mut script = Script::new(vec![]);
+    assert_eq!(
+        setup::unlock(&mut script, storage::env(), &dir, None),
+        Ok(())
+    );
+    assert!(script.screen.contains("Already unlocked"));
+    assert_eq!(holder().timeouts.lock().unwrap()[&name], None);
 
     // Three wrong tries stop, with the same one answer each time.
     holder().forget(&name).unwrap();
@@ -1037,7 +1049,7 @@ async fn no_approval_mode_leaves_the_folder_without_a_policy_and_counts_as_done(
     let mut answers = folder_answers(&dir);
     answers.push(Ask(""));
     answers.extend(sign_in_answers());
-    answers.push(Ask("4"));
+    answers.extend([Ask("4"), Ask("no"), Ask("4"), Ask("confirm")]);
     let script = ready(answers, &dir, &server).await;
     assert!(script.screen.contains("  4. No approval mode, for MCP clients that can't show approval forms (such as Hermes today)."));
     assert!(script
@@ -1169,7 +1181,7 @@ async fn no_approval_mode_tells_the_truth_about_an_earlier_require_approval() {
         .unwrap();
     let mut answers = vec![Ask(""), Ask("")];
     answers.extend(sign_in_answers());
-    answers.push(Ask("4"));
+    answers.extend([Ask("4"), Ask("no"), Ask("4"), Ask("confirm")]);
     let script = ready(answers, &dir, &server).await;
     assert!(
         !script.screen.contains("Routine changes run without asking"),
@@ -1192,5 +1204,79 @@ async fn no_approval_mode_tells_the_truth_about_an_earlier_require_approval() {
             .as_deref(),
         Some("true"),
         "setup never loosens the older setting"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_lock_state_is_reported_as_unknown_and_a_found_entry_needs_no_lock_question() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    made(&dir);
+    set_keyring(&dir, Keyring::Unknown);
+    assert_eq!(
+        storage::keyring_state(storage::env(), &dir),
+        storage::KeyringState::Unknown
+    );
+    let report = skykeep_mcp::status::check(storage::env(), &dir).render();
+    assert!(report.contains("can't tell whether it is locked"), "{report}");
+    // Setup asks for nothing from Apple while the lock state is unknown.
+    let mut script = Script::new(vec![Ask(""), Ask("2")]);
+    assert_eq!(run(&mut script, &dir, &server).await, Ok(Outcome::Quit));
+    assert!(!script.screen.contains("Apple Account"), "{}", script.screen);
+    // An entry that reads back means the keyring answered: ready, no lock question needed.
+    let canonical = dir.canonicalize().unwrap();
+    {
+        let held = skykeep_mcp::state::PrivateState::open(&dir).unwrap();
+        let store = storage::open_store(&held.path).unwrap();
+        fakes().modes.insert(canonical.clone(), Keyring::Ready);
+        store
+            .save(&quince_auth::session::Session {
+                session_token: Some("SYNTHETIC-TOKEN".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        fakes().modes.insert(canonical.clone(), Keyring::Unknown);
+    }
+    assert_eq!(
+        storage::keyring_state(storage::env(), &dir),
+        storage::KeyringState::Ready
+    );
+}
+
+#[tokio::test]
+async fn the_home_folder_itself_is_refused_with_the_suggested_folder_named() {
+    let _one = serial().await;
+    let server = apple().await;
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+        return;
+    };
+    if !Path::new(&home).is_dir() {
+        return;
+    }
+    let (_parent, dir) = folder();
+    let home_typed = leak(PathBuf::from(&home).display().to_string());
+    let mut script = Script::new(vec![Ask("~"), Ask(home_typed), Cancel]);
+    assert!(run(&mut script, &dir, &server).await.is_err());
+    script.done();
+    assert_eq!(
+        script.screen.matches("not your home folder").count(),
+        2,
+        "{}",
+        script.screen
+    );
+    assert!(script.screen.contains("~/.local/share/skykeep-mcp"));
+    assert!(!script.screen.contains("chmod 700"));
+}
+
+#[tokio::test]
+async fn unlock_names_a_missing_folder() {
+    let _one = serial().await;
+    let (_parent, dir) = folder();
+    let mut script = Script::new(vec![]);
+    let refused = setup::unlock(&mut script, storage::env(), &dir, None).unwrap_err();
+    assert!(
+        refused.starts_with(&format!("No Skykeep folder at {}.", dir.display())),
+        "{refused}"
     );
 }

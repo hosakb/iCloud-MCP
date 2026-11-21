@@ -135,6 +135,13 @@ fn help_lists_every_command_and_exits_zero() {
         vec!["help"],
         vec!["setup", "--help"],
         vec!["unlock", "--help"],
+        vec!["status", "--help"],
+        vec!["login", "--help"],
+        vec!["logout", "--state-dir", "/nonexistent", "--help"],
+        vec!["approve", "--help"],
+        vec!["policy", "--help"],
+        vec!["quarantine", "--help"],
+        vec!["require-approval", "--help"],
     ] {
         let out = program().args(&args).output().unwrap();
         assert_eq!(out.status.code(), Some(0), "{args:?}");
@@ -148,6 +155,9 @@ fn help_lists_every_command_and_exits_zero() {
             "policy",
             "approve",
             "quarantine",
+            "require-approval",
+            "allow-routine",
+            "policy --state-dir FOLDER MODE",
         ] {
             assert!(
                 text.contains(&format!("skykeep-mcp {command}")),

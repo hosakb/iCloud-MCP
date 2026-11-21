@@ -147,7 +147,10 @@ where
             }
             sends += 1;
             match route {
-                CodeRoute::TrustedDevice => client.request_code().await,
+                // The first time, the push sign-in may already have made counts; coming back
+                // to the devices asks Apple for a fresh one.
+                CodeRoute::TrustedDevice if sends == 1 => client.request_code().await,
+                CodeRoute::TrustedDevice => client.resend_to_devices().await,
                 CodeRoute::Phone(id) => client.send_sms(id).await,
             }
             .map_err(auth_error)?;

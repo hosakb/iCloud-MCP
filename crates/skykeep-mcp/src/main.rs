@@ -13,7 +13,8 @@ async fn main() {
     }
     let mut all: Vec<_> = std::env::args_os().skip(1).collect();
     let first = all.first().and_then(|c| c.to_str()).map(str::to_string);
-    if matches!(first.as_deref(), Some("--help" | "-h" | "help")) {
+    // Help after any command, too: `login --help` must not try to sign in.
+    if matches!(first.as_deref(), Some("help")) || all.iter().any(|a| a == "--help" || a == "-h") {
         print!("{HELP}");
         return;
     }
@@ -42,8 +43,14 @@ Start here, in a terminal window you opened yourself:
 More commands (each needs --state-dir FOLDER):
   skykeep-mcp login       sign in to Apple again
   skykeep-mcp logout      sign out and forget the saved sign-in
-  skykeep-mcp policy MODE set the approval mode: reads_and_writes, writes_only or yolo
+  skykeep-mcp policy --state-dir FOLDER MODE
+                          set the approval mode: reads_and_writes, writes_only or yolo
   skykeep-mcp approve     approve one queued deletion by its request ID
+  skykeep-mcp require-approval
+                          folders without an approval mode: every change waits for approve
+  skykeep-mcp allow-routine
+                          folders without an approval mode: routine changes run again,
+                          deletions still wait for approve
   skykeep-mcp quarantine  list and retire writes that were set aside
   skykeep-mcp --state-dir FOLDER
                           run the MCP server on stdin and stdout (your MCP client starts this)

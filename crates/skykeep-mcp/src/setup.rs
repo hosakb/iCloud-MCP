@@ -68,6 +68,7 @@ pub enum Outcome {
 }
 
 const NO_SECURE_STORAGE: &str = "Setup can't find a safe place on this computer to keep your sign-in. If you are inside Docker or a similar container, run Skykeep directly on the computer. On a desktop, log in to the desktop session first, then run skykeep-mcp setup again.";
+const UNKNOWN_KEYRING: &str = "Setup can't tell whether your system keyring is unlocked. Log in to your desktop session, then run skykeep-mcp setup again.";
 const LOCKED_KEYRING: &str = "Your system keyring is locked. Unlock it (log in to your desktop session), then run skykeep-mcp setup again.";
 
 /// `~/.local/share/skykeep-mcp`.
@@ -205,6 +206,13 @@ fn step_folder(console: &mut dyn Console, suggested: &Path) -> Result<PathBuf, &
                 }
             }
         };
+        let home = std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .and_then(|h| PathBuf::from(h).canonicalize().ok());
+        if home.is_some_and(|h| path.canonicalize().is_ok_and(|p| p == h)) {
+            console.say("Skykeep needs a folder of its own, not your home folder. Press Enter for the suggested folder, or type for example ~/.local/share/skykeep-mcp.")?;
+            continue;
+        }
         if !path.exists() {
             let create = console.ask(&format!("Create {}? [Y/n] ", path.display()))?;
             if matches!(create.trim().to_ascii_lowercase().as_str(), "n" | "no") {
@@ -470,6 +478,7 @@ fn step_storage(console: &mut dyn Console, env: &Env, dir: &Path) -> Result<bool
                     Ok(true)
                 }
                 KeyringState::Locked => Err(LOCKED_KEYRING),
+                KeyringState::Unknown => Err(UNKNOWN_KEYRING),
                 KeyringState::Missing => {
                     if !holder {
                         return Err(NO_SECURE_STORAGE);
@@ -535,6 +544,7 @@ fn step_storage(console: &mut dyn Console, env: &Env, dir: &Path) -> Result<bool
                 match storage::keyring_state(env, dir) {
                     KeyringState::Ready => {}
                     KeyringState::Locked => return Err(LOCKED_KEYRING),
+                    KeyringState::Unknown => return Err(UNKNOWN_KEYRING),
                     KeyringState::Missing => return Err(NO_SECURE_STORAGE),
                 }
                 console.say("This computer blocks the kernel key storage the protected file needs, but your system keyring works.")?;
@@ -579,8 +589,12 @@ fn step_storage(console: &mut dyn Console, env: &Env, dir: &Path) -> Result<bool
                     }
                 }
                 (KeyringState::Ready, false) => Kind::SystemKeyring,
-                (KeyringState::Locked, true) => {
-                    console.say("Your system keyring is locked, so setup can't keep the sign-in there right now.")?;
+                (KeyringState::Locked | KeyringState::Unknown, true) => {
+                    console.say(if keyring == KeyringState::Locked {
+                        "Your system keyring is locked, so setup can't keep the sign-in there right now."
+                    } else {
+                        "Setup can't tell whether your system keyring is locked, so it won't keep the sign-in there right now."
+                    })?;
                     if choose(
                         console,
                         "  1. Use a protected file instead, opened with a passphrase you choose. After each restart you run skykeep-mcp unlock once.\n  2. Quit, so I can unlock the keyring first (log in to the desktop session) and run setup again\nChoose 1 or 2: ",
@@ -593,6 +607,7 @@ fn step_storage(console: &mut dyn Console, env: &Env, dir: &Path) -> Result<bool
                     Kind::ProtectedFile
                 }
                 (KeyringState::Locked, false) => return Err(LOCKED_KEYRING),
+                (KeyringState::Unknown, false) => return Err(UNKNOWN_KEYRING),
                 (KeyringState::Missing, true) => {
                     console.say("This computer has no system keyring setup can use, so the sign-in goes in a protected file. You choose its passphrase, and after each restart you run skykeep-mcp unlock once.")?;
                     Kind::ProtectedFile
@@ -689,6 +704,12 @@ pub fn unlock(
         inner: console,
         dir: Some(dir.to_path_buf()),
     };
+    if !dir.exists() {
+        return Err(c.scope(&format!(
+            "No Skykeep folder at {}. Run skykeep-mcp setup first.",
+            dir.display()
+        )));
+    }
     let result = unlock_in(&mut c, env, dir, hours);
     result.map_err(|text| c.scope(text))
 }
@@ -718,7 +739,9 @@ fn unlock_in(
     }
     match storage::protected_state(env, dir) {
         Ok(()) if hours.is_none() => {
-            console.say("Already unlocked.")?;
+            // A time limit from an earlier `unlock --hours` goes: plain unlock means until restart.
+            storage::keep_unlocked(env, dir).map_err(|c| c.sentence())?;
+            console.say("Already unlocked. It stays unlocked until this computer restarts.")?;
             return Ok(());
         }
         Ok(()) | Err(Closed::Locked) | Err(Closed::WrongOrDamaged) => {}
@@ -858,6 +881,13 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
             continue;
         }
         if n == 4 {
+            if console
+                .ask("Without an approval mode the assistant's routine changes run without asking you. Type confirm to use no approval mode: ")?
+                .trim()
+                != "confirm"
+            {
+                continue;
+            }
             break None;
         }
         break Some(MODES[n - 1].0);

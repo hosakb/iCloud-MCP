@@ -330,6 +330,22 @@ pub fn protected_state(env: &Env, dir: &Path) -> Result<(), Closed> {
     ProtectedFile::unlocked(dir, env.holder.as_ref()).map(|_| ())
 }
 
+/// Puts the key the holder already keeps for `dir` back with no time limit, so a plain
+/// `unlock` after `unlock --hours N` lasts until the next restart. Asks for nothing.
+pub fn keep_unlocked(env: &Env, dir: &Path) -> Result<(), Closed> {
+    let name = key_name(dir).map_err(|_| Closed::Failed)?;
+    let held = match env.holder.get(&name) {
+        Ok(Some(k)) => k,
+        Ok(None) => return Err(Closed::Locked),
+        Err(HoldError::Unavailable) => return Err(Closed::HolderUnavailable),
+        Err(HoldError::Failed) => return Err(Closed::Failed),
+    };
+    env.holder.put(&name, &held, None).map_err(|e| match e {
+        HoldError::Unavailable => Closed::HolderUnavailable,
+        HoldError::Failed => Closed::Failed,
+    })
+}
+
 /// Removes the protected file and forgets its key. No passphrase needed: nothing is read.
 /// Caller holds the folder's lock.
 pub fn remove_protected(env: &Env, dir: &Path) -> Result<(), &'static str> {
@@ -345,11 +361,13 @@ pub fn remove_protected(env: &Env, dir: &Path) -> Result<(), &'static str> {
 }
 
 /// What the system keyring answers for this folder.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyringState {
     Ready,
     Locked,
     Missing,
+    /// It answered, but would not say whether it is locked.
+    Unknown,
 }
 
 /// Asks the system keyring without an unlock dialog. Reads the session into memory and drops
@@ -362,11 +380,15 @@ pub fn keyring_state(env: &Env, dir: &Path) -> KeyringState {
         return KeyringState::Ready;
     }
     match store.try_load() {
+        // An entry read back: the keyring answered, unlocked.
+        Ok(session) if session.apple_id.is_some() || session.dsid.is_some() || session.is_resumable() => {
+            KeyringState::Ready
+        }
         // A missing entry reads as empty even in a locked collection: ask the lock itself.
         Ok(_) => match store.is_locked() {
             Ok(false) => KeyringState::Ready,
             Ok(true) => KeyringState::Locked,
-            Err(_) => KeyringState::Missing,
+            Err(_) => KeyringState::Unknown,
         },
         Err(quince_auth::Error::Keyring(message))
             if message.to_ascii_lowercase().contains("locked") =>

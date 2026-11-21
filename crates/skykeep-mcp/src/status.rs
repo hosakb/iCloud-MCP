@@ -325,6 +325,13 @@ fn storage_lines(env: &Env, dir: &Path, report: &mut Report) -> Option<quince_au
                     );
                     None
                 }
+                KeyringState::Unknown => {
+                    report.fix(
+                        "Sign-in storage: system keyring, which answers but can't tell whether it is locked.",
+                        "Log in to your desktop session, then run skykeep-mcp status again.",
+                    );
+                    None
+                }
                 KeyringState::Missing => {
                     report.fix(
                         "Sign-in storage: system keyring, not reachable.",

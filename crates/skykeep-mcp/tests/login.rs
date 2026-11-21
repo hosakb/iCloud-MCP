@@ -563,3 +563,39 @@ async fn different_account_is_rejected_before_network() {
         Err("account_mismatch_use_new_state_directory")
     );
 }
+
+/// Choosing Apple devices again after going back asks Apple for a fresh device code.
+#[tokio::test]
+async fn choosing_devices_again_requests_a_fresh_device_code() {
+    async fn device_pushes(answers: &[&str]) -> usize {
+        let server = MockServer::start().await;
+        mock_auth(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = Client::with(
+            dir.path(),
+            Endpoints::at(&server.uri()),
+            Store::file(dir.path()).unwrap().without_passwords(),
+        )
+        .unwrap();
+        let mut inputs = ["fixture@example.invalid", "SYNTHETIC-PASSWORD"]
+            .iter()
+            .chain(answers.iter());
+        let result = authenticate(&mut client, &mut |_| {
+            Ok(Zeroizing::new(inputs.next().unwrap().to_string()))
+        })
+        .await;
+        assert_eq!(result, Ok(()));
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| {
+                r.method == "PUT" && r.url.path().ends_with("/verify/trusteddevice/securitycode")
+            })
+            .count()
+    }
+    let once = device_pushes(&["1", "123456"]).await;
+    let twice = device_pushes(&["1", "b", "1", "123456"]).await;
+    assert_eq!(twice, once + 1, "a second push for the second choice");
+}
