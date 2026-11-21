@@ -1661,6 +1661,21 @@ async fn set_repeat_inner(
     Ok(())
 }
 
+/// The due date Apple holds for a reminder now, in seconds: `None` when it has none, or when
+/// Apple no longer has the reminder.
+pub async fn due_at_cloudkit(
+    http: &reqwest::Client,
+    ckdatabasews_root: &str,
+    params: Vec<(String, String)>,
+    reminder_guid: &str,
+) -> Result<Option<i64>> {
+    let client = ZoneClient::new(http, ckdatabasews_root, CONTAINER, params);
+    Ok(client
+        .lookup_record(ZONE, reminder_guid)
+        .await?
+        .and_then(|r| field::timestamp_seconds(&r, "DueDate")))
+}
+
 /// Remove a reminder.
 ///
 /// Apple marks removal with a Deleted flag rather than destroying the record, which is what

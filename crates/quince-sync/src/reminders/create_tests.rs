@@ -921,3 +921,100 @@ async fn the_note_of_steps_goes_when_the_change_leaves_the_queue() {
         "kept for a resend"
     );
 }
+
+/// The date write fails, and the person gives the reminder a date of their own on a phone
+/// before the retry. The retry keeps the date Apple holds and writes no date over it; the
+/// alert rings at that date.
+#[tokio::test]
+async fn a_date_set_on_a_phone_before_the_date_step_landed_is_kept() {
+    let (server, cloud) = cloud().await;
+    let mut l = library();
+    let guid = record_reminder_create(&mut l, &create()).unwrap();
+    let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+    let lock = LibraryLock::new(l, None);
+    cloud.fail_once("\"DueDate\"", Fault::Before);
+    assert!(send_one(&lock, &server.uri(), &p).await.is_err());
+    assert!(cloud.record(&guid).unwrap()["fields"]
+        .get("DueDate")
+        .is_none());
+    // 10:30 on 9 March in New York (EDT).
+    let phone = 1_773_066_600;
+    cloud.phone_moves_due(&guid, phone);
+    send_one(&lock, &server.uri(), &p).await.unwrap();
+    let reminder = cloud.record(&guid).unwrap();
+    assert_eq!(reminder["fields"]["DueDate"]["value"], phone * 1000);
+    let trigger = cloud.record("AlarmTrigger/TRIGGER-1").unwrap();
+    let raw = trigger["fields"]["DateComponentsData"]["value"]
+        .as_str()
+        .unwrap();
+    let parts: Value = serde_json::from_slice(&b64(raw)).unwrap();
+    assert_eq!((&parts["day"], &parts["hour"]), (&json!(9), &json!(10)));
+}
+
+/// The repeat is written and noted, the alarm fails, and the person takes the repeat away on
+/// a phone. The retry goes by the note and does not put the repeat back.
+#[tokio::test]
+async fn a_repeat_noted_as_written_and_removed_on_a_phone_stays_removed() {
+    let (server, cloud) = cloud().await;
+    let mut l = library();
+    let guid = record_reminder_create(&mut l, &create()).unwrap();
+    let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+    let lock = LibraryLock::new(l, None);
+    cloud.fail_once("\"Alarm\"", Fault::Before);
+    assert!(send_one(&lock, &server.uri(), &p).await.is_err());
+    assert_eq!(
+        lock.lock()
+            .await
+            .state(&create_progress_key(&guid))
+            .unwrap()
+            .as_deref(),
+        Some("2")
+    );
+    cloud.phone_sets(&guid, "RecurrenceRuleIDs", json!([]));
+    send_one(&lock, &server.uri(), &p).await.unwrap();
+    assert!(ids(&cloud.record(&guid).unwrap(), "RecurrenceRuleIDs").is_empty());
+}
+
+/// The alarm is linked and noted, the early alert fails, and the person takes the alarm away
+/// on a phone. The retry goes by the note and does not link it again.
+#[tokio::test]
+async fn an_alarm_noted_as_linked_and_removed_on_a_phone_stays_removed() {
+    let (server, cloud) = cloud().await;
+    let mut l = library();
+    let guid = record_reminder_create(&mut l, &create()).unwrap();
+    let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+    let lock = LibraryLock::new(l, None);
+    cloud.fail_once("DueDateDeltaAlertsData", Fault::Before);
+    assert!(send_one(&lock, &server.uri(), &p).await.is_err());
+    assert_eq!(
+        lock.lock()
+            .await
+            .state(&create_progress_key(&guid))
+            .unwrap()
+            .as_deref(),
+        Some("3")
+    );
+    cloud.phone_sets(&guid, "AlarmIDs", json!([]));
+    send_one(&lock, &server.uri(), &p).await.unwrap();
+    let reminder = cloud.record(&guid).unwrap();
+    assert!(ids(&reminder, "AlarmIDs").is_empty());
+    assert_eq!(early_alerts(&reminder).len(), 1);
+}
+
+/// After a full send the note says every step was taken, until the change leaves the queue.
+#[tokio::test]
+async fn a_full_send_notes_every_step_taken() {
+    let (server, _cloud) = cloud().await;
+    let mut l = library();
+    let guid = record_reminder_create(&mut l, &create()).unwrap();
+    let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+    let lock = LibraryLock::new(l, None);
+    send_one(&lock, &server.uri(), &p).await.unwrap();
+    assert_eq!(
+        lock.lock()
+            .await
+            .state(&create_progress_key(&guid))
+            .unwrap(),
+        Some(ALL_STEPS.to_string())
+    );
+}

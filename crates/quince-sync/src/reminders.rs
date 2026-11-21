@@ -616,14 +616,22 @@ async fn send_create_options(
         ..Default::default()
     };
     if done < 1 {
-        let edit = ReminderEdit {
-            due_at: c.due_at.map(Some),
-            all_day: c.all_day,
-            flagged: c.flagged,
-            timezone: Some(zone.clone()),
-            ..Default::default()
-        };
-        r::edit_cloudkit(http, root, params.clone(), &made, &edit).await?;
+        // A reminder just made here has no date at Apple. One there already was written by an
+        // earlier try whose answer was lost, or set on a phone since: either way it stays, with
+        // the flag and zone written beside it, and the steps after go by it.
+        if r::due_at_cloudkit(http, root, params.clone(), guid)
+            .await?
+            .is_none()
+        {
+            let edit = ReminderEdit {
+                due_at: c.due_at.map(Some),
+                all_day: c.all_day,
+                flagged: c.flagged,
+                timezone: Some(zone.clone()),
+                ..Default::default()
+            };
+            r::edit_cloudkit(http, root, params.clone(), &made, &edit).await?;
+        }
         took(1).await?;
     }
     // One narrow case is not covered: the rule is linked at Apple but saving the step 2 note
