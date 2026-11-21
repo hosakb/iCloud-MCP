@@ -16,33 +16,74 @@ cargo build --release -p skykeep-mcp
 
 The workspace's default member is this crate, so `cargo build` and `cargo test` without `-p` also build only the headless server. The desktop and mobile apps stay in the workspace and build with their own `-p` flags. Linux needs `pkg-config` and the D-Bus development headers for the Secret Service client.
 
-## Sign in
+## Get started
 
-Sign-in happens in a terminal you open yourself, never through the MCP client or an agent:
+After the build, the program is at `target/release/skykeep-mcp`. Copy it to `~/.local/bin` (or another folder your terminal finds programs in), or type its full path wherever this guide says `skykeep-mcp`.
+
+You need a terminal window that you open yourself. Don't run these commands through an AI assistant or chat: what you type there can end up in a transcript.
+
+1. Run the guided setup:
+
+   ```sh
+   skykeep-mcp setup
+   ```
+
+   It walks you through five steps and tells you what each one does:
+
+   1. **Folder.** Where Skykeep keeps its private data. Press Enter to use the suggested folder, `~/.local/share/skykeep-mcp`, or type another one. To use another folder later, add `--state-dir FOLDER` to every command.
+   2. **Where your sign-in is kept.** Your computer's password store when it has one, otherwise a protected file (see below).
+   3. **Apple sign-in.** Your Apple Account, your password and then a verification code. Nothing you type is shown on screen. You choose where Apple sends the code: your Apple devices, or a text message to one of your phone numbers if Apple lists any. You can go back and pick the other way without typing your password again.
+   4. **Approval mode.** How the assistant asks before it reads or changes your data. The recommended choice asks you before every read and every change.
+   5. **Check.** Setup checks everything it set up and prints one line to paste into your MCP client's settings.
+
+   You can run `setup` again at any time. It sees what is already done and asks whether to keep it, switch to another Apple Account, or quit. A folder belongs to one Apple Account, so switching sets up a new folder for the other account and leaves the first one as it is. If setup stopped part way, the next run continues with the first step that is not done.
+
+2. Check that everything is ready:
+
+   ```sh
+   skykeep-mcp status
+   ```
+
+   It only looks at this computer: it never contacts Apple and never asks for a password. Each problem comes with the next step to take. It ends with an error code when something needs fixing, so scripts can check it.
+
+3. Only if setup chose the protected file: after each restart of the computer, run this once before you use the assistant:
+
+   ```sh
+   skykeep-mcp unlock
+   ```
+
+### Where your sign-in is kept
+
+Skykeep never writes your sign-in to a plain file. There are two options:
+
+- **Your computer's password store** (the system keyring, such as GNOME Keyring or KWallet). Setup uses it when it is running and unlocked. Nothing more to do after a restart once you have logged in to your desktop.
+- **A protected file** in the Skykeep folder, for computers without a usable password store, such as a server you reach over SSH. You choose a passphrase of at least 12 characters, typed twice. The file is encrypted with it (AES-256-GCM, key derived with PBKDF2-HMAC-SHA256). After each restart, `skykeep-mcp unlock` asks for the passphrase once and gives the server the key through the Linux kernel's own key storage, so the server can read the file without a desktop. The key is never written to a file. Like the system keyring, it can be read by programs running as your user, and by nobody else. Until you unlock, the server's tools answer `locked: run skykeep-mcp unlock in a terminal`. To make the key expire earlier than the next restart, use `skykeep-mcp unlock --hours 8`.
+
+If neither is available, setup stops and says so instead of keeping the sign-in anywhere less safe. When the option you chose stops working (the keyring is gone, or the kernel key storage is blocked), setup offers the other one. Switching asks you to type `switch`, and removes the sign-in kept the old way; if the old keyring can't be reached at all, setup says that an older entry may stay there unused. A locked keyring is never switched away from: unlock it instead. If you forget the passphrase, run `setup` again and choose to start over with a new one; you then sign in to Apple again, and your cached data stays.
+
+Your Apple password is never stored. When Apple asks you to sign in again, run `setup` again.
+
+### Sign in and out by hand
+
+`setup` uses the same sign-in as these commands, which still work on their own:
 
 ```sh
 skykeep-mcp login --state-dir ~/.local/share/skykeep-mcp
-```
-
-The command asks for your Apple Account, password and verification code with echo turned off. It reads only from the controlling terminal, never from a pipe, an argument or an environment variable. It refuses to start when it sees markers that an agent runtime launched it (`HERMES_AGENT`, `AI_AGENT`, `HERMES_SESSION_ID`, `CODEX_SANDBOX`, `CLAUDECODE`), because an agent-owned terminal can copy what you type into a transcript. That check only catches runtimes that set those markers; an agent with shell access can unset them (see "Write approval" below).
-
-For the code you choose a route: `0` sends it to your trusted devices, or enter one of the listed phone IDs to get a text message. A wrong or expired code can be retried twice. Ctrl-C, Ctrl-D, Escape or three minutes without input cancel the login and nothing is saved.
-
-What is kept afterwards:
-
-- The session and trust tokens, in the desktop Secret Service keyring under the service name `skykeep-mcp`, one entry per state directory. They never go into a plain file, and the server never imports a session from the Skykeep desktop app.
-- The account password is never stored. When the trust token expires, run `login` again.
-- A one-way account tag in the library, so a directory can't be reused for another Apple Account. Use a new directory for a different account.
-
-The state directory must be owned by you, mode `0700`, and contain no symlinks or files readable by others. The server and the helper commands take an exclusive lock on it for each operation. If `login` meets a request in progress it stops with `state_busy_retry`; run it again. A running server picks up the new session on its next request, without a restart.
-
-To sign out:
-
-```sh
 skykeep-mcp logout --state-dir ~/.local/share/skykeep-mcp
 ```
 
-This erases the keyring entry and the cookie file, which is sealed with a key held in the same keyring. Cached notes and reminders stay in the directory until you delete it. If the keyring is locked, the sign-out is recorded and finished the next time the keyring answers; until then no session is loaded.
+`login` asks for your Apple Account, password and verification code with echo turned off. It reads only from the terminal you opened, never from a pipe, an argument or an environment variable. It refuses to start when it sees markers that an agent runtime launched it (`HERMES_AGENT`, `AI_AGENT`, `HERMES_SESSION_ID`, `CODEX_SANDBOX`, `CLAUDECODE`), because an agent-owned terminal can copy what you type into a transcript. That check only catches runtimes that set those markers; an agent with shell access can unset them (see "Write approval" below).
+
+For the code you pick a number from a short list: one sends the code to your Apple devices, and each phone number Apple lists (shown as Apple masks it) gets a text message or a call. At the code prompt, type `b` to go back and pick another way. A wrong or expired code can be retried twice. Ctrl-C, Ctrl-D, Escape or three minutes without input cancel the sign-in and nothing is saved.
+
+What is kept afterwards:
+
+- The session and trust tokens, in the storage chosen above. With the system keyring they are under the service name `skykeep-mcp`, one entry per folder. The server never imports a session from the Skykeep desktop app.
+- A one-way account tag in the library, so a folder can't be reused for another Apple Account. Use a new folder for a different account.
+
+The folder must be owned by you, mode `0700`, and contain no symlinks or files readable by others. The server and the helper commands take an exclusive lock on it for each operation. If a command meets a request in progress it stops with `state_busy_retry`; run it again. A running server picks up the new session on its next request, without a restart.
+
+`logout` erases the stored session and the cookie file, which is sealed with a key kept beside the session. Cached data stays in the folder until you delete it. If the system keyring is locked, the sign-out is recorded and finished the next time the keyring answers; until then no session is loaded. With the protected file, run `unlock` first.
 
 ## Run the server
 
@@ -50,13 +91,13 @@ This erases the keyring entry and the cookie file, which is sealed with a key he
 skykeep-mcp --state-dir ~/.local/share/skykeep-mcp
 ```
 
-Configure your MCP client to start that command. Stdout carries protocol messages only. JSON-RPC batches are not supported and get an `Invalid Request` error. Several clients can share one directory: operations take turns on the lock, and a server that starts while another holds it still answers `initialize`, then returns `state_busy_retry` from each tool call until the lock is free. The server never opens a keyring unlock dialog; if the keyring is locked or the session has expired, tools return `login_required` with instructions instead. While running it refreshes Notes and Reminders every five minutes; a failed pass waits for the next interval rather than retrying.
+Configure your MCP client to start that command. Stdout carries protocol messages only. JSON-RPC batches are not supported and get an `Invalid Request` error. Several clients can share one directory: operations take turns on the lock, and a server that starts while another holds it still answers `initialize`, then returns `state_busy_retry` from each tool call until the lock is free. Setup prints the exact line to paste. The server never opens a keyring unlock dialog or a sign-in prompt; if the keyring is locked or the session has expired, tools return `login_required` with instructions, and with a protected file that is not unlocked they return `locked: run skykeep-mcp unlock in a terminal`. While running it refreshes Notes and Reminders every five minutes; a failed pass waits for the next interval rather than retrying.
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `auth_status` | Whether the directory is bound to an account, and how to sign in. Takes no arguments and never accepts secrets. |
+| `auth_status` | Whether the folder is bound to an account, whether the protected file is locked, and how to sign in. Takes no arguments and never accepts secrets. |
 | `sync` | Refreshes Notes and Reminders, then sends queued changes. Nothing is sent when the refresh fails. |
 | `sync_status` | Last refresh per service, whether the last pass failed, and counts of pending and refused changes. No network access. |
 | `notes_list`, `notes_folders`, `notes_search`, `notes_get` | Read the local cache. `notes_get` returns the plain text and the native formatting runs. |
@@ -77,6 +118,8 @@ Contacts, Calendar, Photos and Drive start empty: call their `*_refresh` tool on
 Reads come from the local cache and say so (`"source": "local_cache"`). A successful write means the change is queued in the library's durable outbox; `remote_verified` is always `false`, because the server does not read each field back from iCloud after sending.
 
 ## Write approval
+
+`setup` sets the approval mode for you (see the `policy` modes under Limitations). The commands below are the older controls and still work.
 
 Deletions never run straight from MCP. A deletion here means `delete`, a `move` into Recently Deleted (that is how iCloud deletes a note), and a `save` that leaves the note body empty. Creating a note in Recently Deleted is refused. For any of these the tool returns `approval_required` with a request ID, and you approve in your own terminal:
 
@@ -214,4 +257,5 @@ MCP-only approvals cannot defend against that authority.
 - Notes with structures the engine can't round-trip are refused rather than flattened. Markdown export is not a lossless copy of a note.
 - A write that iCloud accepts is reported as sent, not as verified field by field. Partial reminder writes are a known inherited gap.
 - Attachments, folder and list management, and bulk operations are not exposed.
-- Only Linux with a Secret Service keyring is supported for session storage. Without one, sign-in fails instead of falling back to a file.
+- Only Linux is supported. The sign-in is kept in a Secret Service keyring or in the passphrase-protected file; with neither, setup and sign-in stop instead of keeping it in a plain file.
+- The protected file needs the Linux kernel key storage for `unlock`. Some containers block it (Docker's default security profile does); there `unlock` says so and the server stays locked.

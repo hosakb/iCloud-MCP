@@ -103,3 +103,57 @@ pub fn hidden(
     let _ = tty.write_all(b"\n");
     result
 }
+
+/// A line the person may see as they type: a menu choice or a folder, never a secret.
+/// Ctrl-D cancels and the caller's timeout ends the wait.
+pub fn visible(tty: &mut File, label: &str, timeout: Duration) -> Result<String, &'static str> {
+    let fd = tty.as_raw_fd();
+    let mut saved = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(fd, saved.as_mut_ptr()) } != 0 {
+        return Err("interactive_terminal_required");
+    }
+    let saved = unsafe { saved.assume_init() };
+    let mut mode = saved;
+    // Ordinary line editing with echo. Ctrl-C stops the program as anywhere else; the mode
+    // set here is the usual one, so nothing is left changed.
+    mode.c_lflag |= libc::ECHO | libc::ICANON | libc::ECHOE | libc::ISIG;
+    if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &mode) } != 0 {
+        return Err("terminal_unavailable");
+    }
+    let _restore = Restore(fd, saved);
+    tty.write_all(label.as_bytes())
+        .map_err(|_| "terminal_unavailable")?;
+    tty.flush().map_err(|_| "terminal_unavailable")?;
+    let deadline = Instant::now() + timeout;
+    let mut bytes = Vec::new();
+    loop {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return Err("input_timeout");
+        };
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready =
+            unsafe { libc::poll(&mut poll, 1, left.as_millis().min(i32::MAX as u128) as i32) };
+        if ready == 0 {
+            return Err("input_timeout");
+        }
+        if ready < 0 {
+            return Err("input_cancelled");
+        }
+        let mut byte = [0];
+        if tty.read(&mut byte).unwrap_or(0) != 1 {
+            return Err("input_cancelled");
+        }
+        match byte[0] {
+            b'\r' | b'\n' => {
+                return String::from_utf8(bytes).map_err(|_| "invalid_input");
+            }
+            3 | 4 | 27 => return Err("input_cancelled"),
+            b if bytes.len() < 4096 => bytes.push(b),
+            _ => return Err("invalid_input"),
+        }
+    }
+}

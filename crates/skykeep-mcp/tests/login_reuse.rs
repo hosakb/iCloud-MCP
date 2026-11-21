@@ -59,7 +59,7 @@ async fn apple(server: &MockServer) {
 fn typist(mut master: File) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
         let mut transcript = Vec::new();
-        for answer in [SECRETS[0], SECRETS[1], "0", SECRETS[2]] {
+        for answer in [SECRETS[0], SECRETS[1], "1", SECRETS[2]] {
             loop {
                 let mut buf = [0; 512];
                 let n = master.read(&mut buf).unwrap();
@@ -164,7 +164,7 @@ async fn binding_refuses_a_directory_owned_by_another_account() {
         Store::file(dir.path()).unwrap().without_passwords(),
     )
     .unwrap();
-    let mut answers = [SECRETS[0], SECRETS[1], "0", SECRETS[2]].into_iter();
+    let mut answers = [SECRETS[0], SECRETS[1], "1", SECRETS[2]].into_iter();
     skykeep_mcp::login::authenticate(&mut client, &mut |_| {
         Ok(zeroize::Zeroizing::new(answers.next().unwrap().to_string()))
     })

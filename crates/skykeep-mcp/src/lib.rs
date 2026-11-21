@@ -3,10 +3,14 @@ pub mod account;
 pub mod calendar;
 pub mod contacts;
 pub mod drive;
+pub mod keyhold;
 pub mod login;
 pub mod photos;
 pub mod scheduler;
+pub mod setup;
 pub mod state;
+pub mod status;
+pub mod storage;
 pub mod sync;
 pub mod terminal;
 use quince_core::Library;
@@ -1013,8 +1017,13 @@ impl Server {
                     .state(ACCOUNT_KEY)
                     .map_err(|_| "library_unavailable")?
                     .is_some();
+                if storage::locked(&self.dir) {
+                    return Ok(
+                        json!({"status":"locked","instructions":format!("{}. Open your own trusted terminal, outside agent/tool capture, and type the passphrase there. Never send passwords, codes or passphrases to MCP or chat.", storage::LOCKED),"session_checked":false}),
+                    );
+                }
                 Ok(
-                    json!({"status":if bound {"session_unverified"} else {"login_required"},"instructions":"Run skykeep-mcp login --state-dir PRIVATE_DIRECTORY in your own trusted terminal, outside agent/tool capture. Never send passwords or codes to MCP or chat.","session_checked":false}),
+                    json!({"status":if bound {"session_unverified"} else {"login_required"},"instructions":"Run skykeep-mcp setup in your own trusted terminal, outside agent/tool capture. Never send passwords or codes to MCP or chat.","session_checked":false}),
                 )
             }
             "reminders_get" => {

@@ -16,7 +16,7 @@
 use crate::account::{binding, Binding};
 use crate::calendar::utc_text;
 use crate::contacts::{cut, encoded_len, gate, owner, read_capped, record_timeout_of};
-use quince_auth::{Client, Endpoints, Store};
+use quince_auth::{Client, Endpoints};
 use quince_core::drive::{DriveItem, ROOT};
 use quince_core::Library;
 use quince_icloud::drive::TRASH;
@@ -1060,7 +1060,7 @@ pub(crate) async fn refresh(
     refresh_target(&args)?;
     gate(dir, approved)?;
     let start = start_of(dir, &args)?;
-    let store = Store::isolated_keyring(dir).map_err(|_| "secure_storage_unavailable")?;
+    let store = crate::storage::open_store(dir)?;
     let session = store
         .try_load()
         .map_err(|_| "login_required_unlock_secure_storage")?;

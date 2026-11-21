@@ -6,6 +6,8 @@
 //! resumes instead of re-prompting.
 
 use crate::sealed::{self, Key};
+
+mod given;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -226,6 +228,8 @@ enum Backend {
     /// The keyring entry's name: one per state directory.
     Keyring(String),
     File(PathBuf),
+    /// Secrets kept by the caller ([`Store::with_secrets`]), under this entry name.
+    Given(Box<dyn PlatformSecrets>, String),
 }
 
 pub struct Store {
@@ -850,6 +854,19 @@ impl Store {
         Ok(store)
     }
 
+    /// Secrets in a store the caller keeps, such as a passphrase-protected file. Like
+    /// [`Self::isolated_keyring`]: never an account password, never another folder's entries.
+    /// The caller must validate and exclusively lock the private state directory first.
+    pub fn with_secrets(
+        state_dir: &Path,
+        secrets: Box<dyn PlatformSecrets>,
+    ) -> std::io::Result<Self> {
+        let mut store = Self::isolated_keyring(state_dir)?;
+        let name = store.name().to_string();
+        store.backend = Backend::Given(secrets, name);
+        Ok(store)
+    }
+
     fn current(&self) -> Result<SystemKeyring, String> {
         match self.service {
             Some(service) => Ok(SystemKeyring(service)),
@@ -956,6 +973,7 @@ impl Store {
             Backend::Keyring(name) => name.as_str(),
             Backend::File(_) => KEYRING_ENTRY,
             Backend::Memory(_) => "skykeep-mcp-memory",
+            Backend::Given(_, name) => name.as_str(),
         }
     }
 
@@ -976,6 +994,7 @@ impl Store {
                 f(&now, &name)
             }
             Backend::File(path) => f(&KeyFile(path.with_file_name("cookie-key")), &name),
+            Backend::Given(given, _) => f(&given::Given(given.as_ref()), &name),
             Backend::Memory(_) => Err("Secret persistence is disabled".into()),
         }
         .map_err(crate::Error::Keyring)
@@ -1012,6 +1031,7 @@ impl Store {
                 &KeyFile(path.with_file_name(format!("account-{id}"))),
                 &name,
             ),
+            Backend::Given(given, _) => f(&given::Given(given.as_ref()), &name),
             Backend::Memory(_) => Err("Secret persistence is disabled".into()),
         }
         .map_err(crate::Error::Keyring)
@@ -1080,6 +1100,11 @@ impl Store {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Session::default()),
                 Err(e) => return Err(crate::Error::Keyring(e.to_string())),
             },
+            Backend::Given(given, name) => match read_secret(&given::Given(given.as_ref()), name) {
+                Ok(Some(j)) => j,
+                Ok(None) => return Ok(Session::default()),
+                Err(e) => return Err(crate::Error::Keyring(e)),
+            },
         };
         let mut session: Session = serde_json::from_str(&json).unwrap_or_default();
         if self.passwordless {
@@ -1130,6 +1155,7 @@ impl Store {
                 Ok(())
             }
             Backend::File(path) => Ok(std::fs::write(path, json)?),
+            Backend::Given(given, name) => given::save(given.as_ref(), name, &json),
             Backend::Memory(_) => Ok(()),
         }
     }
@@ -1202,6 +1228,9 @@ impl Store {
                     Err(e) => note(Err(crate::Error::Keyring(e))),
                 }
             }
+            Backend::Given(given, name) => note(
+                delete_secret(&given::Given(given.as_ref()), name).map_err(crate::Error::Keyring),
+            ),
             Backend::File(path) => note(match std::fs::remove_file(path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
                 _ => Ok(()),
