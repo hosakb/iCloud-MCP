@@ -3,20 +3,23 @@
 //!
 //! Drive has no durable outbox here, so an action runs as soon as it is allowed and the reply
 //! says what happened: done (with what was checked), failed, or unknown when the connection
-//! ended before Apple's answer was read. Nothing is retried on its own. A retry is safe:
-//! every action that adds a name first reads the folder from Apple and refuses a name already
-//! there, so a repeated upload or new folder reports the collision instead of adding a copy,
-//! and a repeated rename or move says the item already has that name or place.
+//! ended before Apple's answer was read. Nothing is retried on its own. Before a change, the
+//! folder is read from Apple: a new folder or upload whose name is already there is refused
+//! (`name_taken`), a rename Apple already shows answers `already_has_this_name`, and a move
+//! already made answers `already_in_destination`. Apple's listing can lag behind a file it
+//! has just filed. An upload retried in that moment is filed by Apple under a free name such
+//! as "plan 2.txt", never over the first, and its reply says `renamed_by_apple: true`.
 //!
 //! The engine (`quince_icloud::drive`) makes the requests. Targets are found in the local
 //! cache, by cloud path or id as the read tools find them, and each action holds to the
 //! version cached: an item Apple changed since is refused, not written over.
 //!
 //! Who approves. [`is_destructive`] names the deletions in one place. They, and a rename or
-//! move of a folder that holds many items, are asked of the person with a preview of what
-//! they affect: in the approval form under the `reads_and_writes` and `writes_only` modes (as
-//! every Drive change is there), and otherwise with `skykeep-mcp approve` in their own
-//! terminal. Upload and download touch only the exchange folder ([`crate::exchange`]).
+//! move of a folder that holds many items (or an unknown number), always need the person's
+//! approval, with a preview of what they affect. The person approves or denies them either
+//! in the MCP client's approval form, under the `reads_and_writes` and `writes_only` modes
+//! (where every Drive change is asked), or with `skykeep-mcp approve` in their own terminal,
+//! under `yolo` or with no approval mode. No mode lets them run without one of the two. Upload and download touch only the exchange folder ([`crate::exchange`]).
 use crate::account::{binding, Binding};
 use crate::drive::{self, Stop, Target, PAUSED};
 use crate::exchange::{self, hides_text};
@@ -396,9 +399,17 @@ fn many(library: &Library, item: &DriveItem) -> Result<bool, &'static str> {
         return Ok(true);
     }
     let reach = affects(library, item)?;
-    Ok(reach["cached_items_beneath"]
+    // What was never read is unknown, and unknown counts as many: a folder not read that
+    // holds anything, or one with a folder beneath not read.
+    let unread_items = reach["folder_read"] == false && item.child_count != Some(0);
+    let unread_below = reach["folders_beneath_not_read"]
         .as_u64()
-        .is_some_and(|n| n >= MANY_ITEMS as u64))
+        .is_some_and(|n| n > 0);
+    Ok(unread_items
+        || unread_below
+        || reach["cached_items_beneath"]
+            .as_u64()
+            .is_some_and(|n| n >= MANY_ITEMS as u64))
 }
 
 /// Whether this action needs the person's approval whatever the approval mode: a deletion, or
@@ -485,8 +496,8 @@ pub(crate) fn preview(library: &Library, args: &Value) -> Result<Value, &'static
 pub struct WriteLimits {
     /// create_folder, rename, move, trash and delete_forever.
     pub change_timeout: Duration,
-    /// upload and download.
-    pub transfer_timeout: Duration,
+    /// upload and download; `None` scales with the size limit ([`transfer_time`]).
+    pub transfer_timeout: Option<Duration>,
     /// The folder reads made before a change.
     pub read: drive::RefreshLimits,
 }
@@ -495,10 +506,16 @@ impl Default for WriteLimits {
     fn default() -> Self {
         Self {
             change_timeout: Duration::from_secs(60),
-            transfer_timeout: Duration::from_secs(600),
+            transfer_timeout: None,
             read: drive::RefreshLimits::default(),
         }
     }
+}
+
+/// How long one upload or download may take under a size limit of `max_bytes`: two minutes,
+/// and one second more per 256 KB of the limit (about nine minutes at 100 MB).
+pub fn transfer_time(max_bytes: u64) -> Duration {
+    Duration::from_secs(120 + max_bytes / (256 * 1024))
 }
 
 /// Makes the session's client for a private directory.
@@ -653,13 +670,15 @@ fn settle(dir: &Path, dsid: &str, effects: &Effects) {
     for id in effects.unlist.iter().chain(&effects.forget) {
         listed.remove(id);
     }
+    // Folders forgotten with a trashed folder are no longer read, as after a refresh.
+    listed.retain(|id, _| id == ROOT || library.drive_item(id).ok().flatten().is_some());
     let _ = library.set_state(drive::LISTED_KEY, &Value::Object(listed).to_string());
 }
 
 /// What the local side of a transfer was given before anything is asked of Apple.
 enum Local {
     None,
-    Upload(exchange::Staged, String),
+    Upload(exchange::Staged, String, u64),
     Download(exchange::Incoming, String, u64),
 }
 
@@ -707,7 +726,7 @@ pub(crate) async fn run(
                 .or_else(|| local.rsplit('/').next().map(str::to_string))
                 .ok_or("invalid_local_path")?;
             let staged = exchange::stage(dir, file, size, exchange.max_bytes, &name)?;
-            Local::Upload(staged, name)
+            Local::Upload(staged, name, exchange.max_bytes)
         }
         DriveWrite::Download { local, .. } => {
             let exchange = exchange::configured(&library)?.ok_or(NO_EXCHANGE)?;
@@ -732,10 +751,11 @@ pub(crate) async fn run(
     let conn = connect(dir, seam).await?;
     let mut effects = Effects::default();
     let limits = seam.limits;
-    let timeout = if matches!(local, Local::None) {
-        limits.change_timeout
-    } else {
-        limits.transfer_timeout
+    let timeout = match &local {
+        Local::None => limits.change_timeout,
+        Local::Upload(_, _, max) | Local::Download(_, _, max) => limits
+            .transfer_timeout
+            .unwrap_or_else(|| transfer_time(*max)),
     };
     let outcome = tokio::time::timeout(
         timeout,
@@ -802,14 +822,29 @@ async fn act(
         }
         DriveWrite::Rename { name, .. } => {
             let item = plan.item.as_ref().ok_or("not_found")?;
-            let items = current(conn, item, limits).await?;
-            if taken(&items, name, Some(&item.drivewsid)).is_some() {
-                return Err("name_taken");
-            }
-            if quince_core::fold::composed(&item.display_name())
-                == quince_core::fold::composed(name)
+            let parent = parent_of(item);
+            let items = fresh(
+                conn,
+                &parent,
+                limits,
+                "not_found_at_apple_run_drive_refresh",
+            )
+            .await?;
+            let now = items
+                .iter()
+                .find(|i| i.drivewsid == item.drivewsid)
+                .ok_or("not_found_at_apple_run_drive_refresh")?;
+            // Asked again after it worked: Apple already shows the name (its version moved
+            // on with the rename, so this is looked at first).
+            if quince_core::fold::composed(&now.display_name()) == quince_core::fold::composed(name)
             {
                 return Err("already_has_this_name");
+            }
+            if item.etag.is_some() && now.etag != item.etag {
+                return Err(CHANGED);
+            }
+            if taken(&items, name, Some(&item.drivewsid)).is_some() {
+                return Err("name_taken");
             }
             effects.unlist.push(parent_of(item));
             quince_icloud::drive::rename(http, root, params(), item, name)
@@ -889,7 +924,7 @@ async fn act(
             }))
         }
         DriveWrite::Upload { .. } => {
-            let Local::Upload(staged, name) = local else {
+            let Local::Upload(staged, name, _) = local else {
                 return Err("invalid_arguments");
             };
             let (folder, _) = plan.folder.as_ref().ok_or("parent_not_found")?;
@@ -930,13 +965,16 @@ async fn act(
                 0
             } else {
                 let docws = conn.docws.as_deref().ok_or("drive_service_unavailable")?;
-                let link = quince_icloud::drive::download_url(http, docws, params(), item)
-                    .await
-                    .map_err(|e| match apple(&e) {
-                        "login_required" => "login_required",
-                        p if p == PAUSED => PAUSED,
-                        _ => "drive_download_failed_nothing_kept",
-                    })?;
+                // Exactly the version previewed and approved: refused if Apple has a newer one.
+                let link =
+                    quince_icloud::drive::download_url_of_version(http, docws, params(), item)
+                        .await
+                        .map_err(|e| match apple(&e) {
+                            "login_required" => "login_required",
+                            p if p == PAUSED => PAUSED,
+                            CHANGED => CHANGED,
+                            _ => "drive_download_failed_nothing_kept",
+                        })?;
                 fetch_into(&conn.client, &link, &mut incoming, max).await?
             };
             incoming.place()?;
@@ -996,11 +1034,11 @@ async fn fetch_into(
 
 /// The tool's entry in `tools/list`.
 pub(crate) fn tool() -> Value {
-    let cloud_path = json!({"type":"string","minLength":1,"maxLength":drive::MAX_PATH_BYTES});
-    let id = json!({"type":"string","minLength":1,"maxLength":drive::MAX_ID_BYTES});
+    let cloud_path = json!({"description":"move only: cloud path of the folder to move the item into, such as /Documents. / is the top folder.","type":"string","minLength":1,"maxLength":drive::MAX_PATH_BYTES});
+    let id = json!({"description":"move only: id of the folder to move the item into, from drive_list, drive_get or drive_search, instead of destination_path.","type":"string","minLength":1,"maxLength":drive::MAX_ID_BYTES});
     json!({
         "name": TOOL,
-        "description": "Change the user's Apple iCloud Drive: create_folder (path or id of the parent, name), rename (path or id, name), move (path or id, destination_path or destination_id), trash (to Recently Deleted), delete_forever, upload (path or id of the folder, local, optional name) and download (path or id of the file, optional local). Targets are found in the local cache as drive_get finds them. local names a file inside the exchange folder the user set up in their terminal: a relative path, never absolute. An existing name is refused, never replaced, in iCloud Drive and locally. Deletions and moves or renames of a folder with many items need the user's approval; every change follows the approval mode. The reply says done with what was checked, or an error; an unknown outcome means run drive_refresh and look before trying again.",
+        "description": "Change the user's Apple iCloud Drive: create_folder (path or id of the parent, name), rename (path or id, name), move (path or id, destination_path or destination_id), trash (to Recently Deleted), delete_forever, upload (path or id of the folder, local, optional name) and download (path or id of the file, optional local). Targets are found in the local cache as drive_get finds them, so run drive_refresh on the folder first. local names a file inside the exchange folder the user set up in their terminal: a relative path, never absolute. An existing name is refused, never replaced, in iCloud Drive and locally. Deletions and moves or renames of a folder with many items always need the user's approval, in the approval form or with skykeep-mcp approve in their terminal; every change follows the approval mode. The reply says done with what was checked, or an error; an unknown outcome means run drive_refresh and look before trying again.",
         "inputSchema": {
             "type": "object",
             "properties": {

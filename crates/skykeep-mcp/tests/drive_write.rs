@@ -105,7 +105,7 @@ fn seam(uri: &str, limits: WriteLimits) -> Seam {
 fn quick() -> WriteLimits {
     WriteLimits {
         change_timeout: Duration::from_secs(20),
-        transfer_timeout: Duration::from_secs(20),
+        transfer_timeout: Some(Duration::from_secs(20)),
         ..WriteLimits::default()
     }
 }
@@ -439,8 +439,8 @@ async fn rename_is_done_and_collisions_and_repeats_are_said() {
         file(REPORT, ROOT, "final", "pdf", 11),
         folder(DOCS, "Documents", 2)
     ]);
-    // Before the change: as cached. After: Apple shows the new name.
-    serve_listing(&f.remote, ROOT, root_items(), Some(2)).await;
+    // Before the change (one read per call): as cached. After: Apple shows the new name.
+    serve_listing(&f.remote, ROOT, root_items(), Some(3)).await;
     serve_listing(&f.remote, ROOT, renamed, None).await;
     answer(&f.remote, "/renameItems", ok_items(REPORT)).await;
     assert_eq!(
@@ -515,6 +515,12 @@ async fn apple_refusing_a_change_is_an_error_without_apple_text() {
 #[tokio::test]
 async fn move_of_a_small_folder_runs_and_a_large_one_waits_with_a_preview() {
     let mut f = fixture(None).await;
+    // Small and read: one file in it.
+    mark_read(
+        f.dir.path(),
+        SMALL,
+        vec![cached_file("FILE::com.apple.CloudDocs::IN", "in")],
+    );
     // Small: into Documents.
     serve_listing(&f.remote, DOCS, docs_items(), Some(1)).await;
     serve_listing(
@@ -1108,7 +1114,7 @@ async fn an_interrupted_upload_is_unknown_and_its_retry_adds_no_copy() {
     f.server.set_drive_seam(seam(
         &f.remote.uri(),
         WriteLimits {
-            transfer_timeout: Duration::from_millis(1500),
+            transfer_timeout: Some(Duration::from_millis(1500)),
             ..quick()
         },
     ));
@@ -1192,4 +1198,332 @@ async fn writes_need_a_signed_in_folder_and_valid_arguments() {
         let reply = call(&mut server, args.clone()).await;
         assert_eq!(text(&reply)["error"], code, "{args}");
     }
+}
+
+fn cached_file(id: &str, name: &str) -> quince_core::drive::DriveItem {
+    quince_core::drive::DriveItem {
+        drivewsid: id.into(),
+        parent_id: None,
+        name: name.into(),
+        extension: Some("txt".into()),
+        kind: "FILE".into(),
+        size: Some(1),
+        child_count: None,
+        created_at: None,
+        modified_at: None,
+        etag: Some("e1".into()),
+    }
+}
+
+fn cached_folder(id: &str, name: &str, count: i64) -> quince_core::drive::DriveItem {
+    quince_core::drive::DriveItem {
+        kind: "FOLDER".into(),
+        extension: None,
+        size: None,
+        child_count: Some(count),
+        ..cached_file(id, name)
+    }
+}
+
+/// The cache as if drive_refresh had read `folder` and found `items`.
+fn mark_read(dir: &Path, folder: &str, items: Vec<quince_core::drive::DriveItem>) {
+    let mut library = quince_core::Library::open(dir).unwrap();
+    library.put_drive_children(folder, &items).unwrap();
+    let mut listed: Value =
+        serde_json::from_str(&library.state("mcp.drive.listed").unwrap().unwrap()).unwrap();
+    listed[folder] = json!(1);
+    library
+        .set_state("mcp.drive.listed", &listed.to_string())
+        .unwrap();
+}
+
+fn listed(dir: &Path) -> Value {
+    let library = quince_core::Library::open(dir).unwrap();
+    serde_json::from_str(&library.state("mcp.drive.listed").unwrap().unwrap()).unwrap()
+}
+
+/// A folder whose contents were never read counts as large: its move or rename waits for the
+/// person. So does a folder read whole but with a folder beneath it never read.
+#[tokio::test]
+async fn a_folder_not_read_whole_counts_as_many_items() {
+    let mut f = fixture(None).await;
+    // Small: Apple counts one item, never read.
+    proposal_id(
+        &ok(
+            &mut f.server,
+            json!({"action":"rename","id":SMALL,"name":"Tiny"}),
+        )
+        .await,
+    );
+    // Read, but the folder in it never was.
+    mark_read(
+        f.dir.path(),
+        SMALL,
+        vec![cached_folder("FOLDER::com.apple.CloudDocs::SUB", "Sub", 3)],
+    );
+    proposal_id(
+        &ok(
+            &mut f.server,
+            json!({"action":"move","id":SMALL,"destination_id":DOCS}),
+        )
+        .await,
+    );
+    // An empty folder is known to hold nothing.
+    {
+        let mut library = quince_core::Library::open(f.dir.path()).unwrap();
+        let mut all = library.drive_children(ROOT).unwrap();
+        for item in &mut all {
+            if item.drivewsid == SMALL {
+                item.child_count = Some(0);
+            }
+        }
+        library.put_drive_children(ROOT, &all).unwrap();
+        library.put_drive_children(SMALL, &[]).unwrap();
+    }
+    serve_listing(&f.remote, ROOT, root_items(), None).await;
+    answer(&f.remote, "/renameItems", ok_items(SMALL)).await;
+    let reply = call(
+        &mut f.server,
+        json!({"action":"rename","id":SMALL,"name":"Tiny"}),
+    )
+    .await;
+    assert_ne!(text(&reply)["status"], "approval_required", "{reply}");
+    assert!(writes(&f.remote)
+        .await
+        .contains(&"/renameItems".to_string()));
+}
+
+/// A rename asked again after it worked says so and sends nothing, though Apple's version of
+/// the item moved on with the rename.
+#[tokio::test]
+async fn a_rename_repeated_after_it_worked_says_already_has_this_name() {
+    let mut f = fixture(None).await;
+    let mut renamed = root_items();
+    renamed[3]["name"] = json!("final");
+    renamed[3]["etag"] = json!("e2");
+    serve_listing(&f.remote, ROOT, root_items(), Some(2)).await;
+    serve_listing(&f.remote, ROOT, renamed, None).await;
+    answer(&f.remote, "/renameItems", ok_items(REPORT)).await;
+    let done = ok(
+        &mut f.server,
+        json!({"action":"rename","id":REPORT,"name":"final.pdf"}),
+    )
+    .await;
+    assert_eq!(done["outcome"], "done", "{done}");
+    assert_eq!(
+        error(
+            &mut f.server,
+            json!({"action":"rename","id":REPORT,"name":"final.pdf"})
+        )
+        .await,
+        "already_has_this_name"
+    );
+    assert_eq!(writes(&f.remote).await, ["/renameItems"]);
+}
+
+/// A trashed folder takes the folders read beneath it out of the read record, as a refresh
+/// that finds a folder gone does.
+#[tokio::test]
+async fn trashing_a_folder_forgets_the_folders_read_beneath_it() {
+    let mut f = fixture(None).await;
+    const SUB: &str = "FOLDER::com.apple.CloudDocs::SUB";
+    mark_read(
+        f.dir.path(),
+        DOCS,
+        vec![cached_file(NOTES, "notes"), cached_folder(SUB, "Sub", 0)],
+    );
+    mark_read(f.dir.path(), SUB, vec![]);
+    assert!(listed(f.dir.path()).get(SUB).is_some());
+    let id = proposal_id(&ok(&mut f.server, json!({"action":"trash","id":DOCS})).await);
+    serve_listing(&f.remote, ROOT, root_items(), Some(2)).await;
+    serve_listing(&f.remote, ROOT, json!([folder(BIG, "Big", 500)]), None).await;
+    answer(&f.remote, "/moveItemsToTrash", ok_items(DOCS)).await;
+    let done = f.server.approve_any(&id).await.unwrap();
+    assert_eq!(done["outcome"], "done", "{done}");
+    let now = listed(f.dir.path());
+    assert!(now.get(SUB).is_none(), "{now}");
+    assert!(now.get(DOCS).is_none(), "{now}");
+    assert!(now.get(ROOT).is_none(), "the top folder changed: {now}");
+}
+
+/// A download gets the version previewed, or nothing.
+#[tokio::test]
+async fn a_download_of_a_file_changed_since_it_was_cached_is_refused() {
+    let mut f = fixture(None).await;
+    Mock::given(method("GET"))
+        .and(path("/ws/com.apple.CloudDocs/download/by_id"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"double_etag":"e2","data_token":{"url":format!("{}/bytes/1", f.remote.uri())}}),
+        ))
+        .mount(&f.remote)
+        .await;
+    assert_eq!(
+        error(&mut f.server, json!({"action":"download","id":REPORT})).await,
+        "drive_item_changed_run_drive_refresh"
+    );
+    assert!(!f.exchange.join("report.pdf").exists());
+    assert!(leftovers(&f.exchange).is_empty());
+    assert!(!requests(&f.remote)
+        .await
+        .iter()
+        .any(|r| r.url.path() == "/bytes/1"));
+}
+
+/// A partial download a crash left behind goes at the next download into its folder, once it
+/// is old enough that nothing is still writing it; a fresh one stays.
+#[tokio::test]
+async fn stale_partial_downloads_are_removed_by_the_next_download() {
+    let mut f = fixture(None).await;
+    let old = f.exchange.join(".skykeep-download-old.part");
+    let young = f.exchange.join(".skykeep-download-young.part");
+    let other = f.exchange.join(".skykeep-download-mine.txt");
+    for p in [&old, &young, &other] {
+        std::fs::write(p, b"x").unwrap();
+    }
+    let past = std::time::SystemTime::now() - Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&other)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+    serve_download(&f.remote, b"hello world".to_vec()).await;
+    ok(&mut f.server, json!({"action":"download","id":REPORT})).await;
+    assert!(!old.exists());
+    assert!(young.exists());
+    assert!(other.exists(), "only partial downloads are removed");
+}
+
+/// A folder inside the exchange folder that others can write to is refused, both ways.
+#[tokio::test]
+async fn a_shared_folder_inside_the_exchange_folder_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = fixture(None).await;
+    let shared = f.exchange.join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::write(shared.join("a.txt"), b"x").unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert_eq!(
+        error(
+            &mut f.server,
+            json!({"action":"upload","path":"/","local":"shared/a.txt"})
+        )
+        .await,
+        "local_folder_not_private"
+    );
+    assert_eq!(
+        error(
+            &mut f.server,
+            json!({"action":"download","id":REPORT,"local":"shared/b.pdf"})
+        )
+        .await,
+        "local_folder_not_private"
+    );
+    assert!(requests(&f.remote).await.is_empty());
+}
+
+/// Without an exchange folder, the error says the exact command, with this private folder.
+#[tokio::test]
+async fn the_missing_exchange_folder_error_names_the_command_to_type() {
+    let mut f = fixture(None).await;
+    {
+        let mut library = quince_core::Library::open(f.dir.path()).unwrap();
+        library.set_state("mcp.drive.exchange", "").unwrap();
+    }
+    let reply = call(&mut f.server, json!({"action":"download","id":REPORT})).await;
+    let value = text(&reply);
+    assert_eq!(
+        value["error"],
+        "exchange_folder_not_set_up_run_skykeep_mcp_exchange_in_a_terminal"
+    );
+    let instructions = value["instructions"].as_str().unwrap();
+    let dir = f.dir.path().canonicalize().unwrap();
+    assert!(
+        instructions.contains(&format!(
+            "skykeep-mcp exchange --state-dir {}",
+            dir.display()
+        )),
+        "{instructions}"
+    );
+}
+
+/// What `skykeep-mcp exchange` prints when it stops: what is wrong and what to type.
+#[test]
+fn exchange_setup_errors_say_what_to_type() {
+    use skykeep_mcp::exchange::{explain, set_up};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = private_dir();
+    let state = dir.path();
+    let range = explain("exchange_limit_out_of_range", None, state);
+    assert!(range.contains("from 1 to 10240"), "{range}");
+    assert!(range.contains("--max-mb 100"), "{range}");
+    let mut library = quince_core::Library::open(state).unwrap();
+    let missing = state.join("no/such/Exchange");
+    assert_eq!(
+        set_up(&mut library, Some(missing.clone()), None),
+        Err("exchange_parent_missing")
+    );
+    let text = explain("exchange_parent_missing", Some(&missing), state);
+    assert!(
+        text.contains(&format!("mkdir -p {}", state.join("no/such").display())),
+        "{text}"
+    );
+    let open = state.join("open folder");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert_eq!(
+        set_up(&mut library, Some(open.clone()), None),
+        Err("exchange_folder_writable_by_others")
+    );
+    let text = explain("exchange_folder_writable_by_others", Some(&open), state);
+    assert!(
+        text.contains(&format!("chmod 700 '{}'", open.display())),
+        "{text}"
+    );
+    assert_eq!(
+        set_up(&mut library, Some(state.join("fine")), Some(0)),
+        Err("exchange_limit_out_of_range")
+    );
+    assert_eq!(
+        set_up(&mut library, Some(state.join("fine")), Some(10_241)),
+        Err("exchange_limit_out_of_range")
+    );
+    assert_eq!(
+        set_up(&mut library, Some(state.join("fine")), Some(10_240))
+            .unwrap()
+            .max_bytes,
+        10_240 * 1024 * 1024
+    );
+    assert_eq!(
+        skykeep_mcp::status::with_dir("run skykeep-mcp exchange", state),
+        format!(
+            "run skykeep-mcp exchange --state-dir {}",
+            skykeep_mcp_quoted(state)
+        )
+    );
+}
+
+fn skykeep_mcp_quoted(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if text
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-+,:@".contains(c))
+    {
+        text.into_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+#[test]
+fn transfers_get_more_time_under_a_larger_limit() {
+    use skykeep_mcp::drive_write::transfer_time;
+    assert_eq!(transfer_time(100 * 1024 * 1024), Duration::from_secs(520));
+    assert!(transfer_time(10_240 * 1024 * 1024) > transfer_time(100 * 1024 * 1024));
 }

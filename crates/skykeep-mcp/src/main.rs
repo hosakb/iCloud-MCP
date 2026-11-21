@@ -18,6 +18,14 @@ async fn main() {
         print!("{HELP}");
         return;
     }
+    if first.as_deref() == Some("exchange") {
+        all.remove(0);
+        if let Err(error) = exchange(all) {
+            eprintln!("skykeep-mcp: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Some(command) = first.filter(|c| ["setup", "status", "unlock"].contains(&c.as_str())) {
         all.remove(0);
         if let Err(error) = guided(&command, all).await {
@@ -45,14 +53,15 @@ More commands (each needs --state-dir FOLDER):
   skykeep-mcp logout      sign out and forget the saved sign-in
   skykeep-mcp policy --state-dir FOLDER MODE
                           set the approval mode: reads_and_writes, writes_only or yolo
-  skykeep-mcp approve     approve one queued deletion by its request ID
+  skykeep-mcp approve     approve one waiting change by its request ID: a Notes or
+                          Reminders change is queued, a Drive change runs at once
   skykeep-mcp require-approval
                           folders without an approval mode: every change waits for approve
   skykeep-mcp allow-routine
                           folders without an approval mode: routine changes run again,
                           deletions still wait for approve
   skykeep-mcp quarantine  list and retire writes that were set aside
-  skykeep-mcp exchange --state-dir FOLDER [--path DIR] [--max-mb N]
+  skykeep-mcp exchange --state-dir FOLDER [--path DIR] [--max-mb N]  (flags in any order)
                           set up the one folder Drive uploads read from and downloads
                           write into (default ~/Skykeep-Exchange, limit 100 MB) and print it
   skykeep-mcp --state-dir FOLDER
@@ -60,6 +69,71 @@ More commands (each needs --state-dir FOLDER):
 
 FOLDER defaults to ~/.local/share/skykeep-mcp for setup, status and unlock.
 ";
+
+/// `exchange`: the flags in any order. Sets up the Drive exchange folder and prints it; each
+/// refusal is one sentence saying what is wrong and what to type.
+fn exchange(args: Vec<std::ffi::OsString>) -> Result<(), String> {
+    const USAGE: &str = "usage: skykeep-mcp exchange --state-dir FOLDER [--path DIR] [--max-mb N]";
+    let (mut dir, mut path, mut mb) = (None, None, None);
+    let mut args = args.into_iter();
+    while let Some(flag) = args.next() {
+        let value = args.next();
+        if flag == "--state-dir" && dir.is_none() {
+            dir = Some(PathBuf::from(value.ok_or(USAGE)?));
+        } else if flag == "--path" && path.is_none() {
+            path = Some(PathBuf::from(value.ok_or_else(|| {
+                skykeep_mcp::exchange::explain(
+                    "exchange_path_required",
+                    None,
+                    std::path::Path::new("FOLDER"),
+                )
+            })?));
+        } else if flag == "--max-mb" && mb.is_none() {
+            mb = Some(value.and_then(|v| v.to_str().and_then(|v| v.parse::<u64>().ok())));
+        } else {
+            return Err(USAGE.into());
+        }
+    }
+    let dir = std::path::absolute(dir.ok_or(USAGE)?).map_err(|_| USAGE)?;
+    let explain = |code: &str, path: Option<&std::path::Path>| {
+        skykeep_mcp::exchange::explain(code, path, &dir)
+    };
+    let mb = match mb {
+        Some(Some(n)) => Some(n),
+        Some(None) => return Err(explain("exchange_limit_out_of_range", None)),
+        None => None,
+    };
+    if terminal::agent_marked(|name| std::env::var_os(name)) {
+        return Err("this command refuses to run in an AI agent's terminal: open your own terminal window and run it there".into());
+    }
+    let mut tty = terminal::controlling().map_err(|_| {
+        "this command needs a real terminal: open a terminal window and run it there".to_string()
+    })?;
+    let held = PrivateState::open(&dir).map_err(|e| explain(e, None))?;
+    let mut library =
+        quince_core::Library::open(&held.path).map_err(|_| explain("library_unavailable", None))?;
+    let shown = path
+        .as_ref()
+        .and_then(|p| std::path::absolute(p).ok())
+        .or_else(|| {
+            skykeep_mcp::exchange::configured(&library)
+                .ok()
+                .flatten()
+                .map(|e| e.path)
+        })
+        .or_else(skykeep_mcp::exchange::default_path);
+    let exchange = skykeep_mcp::exchange::set_up(&mut library, path, mb)
+        .map_err(|e| explain(e, shown.as_deref()))?;
+    use std::io::Write;
+    writeln!(
+        tty,
+        "Drive exchange folder: {}\nSize limit: {} MB per upload or download.",
+        exchange.path.display(),
+        exchange.max_bytes / (1024 * 1024)
+    )
+    .map_err(|_| "terminal_unavailable".to_string())?;
+    Ok(())
+}
 
 /// The person's own terminal, as setup and unlock talk to it.
 struct Tty(std::fs::File);
@@ -178,7 +252,6 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
             "allow-routine",
             "policy",
             "quarantine",
-            "exchange",
         ]
         .iter()
         .any(|name| s == name)
@@ -201,25 +274,6 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
     } else {
         None
     };
-    let mut exchange_path = None;
-    let mut exchange_mb = None;
-    if command == "exchange" {
-        while let Some(flag) = args.next() {
-            if flag == "--path" && exchange_path.is_none() {
-                exchange_path = Some(PathBuf::from(args.next().ok_or("exchange_path_required")?));
-            } else if flag == "--max-mb" && exchange_mb.is_none() {
-                let mb: u64 = args
-                    .next()
-                    .and_then(|a| a.to_str().and_then(|a| a.parse().ok()))
-                    .ok_or("exchange_limit_out_of_range")?;
-                exchange_mb = Some(mb);
-            } else {
-                return Err(
-                    "usage: skykeep-mcp exchange --state-dir FOLDER [--path DIR] [--max-mb N]",
-                );
-            }
-        }
-    }
     if args.next().is_some() {
         return Err("unexpected_argument");
     }
@@ -268,21 +322,6 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
                 .map_err(|_| "terminal_unavailable")?;
             return Ok(());
         }
-        if command == "exchange" {
-            use std::io::Write;
-            let held = PrivateState::open(&dir)?;
-            let mut library =
-                quince_core::Library::open(&held.path).map_err(|_| "library_unavailable")?;
-            let exchange = skykeep_mcp::exchange::set_up(&mut library, exchange_path, exchange_mb)?;
-            writeln!(
-                tty,
-                "Drive exchange folder: {}\nSize limit: {} MB per upload or download.",
-                exchange.path.display(),
-                exchange.max_bytes / (1024 * 1024)
-            )
-            .map_err(|_| "terminal_unavailable")?;
-            return Ok(());
-        }
         if command == "approve" {
             use std::io::Write;
             let id = terminal::hidden(&mut tty, "Approval request ID: ", Duration::from_secs(180))?;
@@ -290,13 +329,13 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
             let details = server.approval_details(&id)?;
             writeln!(
                 tty,
-                "Review this exact queued operation:
+                "Review this exact change:
 {details}"
             )
             .map_err(|_| "terminal_unavailable")?;
             let answer = terminal::hidden(
                 &mut tty,
-                "Type approve to queue it (a Drive change runs now), or Ctrl-C to cancel: ",
+                "Type approve to allow it (a Notes or Reminders change is queued for the next sync, a Drive change runs now), or Ctrl-C to cancel: ",
                 Duration::from_secs(180),
             )?;
             if *answer != "approve" {

@@ -40,7 +40,7 @@ pub struct Report {
 /// can't show approval forms. Only setup and status read it; it changes no policy.
 pub const NO_MODE_KEY: &str = "mcp.setup.no_approval_mode";
 
-fn quoted(path: &Path) -> String {
+pub(crate) fn quoted(path: &Path) -> String {
     let text = path.to_string_lossy();
     if text
         .chars()
@@ -92,6 +92,7 @@ pub fn with_dir(text: &str, dir: &Path) -> String {
             "logout",
             "approve",
             "quarantine",
+            "exchange",
         ]
         .contains(&word.as_str());
         let tail = &after[word.len()..];

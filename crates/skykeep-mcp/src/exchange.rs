@@ -48,7 +48,7 @@ pub fn default_path() -> Option<PathBuf> {
 }
 
 /// The folder as set up, `None` before it is.
-pub(crate) fn configured(library: &quince_core::Library) -> Result<Option<Exchange>, &'static str> {
+pub fn configured(library: &quince_core::Library) -> Result<Option<Exchange>, &'static str> {
     match library.state(KEY).map_err(|_| "library_unavailable")? {
         None => Ok(None),
         Some(raw) if raw.is_empty() => Ok(None),
@@ -121,6 +121,9 @@ pub fn set_up(
     }
     if std::fs::symlink_metadata(&path).is_err() {
         use std::os::unix::fs::DirBuilderExt;
+        if !path.parent().is_some_and(Path::is_dir) {
+            return Err("exchange_parent_missing");
+        }
         // Only the folder itself: its parent must exist.
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -130,8 +133,11 @@ pub fn set_up(
     let raw = c_name(path.to_str().ok_or("exchange_folder_path_unsafe")?)?;
     let fd = open_dir_at(None, &raw).map_err(|_| "exchange_folder_unavailable")?;
     let st = fstat(fd.as_raw_fd())?;
+    if st.st_uid != unsafe { libc::geteuid() } {
+        return Err("exchange_folder_not_yours");
+    }
     if !private_enough(&st) {
-        return Err("exchange_folder_must_be_yours_and_not_writable_by_others");
+        return Err("exchange_folder_writable_by_others");
     }
     let max_bytes = match max_mb {
         Some(mb) if (1..=MAX_LIMIT_MB).contains(&mb) => mb * 1024 * 1024,
@@ -148,6 +154,31 @@ pub fn set_up(
         .set_state(KEY, &text)
         .map_err(|_| "library_unavailable")?;
     Ok(exchange)
+}
+
+/// What a person reads when `skykeep-mcp exchange` stops with `code`: what is wrong and what
+/// to type. `path` is the folder it was setting up, `dir` the private folder.
+pub fn explain(code: &str, path: Option<&Path>, dir: &Path) -> String {
+    let state = crate::status::quoted(dir);
+    let folder = path.map_or_else(|| "the folder".to_string(), crate::status::quoted);
+    match code {
+        "exchange_limit_out_of_range" => format!("--max-mb takes a whole number of megabytes from 1 to {MAX_LIMIT_MB}, for example: skykeep-mcp exchange --state-dir {state} --max-mb 100"),
+        "exchange_parent_missing" => {
+            let parent = path
+                .and_then(Path::parent)
+                .map_or_else(|| "its parent".to_string(), crate::status::quoted);
+            format!("The folder that would hold {folder} does not exist. Create it with: mkdir -p {parent} and run the same command again.")
+        }
+        "exchange_folder_writable_by_others" => format!("Other users can change {folder}. Make it yours alone with: chmod 700 {folder} and run the same command again."),
+        "exchange_folder_not_yours" => format!("{folder} belongs to another user. Pick a folder of your own with: skykeep-mcp exchange --state-dir {state} --path DIR"),
+        "exchange_folder_path_unsafe" => format!("The path to {folder} has a symbolic link or .. in it. Give the real path, for example: skykeep-mcp exchange --state-dir {state} --path ~/{DEFAULT_NAME}"),
+        "home_folder_unknown_give_path" => format!("Your home folder is not known here. Name the folder with: skykeep-mcp exchange --state-dir {state} --path DIR"),
+        "exchange_folder_unavailable" => format!("{folder} could not be created or opened. Check that it is a folder you can open, or pick another with: skykeep-mcp exchange --state-dir {state} --path DIR"),
+        "invalid_exchange_setting" => format!("The saved exchange setting is unreadable. Set it again with: skykeep-mcp exchange --state-dir {state} --path DIR"),
+        "exchange_path_required" => "--path needs a folder after it, for example: --path ~/Skykeep-Exchange".to_string(),
+        "state_busy_retry" => "Another Skykeep command is using the private folder. Run the same command again in a moment.".to_string(),
+        other => format!("The exchange folder was not set up ({other}). Run skykeep-mcp status --state-dir {state} to check the private folder."),
+    }
 }
 
 /// The folder, opened and checked to be the one set up.
@@ -232,6 +263,10 @@ fn walk(root: OwnedFd, names: &[String]) -> Result<OwnedFd, &'static str> {
             }
             _ => "local_file_unavailable",
         })?;
+        // A folder another user can change could swap what is in it under us.
+        if !private_enough(&fstat(at.as_raw_fd())?) {
+            return Err("local_folder_not_private");
+        }
     }
     Ok(at)
 }
@@ -351,10 +386,63 @@ impl Drop for Incoming {
     }
 }
 
+/// A partial download untouched this long was cut off (a crash or a power cut): every chunk
+/// written moves its time on.
+const STALE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Removes stale partial downloads from `dir`: regular files of this user named as partial
+/// downloads are, not changed for [`STALE`]. Best effort.
+fn sweep(dir: &OwnedFd) {
+    let copy = unsafe { libc::dup(dir.as_raw_fd()) };
+    if copy < 0 {
+        return;
+    }
+    let stream = unsafe { libc::fdopendir(copy) };
+    if stream.is_null() {
+        unsafe { libc::close(copy) };
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let mut stale = Vec::new();
+    loop {
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let text = name.to_string_lossy();
+        if text.starts_with(PARTIAL_PREFIX) && text.ends_with(".part") {
+            stale.push(name.to_owned());
+        }
+    }
+    unsafe { libc::closedir(stream) };
+    for name in stale {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let found = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if found == 0
+            && st.st_mode & libc::S_IFMT == libc::S_IFREG
+            && st.st_uid == unsafe { libc::geteuid() }
+            && now.saturating_sub(st.st_mtime as i64) >= STALE.as_secs() as i64
+        {
+            unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+        }
+    }
+}
+
 /// Starts a download into `names` (relative to the folder). Refused when the name is taken.
 pub(crate) fn incoming(exchange: &Exchange, names: &[String]) -> Result<Incoming, &'static str> {
     let (last, dirs) = names.split_last().ok_or("invalid_local_path")?;
     let dir = walk(open_root(exchange)?, dirs)?;
+    sweep(&dir);
     let name = c_name(last)?;
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe {

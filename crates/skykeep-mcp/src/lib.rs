@@ -165,6 +165,29 @@ fn policy(
     )))
 }
 
+/// An error result. One about the Drive exchange folder says the exact command that sets it
+/// up, with this private folder in it, for the person to type in their own terminal.
+fn error_value(error: &'static str, dir: &Path) -> Value {
+    let mut value = json!({"error":error});
+    if error.starts_with("exchange_folder_") {
+        value["instructions"] = json!(format!(
+            "In your own terminal, run: {}",
+            status::with_dir("skykeep-mcp exchange", dir)
+        ));
+    }
+    value
+}
+
+/// [`tool_reply`] with [`error_value`]'s instructions.
+fn tool_reply_in(id: Value, result: Result<Value, &'static str>, dir: &Path) -> Value {
+    match result {
+        Err(error) => {
+            json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":error_value(error, dir).to_string()}],"isError":true}})
+        }
+        ok => tool_reply(id, ok),
+    }
+}
+
 fn tool_reply(id: Value, result: Result<Value, &'static str>) -> Value {
     let failed = result.is_err();
     let value = result.unwrap_or_else(|error| json!({"error":error}));
@@ -833,7 +856,11 @@ impl Server {
                 )
                 .await;
             self.grant = None;
-            return Some(tool_reply(pending.request["id"].clone(), result));
+            return Some(tool_reply_in(
+                pending.request["id"].clone(),
+                result,
+                &self.dir,
+            ));
         }
         // Batches and other non-object messages are not supported; say so instead of dropping them.
         if !request.is_object() {
@@ -913,7 +940,7 @@ impl Server {
                     .await;
                 let (value, failed) = match result {
                     Ok(value) => (value, false),
-                    Err(error) => (json!({"error":error}), true),
+                    Err(error) => (error_value(error, &self.dir), true),
                 };
                 Ok(json!({"content":[{"type":"text","text":value.to_string()}],"isError":failed}))
             }
