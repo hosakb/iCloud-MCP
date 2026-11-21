@@ -1176,9 +1176,14 @@ async fn no_approval_mode_tells_the_truth_about_an_earlier_require_approval() {
         "{}",
         script.screen
     );
-    assert!(script.screen.contains("Every change waits until you approve it"));
+    assert!(script
+        .screen
+        .contains("Every change waits until you approve it"));
     let report = skykeep_mcp::status::check(storage::env(), &dir).render();
-    assert!(report.contains("Every change waits until you approve it"), "{report}");
+    assert!(
+        report.contains("Every change waits until you approve it"),
+        "{report}"
+    );
     assert_eq!(
         quince_core::Library::open(&dir)
             .unwrap()
