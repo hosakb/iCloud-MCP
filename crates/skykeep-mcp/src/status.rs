@@ -188,11 +188,17 @@ pub fn check(env: &Env, dir: &Path) -> Report {
             let (text, next) = match error {
                 "state_must_be_owned_and_private" => (
                     format!("The folder {shown} is not private to you."),
-                    format!("Make sure it belongs to you, then run: chmod 700 {shown}"),
+                    format!(
+                        "Make sure it belongs to you, then run: chmod 700 {}",
+                        quoted(dir)
+                    ),
                 ),
                 "unsafe_state_contents" => (
                     format!("A file in {shown} can be read by others, or is a link."),
-                    format!("Run: chmod 600 {shown}/* and remove any links from the folder."),
+                    format!(
+                        "Run: chmod 600 {}/* and remove any links from the folder.",
+                        quoted(dir)
+                    ),
                 ),
                 "unsafe_state_path" => (
                     format!("The path {shown} goes through a link or '..'."),
@@ -222,7 +228,18 @@ pub fn check(env: &Env, dir: &Path) -> Report {
     } else {
         None
     };
-    let session = store.as_ref().and_then(|s| s.try_load().ok());
+    let session = match store.as_ref().map(|s| s.try_load()) {
+        Some(Ok(session)) => Some(session),
+        Some(Err(_)) => {
+            // The storage answered a moment ago; a failed read now is still a problem.
+            report.fix(
+                "Skykeep couldn't read the saved sign-in from its storage.",
+                "Run skykeep-mcp status again in a moment. If it keeps failing, run skykeep-mcp setup.",
+            );
+            None
+        }
+        None => None,
+    };
     match &session {
         Some(s) if s.is_resumable() => report.ok(format!(
             "Signed in as {} (checked on this computer only)",

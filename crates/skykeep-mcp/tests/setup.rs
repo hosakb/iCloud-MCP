@@ -31,7 +31,11 @@ enum Keyring {
     Missing,
     /// Entries answer, but the lock state can't be read.
     Unknown,
+    /// The first read works, every later one fails.
+    Flaky,
 }
+
+static READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[derive(Default)]
 struct Fakes {
@@ -61,7 +65,7 @@ impl FakeKeyring {
     }
     fn check(&self) -> Result<(), String> {
         match self.mode() {
-            Keyring::Ready | Keyring::Unknown => Ok(()),
+            Keyring::Ready | Keyring::Unknown | Keyring::Flaky => Ok(()),
             Keyring::Locked => Err("Secret Service: object locked".into()),
             Keyring::Missing => Err("no Secret Service on the session bus".into()),
         }
@@ -70,6 +74,9 @@ impl FakeKeyring {
 
 impl PlatformSecrets for FakeKeyring {
     fn get(&self, _: &str, name: &str) -> Result<Option<String>, String> {
+        if self.mode() == Keyring::Flaky && READS.fetch_add(1, Ordering::SeqCst) > 0 {
+            return Err("Secret Service: the read failed".into());
+        }
         let found = fakes().entries.get(&(self.0.clone(), name.into())).cloned();
         if self.mode() == Keyring::Locked && found.is_none() {
             return Ok(None);
@@ -91,7 +98,7 @@ impl PlatformSecrets for FakeKeyring {
     }
     fn locked(&self, _: &str) -> Result<bool, String> {
         match self.mode() {
-            Keyring::Ready => Ok(false),
+            Keyring::Ready | Keyring::Flaky => Ok(false),
             Keyring::Locked => Ok(true),
             Keyring::Missing | Keyring::Unknown => {
                 Err("no Secret Service on the session bus".into())
@@ -1286,4 +1293,39 @@ async fn unlock_names_a_missing_folder() {
         refused.starts_with(&format!("No Skykeep folder at {}.", dir.display())),
         "{refused}"
     );
+}
+
+/// Storage that answered once and then failed: status must not call the folder ready.
+#[tokio::test]
+async fn status_reports_a_sign_in_it_could_not_read() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    first_run_with_keyring(&dir, &server).await;
+    READS.store(0, Ordering::SeqCst);
+    set_keyring(&dir, Keyring::Flaky);
+    let report = skykeep_mcp::status::check(storage::env(), &dir);
+    set_keyring(&dir, Keyring::Ready);
+    let text = report.render();
+    assert!(!report.ready(), "{text}");
+    assert!(text.contains("couldn't read the saved sign-in"), "{text}");
+}
+
+/// The printed repair commands keep a folder name with a space in one piece.
+#[tokio::test]
+async fn status_quotes_the_folder_in_its_chmod_commands() {
+    let _one = serial().await;
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().canonicalize().unwrap().join("my skykeep");
+    made(&dir);
+    let quoted = format!("'{}'", dir.display());
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let text = skykeep_mcp::status::check(storage::env(), &dir).render();
+    assert!(text.contains(&format!("chmod 700 {quoted}")), "{text}");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let shared = dir.join("shared");
+    std::fs::write(&shared, b"x").unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let text = skykeep_mcp::status::check(storage::env(), &dir).render();
+    assert!(text.contains(&format!("chmod 600 {quoted}/*")), "{text}");
 }
