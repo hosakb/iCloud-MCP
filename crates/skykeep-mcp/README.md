@@ -114,12 +114,12 @@ Configure your MCP client to start that command. Stdout carries protocol message
 | Tool | What it does |
 |---|---|
 | `auth_status` | Whether the folder is bound to an account, whether the protected file is locked, and how to sign in. Takes no arguments and never accepts secrets. |
-| `sync` | Refreshes Notes and Reminders, then sends queued changes. Nothing is sent when the refresh fails. |
+| `sync` | Refreshes Notes and Reminders, then sends queued changes. Nothing is sent when the refresh fails. `left_queue_this_sync` lists each write that left the queue, with outcome `cloudkit_accepted` or `finished_unconfirmed` (see Reminders below). |
 | `sync_status` | Last refresh per service, whether the last pass failed, and counts of pending and refused changes. No network access. |
 | `notes_list`, `notes_folders`, `notes_search`, `notes_get` | Read the local cache. `notes_get` returns the plain text and the native formatting runs. |
 | `notes_write` | Queues `create`, `save`, `move`, `pin` or `delete`. Edits to an existing note need the `base_etag` you read, and are refused for locked or read-only notes. |
 | `reminders_lists`, `reminders_list`, `reminders_search`, `reminders_get` | Read the local cache. |
-| `reminders_write` | Queues `create`, `edit`, `tick` (complete or reopen) or `delete`. An `edit` changes only the fields in `patch`; moving a reminder is an edit of `list_guid`. |
+| `reminders_write` | Queues `create`, `edit`, `tick` (complete or reopen) or `delete`. An `edit` changes only the fields in `patch`; moving a reminder is an edit of `list_guid`. A `create` can also take `repeat`, `due_time_alert`, `early_alert` and `timezone` (see Reminders below). |
 | `contacts_list`, `contacts_search`, `contacts_get` | Read the local Contacts cache. Read-only. |
 | `contacts_refresh` | Reads Contacts from Apple into the local cache, replacing it. Never writes to Apple and never opens a sign-in prompt. |
 | `calendar_calendars`, `calendar_events`, `calendar_search`, `calendar_get` | Read the local Calendar cache. Read-only. |
@@ -132,6 +132,23 @@ Configure your MCP client to start that command. Stdout carries protocol message
 Contacts, Calendar, Photos and Drive start empty: call their `*_refresh` tool once to fill the cache, and again whenever you want newer data. Their refresh is not part of `sync`.
 
 Reads come from the local cache and say so (`"source": "local_cache"`). A successful write means the change is queued in the library's durable outbox; `remote_verified` is always `false`, because the server does not read each field back from iCloud after sending.
+
+### Reminders: repeat and alerts on create
+
+A `reminders_write` `create` takes four optional fields:
+
+| Field | Meaning |
+|---|---|
+| `repeat` | `{"frequency":"daily"}`, repeating from `due_at` for ever, or with `"until":"YYYY-MM-DD"`, the last day it repeats. Needs `due_at`. Only daily, every day, is supported. |
+| `due_time_alert` | `true` adds an alert at `due_at`. Needs a timed (not all-day) `due_at`. |
+| `early_alert` | `{"amount":15,"unit":"minutes"}` alerts that long before `due_at`. Units: `minutes`, `hours`, `days`, `weeks`, `months`; amount 1 to 10000. Needs a timed `due_at`, and an early alert already set on one of your reminders from an Apple device, because Apple writes an account id inside each one. |
+| `timezone` | IANA zone the timed `due_at` and its alerts are kept in, such as `Europe/Berlin`. Without it, a timed create with any of the fields above is kept in this computer's zone as it was when queued. |
+
+Combinations that cannot work are refused with a code and nothing is queued: `due_time_alert_requires_due_at`, `early_alert_requires_due_at`, `all_day_cannot_have_timed_alert`, `timezone_requires_timed_due_at`, `unknown_timezone`, `repeat_requires_due_at`, `invalid_repeat_end`, `repeat_end_before_due`, `invalid_early_alert` and `early_alert_account_unavailable`. For an all-day reminder, `until` is read in UTC. The options wait for approval with the rest of the create.
+
+Each option is its own record at Apple. The queued create keeps the record ids they will have, and `sync` writes them one step at a time after the reminder: date, repeat, alert at the due time, then early alert. A step that fails keeps the whole create queued. The next sync, after a retry or a restart, takes only the steps still to do, reusing any record an earlier try made, so it makes no second rule or alert and leaves none unattached. A date moved on a phone in between is kept, and the alert rings at the date Apple holds when it is written. If the reminder has meanwhile become all-day or lost its date, no alert is added, and the alarm records this create made are removed. Alarms and early alerts set elsewhere are kept.
+
+The create reply says `queued: true`, `cloudkit_accepted: false` and `remote_verified: false`. In the `sync` reply, `left_queue_this_sync` gives `cloudkit_accepted` only for creates whose every write must succeed (one with no date or flag, or one with these options); every other write that left the queue is `finished_unconfirmed`. Nothing reads the repeat or alerts back from Apple. Whether Apple's apps show them and a device actually rings has not been checked against a real account.
 
 ## Write approval
 
