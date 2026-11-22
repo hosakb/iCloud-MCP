@@ -3,7 +3,7 @@
 iCloud-MCP is a local MCP server for Apple Notes, Reminders, Contacts, Calendar, Photos and iCloud Drive. It is a fork of Skykeep and runs on the Skykeep engine. The command is `skykeep-mcp`. It speaks newline-delimited JSON-RPC over stdio, keeps its own private library directory and has no network listener.
 
 - Notes and Reminders can be read and changed. Changes wait in a local queue until `sync` sends them. A new reminder can repeat daily and alert at its due time or before it.
-- Contacts, Calendar and Photos are read-only. Photos gives metadata only, never the pictures.
+- Contacts and Calendar are read-only. Photos reads give metadata only, never the pictures. `photos_write` changes photo details and albums, uploads a file from the exchange folder, and moves a photo to Recently Deleted only with your approval.
 - iCloud Drive can be read and changed with `drive_write`. File contents move only through one local exchange folder you set up, and deletions always need your approval.
 - `setup` guides you through sign-in in your own terminal. `status` checks the setup and `unlock` opens the protected sign-in file after a restart.
 - A permissions file sets each tool or action to `allow`, `ask` or `deny`. With `ask: client` your MCP client shows a card with "Approve this time", "Deny" and "Always allow this action". The server reads the file at every tool call, so an edit counts from the next call.
@@ -134,6 +134,7 @@ Configure your MCP client to start that command. Stdout carries protocol message
 | `calendar_refresh` | Reads Calendar from Apple into the local cache over a bounded window, replacing it. Never writes to Apple, never answers invitations and never opens a sign-in prompt. |
 | `photos_albums`, `photos_list`, `photos_search`, `photos_get` | Read the cached metadata of your personal Photos library: dates, kind, size, filename, title, caption, keywords. No pictures, places or faces. Read-only. |
 | `photos_refresh` | Reads Photos metadata from Apple into the local cache, a bounded batch per call, so a large library takes several calls. Never downloads pictures and never changes photos or albums. |
+| `photos_write` | Changes the personal Photos library with one `action`: `upload`, `set_favorite`, `set_title_and_caption`, `set_rating`, `set_keywords`, `set_date`, `create_album`, `rename_album` or `trash`. Runs against Apple once it is allowed; see "Photos changes" below. |
 | `drive_list`, `drive_get`, `drive_search` | List a cached iCloud Drive folder, read one item's details, or search names. Paths look like `/Documents/Taxes`. Metadata only: no file contents and no local paths. Read-only. |
 | `drive_refresh` | Reads one Drive folder's item list (and those on its path) from Apple into the local cache. Never changes anything in Drive. |
 | `drive_write` | Changes Drive with one `action`: `create_folder`, `rename`, `move`, `trash`, `delete_forever`, `upload` or `download`. Runs against Apple once it is allowed; see "Drive changes" below. |
@@ -184,9 +185,20 @@ Each option is its own record at Apple. The queued create keeps the record ids t
 
 The create reply says `queued: true`, `cloudkit_accepted: false` and `remote_verified: false`, and `options` repeats what was queued: `timezone` (the zone given, or the one chosen; `null` for an all-day or dateless create, or a timed one with none of these options), `repeat` (`frequency` and `ends_at`, the last second of `until` in Unix seconds, or `null` for ever), `due_time_alert` (`true` or `false`) and `early_alert` (`amount` and `unit`, or `null`). It holds no record ids or account id. In the `sync` reply, `left_queue_this_sync` gives `cloudkit_accepted` only for creates whose every write must succeed (one with no date or flag, or one with these options); every other write that left the queue is `finished_unconfirmed`. `cloudkit_accepted` still covers an option left out on purpose for one of the reasons above, and the write that adds a new reminder to its list's order is not checked; `left_queue_note` in the reply says so. Nothing reads the repeat or alerts back from Apple. Whether Apple's apps show them and a device actually rings has not been checked against a real account.
 
+## Photos changes
+
+`photos_write` finds the photo or album in the local cache by its id, as `photos_get` and `photos_albums` show it, so run `photos_refresh` first. Hidden photos, photos in Recently Deleted and Shared Library photos are not found. Like Drive, Photos has no outbox here: an allowed change runs at once and the reply says what happened.
+
+- `upload` reads one file from the exchange folder (`local`, see "The exchange folder" above) and adds it as a new photo. It takes JPEG, HEIC, HEIF, PNG, GIF, TIFF, WebP and DNG pictures and MOV, MP4, M4V and AVI videos of at least 125 bytes, up to the folder's limit. The reply comes once Apple's upload job says the photo is made; the new photo is in the cache after the next `photos_refresh`.
+- `set_favorite`, `set_title_and_caption` (an empty text clears it), `set_rating` (0 to 5), `set_date` (`taken_at` such as `2024-05-01T14:30:00+02:00`) and `trash` change one photo. `create_album` and `rename_album` change albums; a name another cached album already has is refused (`album_name_taken`, compared without case).
+- Each change holds to the version in the cache. The server looks the record up at Apple and writes over exactly that version. A photo or album that changed since `photos_refresh` read it, or that another device changes during the write, is refused with `photos_item_changed_run_photos_refresh` and left as it is. `set_keywords` is the one exception at write time: Apple keeps the keywords as one list, and the words added and taken away are merged into the list as Apple has it then, so a word another device adds at the same moment stays.
+- `"outcome": "done"` comes with `checked`, which says what Apple's answer showed. Nothing is read back, so `remote_verified` is `false`. `photos_write_outcome_unknown_run_photos_refresh_before_retrying` means the connection ended before Apple answered: refresh and look before trying again, because an upload or a new album asked again could be made twice. After a change the cache shows the new value and version, so a second change to the same photo or album needs no refresh.
+
+Approvals. `trash` moves a photo to Recently Deleted, where Apple keeps it about 30 days. It always needs your approval, in the MCP client's approval form under `reads_and_writes` and `writes_only`, or with `skykeep-mcp approve` under `yolo` and in a folder with no approval mode. An `allow` rule doesn't change that, and the card never offers "Always allow" for it. The terminal shows the photo's file name, title and date. A request is used once and is refused if the photo changed in the cache since it was made. Every other action follows the approval mode and the permissions file, under names such as `photos_write.set_rating`. Deleting for good, editing pictures, shared albums and changes to many photos at once are not offered.
+
 ## Write approval
 
-`setup` sets the approval mode for you (step 4 under "Get started"). With mode 1 or 2, approval happens in your MCP client's approval form. In a folder with no approval mode (choice 4, or one set up before approval modes existed), approval happens in your terminal with `skykeep-mcp approve`, as described below. With mode 3 (`yolo`), only Drive deletions, and moves and renames of large Drive folders, are asked, also with `skykeep-mcp approve` (see "Drive changes"). `require-approval` and `allow-routine` apply only to a folder with no approval mode and refuse to run in the others.
+`setup` sets the approval mode for you (step 4 under "Get started"). With mode 1 or 2, approval happens in your MCP client's approval form. In a folder with no approval mode (choice 4, or one set up before approval modes existed), approval happens in your terminal with `skykeep-mcp approve`, as described below. With mode 3 (`yolo`), only Drive deletions, moves and renames of large Drive folders, and Photos moves to Recently Deleted are asked, also with `skykeep-mcp approve` (see "Drive changes" and "Photos changes"). `require-approval` and `allow-routine` apply only to a folder with no approval mode and refuse to run in the others.
 
 Deletions never run straight from MCP in such a folder, whatever the permissions file says; the file can only refuse them. For Notes and Reminders, a deletion here means `delete`, a `move` into Recently Deleted (that is how iCloud deletes a note), and a `save` that leaves the note body empty. Creating a note in Recently Deleted is refused. For any of these the tool returns `approval_required` with a request ID, and you approve in your own terminal:
 
@@ -194,9 +206,9 @@ Deletions never run straight from MCP in such a folder, whatever the permissions
 skykeep-mcp approve --state-dir ~/.local/share/skykeep-mcp
 ```
 
-Drive deletions, and Drive renames or moves of a large folder, wait for `approve` the same way; see "Drive changes" above.
+Drive deletions, Drive renames or moves of a large folder, and Photos moves to Recently Deleted wait for `approve` the same way; see "Drive changes" and "Photos changes" above.
 
-It asks for the request ID, shows the exact change and allows it only after you type `approve`. A Notes or Reminders change is then queued; a Drive change runs at once and the command prints its outcome. To require this for every write, run `skykeep-mcp require-approval --state-dir DIR`; `allow-routine` switches back. Both commands ask you to type `confirm`.
+It asks for the request ID, shows the exact change and allows it only after you type `approve`. A Notes or Reminders change is then queued; a Drive or Photos change runs at once and the command prints its outcome. To require this for every write, run `skykeep-mcp require-approval --state-dir DIR`; `allow-routine` switches back. Both commands ask you to type `confirm`.
 
 There is no volume limit. Under the default policy an agent can queue any number of routine edits, ticks and saves that shorten a note without emptying it. If you want to see every write first, use `require-approval`.
 
@@ -254,7 +266,7 @@ It needs a folder that setup has prepared. It prints the rules in use, when the 
 - Notes with structures the engine can't round-trip are refused rather than flattened. Markdown export is not a lossless copy of a note.
 - A write that iCloud accepts is reported as sent, not as verified field by field. Partial reminder writes are a known inherited gap.
 - Note attachments, Notes folder and Reminders list management, and bulk operations are not exposed.
-- Contacts, Calendar and Photos have no write tools.
+- Contacts and Calendar have no write tools. Photos changes are only the actions of `photos_write`: no deleting for good, no picture edits, no shared albums and no changes to many photos at once.
 - Mail is not implemented and not planned, because upstream Skykeep has no Mail support.
 - Only Linux is supported. The sign-in is kept in a Secret Service keyring or in the passphrase-protected file; with neither, setup and sign-in stop instead of keeping it in a plain file.
 - The protected file needs the Linux kernel key storage for `unlock`. Some containers block it (Docker's default security profile does); there `unlock` says so and the server stays locked.

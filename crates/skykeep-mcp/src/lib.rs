@@ -287,16 +287,24 @@ fn terminal_proposal(
         .map_err(|_| "library_unavailable")?
         .ok_or("login_required")?;
     let id = uuid::Uuid::new_v4().to_string();
-    let proposal = json!({"tool":name,"args":args,"account":account,
+    let mut proposal = json!({"tool":name,"args":args,"account":account,
         "binding":{"policy":policy,"state_identity":identity,"rules":rules}});
+    // A Photos change carries what it reaches as cached, for the terminal to show and for the
+    // approval to hold to; a photo or album not in the cache is refused here, at once.
+    let photos = name == photos_write::TOOL;
+    if photos {
+        proposal["preview"] = photos_write::preview(library, args)?;
+    }
     library
         .set_state(&format!("mcp.approval.{id}"), &proposal.to_string())
         .map_err(|_| "library_unavailable")?;
-    Ok(
-        json!({"status":"approval_required","request_id":id,"approval":"terminal",
+    let mut reply = json!({"status":"approval_required","request_id":id,"approval":"terminal",
         "next":status::with_dir("Ask the person to run skykeep-mcp approve in their own terminal and type this request ID there.", dir),
-        "remote_verified":false}),
-    )
+        "remote_verified":false});
+    if photos {
+        reply["approve_in_terminal"] = json!(status::with_dir("skykeep-mcp approve", dir));
+    }
+    Ok(reply)
 }
 
 /// The terminal approval `id` names exactly this call under the current mode and folder.
@@ -405,6 +413,11 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
         drive_write::IN_RECENTLY_DELETED_LOGIN => Some(format!("The item is in Recently Deleted in iCloud Drive but was not deleted for good, because the sign-in has expired. Sign in again with {} in your own terminal, then delete it from Recently Deleted in iCloud Drive, or leave it: Apple deletes it by itself after about 30 days.", status::with_dir("skykeep-mcp login", dir))),
         photos_write::UNKNOWN => Some("The connection ended before Apple answered, so the Photos change may or may not have been made. Run photos_refresh and look at the photo or album before trying again; an upload or a new album asked again could be made twice.".to_string()),
         photos_write::CHANGED => Some("The photo or album changed in iCloud Photos since the local cache read it, so it was left as it is. Run photos_refresh, look at it again, then ask again.".to_string()),
+        "album_name_taken" => Some("Another album in iCloud Photos already has that name, as the local cache shows, so nothing was changed. Ask again with another name, or rename the other album first.".to_string()),
+        "album_already_has_this_name" => Some("Nothing to do: the album already has that name in the local cache.".to_string()),
+        "photos_file_too_small" => Some(format!("iCloud Photos takes files of at least {} bytes, so nothing was uploaded. Pick a whole photo or video file.", quince_icloud::photos_upload::MIN_BYTES)),
+        "photos_file_type_not_supported" => Some(format!("iCloud Photos takes these file types: {}. Nothing was uploaded; convert the file to one of them first.", photos_write::UPLOAD_TYPES)),
+        "approval_stale_photos_changed_ask_again" => Some("The photo or album changed in the local cache after this request was made, so it did not run. Ask again to get a new request that shows it as it is now.".to_string()),
         "name_taken" => Some("Something with that name is already in that iCloud Drive folder, and it was left as it is. Ask again with another name, or rename or remove the one that is there first.".to_string()),
         "local_file_exists_not_overwritten" => Some("A file with that name is already in the exchange folder, and it was left as it is. Ask again with another local name, or move that file away first.".to_string()),
         "already_has_this_name" => Some("Nothing to do: iCloud Drive already shows the item under that name.".to_string()),
@@ -1385,6 +1398,8 @@ impl Server {
         let proposal: Value = serde_json::from_str(&raw).map_err(|_| "approval_not_found")?;
         let text = if proposal["tool"] == drive_write::TOOL {
             drive_write::plain_preview(&proposal["preview"])
+        } else if proposal["tool"] == photos_write::TOOL {
+            photos_write::plain_preview(&proposal["preview"])
         } else {
             raw
         };
@@ -1702,8 +1717,17 @@ impl Server {
                         &active.fingerprint,
                     );
                 }
-                // A terminal request is used up before it runs, so it runs once.
+                // A terminal request holds to the preview it showed, and is used up before it
+                // runs, so it runs once.
                 if let (true, Some(id)) = (terminal_approved, &terminal) {
+                    let stored: Value = library
+                        .state(&format!("mcp.approval.{id}"))
+                        .map_err(|_| "library_unavailable")?
+                        .and_then(|raw| serde_json::from_str(&raw).ok())
+                        .unwrap_or(Value::Null);
+                    if stored["preview"] != photos_write::preview(library, &args)? {
+                        return Err("approval_stale_photos_changed_ask_again");
+                    }
                     library
                         .set_state(&format!("mcp.approval.{id}"), "")
                         .map_err(|_| "library_unavailable")?;

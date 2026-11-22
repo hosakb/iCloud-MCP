@@ -2,12 +2,16 @@
 //! `upload` (from the exchange folder), `set_favorite`, `set_title_and_caption`, `set_rating`,
 //! `set_keywords`, `set_date`, `create_album`, `rename_album` and `trash` (to Recently Deleted).
 //!
-//! The engine (`quince_icloud::photos` and `quince_icloud::photos_upload`) makes the requests.
-//! A change runs as soon as it is allowed; nothing is queued or retried here. A photo or album
-//! is found in the local cache, as the read tools find it, and each change holds to the version
-//! cached: before writing, the record is looked up at Apple, and one whose change tag moved
-//! since the cache read it is refused (`photos_item_changed_run_photos_refresh`), never written
-//! over. The reply says what Apple's answer showed; nothing is read back afterwards, so
+//! The engine's CloudKit client (`quince_icloud::cloudkit`) and its Photos code
+//! (`quince_icloud::photos`, `quince_icloud::photos_upload`) make the requests. A change runs
+//! as soon as it is allowed; nothing is queued or retried here. A photo or album is found in
+//! the local cache, as the read tools find it, and each change holds to the version cached:
+//! the record is looked up at Apple, refused (`photos_item_changed_run_photos_refresh`) when its
+//! change tag moved since the cache read it, and then written with `update_record_exact` over
+//! exactly that tag, so CloudKit also refuses it when another device wrote in between. Keywords
+//! are the one exception: Apple keeps them as one encoded list, which the engine rebuilds from
+//! Apple's record at the moment of writing, so the words added and taken away here are merged
+//! into it. The reply says what Apple's answer showed; nothing is read back afterwards, so
 //! `remote_verified` stays false.
 //!
 //! Who approves. [`is_destructive`] (the permissions rules' own classification) names `trash`
@@ -23,7 +27,7 @@ use quince_auth::{Client, Endpoints};
 use quince_core::photos::{Album, Photo};
 use quince_core::Library;
 use quince_icloud::cloudkit::ZoneClient;
-use quince_icloud::photos::{self as apple, Flag};
+use quince_icloud::photos as apple;
 use quince_icloud::photos_upload::{self as upload, Outcome, Refusal};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -51,6 +55,9 @@ pub fn is_destructive(action: &str) -> bool {
     crate::permissions::is_deletion(TOOL, action)
 }
 
+/// The file types iCloud Photos takes, in words, as the engine's uploader lists them
+/// (`photos_upload`): jpg, jpeg, heic, heif, png, gif, tif, tiff, webp, mov, mp4, m4v, avi, dng.
+pub const UPLOAD_TYPES: &str = "JPEG (.jpg, .jpeg), HEIC (.heic, .heif), PNG, GIF, TIFF (.tif, .tiff), WebP, DNG, and the videos MOV, MP4, M4V and AVI";
 pub const MAX_TITLE_CHARS: usize = 255;
 pub const MAX_CAPTION_CHARS: usize = 2048;
 pub const MAX_ALBUM_NAME_CHARS: usize = 255;
@@ -405,6 +412,74 @@ pub(crate) fn preview(library: &Library, args: &Value) -> Result<Value, &'static
     Ok(value)
 }
 
+/// A preview in plain lines, for the terminal approval: what the change does, the photo (its
+/// file name, title and date) or album, and the new values.
+pub(crate) fn plain_preview(preview: &Value) -> String {
+    let text = |v: &Value| match v {
+        Value::String(s) => s.clone(),
+        Value::Null => "none".to_string(),
+        other => other.to_string(),
+    };
+    let mut lines = vec![format!(
+        "Photos change: {}{}",
+        text(&preview["action"]),
+        if preview["destructive"] == true {
+            ", a move to Recently Deleted"
+        } else {
+            ""
+        }
+    )];
+    if preview["effect"].is_string() {
+        lines.push(format!("What it does: {}", text(&preview["effect"])));
+    }
+    let photo = &preview["photo"];
+    if photo.is_object() {
+        let mut about = vec![format!("taken {}", text(&photo["taken_at"]))];
+        if photo["title"].is_string() {
+            about.push(format!("title {}", text(&photo["title"])));
+        }
+        about.push(format!("id {}", text(&photo["id"])));
+        lines.push(format!(
+            "Photo: {} ({})",
+            photo["filename"].as_str().unwrap_or("no file name"),
+            about.join(", ")
+        ));
+    }
+    let album = &preview["album"];
+    if album.is_object() {
+        lines.push(format!(
+            "Album: {} (id {})",
+            text(&album["name"]),
+            text(&album["id"])
+        ));
+    }
+    if preview["local_file"].is_string() {
+        lines.push(format!(
+            "Local file in the exchange folder: {}",
+            text(&preview["local_file"])
+        ));
+    }
+    for (key, label) in [
+        ("new_favorite", "Favorite"),
+        ("new_title", "New title"),
+        ("new_caption", "New caption"),
+        ("new_rating", "New rating"),
+        ("new_keywords", "New keywords"),
+        ("new_taken_at", "New date"),
+        ("new_album_name", "New album"),
+        ("new_name", "New name"),
+    ] {
+        if let Some(value) = preview.get(key).filter(|v| !v.is_null()) {
+            let shown = match value {
+                Value::Array(words) => words.iter().map(text).collect::<Vec<_>>().join(", "),
+                other => text(other),
+            };
+            lines.push(format!("{label}: {shown}"));
+        }
+    }
+    lines.join("\n")
+}
+
 // --- Running an action.
 
 fn client_for(dir: &Path, seam: &Seam) -> Result<Client, &'static str> {
@@ -486,6 +561,34 @@ async fn hold_version(
         return Err(CHANGED);
     }
     Ok(cached.to_string())
+}
+
+const ASSET: &str = "CPLAsset";
+const ALBUM: &str = "CPLAlbum";
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// `fields` written over exactly the version cached, checked at Apple first. CloudKit refuses
+/// the write when the record moved on in between, and that refusal comes back as
+/// [`CHANGED`]: nothing is sent again over a newer version (the engine's `update_record`
+/// would retry once with Apple's newest tag).
+async fn exact(
+    zone_client: &ZoneClient<'_>,
+    zone: &str,
+    record: &str,
+    record_type: &str,
+    cached: Option<&str>,
+    fields: &Value,
+) -> Result<Value, &'static str> {
+    let tag = hold_version(zone_client, zone, record, cached).await?;
+    zone_client
+        .update_record_exact(zone, record, record_type, &tag, fields.clone())
+        .await
+        .map_err(|e| engine(&e))
 }
 
 /// The record in Apple's answer to a change.
@@ -726,19 +829,9 @@ impl Work<'_> {
             }
             PhotosWrite::SetFavorite { favorite, .. } => {
                 let p = after.as_mut().ok_or("not_found")?;
-                let tag = hold_version(&zc, &zone, &p.id, p.change_tag.as_deref()).await?;
-                let answer = apple::set_flag(
-                    http,
-                    &conn.ck,
-                    params(),
-                    None,
-                    &p.id,
-                    Some(&tag),
-                    Flag::Favorite,
-                    *favorite,
-                )
-                .await
-                .map_err(|e| engine(&e))?;
+                let fields = json!({"isFavorite": {"value": i64::from(*favorite)}});
+                let answer =
+                    exact(&zc, &zone, &p.id, ASSET, p.change_tag.as_deref(), &fields).await?;
                 let checked = shows(&answer, "isFavorite", &json!(i64::from(*favorite)));
                 p.favorite = *favorite;
                 p.change_tag = new_tag(&answer);
@@ -749,19 +842,24 @@ impl Work<'_> {
             }
             PhotosWrite::SetTitleAndCaption { title, caption, .. } => {
                 let p = after.as_mut().ok_or("not_found")?;
-                hold_version(&zc, &zone, &p.id, p.change_tag.as_deref()).await?;
-                let answer = apple::set_title_and_caption(
-                    http,
-                    &conn.ck,
-                    params(),
-                    None,
+                // Apple's names: the title is `captionEnc`, the caption `extendedDescEnc`,
+                // each base64 of its UTF-8 bytes; only the fields given are sent.
+                let mut fields = serde_json::Map::new();
+                if let Some(t) = title {
+                    fields.insert("captionEnc".into(), json!({"value": base64_text(t)}));
+                }
+                if let Some(c) = caption {
+                    fields.insert("extendedDescEnc".into(), json!({"value": base64_text(c)}));
+                }
+                let answer = exact(
+                    &zc,
+                    &zone,
                     &p.id,
-                    title.as_deref(),
-                    caption.as_deref(),
+                    ASSET,
+                    p.change_tag.as_deref(),
+                    &Value::Object(fields),
                 )
-                .await
-                .map_err(|e| engine(&e))?
-                .ok_or("title_or_caption_required")?;
+                .await?;
                 let checked = title
                     .as_deref()
                     .is_none_or(|t| shows(&answer, "captionEnc", &json!(base64_text(t))))
@@ -781,18 +879,9 @@ impl Work<'_> {
             }
             PhotosWrite::SetRating { rating, .. } => {
                 let p = after.as_mut().ok_or("not_found")?;
-                let tag = hold_version(&zc, &zone, &p.id, p.change_tag.as_deref()).await?;
-                let answer = apple::set_rating(
-                    http,
-                    &conn.ck,
-                    params(),
-                    None,
-                    &p.id,
-                    Some(&tag),
-                    i64::from(*rating),
-                )
-                .await
-                .map_err(|e| engine(&e))?;
+                let fields = json!({"rating": {"value": i64::from(*rating)}});
+                let answer =
+                    exact(&zc, &zone, &p.id, ASSET, p.change_tag.as_deref(), &fields).await?;
                 let checked = shows(&answer, "rating", &json!(i64::from(*rating)));
                 p.rating = i64::from(*rating);
                 p.change_tag = new_tag(&answer);
@@ -803,6 +892,10 @@ impl Work<'_> {
             }
             PhotosWrite::SetKeywords { keywords, .. } => {
                 let p = after.as_mut().ok_or("not_found")?;
+                // Apple holds keywords as one encoded list, which the engine builds from the
+                // record as Apple has it at the moment of writing: the words added and taken
+                // away here are merged into that list, so a word another device added after
+                // this check stays.
                 hold_version(&zc, &zone, &p.id, p.change_tag.as_deref()).await?;
                 let (answer, words) = apple::set_keywords(
                     http,
@@ -831,11 +924,9 @@ impl Work<'_> {
             PhotosWrite::SetDate { taken_at, .. } => {
                 let p = after.as_mut().ok_or("not_found")?;
                 let at = parse_moment(taken_at)?;
-                let tag = hold_version(&zc, &zone, &p.id, p.change_tag.as_deref()).await?;
+                let fields = json!({"assetDate": {"value": at * 1000}});
                 let answer =
-                    apple::set_date(http, &conn.ck, params(), None, &p.id, Some(&tag), at * 1000)
-                        .await
-                        .map_err(|e| engine(&e))?;
+                    exact(&zc, &zone, &p.id, ASSET, p.change_tag.as_deref(), &fields).await?;
                 let checked = shows(&answer, "assetDate", &json!(at * 1000));
                 p.taken_at = at;
                 p.change_tag = new_tag(&answer);
@@ -846,26 +937,13 @@ impl Work<'_> {
             }
             PhotosWrite::Trash { .. } => {
                 let p = after.as_mut().ok_or("not_found")?;
-                let tag = hold_version(&zc, &zone, &p.id, p.change_tag.as_deref()).await?;
-                let answer = apple::set_flag(
-                    http,
-                    &conn.ck,
-                    params(),
-                    None,
-                    &p.id,
-                    Some(&tag),
-                    Flag::Deleted,
-                    true,
-                )
-                .await
-                .map_err(|e| engine(&e))?;
+                // Recently Deleted, as Photos moves a photo there; never `isExpunged`.
+                let fields = json!({"isDeleted": {"value": 1}});
+                let answer =
+                    exact(&zc, &zone, &p.id, ASSET, p.change_tag.as_deref(), &fields).await?;
                 let checked = shows(&answer, "isDeleted", &json!(1));
                 p.deleted = true;
-                p.deleted_at = Some(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs() as i64),
-                );
+                p.deleted_at = Some(now_millis() / 1000);
                 p.change_tag = new_tag(&answer);
                 let mut value = done(checked, "the photo in Recently Deleted");
                 value["photo"] = shown_photo(p);
@@ -895,21 +973,24 @@ impl Work<'_> {
             }
             PhotosWrite::RenameAlbum { name, .. } => {
                 let mut album = self.album.cloned().ok_or("album_not_found")?;
-                let tag = hold_version(&zc, &zone, &album.id, album.change_tag.as_deref()).await?;
-                // The engine looks for the new change tag at the top of Apple's answer, where it
-                // is not, so it answers none: the album is cached without a version, and the
-                // next change to it asks for photos_refresh first.
-                let tag =
-                    apple::rename_album(http, &conn.ck, params(), &album.id, Some(&tag), name)
-                        .await
-                        .map_err(|e| engine(&e))?;
-                album.name = name.clone();
-                album.change_tag = tag;
-                let value = json!({
-                    "outcome": "done",
-                    "album": show_album(&album),
-                    "checked": "Apple accepted the rename without an error; the album was not read back",
+                let fields = json!({
+                    "albumNameEnc": {"value": base64_text(name)},
+                    "userModificationDate": {"value": now_millis()},
                 });
+                let answer = exact(
+                    &zc,
+                    &zone,
+                    &album.id,
+                    ALBUM,
+                    album.change_tag.as_deref(),
+                    &fields,
+                )
+                .await?;
+                let checked = shows(&answer, "albumNameEnc", &json!(base64_text(name)));
+                album.name = name.clone();
+                album.change_tag = new_tag(&answer);
+                let mut value = done(checked, "the new name");
+                value["album"] = show_album(&album);
                 Ok((value, Settled::Album(album)))
             }
         }
@@ -921,7 +1002,7 @@ pub(crate) fn tool() -> Value {
     let id = json!({"description":"Photo id from photos_list, photos_search or photos_get.","type":"string","minLength":1,"maxLength":crate::photos::MAX_ID_BYTES});
     json!({
         "name": TOOL,
-        "description": "Change the user's Apple iCloud Photos (personal library): upload (local, a photo or video file in the exchange folder the user set up in their terminal), set_favorite (id, favorite), set_title_and_caption (id, title and/or caption; empty text clears), set_rating (id, rating 0 to 5), set_keywords (id, keywords: the whole new list), set_date (id, taken_at such as 2024-05-01T14:30:00+02:00), create_album (name), rename_album (album_id, name) and trash (id; moves the photo to Recently Deleted). Photos and albums are found in the local cache, so run photos_refresh first. A photo or album changed at Apple since the cache read it is refused, never written over; run photos_refresh and ask again. trash always needs the user's approval, in the approval form or with skykeep-mcp approve in their terminal; every change follows the approval mode. Nothing is deleted for good, no picture is edited, and shared albums are not touched. The reply says done with what Apple's answer showed, or an error; an unknown outcome means run photos_refresh and look before trying again.",
+        "description": "Change the user's Apple iCloud Photos (personal library): upload (local, a photo or video file in the exchange folder the user set up in their terminal), set_favorite (id, favorite), set_title_and_caption (id, title and/or caption; empty text clears), set_rating (id, rating 0 to 5), set_keywords (id, keywords: the whole new list; the words added or taken away are merged into Apple's list as it is at that moment, so a word another device adds at the same time stays), set_date (id, taken_at such as 2024-05-01T14:30:00+02:00), create_album (name), rename_album (album_id, name) and trash (id; moves the photo to Recently Deleted). Photos and albums are found in the local cache, so run photos_refresh first. A photo or album changed at Apple since the cache read it is refused, never written over; run photos_refresh and ask again. trash always needs the user's approval, in the approval form or with skykeep-mcp approve in their terminal; every change follows the approval mode. Nothing is deleted for good, no picture is edited, and shared albums are not touched. The reply says done with what Apple's answer showed, or an error; an unknown outcome means run photos_refresh and look before trying again.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -977,6 +1058,20 @@ mod tests {
             "2024-01-01T00:00:00+19:00",
         ] {
             assert_eq!(parse_moment(bad), Err("invalid_date"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_types_named_are_the_ones_the_engine_takes() {
+        for ext in [
+            "jpg", "jpeg", "heic", "heif", "png", "gif", "tif", "tiff", "webp", "dng", "mov",
+            "mp4", "m4v", "avi",
+        ] {
+            assert_eq!(upload::refusal(&format!("a.{ext}"), 1000), None, "{ext}");
+            assert!(
+                UPLOAD_TYPES.to_lowercase().contains(ext),
+                "{ext} in {UPLOAD_TYPES}"
+            );
         }
     }
 

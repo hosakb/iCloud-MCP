@@ -892,3 +892,172 @@ async fn an_answer_that_does_not_come_in_time_is_an_unknown_outcome_with_what_to
     // The cache is left as it was, for the refresh to settle.
     assert_eq!(cached(f.dir.path(), "P-1").rating, 0);
 }
+
+/// A modify answered as CloudKit answers a write over a version another device replaced.
+async fn conflict_on_write(remote: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path(format!("{DB}/records/modify")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"records":[{"recordName":"X","reason":"record changed","serverErrorCode":"CONFLICT"}]}),
+        ))
+        .with_priority(1)
+        .mount(remote)
+        .await;
+}
+
+#[tokio::test]
+async fn a_conflict_at_write_time_is_refused_and_nothing_is_sent_again() {
+    // Apple's lookup still shows the cached version, but another device writes first, so
+    // CloudKit refuses the write itself.
+    for (lookup, args, tag) in [
+        (
+            TAG,
+            json!({"action":"set_favorite","id":"P-1","favorite":true}),
+            TAG,
+        ),
+        (
+            TAG,
+            json!({"action":"set_title_and_caption","id":"P-1","title":"x"}),
+            TAG,
+        ),
+        (
+            TAG,
+            json!({"action":"set_rating","id":"P-1","rating":1}),
+            TAG,
+        ),
+        (
+            TAG,
+            json!({"action":"set_date","id":"P-1","taken_at":"2020-01-01T00:00:00Z"}),
+            TAG,
+        ),
+        (
+            ALBUM_TAG,
+            json!({"action":"rename_album","album_id":"AL-1","name":"Holidays"}),
+            ALBUM_TAG,
+        ),
+    ] {
+        let mut f = fixture_at(Some("yolo"), lookup).await;
+        conflict_on_write(&f.remote).await;
+        assert_eq!(
+            error(&mut f.server, args.clone()).await,
+            "photos_item_changed_run_photos_refresh",
+            "{args}"
+        );
+        // One write, over the cached version, never a second one over a newer tag.
+        let sent = modified(&f.remote).await;
+        assert_eq!(sent.len(), 1, "{args}");
+        assert_eq!(sent[0]["operationType"], "update", "{args}");
+        assert_eq!(sent[0]["record"]["recordChangeTag"], tag, "{args}");
+        assert_eq!(cached(f.dir.path(), "P-1"), photo("P-1"), "{args}");
+    }
+    // A move to Recently Deleted, approved in the terminal, is refused the same way.
+    let mut f = fixture(Some("yolo")).await;
+    conflict_on_write(&f.remote).await;
+    let id = proposal_id(&ok(&mut f.server, json!({"action":"trash","id":"P-1"})).await);
+    assert_eq!(
+        f.server.approve_any(&id).await,
+        Err("photos_item_changed_run_photos_refresh")
+    );
+    assert_eq!(modified(&f.remote).await.len(), 1);
+    assert!(!cached(f.dir.path(), "P-1").deleted);
+}
+
+#[tokio::test]
+async fn an_album_renamed_once_can_be_renamed_again_without_a_refresh() {
+    let mut f = fixture_at(Some("yolo"), ALBUM_TAG).await;
+    for name in ["Holidays", "Summer"] {
+        let done = ok(
+            &mut f.server,
+            json!({"action":"rename_album","album_id":"AL-1","name":name}),
+        )
+        .await;
+        assert_eq!(done["outcome"], "done", "{name}: {done}");
+    }
+    let sent = modified(&f.remote).await;
+    assert_eq!(sent[1]["record"]["recordChangeTag"], "tag-2");
+    assert_eq!(
+        sent[1]["record"]["fields"]["albumNameEnc"]["value"],
+        b64("Summer")
+    );
+    assert_eq!(sent[1]["record"]["recordType"], "CPLAlbum");
+}
+
+#[tokio::test]
+async fn a_terminal_trash_request_shows_plain_lines_and_holds_to_its_preview() {
+    let mut f = fixture(Some("yolo")).await;
+    // A photo the cache doesn't have is refused at once, with no request made.
+    assert_eq!(
+        error(&mut f.server, json!({"action":"trash","id":"P-NONE"})).await,
+        "not_found"
+    );
+    let reply = ok(&mut f.server, json!({"action":"trash","id":"P-1"})).await;
+    let id = proposal_id(&reply);
+    assert!(reply["approve_in_terminal"]
+        .as_str()
+        .unwrap()
+        .contains("skykeep-mcp approve"));
+    let shown = f.server.approval_text(&id).unwrap();
+    assert!(
+        shown.starts_with("Photos change: trash, a move to Recently Deleted\n"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("What it does: moved to Recently Deleted"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("Photo: P-1.HEIC (taken 2023-11-14T22:13:20Z, id P-1)"),
+        "{shown}"
+    );
+    assert!(!shown.contains('{'), "{shown}");
+    // The photo changes in the cache before the person approves: the request is stale.
+    {
+        let mut library = quince_core::Library::open(f.dir.path()).unwrap();
+        let mut p = photo("P-1");
+        p.title = Some("Renamed".into());
+        library.put_photos(&[p]).unwrap();
+    }
+    assert_eq!(
+        f.server.approve_any(&id).await,
+        Err("approval_stale_photos_changed_ask_again")
+    );
+    assert!(modified(&f.remote).await.is_empty());
+    let id = proposal_id(&ok(&mut f.server, json!({"action":"trash","id":"P-1"})).await);
+    assert!(f
+        .server
+        .approval_text(&id)
+        .unwrap()
+        .contains("title Renamed"));
+    let done = f.server.approve_any(&id).await.unwrap();
+    assert_eq!(done["outcome"], "done", "{done}");
+}
+
+#[tokio::test]
+async fn album_and_file_refusals_say_what_to_do() {
+    let mut f = fixture(Some("yolo")).await;
+    jpeg(&f.exchange.join("tiny.jpg"), 10);
+    for (args, words) in [
+        (
+            json!({"action":"create_album","name":"Trips"}),
+            "Ask again with another name",
+        ),
+        (
+            json!({"action":"rename_album","album_id":"AL-1","name":"Trips"}),
+            "Nothing to do",
+        ),
+        (
+            json!({"action":"upload","local":"tiny.jpg"}),
+            "at least 125 bytes",
+        ),
+        (
+            json!({"action":"upload","local":"notes.txt"}),
+            "HEIC (.heic, .heif)",
+        ),
+    ] {
+        let value = text(&call(&mut f.server, args.clone()).await);
+        assert!(
+            value["instructions"].as_str().unwrap().contains(words),
+            "{args}: {value}"
+        );
+    }
+}
