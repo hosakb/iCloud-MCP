@@ -337,7 +337,7 @@ async fn post(
             .send()
             .await?;
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+        let text = crate::bounded::reply(response).await?;
         if status.as_u16() == 450 {
             return Err(Error::ReauthRequired);
         }

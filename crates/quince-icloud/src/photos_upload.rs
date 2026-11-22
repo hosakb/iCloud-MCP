@@ -128,7 +128,7 @@ impl Service<'_> {
             match sent {
                 Ok(r) => {
                     let status = r.status().as_u16();
-                    let text = r.text().await.unwrap_or_default();
+                    let text = crate::bounded::reply(r).await?;
                     if status == 450 || status == 401 {
                         return Err(Error::ReauthRequired);
                     }
