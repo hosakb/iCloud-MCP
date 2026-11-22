@@ -1,8 +1,10 @@
-# skykeep-mcp
+# iCloud-MCP
 
-A local MCP server for Apple Notes and Reminders, built on the [Skykeep](https://github.com/YashwanthKamireddi/Skykeep) Rust engine. It uses newline-delimited JSON-RPC over stdio and has no network listener. Reads use a private local SQLite cache. Writes enter a durable outbox for sync with iCloud.
+iCloud-MCP is a local MCP server for Apple Notes, Reminders, Contacts, Calendar, Photos and iCloud Drive, built on the [Skykeep](https://github.com/YashwanthKamireddi/Skykeep) Rust engine. The command is `skykeep-mcp`. It uses newline-delimited JSON-RPC over stdio and has no network listener. Reads use a private local SQLite cache.
 
-This fork contains the MCP server and its four engine crates, not the upstream desktop or mobile applications. Only Notes and Reminders are synced or contacted by the MCP server.
+Notes and Reminders can be read and changed; their changes enter a durable outbox for sync with iCloud. Contacts, Calendar and Photos are read-only. iCloud Drive can be read and changed, with file contents moving only through one local exchange folder. Mail is not implemented and not planned, because upstream Skykeep has no Mail support.
+
+This fork contains the MCP server and its four engine crates, not the upstream desktop or mobile applications. The source is at [hosakb/iCloud-MCP](https://github.com/hosakb/iCloud-MCP).
 
 ## Build
 
@@ -12,41 +14,25 @@ Install the Rust version pinned in [rust-toolchain.toml](rust-toolchain.toml). O
 cargo build --locked --release -p skykeep-mcp
 ```
 
-The binary is `target/release/skykeep-mcp`. The default workspace member is the server, so plain `cargo build` and `cargo test` select it. Session storage is supported only on Linux with a Secret Service keyring.
+The binary is `target/release/skykeep-mcp`. The default workspace member is the server, so plain `cargo build` and `cargo test` select it. Only Linux is supported. The sign-in is kept in a Secret Service keyring or in a passphrase-protected file.
 
-## Sign in and run
+## Set up and run
 
-Sign in from a terminal you open yourself, never an agent-owned terminal:
-
-```sh
-target/release/skykeep-mcp login --state-dir ~/.local/share/skykeep-mcp
-```
-
-The command prompts for the account, password and verification code with echo off. Choose `0` for a trusted-device code or a listed phone ID for SMS. The password is not stored. Session and trust tokens stay in the system keyring; cookies are sealed with a key held there. Use a separate state directory for each Apple Account.
-
-Configure your MCP client to launch the binary with these arguments:
+From a terminal you open yourself, never an agent-owned terminal, run the guided setup:
 
 ```sh
-target/release/skykeep-mcp --state-dir ~/.local/share/skykeep-mcp
+target/release/skykeep-mcp setup
 ```
 
-The state directory must be owned by you, mode `0700`, without symlinks or shared files. A locked keyring or expired session produces `login_required`, not a keyring unlock dialog. The server refreshes Notes and Reminders every five minutes. `sync` requests a refresh and sends queued changes only after a successful refresh.
+It asks for the state folder, where to keep the sign-in, your Apple Account sign-in and an approval mode, then prints what to paste into your MCP client's settings. `skykeep-mcp status` checks the setup without contacting Apple. If setup chose the passphrase-protected file, run `skykeep-mcp unlock` once after each restart. The Apple password is never stored.
 
-## Tools and write approval
+## Tools and approval
 
-The server exposes authentication and sync status, local Notes and Reminders reads and searches, and queued writes. The [MCP reference](crates/skykeep-mcp/README.md#tools) lists the tools, operation fields and error behavior.
+The [MCP reference](crates/skykeep-mcp/README.md#tools) lists every tool, its fields and its errors. A permissions file in the state folder sets each tool or action to `allow`, `ask: client`, `ask: terminal` or `deny`. `ask: client` shows an approval card in the MCP client, `ask: terminal` waits for `skykeep-mcp approve` in your own terminal. Drive deletions always need a person, in every approval mode.
 
-Deletions, moves into Recently Deleted and saves that empty a note require approval in your own terminal:
+Approval protects against clients limited to MCP tools, not agents with shell access as the owner of the state directory. Such an agent can edit local state or invoke terminal helpers.
 
-```sh
-target/release/skykeep-mcp approve --state-dir ~/.local/share/skykeep-mcp
-```
-
-To require approval for every write, run `require-approval --state-dir DIR`. `allow-routine --state-dir DIR` restores routine writes without approval. These commands ask for terminal confirmation. Default policy has no volume limit on routine edits.
-
-Approval protects against clients limited to MCP tools, not agents with shell access as the owner of the state directory. Such an agent can edit local state or invoke terminal helpers. Agent-marker checks prevent accidents, not a hostile process running as your user.
-
-A successful write means queued locally, not verified in iCloud. `remote_verified` is always `false`. Unsupported note structures are refused rather than flattened. Attachments, folder/list management and bulk operations are not exposed. See the [MCP reference](crates/skykeep-mcp/README.md) for full login, logout and approval behavior and limitations.
+A successful Notes or Reminders write means queued locally, not verified in iCloud. See the [MCP reference](crates/skykeep-mcp/README.md) for sign-in, approval, the permissions file and limitations.
 
 ## Development
 
@@ -60,7 +46,7 @@ Tests use synthetic fixtures and local mock servers. They do not require an Appl
 
 ## License and upstream attribution
 
-This fork derives from Skykeep by Yashwanth Kamireddi. The retained engine crates keep their upstream names and code. Skykeep is free and open source under the [GPL-3.0-only license](LICENSE).
+This fork derives from Skykeep by Yashwanth Kamireddi. The retained engine crates keep their upstream names and code. Skykeep is free and open source under the [GPL-3.0-only license](LICENSE). iCloud-MCP is a modified fork of Skykeep, its changes are recorded in the git history, and it stays under GPL-3.0-only.
 
 Copyright (C) 2026 Yashwanth Kamireddi. The inherited [funding configuration](.github/FUNDING.yml) supports the upstream project and remains unchanged.
 

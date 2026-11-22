@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: Security reporting policy
-    url: https://github.com/hosakb/skykeep-mcp/blob/main/SECURITY.md
+    url: https://github.com/hosakb/iCloud-MCP/blob/main/SECURITY.md
     about: Report vulnerabilities privately using this fork's security policy, not public issues.

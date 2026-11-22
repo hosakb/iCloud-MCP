@@ -1,12 +1,19 @@
-# skykeep-mcp
+# iCloud-MCP
 
-A local MCP server for Apple Notes, Reminders, Contacts, Calendar, Photos and iCloud Drive, built on the Skykeep engine. It speaks newline-delimited JSON-RPC over stdio, keeps its own private library directory and has no network listener. Notes, Reminders and Drive can be changed; Contacts, Calendar and Photos are read-only, and Photos exposes metadata only (no pictures). Drive file contents move only through one local exchange folder you set up. Mail is not implemented.
+iCloud-MCP is a local MCP server for Apple Notes, Reminders, Contacts, Calendar, Photos and iCloud Drive. It is a fork of Skykeep and runs on the Skykeep engine. The command is `skykeep-mcp`. It speaks newline-delimited JSON-RPC over stdio, keeps its own private library directory and has no network listener.
+
+- Notes and Reminders can be read and changed. Changes wait in a local queue until `sync` sends them. A new reminder can repeat daily and alert at its due time or before it.
+- Contacts, Calendar and Photos are read-only. Photos gives metadata only, never the pictures.
+- iCloud Drive can be read and changed with `drive_write`. File contents move only through one local exchange folder you set up, and deletions always need your approval.
+- `setup` guides you through sign-in in your own terminal. `status` checks the setup and `unlock` opens the protected sign-in file after a restart.
+- A permissions file sets each tool or action to `allow`, `ask` or `deny`. With `ask: client` your MCP client shows a card with "Approve this time", "Deny" and "Always allow this action". The server reads the file at every tool call, so an edit counts from the next call.
+- Mail is not implemented and not planned, because upstream Skykeep has no Mail support.
 
 ## Architecture
 
-![Skykeep MCP: Hermes talks to the MCP server over stdio, which syncs with Apple iCloud. Live today: Notes, Reminders and Drive (read and write), Contacts, Calendar and Photos (read-only). Also live: reminders created with a daily repeat and alerts. Planned with no route built yet: Mail](docs/architecture.webp)
+![Diagram of the routes from the MCP client through the iCloud-MCP server to Apple iCloud](docs/architecture.webp)
 
-Edit `docs/architecture.html` and re-export `docs/architecture.webp` whenever a route moves from planned to live.
+Edit `docs/architecture.html` and re-export `docs/architecture.webp` whenever a route changes.
 
 ## Build
 
@@ -37,7 +44,7 @@ You need a terminal window that you open yourself. Don't run these commands thro
 
    It walks you through five steps and tells you what each one does:
 
-   1. **Folder.** Where Skykeep keeps its private data. Press Enter to use the suggested folder, `~/.local/share/skykeep-mcp`, or type another one as a full path starting with `/` or `~`. Setup asks before it creates a folder. With another folder, add `--state-dir FOLDER` to every command; setup and status print each command with it already filled in.
+   1. **Folder.** Where iCloud-MCP keeps its private data. Press Enter to use the suggested folder, `~/.local/share/skykeep-mcp`, or type another one as a full path starting with `/` or `~`. Setup asks before it creates a folder. With another folder, add `--state-dir FOLDER` to every command; setup and status print each command with it already filled in.
    2. **Where your sign-in is kept.** Your computer's password store when it has one, otherwise a protected file (see below).
    3. **Apple sign-in.** Your Apple Account, your password and then a verification code. Your account, password and code are not shown as you type. You pick a number for where Apple sends the code: your Apple devices, or a text message to one of your phone numbers if Apple lists any. At the code you can type `b` to go back and pick the other way without typing your password again.
    4. **Approval mode.** When the assistant has to ask you before it acts:
@@ -49,7 +56,7 @@ You need a terminal window that you open yourself. Don't run these commands thro
       | 3. Don't ask, not even before deleting notes or reminders (`yolo`, you type `confirm`) | No question | No question, except Drive deletions, and moves and renames of large Drive folders, which wait for `skykeep-mcp approve` in a terminal (see "Drive changes") |
       | 4. No approval mode, for clients without approval forms (you type `confirm`) | No question | Routine changes: no question. Deletions, and renames and moves of Drive folders with 20 or more items or an unknown count, wait until you run `skykeep-mcp approve` in a terminal |
 
-      Choices 1 and 2 need an MCP client that can show Skykeep's approval card. Hermes should show it; if no card appears, use choice 4 or `ask: terminal` rules. In a client or session without approval forms, every request that needs approval fails with `approval_requires_form_client`; use choice 4 or set those actions to `ask: terminal` in the permissions file (see "Permissions file" below). Choice 4 keeps a folder's earlier `require-approval` setting: then every change waits for `skykeep-mcp approve`, and setup and status say so. Once a folder has had choice 1, 2 or 3, it can't go back to 4; set up a new folder instead.
+      Choices 1 and 2 need an MCP client that can show iCloud-MCP's approval card. Hermes supports MCP form elicitation and shows the card. In a client or session without approval forms, every request that needs approval fails with `approval_requires_form_client`; use choice 4 or set those actions to `ask: terminal` in the permissions file (see "Permissions file" below). Choice 4 keeps a folder's earlier `require-approval` setting: then every change waits for `skykeep-mcp approve`, and setup and status say so. Once a folder has had choice 1, 2 or 3, it can't go back to 4; set up a new folder instead.
    After step 4, setup offers to write a starter permissions file. In it every deletion asks the way your approval mode already asks, or more strictly. Press Enter to skip it.
    5. **Check.** Setup checks everything it set up and prints what to paste into your MCP client's settings: a JSON line for most clients, and a `config.yaml` block for Hermes.
 
@@ -71,12 +78,12 @@ You need a terminal window that you open yourself. Don't run these commands thro
 
 ### Where your sign-in is kept
 
-Skykeep never writes your sign-in to a plain file. There are two options:
+iCloud-MCP never writes your sign-in to a plain file. There are two options:
 
 - **Your computer's password store** (the system keyring, such as GNOME Keyring or KWallet). Setup uses it when it is running and unlocked. Nothing more to do after a restart once you have logged in to your desktop.
-- **A protected file** in the Skykeep folder, for computers without a usable password store, such as a server you reach over SSH. You choose a passphrase of at least 12 characters, typed twice. The file is encrypted with it (AES-256-GCM, key derived with PBKDF2-HMAC-SHA256). After each restart, `skykeep-mcp unlock` asks for the passphrase once and gives the server the key through the Linux kernel's own key storage, so the server can read the file without a desktop. The key is never written to a file. Like the system keyring, it can be read by programs running as your user, and by nobody else. Until you unlock, the server's tools answer `locked: run skykeep-mcp unlock in a terminal`. To make the key expire earlier than the next restart, use `skykeep-mcp unlock --hours 8`; a later plain `skykeep-mcp unlock` removes that limit again.
+- **A protected file** in the iCloud-MCP folder, for computers without a usable password store, such as a server you reach over SSH. You choose a passphrase of at least 12 characters, typed twice. The file is encrypted with it (AES-256-GCM, key derived with PBKDF2-HMAC-SHA256). After each restart, `skykeep-mcp unlock` asks for the passphrase once and gives the server the key through the Linux kernel's own key storage, so the server can read the file without a desktop. The key is never written to a file. Like the system keyring, it can be read by programs running as your user, and by nobody else. Until you unlock, the server's tools answer `locked: run skykeep-mcp unlock in a terminal`. To make the key expire earlier than the next restart, use `skykeep-mcp unlock --hours 8`; a later plain `skykeep-mcp unlock` removes that limit again.
 
-If neither is available, setup stops and says so instead of keeping the sign-in anywhere less safe. If you are inside Docker or a similar container, run Skykeep directly on the computer; on a desktop, log in to the desktop session first. When the option you chose stops working (the keyring is gone, or the kernel key storage is blocked), setup offers the other one. Switching asks you to type `switch`, removes the sign-in kept the old way, and you sign in to Apple again. If the old keyring can't be reached at all, setup says that an older entry may stay there unused; before the folder ever uses that keyring again, setup erases it. A locked keyring is never switched away from: unlock it instead. If you forget the passphrase, run `setup` again and choose to start over with a new one; you then sign in to Apple again, and your cached data stays.
+If neither is available, setup stops and says so instead of keeping the sign-in anywhere less safe. If you are inside Docker or a similar container, run iCloud-MCP directly on the computer; on a desktop, log in to the desktop session first. When the option you chose stops working (the keyring is gone, or the kernel key storage is blocked), setup offers the other one. Switching asks you to type `switch`, removes the sign-in kept the old way, and you sign in to Apple again. If the old keyring can't be reached at all, setup says that an older entry may stay there unused; before the folder ever uses that keyring again, setup erases it. A locked keyring is never switched away from: unlock it instead. If you forget the passphrase, run `setup` again and choose to start over with a new one; you then sign in to Apple again, and your cached data stays.
 
 Your Apple password is never stored. When Apple asks you to sign in again, run `setup` again and choose to sign in again in this folder.
 
@@ -98,7 +105,7 @@ What is kept afterwards:
 - The session and trust tokens, in the storage chosen above. With the system keyring they are under the service name `skykeep-mcp`, one entry per folder. The server never imports a session from the Skykeep desktop app.
 - A one-way account tag in the library, so a folder can't be reused for another Apple Account. Use a new folder for a different account.
 
-The folder must be owned by you, mode `0700`, and contain no symlinks or files readable by others. The one exception is `permissions.yaml`: a shared or linked copy doesn't stop the folder, and Skykeep treats that file as unusable (see "Permissions file"). The server and the helper commands take an exclusive lock on it for each operation. If a command meets a request in progress it stops with `state_busy_retry`; run it again. A running server picks up the new session on its next request, without a restart.
+The folder must be owned by you, mode `0700`, and contain no symlinks or files readable by others. The one exception is `permissions.yaml`: a shared or linked copy doesn't stop the folder, and iCloud-MCP treats that file as unusable (see "Permissions file"). The server and the helper commands take an exclusive lock on it for each operation. If a command meets a request in progress it stops with `state_busy_retry`; run it again. A running server picks up the new session on its next request, without a restart.
 
 `logout` erases the stored session and the cookie file, which is sealed with a key kept beside the session. Cached data stays in the folder until you delete it. If the system keyring is locked, the sign-out is recorded and finished the next time the keyring answers; until then no session is loaded. With the protected file, run `unlock` first.
 
@@ -197,7 +204,7 @@ What approval protects against: an agent that reaches this server only through M
 
 ## Permissions file
 
-One file in the folder decides, for each tool and action, whether Skykeep runs it, asks first or refuses it: `permissions.yaml`, so by default `~/.local/share/skykeep-mcp/permissions.yaml`. Skykeep reads it before every tool call, so an edit counts at once. There is no apply step.
+One file in the folder decides, for each tool and action, whether iCloud-MCP runs it, asks first or refuses it: `permissions.yaml`, so by default `~/.local/share/skykeep-mcp/permissions.yaml`. iCloud-MCP reads it before every tool call, so an edit counts at once. There is no apply step.
 
 ```yaml
 version: 1
@@ -209,10 +216,10 @@ rules:
   contacts_get: deny                   # always refused
 ```
 
-| Value | What Skykeep does |
+| Value | What iCloud-MCP does |
 | --- | --- |
 | `allow` | Runs the action without asking. |
-| `ask: client` | Shows the approval card in your MCP client. This is meant to be the normal way in Hermes: its CLI and desktop app are expected to show the card with its buttons, which was not tested here. If no card appears, use `ask: terminal` for that action. Cron jobs and other unattended sessions are expected to decline it, so nothing runs there; this was not tested with Hermes. |
+| `ask: client` | Shows the approval card in your MCP client. Hermes supports MCP form elicitation and shows the card. A session where nobody answers, such as a cron job, can't approve it: a card closed without a choice counts as Deny and nothing runs. For clients or sessions without approval forms, use `ask: terminal`. |
 | `ask: terminal` | Returns a request ID and waits until you run `skykeep-mcp approve --state-dir FOLDER` in your own terminal, as for deletions today. Use it for clients or sessions without approval forms. Only tools that change something can use it. A request made before the file changed no longer counts, and a later `deny` refuses older requests too. |
 | `deny` | Refuses with `denied_by_permissions` and a sentence saying the file blocks it. |
 
@@ -228,13 +235,13 @@ Anything the file does not list follows the folder's approval mode. A rule can m
 nano ~/.local/share/skykeep-mcp/permissions.yaml
 ```
 
-Use your folder if it is another one. nano keeps the file's mode 600, so only you can read or change it. A new file gets your usual mode, often 664 on Ubuntu, and Skykeep then reports it with the `chmod 600` command to run. Some editors leave a backup copy such as `permissions.yaml~` next to it; if others can read that copy, Skykeep refuses the whole folder and names the file to delete or `chmod 600`.
+Use your folder if it is another one. nano keeps the file's mode 600, so only you can read or change it. A new file gets your usual mode, often 664 on Ubuntu, and iCloud-MCP then reports it with the `chmod 600` command to run. Some editors leave a backup copy such as `permissions.yaml~` next to it; if others can read that copy, iCloud-MCP refuses the whole folder and names the file to delete or `chmod 600`.
 
- This means a client or agent that can edit this file can change its own approval level, for example to delete without asking. That is a deliberate choice for ease of use. If you don't want it, don't give the agent file access to the folder. The rules themselves are never visible or changeable through Skykeep's MCP tools.
+ This means a client or agent that can edit this file can change its own approval level, for example to delete without asking. That is a deliberate choice for ease of use. If you don't want it, don't give the agent file access to the folder. The rules themselves are never visible or changeable through iCloud-MCP's MCP tools.
 
-**When the file is wrong.** Skykeep reads only a regular file in the folder that belongs to you and that no one else can change. It never follows a link and reads at most 64 KiB. The format is a strict part of YAML: `version: 1`, `rules:`, and one rule per line indented with spaces. A broken file never makes anything looser. Skykeep keeps the last valid rules it loaded from the file. If there are none, the approval mode decides and every deletion asks, even under `yolo`. Each tool result says so while the file is unusable, and `status` and `permissions show` say what is wrong. A file that others can change, which is common on Ubuntu with mode 664, is reported with the command that fixes it: `chmod 600 FOLDER/permissions.yaml`.
+**When the file is wrong.** iCloud-MCP reads only a regular file in the folder that belongs to you and that no one else can change. It never follows a link and reads at most 64 KiB. The format is a strict part of YAML: `version: 1`, `rules:`, and one rule per line indented with spaces. A broken file never makes anything looser. iCloud-MCP keeps the last valid rules it loaded from the file. If there are none, the approval mode decides and every deletion asks, even under `yolo`. Each tool result says so while the file is unusable, and `status` and `permissions show` say what is wrong. A file that others can change, which is common on Ubuntu with mode 664, is reported with the command that fixes it: `chmod 600 FOLDER/permissions.yaml`.
 
-**Seeing what changed.** Each time the file's content changes, Skykeep records when it loaded it and what became looser or stricter. `skykeep-mcp status` reports looser changes, for example `reminders_write.delete: waits for skykeep-mcp approve in your terminal before, now runs without asking`, until you look. `status` only reads; it never records anything.
+**Seeing what changed.** Each time the file's content changes, iCloud-MCP records when it loaded it and what became looser or stricter. `skykeep-mcp status` reports looser changes, for example `reminders_write.delete: waits for skykeep-mcp approve in your terminal before, now runs without asking`, until you look. `status` only reads; it never records anything.
 
 ```sh
 skykeep-mcp permissions show --state-dir FOLDER
@@ -243,6 +250,14 @@ skykeep-mcp permissions show --state-dir FOLDER
 It needs a folder that setup has prepared. It prints the rules in use, when the last change was loaded, any problem with the file, every change since you last ran it in your own terminal, and the newest lines of `permissions-log.jsonl`. That log gets one line, with tool, action and time but no content, for each deletion that ran without asking because the file allowed it, and for each rule saved from a card. A run through an agent's terminal shows the changes but does not mark them as seen. An agent that can edit files can also edit the log, so it is a record, not a protection.
 
 ## Limitations
+
+- Notes with structures the engine can't round-trip are refused rather than flattened. Markdown export is not a lossless copy of a note.
+- A write that iCloud accepts is reported as sent, not as verified field by field. Partial reminder writes are a known inherited gap.
+- Note attachments, Notes folder and Reminders list management, and bulk operations are not exposed.
+- Contacts, Calendar and Photos have no write tools.
+- Mail is not implemented and not planned, because upstream Skykeep has no Mail support.
+- Only Linux is supported. The sign-in is kept in a Secret Service keyring or in the passphrase-protected file; with neither, setup and sign-in stop instead of keeping it in a plain file.
+- The protected file needs the Linux kernel key storage for `unlock`. Some containers block it (Docker's default security profile does); there `unlock` says so and the server stays locked.
 
 ### Approval modes in detail
 
@@ -349,19 +364,11 @@ MCP tool can resend, release or retire a refused write.
 Hermes 0.23.3 sends `initialize` with protocol `2025-11-25` and
 `elicitation: {form: {}, url: {}}`, so the server shows it the approval card. How
 each Hermes surface renders the three choices, and whether it returns the chosen
-value, was not tested here; a card answered without a choice counts as Deny. No
-Hermes files were edited. OpenClaw
-runtime interoperability is untested. The candidate is based on cleanup main;
-deleted app files have not been restored. Independent security re-review is required.
+value, was not tested here; a card answered without a choice counts as Deny. OpenClaw
+runtime interoperability is untested.
 
 References: [MCP elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation),
 [MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools),
 [Hermes configuration](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference).
 Client UI is client-owned. A same-user executable can forge consent or edit state;
 MCP-only approvals cannot defend against that authority.
-
-- Notes with structures the engine can't round-trip are refused rather than flattened. Markdown export is not a lossless copy of a note.
-- A write that iCloud accepts is reported as sent, not as verified field by field. Partial reminder writes are a known inherited gap.
-- Attachments, folder and list management, and bulk operations are not exposed.
-- Only Linux is supported. The sign-in is kept in a Secret Service keyring or in the passphrase-protected file; with neither, setup and sign-in stop instead of keeping it in a plain file.
-- The protected file needs the Linux kernel key storage for `unlock`. Some containers block it (Docker's default security profile does); there `unlock` says so and the server stays locked.
