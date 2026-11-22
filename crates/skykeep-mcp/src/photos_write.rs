@@ -622,7 +622,7 @@ fn engine(e: &quince_icloud::Error) -> &'static str {
     match e {
         E::ReauthRequired => "login_required",
         E::NeedsDeviceApproval => PAUSED,
-        E::Network(_) | E::Busy(_) => UNKNOWN,
+        E::Network(_) | E::Stalled | E::Busy(_) => UNKNOWN,
         E::Conflict => CHANGED,
         _ => NOT_CONFIRMED,
     }
@@ -894,8 +894,11 @@ impl Work<'_> {
                     .service_url("photosupload")
                     .ok_or("photos_service_unavailable")?;
                 let quiet: Arc<dyn Fn(upload::Stage) + Send + Sync> = Arc::new(|_| {});
+                // The photo's bytes go through the session's uploads client, watched while
+                // they go; the read timeout of the plain client cut off long uploads.
                 let outcome = upload::upload(
                     http,
+                    conn.client.uploads(),
                     &up,
                     &conn.dsid,
                     &zone,
@@ -1193,6 +1196,14 @@ pub(crate) fn tool() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An upload that stopped part way, or got no answer once every byte was in, can not
+    /// tell whether Apple made the photo. Before the watched upload such a stop came back
+    /// as a network timeout, and it still reads the same way.
+    #[test]
+    fn a_stalled_upload_is_an_unknown_outcome_like_a_dropped_connection() {
+        assert_eq!(engine(&quince_icloud::Error::Stalled), UNKNOWN);
+    }
 
     #[test]
     fn only_trash_is_a_removal_and_it_is_recoverable() {

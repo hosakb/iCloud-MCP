@@ -662,7 +662,7 @@ fn apple(e: &quince_icloud::Error) -> &'static str {
     match e {
         E::ReauthRequired => "login_required",
         E::NeedsDeviceApproval => PAUSED,
-        E::Network(_) | E::Busy(_) => UNKNOWN,
+        E::Network(_) | E::Stalled | E::Busy(_) => UNKNOWN,
         E::Refused(_) if quince_icloud::drive::transient(e) => UNKNOWN,
         E::Conflict => CHANGED,
         _ => NOT_CONFIRMED,
@@ -1006,8 +1006,11 @@ async fn act(
             }
             effects.unlist.push(folder.clone());
             let progress: quince_icloud::drive::Progress = Arc::new(|_, _| {});
+            // The file's bytes go through the session's uploads client, watched while they
+            // go; the read timeout of the plain client cut off uploads longer than a minute.
             let filed = quince_icloud::drive::upload(
                 http,
+                conn.client.uploads(),
                 docws,
                 root,
                 params(),
@@ -1161,6 +1164,14 @@ pub(crate) fn tool() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An upload that stopped part way, or got no answer once every byte was in, can not
+    /// tell whether Apple filed it. Before the watched upload such a stop came back as a
+    /// network timeout, and it still reads the same way.
+    #[test]
+    fn a_stalled_upload_is_an_unknown_outcome_like_a_dropped_connection() {
+        assert_eq!(apple(&quince_icloud::Error::Stalled), UNKNOWN);
+    }
 
     #[test]
     fn every_action_parses_and_only_deletions_are_destructive() {
