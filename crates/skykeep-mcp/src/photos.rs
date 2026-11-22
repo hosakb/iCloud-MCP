@@ -680,6 +680,11 @@ const PAGE_RECORDS: usize = 500;
 /// dropped before the engine sees it.
 const KEPT_TYPES: [&str; 4] = ["CPLMaster", "CPLAsset", "CPLContainerRelation", "CPLAlbum"];
 
+/// Apple was busy, had asked to wait, or sent a reply that could not be used.
+pub(crate) const APPLE_FAILED: &str = "photos_refresh_failed_cache_kept";
+/// Apple's reply arrived but could not be saved to the cache.
+pub(crate) const STORE_FAILED: &str = "photos_refresh_store_failed_cache_kept";
+
 /// Why a refresh read stopped. Apple's own error bodies are never kept or shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stop {
@@ -701,7 +706,7 @@ impl Stop {
     fn code(self) -> &'static str {
         match self {
             Stop::Reauth => "login_required",
-            Stop::Busy | Stop::Failed | Stop::StaleToken => "photos_refresh_failed_cache_kept",
+            Stop::Busy | Stop::Failed | Stop::StaleToken => APPLE_FAILED,
             Stop::TooLarge => "photos_response_too_large_cache_kept",
             Stop::Locked => "photos_paused_approve_on_apple_device",
             Stop::Preparing => "photos_library_preparing_cache_kept",
@@ -1257,7 +1262,8 @@ async fn read_library(
             let stopped = *stopped
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            return Err(stopped.unwrap_or("photos_refresh_failed_cache_kept"));
+            // No stop from Apple's side: saving the reply to the cache failed.
+            return Err(stopped.unwrap_or(STORE_FAILED));
         }
     }
     let (read, complete, incremental) = *outcome
