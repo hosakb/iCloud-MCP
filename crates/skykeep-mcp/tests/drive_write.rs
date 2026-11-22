@@ -1206,6 +1206,41 @@ async fn an_interrupted_upload_is_unknown_and_its_retry_adds_no_copy() {
     );
 }
 
+/// The upload action sends a file of several pieces through the session's uploads client and
+/// the watched upload (#59): Apple holds its receipt back for two seconds once every byte is
+/// in, and the file still lands whole, sent once, its receipt checked against those bytes.
+#[tokio::test]
+async fn a_file_of_many_pieces_goes_through_the_uploads_client_whole() {
+    let mut f = fixture(None).await;
+    let bytes: Vec<u8> = (0..(1024 * 1024 + 7)).map(|i| (i % 251) as u8).collect();
+    std::fs::write(f.exchange.join("plan.txt"), &bytes).unwrap();
+    serve_listing(&f.remote, DOCS, docs_items(), None).await;
+    serve_upload(&f.remote, &bytes, Some(Duration::from_secs(2))).await;
+    let done = ok(
+        &mut f.server,
+        json!({"action":"upload","path":"/Documents","local":"plan.txt"}),
+    )
+    .await;
+    assert_eq!(done["outcome"], "done", "{done}");
+    assert_eq!(done["remote_verified"], true);
+    assert_eq!(done["item"]["size"], bytes.len());
+    let sent = requests(&f.remote).await;
+    let slots: Vec<_> = sent.iter().filter(|r| r.url.path() == "/slot").collect();
+    assert_eq!(slots.len(), 1, "the bytes went once");
+    let body = &slots[0].body;
+    let at = body
+        .windows(64)
+        .position(|w| w == &bytes[..64])
+        .expect("the file's first bytes are in the upload");
+    assert_eq!(
+        &body[at..at + bytes.len()],
+        &bytes[..],
+        "the whole file, in order"
+    );
+    let staging = f.dir.path().join("drive-upload");
+    assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+}
+
 #[tokio::test]
 async fn writes_need_a_signed_in_folder_and_valid_arguments() {
     let dir = private_dir();
