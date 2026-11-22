@@ -73,7 +73,11 @@ pub const BAD_ARGUMENTS: &str = "invalid_photos_write_arguments";
 pub const NO_PHOTO: &str = "photo_not_found";
 pub const BAD_DATE: &str = "invalid_taken_at";
 pub const UNKNOWN: &str = "photos_write_outcome_unknown_run_photos_refresh_before_retrying";
-const NOT_CONFIRMED: &str = "photos_write_not_confirmed_run_photos_refresh";
+pub const NOT_CONFIRMED: &str = "photos_write_not_confirmed_run_photos_refresh";
+pub const KEYWORDS_NOT_KEPT: &str = "photos_keywords_not_kept_by_this_tool";
+pub const KEYWORD_CASE: &str = "photos_keyword_case_change_not_supported";
+/// An approval made for the photo or album as it was cached, which has changed since.
+pub const STALE: &str = "approval_stale_photos_changed_ask_again";
 pub const CHANGED: &str = "photos_item_changed_run_photos_refresh";
 pub const GONE: &str = "photos_item_not_found_at_apple_run_photos_refresh";
 pub const NO_VERSION: &str = "photos_item_version_unknown_run_photos_refresh";
@@ -150,11 +154,39 @@ impl PhotosWrite {
 
 /// Text a person typed for Photos: at most `max` characters, nothing that hides or reorders
 /// text, and no control characters (a caption may hold line breaks).
+/// The line and paragraph separators: not control characters, but they break a line where
+/// they are shown.
+fn breaks_line(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}')
+}
+
 fn text_ok(text: &str, max: usize, lines: bool) -> bool {
     text.chars().count() <= max
         && !text
             .chars()
-            .any(|c| hides_text(c) || (c.is_control() && !(lines && c == '\n')))
+            .any(|c| hides_text(c) || breaks_line(c) || (c.is_control() && !(lines && c == '\n')))
+}
+
+/// A keyword this tool can send: 1 to `MAX_KEYWORD_CHARS` characters, no space at either end.
+fn keyword_ok(word: &str) -> bool {
+    !word.trim().is_empty() && word.trim() == word && text_ok(word, MAX_KEYWORD_CHARS, false)
+}
+
+/// Refuses a keyword change that would lose words or do nothing: Apple's list is rebuilt from
+/// the cached one, so a cached word this tool could not send back (too long, padded, with
+/// control characters, or past the 50th) would be dropped, and a word given again in another
+/// case is the same word to Photos, so its case would not change.
+fn keywords_change_ok(cached: &[String], wanted: &[String]) -> Result<(), &'static str> {
+    if cached.len() > MAX_KEYWORDS || !cached.iter().all(|w| keyword_ok(w)) {
+        return Err(KEYWORDS_NOT_KEPT);
+    }
+    if wanted
+        .iter()
+        .any(|w| cached.iter().any(|c| c != w && c.eq_ignore_ascii_case(w)))
+    {
+        return Err(KEYWORD_CASE);
+    }
+    Ok(())
 }
 
 fn name_ok(name: &str) -> Result<(), &'static str> {
@@ -273,10 +305,7 @@ pub(crate) fn validate(args: &Value) -> Result<PhotosWrite, &'static str> {
                 return Err("too_many_keywords");
             }
             for (i, word) in keywords.iter().enumerate() {
-                if word.trim().is_empty()
-                    || word.trim() != word
-                    || !text_ok(word, MAX_KEYWORD_CHARS, false)
-                {
+                if !keyword_ok(word) {
                     return Err("invalid_keyword");
                 }
                 if keywords[..i].iter().any(|w| w.eq_ignore_ascii_case(word)) {
@@ -398,6 +427,7 @@ pub(crate) fn preview(library: &Library, args: &Value) -> Result<Value, &'static
         PhotosWrite::SetRating { rating, .. } => value["new_rating"] = json!(rating),
         PhotosWrite::SetKeywords { keywords, .. } => {
             let cached = cached_photo(library, op.photo_id().unwrap_or_default())?.keywords;
+            keywords_change_ok(&cached, keywords)?;
             let missing = |from: &[String], to: &[String]| -> Vec<String> {
                 from.iter()
                     .filter(|w| !to.iter().any(|t| t.eq_ignore_ascii_case(w)))
@@ -757,6 +787,9 @@ pub(crate) async fn run(
         }
         _ => None,
     };
+    if let (PhotosWrite::SetKeywords { keywords, .. }, Some(p)) = (&op, &photo) {
+        keywords_change_ok(&p.keywords, keywords)?;
+    }
     let first_position = library
         .albums()
         .map_err(|_| "library_unavailable")?
@@ -789,7 +822,11 @@ pub(crate) async fn run(
     };
     // The cache follows Apple's answer, only while the directory still belongs to the
     // account the change ran as.
-    let mut note = "the local cache shows the change";
+    let mut note = if value["outcome"] == "sent_not_confirmed" {
+        "the local cache shows the change as sent, but Apple's answer did not confirm it; run photos_refresh and look"
+    } else {
+        "the local cache shows the change"
+    };
     if let Ok(mut library) = Library::open(dir) {
         if binding(&library, &conn.dsid) == Ok(Binding::Same) {
             let stored = match settled {
@@ -1116,7 +1153,10 @@ pub(crate) fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String>
         "photos_duplicate_already_in_library" => "Apple says this photo is already in the library, so no second copy was made. Run photos_refresh to see it.".into(),
         "icloud_storage_full_nothing_uploaded" => "iCloud storage is full, so nothing was uploaded. Free space or add storage in the Apple Account settings, then ask again.".into(),
         "local_file_over_exchange_limit" => format!("The file is larger than the exchange folder's size limit, so nothing was sent. To raise the limit, run in your own terminal: {}", crate::status::with_dir("skykeep-mcp exchange --max-mb N", dir)),
-        "approval_stale_photos_changed_ask_again" => "The photo or album changed in the local cache after this request was made, so it did not run. Ask again to get a new request that shows it as it is now.".into(),
+        NOT_CONFIRMED => "Apple answered with an error, so the change may not have been made. Run photos_refresh and look at the photo or album before asking again; an upload or a new album asked again could be made twice.".into(),
+        KEYWORDS_NOT_KEPT => format!("This photo already has keywords this tool can't send back: longer than {MAX_KEYWORD_CHARS} characters, with a space at either end, with control characters, or more than {MAX_KEYWORDS}. A change here would drop them, so nothing was sent. Change the keywords in the Photos app instead."),
+        KEYWORD_CASE => "Photos compares keywords without regard to case, so a word given again in another case would stay as it is. To change its case, remove the word in one change and add it in the new case in a second.".into(),
+        STALE => "The photo or album changed in the local cache after this request was made, so it did not run. Ask again to get a new request that shows it as it is now.".into(),
         _ => return None,
     };
     Some(text)
@@ -1127,7 +1167,7 @@ pub(crate) fn tool() -> Value {
     let id = json!({"description":"Photo id from photos_list, photos_search or photos_get.","type":"string","minLength":1,"maxLength":crate::photos::MAX_ID_BYTES});
     json!({
         "name": TOOL,
-        "description": "Change the user's Apple iCloud Photos (personal library): upload (local, a photo or video file in the exchange folder the user set up in their terminal), set_favorite (id, favorite), set_title_and_caption (id, title and/or caption; empty text clears), set_rating (id, rating 0 to 5), set_keywords (id, keywords: the whole new list; the words added or taken away are merged into Apple's list as it is at that moment, so a word another device adds at the same time stays; run photos_refresh before the next change to that photo), set_date (id, taken_at such as 2024-05-01T14:30:00+02:00), create_album (name), rename_album (album_id, name) and trash (id; moves the photo to Recently Deleted). Photos and albums are found in the local cache, so run photos_refresh first. A photo or album changed at Apple since the cache read it is refused, never written over; run photos_refresh and ask again. trash always needs the user's approval, in the approval form or with skykeep-mcp approve in their terminal; every change follows the approval mode. Nothing is deleted for good, no picture is edited, and shared albums are not touched. The reply says done with what Apple's answer showed, or an error; an unknown outcome means run photos_refresh and look before trying again.",
+        "description": "Change the user's Apple iCloud Photos (personal library): upload (local, a photo or video file in the exchange folder the user set up in their terminal), set_favorite (id, favorite), set_title_and_caption (id, title and/or caption; empty text clears), set_rating (id, rating 0 to 5), set_keywords (id, keywords: the whole new list; the words added or taken away are merged into Apple's list as it is at that moment, so a word another device adds at the same time stays; run photos_refresh before the next change to that photo), set_date (id, taken_at such as 2024-05-01T14:30:00+02:00), create_album (name), rename_album (album_id, name) and trash (id; moves the photo to Recently Deleted). Photos and albums are found in the local cache, so run photos_refresh first. A photo or album changed at Apple since the cache read it is refused, never written over; run photos_refresh and ask again. trash always needs the user's approval, in the approval form or with skykeep-mcp approve in their terminal; every change follows the approval mode. Nothing is deleted for good, no picture is edited, and shared albums are not touched. The reply says done with what Apple's answer showed, or sent_not_confirmed when Apple accepted the change but its answer did not show it (run photos_refresh and look), or an error; an unknown outcome means run photos_refresh and look before trying again.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1197,6 +1237,33 @@ mod tests {
                 UPLOAD_TYPES.to_lowercase().contains(ext),
                 "{ext} in {UPLOAD_TYPES}"
             );
+        }
+    }
+
+    #[test]
+    fn line_and_paragraph_separators_are_refused_in_every_text() {
+        for mark in ['\u{2028}', '\u{2029}'] {
+            let text = format!("a{mark}b");
+            for (args, code) in [
+                (
+                    json!({"action":"set_title_and_caption","id":"A","title":text}),
+                    "invalid_title",
+                ),
+                (
+                    json!({"action":"set_title_and_caption","id":"A","caption":text}),
+                    "invalid_caption",
+                ),
+                (
+                    json!({"action":"set_keywords","id":"A","keywords":[text]}),
+                    "invalid_keyword",
+                ),
+                (
+                    json!({"action":"create_album","name":text}),
+                    "invalid_album_name",
+                ),
+            ] {
+                assert_eq!(validate(&args).map(|_| ()), Err(code), "{args}");
+            }
         }
     }
 

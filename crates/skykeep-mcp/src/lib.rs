@@ -1515,6 +1515,11 @@ impl Server {
                 exact.snapshot = Some(resolved_snapshot(library, name, &args)?);
             }
             if grant != &exact {
+                // A Photos card approved for the photo or album as it was cached, which
+                // changed since: the same code as a stale terminal request, with what to do.
+                if name == photos_write::TOOL && grant.snapshot != exact.snapshot {
+                    return Err(photos_write::STALE);
+                }
                 return Err("approval_policy_changed");
             }
         }
@@ -1722,7 +1727,7 @@ impl Server {
                         .and_then(|raw| serde_json::from_str(&raw).ok())
                         .unwrap_or(Value::Null);
                     if stored["preview"] != photos_write::preview(library, &args)? {
-                        return Err("approval_stale_photos_changed_ask_again");
+                        return Err(photos_write::STALE);
                     }
                     library
                         .set_state(&format!("mcp.approval.{id}"), "")

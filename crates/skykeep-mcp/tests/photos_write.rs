@@ -788,7 +788,15 @@ async fn a_card_goes_stale_when_the_photo_changes_in_the_cache_before_it_is_answ
         library.put_photos(&[p]).unwrap();
     }
     let reply = f.server.handle(decide(&form, "approve")).await.unwrap();
-    assert_eq!(text(&reply)["error"], "approval_policy_changed", "{reply}");
+    let value = text(&reply);
+    assert_eq!(
+        value["error"], "approval_stale_photos_changed_ask_again",
+        "{reply}"
+    );
+    assert!(value["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("Ask again"));
     assert!(modified(&f.remote).await.is_empty());
 }
 
@@ -1187,6 +1195,10 @@ async fn an_answer_that_does_not_show_the_change_is_sent_not_confirmed() {
     .await;
     assert_eq!(done["outcome"], "sent_not_confirmed", "{done}");
     assert!(done["checked"].as_str().unwrap().contains("photos_refresh"));
+    assert!(
+        done["cache"].as_str().unwrap().contains("photos_refresh"),
+        "{done}"
+    );
     // A keyword answer that drops the field is not confirmed either.
     f.remote.reset().await;
     let mut g = fixture(Some("yolo")).await;
@@ -1310,4 +1322,81 @@ async fn refusals_of_arguments_say_what_the_action_takes() {
             "{args}: {value}"
         );
     }
+}
+
+/// A photo whose cached keywords are `words`.
+fn with_keywords(dir: &Path, words: Vec<String>) {
+    let mut library = quince_core::Library::open(dir).unwrap();
+    let mut p = photo("P-1");
+    p.keywords = words;
+    library.put_photos(&[p]).unwrap();
+}
+
+#[tokio::test]
+async fn a_keyword_change_is_refused_when_it_would_drop_words_it_cannot_send_back() {
+    let mut f = fixture(Some("yolo")).await;
+    let args = json!({"action":"set_keywords","id":"P-1","keywords":["Sea"]});
+    for words in [
+        vec!["Beach".to_string(), "x".repeat(65)],
+        vec![" padded".to_string()],
+        vec!["tab\there".to_string()],
+        (0..51).map(|i| format!("k{i}")).collect(),
+    ] {
+        with_keywords(f.dir.path(), words.clone());
+        let value = text(&call(&mut f.server, args.clone()).await);
+        assert_eq!(
+            value["error"], "photos_keywords_not_kept_by_this_tool",
+            "{words:?}: {value}"
+        );
+        assert!(value["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("Photos app"));
+    }
+    assert!(modified(&f.remote).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_keyword_change_of_case_only_is_refused_not_reported_done() {
+    let mut f = fixture(Some("yolo")).await;
+    let value = text(
+        &call(
+            &mut f.server,
+            json!({"action":"set_keywords","id":"P-1","keywords":["beach"]}),
+        )
+        .await,
+    );
+    assert_eq!(
+        value["error"], "photos_keyword_case_change_not_supported",
+        "{value}"
+    );
+    assert!(value["instructions"].as_str().unwrap().contains("case"));
+    assert!(modified(&f.remote).await.is_empty());
+}
+
+#[tokio::test]
+async fn an_error_answer_from_apple_says_the_change_may_not_have_been_made() {
+    let mut f = fixture(Some("yolo")).await;
+    Mock::given(method("POST"))
+        .and(path(format!("{DB}/records/modify")))
+        .respond_with(ResponseTemplate::new(400).set_body_string("{}"))
+        .with_priority(1)
+        .mount(&f.remote)
+        .await;
+    let value = text(
+        &call(
+            &mut f.server,
+            json!({"action":"set_rating","id":"P-1","rating":3}),
+        )
+        .await,
+    );
+    assert_eq!(
+        value["error"],
+        "photos_write_not_confirmed_run_photos_refresh"
+    );
+    let next = value["instructions"].as_str().unwrap();
+    assert!(
+        next.contains("may not have been made") && next.contains("twice"),
+        "{next}"
+    );
 }
