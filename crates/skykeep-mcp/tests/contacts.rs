@@ -189,7 +189,11 @@ async fn tools_list_names_apple_icloud_contacts_with_strict_read_only_schemas() 
     let tools = list["result"]["tools"].as_array().unwrap();
     let contacts: Vec<&Value> = tools
         .iter()
-        .filter(|t| t["name"].as_str().unwrap().starts_with("contacts"))
+        .filter(|t| {
+            let name = t["name"].as_str().unwrap();
+            // contacts_write has its own tests (tests/contacts_write.rs).
+            name.starts_with("contacts") && name != "contacts_write"
+        })
         .collect();
     let names: Vec<&str> = contacts
         .iter()
@@ -253,7 +257,7 @@ async fn tools_list_names_apple_icloud_contacts_with_strict_read_only_schemas() 
         }
         if name.starts_with("contacts") {
             assert!(
-                !name.contains("write") && !name.contains("delete"),
+                name == "contacts_write" || !name.contains("delete"),
                 "{name}"
             );
         }

@@ -15,7 +15,7 @@ pub const MODES: [(&str, &str); 3] = [
     ),
     (
         "yolo",
-        "Don't ask, not even before deleting notes or reminders. Drive deletions, and moves and renames of large Drive folders, still wait for skykeep-mcp approve.",
+        "Don't ask, not even before deleting notes or reminders. Drive and Contacts deletions, and moves and renames of large Drive folders, still wait for skykeep-mcp approve.",
     ),
 ];
 
