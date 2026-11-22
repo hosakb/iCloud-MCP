@@ -1528,3 +1528,19 @@ async fn trash_asks_on_the_card_in_every_mode_and_only_an_approval_runs_it() {
         assert!(modified(&f.remote).await.is_empty(), "{mode:?}");
     }
 }
+
+/// The file's approval_mode is the mode in force for Photos too: yolo there runs a change
+/// without a card where setup stored writes_only, and a trash still asks.
+#[tokio::test]
+async fn the_files_yolo_runs_a_photos_change_unasked_and_trash_still_asks() {
+    let mut f = fixture(Some("writes_only")).await;
+    rules(f.dir.path(), "version: 1\napproval_mode: yolo\n");
+    let done = ok(
+        &mut f.server,
+        json!({"action":"set_favorite","id":"P-1","favorite":true}),
+    )
+    .await;
+    assert_eq!(done["outcome"], "done", "{done}");
+    let form = call(&mut f.server, json!({"action":"trash","id":"P-2"})).await;
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+}

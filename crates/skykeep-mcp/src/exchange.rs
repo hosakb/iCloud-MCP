@@ -43,6 +43,9 @@ pub struct Exchange {
     /// Device and inode when it was set up.
     pub identity: (u64, u64),
     pub max_bytes: u64,
+    /// Named in permissions.yaml: a later failure points to the file, not the command.
+    #[serde(skip)]
+    pub from_file: bool,
 }
 
 /// The home folder's `Skykeep-Exchange`.
@@ -158,6 +161,7 @@ pub fn checked(written: &str, state_dir: &Path, max_bytes: u64) -> Result<Exchan
         path: real,
         identity: (st.st_dev as u64, st.st_ino as u64),
         max_bytes,
+        from_file: false,
     })
 }
 
@@ -176,7 +180,9 @@ pub fn in_force(
         .and_then(|s| s.as_ref())
         .map_or(DEFAULT_MAX_BYTES, |s| s.max_bytes);
     if let Some(written) = &active.exchange {
-        return checked(written, state_dir, max_bytes).map(Some);
+        let mut exchange = checked(written, state_dir, max_bytes)?;
+        exchange.from_file = true;
+        return Ok(Some(exchange));
     }
     let Some(stored) = stored? else {
         return Ok(None);
@@ -209,12 +215,13 @@ pub fn problem(code: &str) -> &'static str {
             "is a system or shared folder, your home folder or a folder above it"
         }
         "exchange_folder_hidden_or_credentials" => "is inside a hidden folder (a name that starts with a dot, such as .ssh or .gnupg) or a credentials or keyring folder",
-        "exchange_folder_private_state" => "is Skykeep's private folder, is inside it or holds it",
+        "exchange_folder_private_state" => "is the private folder (--state-dir), is inside it or holds it",
         "exchange_folder_home_unknown" => "starts with ~, but the home folder is not known here",
         "exchange_folder_not_a_full_path" => "is not a full path",
         "exchange_folder_changed_run_skykeep_mcp_exchange" => {
             "is no longer the folder that was set up"
         }
+        "exchange_folder_changed" => "changed while it was in use; try again",
         _ => "can't be opened",
     }
 }
@@ -229,7 +236,8 @@ pub fn fix(code: &str, dir: &Path, written: Option<&str>) -> String {
             crate::permissions::EXCHANGE_KEY
         );
     };
-    let folder = crate::status::quoted(Path::new(written));
+    // Expanded first: a quoted ~ would not be expanded by the shell.
+    let folder = crate::status::quoted(&expand(written).unwrap_or_else(|_| PathBuf::from(written)));
     let change = format!(
         "change {}: in {file} to a private folder of your own, such as ~/{DEFAULT_NAME}, or run {terminal} in your own terminal",
         crate::permissions::EXCHANGE_KEY
@@ -266,7 +274,7 @@ pub fn next_step(code: &str, dir: &Path) -> String {
     match &written {
         Some(w) => format!(
             "The exchange folder {} in {} {}, so nothing was uploaded or downloaded. {}",
-            crate::status::quoted(Path::new(w)),
+            crate::status::quoted(&expand(w).unwrap_or_else(|_| PathBuf::from(w))),
             crate::permissions::FILE_NAME,
             problem(code),
             fix(code, dir, Some(w))
@@ -395,6 +403,7 @@ fn set_up_in(
         path,
         identity: (st.st_dev as u64, st.st_ino as u64),
         max_bytes,
+        from_file: false,
     };
     let text = serde_json::to_string(&exchange).map_err(|_| "library_unavailable")?;
     library
@@ -481,17 +490,20 @@ fn real_path(path: &Path) -> Result<PathBuf, &'static str> {
 
 /// The folder, opened and checked to be the one set up.
 fn open_root(exchange: &Exchange) -> Result<OwnedFd, &'static str> {
-    let raw = c_name(
-        exchange
-            .path
-            .to_str()
-            .ok_or("exchange_folder_changed_run_skykeep_mcp_exchange")?,
-    )?;
-    let fd =
-        open_dir_at(None, &raw).map_err(|_| "exchange_folder_missing_run_skykeep_mcp_exchange")?;
+    // A folder named in permissions.yaml gets codes whose next step points to the file.
+    let (missing, changed) = if exchange.from_file {
+        ("exchange_folder_missing", "exchange_folder_changed")
+    } else {
+        (
+            "exchange_folder_missing_run_skykeep_mcp_exchange",
+            "exchange_folder_changed_run_skykeep_mcp_exchange",
+        )
+    };
+    let raw = c_name(exchange.path.to_str().ok_or(changed)?)?;
+    let fd = open_dir_at(None, &raw).map_err(|_| missing)?;
     let st = fstat(fd.as_raw_fd())?;
     if (st.st_dev as u64, st.st_ino as u64) != exchange.identity || !private_enough(&st) {
-        return Err("exchange_folder_changed_run_skykeep_mcp_exchange");
+        return Err(changed);
     }
     Ok(fd)
 }
@@ -859,6 +871,35 @@ pub(crate) fn stage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_folder_from_the_file_that_fails_at_use_points_to_the_file() {
+        let gone = |from_file| Exchange {
+            path: PathBuf::from("/nonexistent-exchange-for-test/in"),
+            identity: (0, 0),
+            max_bytes: 1,
+            from_file,
+        };
+        assert_eq!(
+            open_root(&gone(true)).map(|_| ()),
+            Err("exchange_folder_missing")
+        );
+        assert_eq!(
+            open_root(&gone(false)).map(|_| ()),
+            Err("exchange_folder_missing_run_skykeep_mcp_exchange")
+        );
+        let here = std::env::current_dir().unwrap();
+        let moved = Exchange {
+            path: here,
+            identity: (0, 0),
+            max_bytes: 1,
+            from_file: true,
+        };
+        assert_eq!(
+            open_root(&moved).map(|_| ()),
+            Err("exchange_folder_changed")
+        );
+    }
 
     #[test]
     fn local_paths_are_plain_relative_names() {

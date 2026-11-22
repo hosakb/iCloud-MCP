@@ -189,6 +189,7 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
             "invalid_request_id",
             "read_approval_required",
             "write_authorization_stale",
+            "write_mode_stricter",
             "write_refused",
         ],
     ),

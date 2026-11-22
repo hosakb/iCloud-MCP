@@ -2617,3 +2617,26 @@ async fn a_drive_deletion_card_starts_with_a_plain_sentence() {
         "{first}"
     );
 }
+
+/// The file's approval_mode is the mode in force for Drive too: yolo there runs a change
+/// without a card where setup stored writes_only, and a trash still asks.
+#[tokio::test]
+async fn the_files_yolo_runs_a_drive_change_unasked_and_trash_still_asks() {
+    let mut f = fixture(Some("writes_only")).await;
+    rules(f.dir.path(), "version: 1\napproval_mode: yolo\n");
+    serve_listing(&f.remote, DOCS, docs_items(), None).await;
+    answer(
+        &f.remote,
+        "/createFolders",
+        json!({"folders":[{"drivewsid":"FOLDER::com.apple.CloudDocs::NEW","name":"Taxes","type":"FOLDER","status":"OK"}]}),
+    )
+    .await;
+    let done = ok(
+        &mut f.server,
+        json!({"action":"create_folder","path":"/Documents","name":"Taxes"}),
+    )
+    .await;
+    assert_eq!(done["outcome"], "done", "{done}");
+    let form = call(&mut f.server, json!({"action":"trash","id":REPORT})).await;
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+}

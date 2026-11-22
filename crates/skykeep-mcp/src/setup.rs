@@ -279,7 +279,9 @@ fn survey(env: &Env, dir: &Path) -> Result<Found, &'static str> {
             }
         }
     }
+    // The mode in force: the permissions file's approval_mode, else the stored one.
     let mode = match crate::policy(&library, dir) {
+        Ok(_) if file_mode(&library, dir).is_some() => file_mode(&library, dir),
         Ok(Some((p, _))) => Some(p.mode),
         Ok(None) if no_mode_chosen(&library) => Some("none".into()),
         _ => None,
@@ -290,6 +292,18 @@ fn survey(env: &Env, dir: &Path) -> Result<Found, &'static str> {
         account,
         mode,
     })
+}
+
+/// The approval mode `permissions.yaml` sets in `dir` (or its last valid one), if it sets one.
+fn file_mode(library: &quince_core::Library, dir: &Path) -> Option<String> {
+    let stored = crate::policy(library, dir)
+        .ok()
+        .flatten()
+        .map(|(p, _)| p.mode);
+    crate::permissions::peek(library, dir, stored.as_deref())
+        .ok()
+        .filter(|a| a.mode_in_file)
+        .and_then(|a| a.mode)
 }
 
 /// The mode in words; "none" says what it does in this folder, from `library`.
@@ -384,10 +398,12 @@ async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcom
         }
         let mode = {
             let held = PrivateState::open(&dir)?;
-            describe(
-                found.mode.as_deref().unwrap_or_default(),
-                &crate::setup(&held.path)?,
-            )
+            let library = crate::setup(&held.path)?;
+            let mut text = describe(found.mode.as_deref().unwrap_or_default(), &library);
+            if file_mode(&library, &held.path).is_some() {
+                text.push_str(" (set in permissions.yaml)");
+            }
+            text
         };
         c.say(&format!(
             "\nThis folder is already set up. Sign-in kept in the {}, signed in as {}, approval mode: {mode}",
@@ -842,7 +858,18 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
         return Err("login_required");
     }
     let existing = crate::policy(&library, &held.path);
+    let in_file = file_mode(&library, &held.path);
     match &existing {
+        Ok(_) if in_file.is_some() => {
+            let answer = console.ask(&format!(
+                "Current mode: {} It is set in permissions.yaml ({}:), which replaces the mode chosen here; a new choice changes that line.\nPress Enter to keep it, or type change: ",
+                status::describe_mode(in_file.as_deref().unwrap_or_default()),
+                crate::permissions::MODE_KEY
+            ))?;
+            if answer.trim().is_empty() {
+                return Ok(());
+            }
+        }
         Ok(Some((policy, _))) => {
             let answer = console.ask(&format!(
                 "Current mode: {}\nPress Enter to keep it, or type change: ",
@@ -871,13 +898,19 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
     let raw = library
         .state("mcp.policy")
         .map_err(|_| "policy_unavailable")?;
-    let offer_none = raw.is_none();
+    // A mode line in permissions.yaml would still apply, so no-mode is not offered then.
+    let offer_none = raw.is_none() && in_file.is_none();
     let mut menu = format!(
         "  1. {} Recommended.\n  2. {}\n  3. {}\n",
         MODES[0].1, MODES[1].1, MODES[2].1
     );
     if offer_none {
         menu.push_str(&format!("  4. No approval mode (older behaviour). {} Once you pick 1, 2 or 3, this folder can't go back to 4. Most people should pick 1.\nChoose 1, 2, 3 or 4 (Enter picks 1): ", status::no_mode_choice(&library)));
+    } else if in_file.is_some() {
+        console.say(&format!(
+            "permissions.yaml sets {}:, so there is no choice without an approval mode.",
+            crate::permissions::MODE_KEY
+        ))?;
     } else {
         console.say("This folder has had an approval mode, so there is no choice without one.")?;
         menu.push_str("Choose 1, 2 or 3 (Enter picks 1): ");

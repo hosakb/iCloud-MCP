@@ -865,7 +865,7 @@ type Change = (Value, Option<Value>);
 /// How strict an approval mode is, for telling a looser change from a stricter one. A folder
 /// without a mode counts as between writes_only and yolo, or as writes_only after
 /// `require-approval`.
-fn mode_rank(mode: Option<&str>, require_all: bool) -> u8 {
+pub(crate) fn mode_rank(mode: Option<&str>, require_all: bool) -> u8 {
     match mode {
         Some("reads_and_writes") => 4,
         Some("writes_only") => 3,
@@ -1552,7 +1552,7 @@ pub fn starter(dir: &Path) -> String {
          #   approval_mode: reads_and_writes, writes_only or yolo. Deletions ask in every mode.\n\
          #   exchange_folder: the one folder Drive and Photos uploads read from and Drive\n\
          #     downloads write into. A private folder of your own, not a link, not a system\n\
-         #     folder and not inside a hidden folder such as .ssh or Skykeep's own folder.\n\
+         #     folder and not inside a hidden folder such as .ssh or the private folder.\n\
          # Passwords, codes and the passphrase never go in this file.\n\
          version: 1\n\
          # approval_mode: writes_only\n\

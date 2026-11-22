@@ -164,7 +164,7 @@ fn exchange(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     use std::io::Write;
     writeln!(
         tty,
-        "Drive exchange folder: {}\nSize limit: {} MB per upload or download.\npermissions.yaml now says {EXCHANGE_KEY}: {}. Skykeep uses that line; you can also change it in the file.",
+        "Drive exchange folder: {}\nSize limit: {} MB per upload or download.\npermissions.yaml now says {EXCHANGE_KEY}: {}. iCloud-MCP uses that line; you can also change it in the file.",
         exchange.path.display(),
         exchange.max_bytes / (1024 * 1024),
         exchange.path.display()
@@ -357,7 +357,7 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
                     return Err("permissions_file_unusable");
                 }
             }
-            writeln!(tty, "Set approval mode to {mode} for {}. This writes {MODE_KEY}: {mode} into permissions.yaml there, the line Skykeep uses. YOLO runs reads and changes without prompts; deletions, moves to Recently Deleted and moves and renames of large Drive folders still ask on the approval card. All currently pending writes will be quarantined, including previously approved writes. Old terminal proposals cannot be released under this policy. Type confirm to persist.", dir.display()).map_err(|_| "terminal_unavailable")?;
+            writeln!(tty, "Set approval mode to {mode} for {}. This writes {MODE_KEY}: {mode} into permissions.yaml there, the line iCloud-MCP uses. YOLO runs reads and changes without prompts; deletions, moves to Recently Deleted and moves and renames of large Drive folders still ask on the approval card. All currently pending writes will be quarantined, including previously approved writes. Old terminal proposals cannot be released under this policy. Type confirm to persist.", dir.display()).map_err(|_| "terminal_unavailable")?;
             let answer = terminal::hidden(&mut tty, "Confirmation: ", Duration::from_secs(180))?;
             if *answer != "confirm" {
                 return Err("policy_change_cancelled");
@@ -368,7 +368,7 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
                 writeln!(tty, "The mode was stored, but permissions.yaml could not be edited ({reason}). A {MODE_KEY}: line in the file still wins; change it there.").map_err(|_| "terminal_unavailable")?;
                 return Err("permissions_file_unusable");
             }
-            writeln!(tty, "Saved policy: {saved}\npermissions.yaml now says {MODE_KEY}: {mode}. Skykeep uses that line; you can also change it in the file.").map_err(|_| "terminal_unavailable")?;
+            writeln!(tty, "Saved policy: {saved}\npermissions.yaml now says {MODE_KEY}: {mode}. iCloud-MCP uses that line; you can also change it in the file.").map_err(|_| "terminal_unavailable")?;
             return Ok(());
         }
         if command == "quarantine" {

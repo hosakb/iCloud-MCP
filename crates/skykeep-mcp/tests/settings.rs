@@ -620,3 +620,84 @@ fn the_policy_command_writes_the_files_line_and_keeps_its_comments() {
         serde_json::from_str(&library.state("mcp.policy").unwrap().unwrap()).unwrap();
     assert_eq!(stored["mode"], "yolo");
 }
+
+#[tokio::test]
+async fn a_write_queued_under_a_looser_mode_is_set_aside_when_the_file_gets_stricter() {
+    let mut f = folder(Some("writes_only")).await;
+    let dir = f.path();
+    write_file(&dir, "version: 1\napproval_mode: yolo\n");
+    let create = |title: &str| json!({"action":"create","list_guid":"list","title":title});
+    assert!(!asks(&mut f, 1, "reminders_write", create("Queued under yolo")).await);
+    let library = quince_core::Library::open(&dir).unwrap();
+    let first = library.outbox_all_pending().unwrap().remove(0);
+    assert_eq!(
+        skykeep_mcp::sync::authorized(&library, &dir, &first),
+        Ok(())
+    );
+    // Looser again changes nothing for it.
+    write_file(
+        &dir,
+        "version: 1\napproval_mode: yolo\nrules:\n  notes_list: deny\n",
+    );
+    assert_eq!(
+        skykeep_mcp::sync::authorized(&library, &dir, &first),
+        Ok(())
+    );
+    // Stricter: it is never sent, and the next write sets it aside.
+    write_file(
+        &dir,
+        "version: 1\napproval_mode: writes_only\nrules:\n  reminders_write.create: allow\n",
+    );
+    assert_eq!(
+        skykeep_mcp::sync::authorized(&library, &dir, &first),
+        Err("write_mode_stricter")
+    );
+    assert!(
+        !asks(
+            &mut f,
+            2,
+            "reminders_write",
+            create("Queued under writes_only")
+        )
+        .await
+    );
+    let pending = library.outbox_all_pending().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_ne!(pending[0].id, first.id);
+    assert_eq!(
+        skykeep_mcp::sync::authorized(&library, &dir, &pending[0]),
+        Ok(())
+    );
+    let refused = library.outbox_refused_brief().unwrap();
+    assert!(
+        refused
+            .iter()
+            .any(|r| r.id == first.id && r.reason == "mcp_quarantine:write_mode_stricter"),
+        "{:?}",
+        refused.iter().map(|r| &r.reason).collect::<Vec<_>>()
+    );
+}
+
+/// A suggested mkdir or chmod line names the folder so the shell finds it: a path the file
+/// writes with ~/ is expanded before it is quoted.
+#[test]
+fn suggested_commands_never_quote_a_tilde() {
+    if std::env::var_os("HOME").filter(|h| !h.is_empty()).is_none() {
+        return;
+    }
+    let state = private("state");
+    let dir = state.path().canonicalize().unwrap();
+    write_file(&dir, "version: 1\nexchange_folder: ~/Sky Missing Folder\n");
+    for code in [
+        "exchange_folder_missing",
+        "exchange_folder_writable_by_others",
+    ] {
+        let step = skykeep_mcp::next_step(code, &dir, &Value::Null).unwrap();
+        assert!(!step.contains("'~") && !step.contains("\"~"), "{step}");
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert!(
+            step.contains(&home.join("Sky Missing Folder").display().to_string()),
+            "{step}"
+        );
+    }
+}

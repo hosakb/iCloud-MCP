@@ -103,7 +103,7 @@ fn bounded_context(context: Value) -> Result<Value, &'static str> {
 
 /// Grant failures that belong to one queued write. Anything else (an unreadable library,
 /// a changed policy, account or directory) still stops the whole pass.
-const QUARANTINABLE: [&str; 11] = [
+const QUARANTINABLE: [&str; 12] = [
     "payload_too_large",
     "preview_too_large",
     "invalid_preview",
@@ -111,6 +111,7 @@ const QUARANTINABLE: [&str; 11] = [
     "authorization_too_large",
     "invalid_authorization",
     "write_authorization_stale",
+    "write_mode_stricter",
     "not_found",
     "operation_too_large",
     "template_too_large",
@@ -192,16 +193,20 @@ fn refused_ids(dir: &Path) -> Result<Vec<i64>, &'static str> {
         .collect())
 }
 
+/// Records the grant a queued write is sent under: the stored policy, the approval mode in
+/// force when it was queued (the file's, else the stored one), the write and its context.
 pub(crate) fn record_authorization(
     library: &mut Library,
+    dir: &Path,
     p: &quince_core::outbox::Pending,
 ) -> Result<(), &'static str> {
     let policy = library
         .state("mcp.policy")
         .map_err(|_| "policy_unavailable")?
         .ok_or("policy_unavailable")?;
-    let grant =
-        json!({"policy":policy,"pending":pending_value(p),"context":send_context(library,p)?});
+    let mode = crate::mode_in_force(library, dir)?;
+    let grant = json!({"policy":policy,"mode":mode,"pending":pending_value(p),
+        "context":send_context(library,p)?});
     library
         .set_state(&format!("mcp.authorization.{}", p.id), &grant.to_string())
         .map_err(|_| "library_unavailable")
@@ -230,7 +235,7 @@ fn authorization_check(
     p: &quince_core::outbox::Pending,
     context: bool,
 ) -> Result<(), &'static str> {
-    let Some((_, binding)) = crate::policy(library, dir)? else {
+    let Some((stored, binding)) = crate::policy(library, dir)? else {
         return Err("configured_policy_required");
     };
     if p.payload.len() > 262144 {
@@ -244,12 +249,46 @@ fn authorization_check(
         return Err("authorization_too_large");
     }
     let grant: Value = serde_json::from_str(&raw).map_err(|_| "invalid_authorization")?;
-    if grant.as_object().is_none_or(|m| m.len() != 3)
+    // A grant from before the mode was recorded has three fields and was made under the
+    // stored mode.
+    let fields = grant.as_object().map_or(0, |m| m.len());
+    if !(fields == 3 || (fields == 4 && grant["mode"].is_string()))
         || grant["policy"] != binding.policy
         || grant["pending"] != pending_value(p)
         || (context && grant["context"] != send_context(library, p)?)
     {
         return Err("write_authorization_stale");
+    }
+    // Queued under a looser mode than the one in force now: never sent.
+    let queued = grant["mode"].as_str().unwrap_or(&stored.mode);
+    let now = crate::mode_in_force(library, dir)?;
+    if crate::permissions::mode_rank(now.as_deref(), false)
+        > crate::permissions::mode_rank(Some(queued), false)
+    {
+        return Err("write_mode_stricter");
+    }
+    Ok(())
+}
+
+/// Sets aside every queued write made under a looser approval mode than the one in force,
+/// so it is never sent and the next write is not blocked by it.
+pub(crate) fn quarantine_looser(library: &mut Library, dir: &Path) -> Result<(), &'static str> {
+    if crate::policy(library, dir)?.is_none() {
+        return Ok(());
+    }
+    for p in library
+        .outbox_all_pending()
+        .map_err(|_| "library_unavailable")?
+    {
+        if authorization_check(library, dir, &p, false) == Err("write_mode_stricter") {
+            library
+                .atomically(|library| -> quince_core::Result<()> {
+                    library.outbox_refuse(p.id, "mcp_quarantine:write_mode_stricter")?;
+                    library.set_state(&format!("mcp.authorization.{}", p.id), "")?;
+                    library.set_state(&reread_key(&p.service), "1")
+                })
+                .map_err(|_| "library_unavailable")?;
+        }
     }
     Ok(())
 }
@@ -261,11 +300,7 @@ pub async fn run(dir: &Path) -> Result<Value, &'static str> {
 fn refresh_gate(dir: &Path, approved: bool) -> Result<bool, &'static str> {
     let mut library = Library::open(dir).map_err(|_| "library_unavailable")?;
     let configured = crate::policy(&library, dir)?;
-    if configured
-        .as_ref()
-        .is_some_and(|(p, _)| p.mode == "reads_and_writes")
-        && !approved
-    {
+    if crate::mode_in_force(&library, dir)?.as_deref() == Some("reads_and_writes") && !approved {
         return Err("read_approval_required");
     }
     if configured.is_some() {

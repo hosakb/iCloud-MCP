@@ -1789,3 +1789,21 @@ async fn require_approval_without_a_mode_asks_every_calendar_change_on_the_card(
         assert_eq!(writes(&f.remote).await.len(), 1, "{rule}");
     }
 }
+
+/// The file's approval_mode is the mode in force for Calendar too: yolo there runs a change
+/// without a card where setup stored writes_only, and a delete still asks.
+#[tokio::test]
+async fn the_files_yolo_runs_a_calendar_change_unasked_and_a_delete_still_asks() {
+    let mut f = fixture(Some("writes_only")).await;
+    rules(f.dir.path(), "version: 1\napproval_mode: yolo\n");
+    let form = call(
+        &mut f.server,
+        json!({"action":"delete","guid":"E-1","etag":"etag-E-1"}),
+    )
+    .await;
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+    let reply = f.server.handle(answer(&form, "deny")).await.unwrap();
+    assert_eq!(text(&reply)["error"], "approval_denied");
+    let done = ok(&mut f.server, update("E-1", json!({"title":"t2"}))).await;
+    assert_eq!(done["outcome"], "done", "{done}");
+}

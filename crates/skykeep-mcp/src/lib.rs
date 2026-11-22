@@ -357,6 +357,13 @@ struct Policy {
     state_identity: (u64, u64),
 }
 
+/// The approval mode in force: the permissions file's `approval_mode:`, else the stored one.
+/// Read only; the server records file loads at each tool call.
+pub(crate) fn mode_in_force(library: &Library, dir: &Path) -> Result<Option<String>, &'static str> {
+    let stored = policy(library, dir)?.map(|(p, _)| p.mode);
+    Ok(permissions::peek(library, dir, stored.as_deref())?.mode)
+}
+
 fn policy(
     library: &Library,
     dir: &Path,
@@ -2227,6 +2234,8 @@ fn authorized_enqueue(
     {
         return Err("quarantine_full_retire_in_terminal");
     }
+    // Writes queued under a looser mode than the one in force are set aside first.
+    sync::quarantine_looser(library, dir)?;
     let before = sync::pending_operations(library)?;
     for p in &before {
         sync::authorized_payload(library, dir, p)?;
@@ -2283,7 +2292,7 @@ fn authorized_enqueue(
                     || result["guid"] == p.record
                     || (old == Some(p) && current.contains(&p.id))
                 {
-                    sync::record_authorization(library, p).map_err(Refused)?;
+                    sync::record_authorization(library, dir, p).map_err(Refused)?;
                 }
             }
             for p in &before {
