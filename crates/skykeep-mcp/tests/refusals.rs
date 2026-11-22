@@ -79,6 +79,11 @@ async fn refusals_keep_their_own_code_in_every_approval_mode() {
         let (_dir, mut server, library) = folder(None).await;
         let expected = call(&mut server, name, args.clone()).await;
         assert_eq!(expected["error"], code, "{expected}");
+        if code == "conflict" {
+            assert!(expected["instructions"]
+                .as_str()
+                .is_some_and(|t| t.contains("base_etag")));
+        }
         drop(library);
         for mode in ["writes_only", "reads_and_writes", "yolo"] {
             let (_dir, mut server, library) = folder(Some(mode)).await;
