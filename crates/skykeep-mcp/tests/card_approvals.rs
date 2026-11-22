@@ -476,3 +476,37 @@ async fn tool_descriptions_name_the_card_not_the_terminal() {
         }
     }
 }
+
+/// A note already in Recently Deleted: deleting it again is "Delete Now", gone for good. The
+/// card says so and, like every permanent delete, offers no "Always allow".
+#[tokio::test]
+async fn deleting_a_note_already_in_recently_deleted_is_permanent_on_the_card() {
+    let args = json!({"action":"delete","guid":"note","base_etag":"etag-1"});
+    for mode in MODES {
+        for rule in ["", "  notes_write.delete: allow\n"] {
+            let mut f = folder(mode, true).await;
+            let mut note = f.library.note("note").unwrap().unwrap();
+            note.folder_guid = Some(TRASH_FOLDER.into());
+            note.body = Some("Synthetic\nkeep me".into());
+            f.library.put_notes(&[note]).unwrap();
+            if !rule.is_empty() {
+                let rules = f.path.join("permissions.yaml");
+                std::fs::write(&rules, format!("version: 1\nrules:\n{rule}")).unwrap();
+                std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let form = change_card(&mut f, mode, "notes_write", &args).await;
+            let message = form["params"]["message"].as_str().unwrap();
+            assert_eq!(
+                message.lines().next(),
+                Some("Delete forever \"Synthetic\" in Notes. This can't be undone."),
+                "{mode:?} {rule}"
+            );
+            assert!(!message.contains("30 days"), "{message}");
+            assert!(!message.contains("Always allow"), "{message}");
+            assert_eq!(f.library.outbox_count().unwrap(), 0);
+            let reply = f.server.handle(answer(&form, "approve")).await.unwrap();
+            assert_eq!(body(&reply)["status"], "queued", "{mode:?} {rule}: {reply}");
+            assert_eq!(f.library.outbox_count().unwrap(), 1);
+        }
+    }
+}

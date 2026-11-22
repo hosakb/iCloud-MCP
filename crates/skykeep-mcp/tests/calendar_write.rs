@@ -1673,6 +1673,40 @@ async fn a_delete_asks_on_the_card_in_every_mode_and_runs_once() {
     }
 }
 
+/// A delete card names its scope in the first line: one occurrence, every occurrence of the
+/// series, or the one event that does not repeat.
+#[tokio::test]
+async fn a_delete_card_says_which_occurrences_go() {
+    let cases = [
+        (
+            json!({"action":"delete","guid":"MASTER","etag":"etag-MASTER","scope":"whole_series"}),
+            "Delete every occurrence of \"Yoga\", past and future, in Calendar. This can't be undone.",
+        ),
+        (
+            json!({"action":"delete","guid":OCCURRENCE,"etag":format!("etag-{OCCURRENCE}"),"scope":"this_occurrence"}),
+            "Delete one occurrence of \"Standup\" in Calendar; the rest of the series stays. This can't be undone.",
+        ),
+        (
+            delete_e1(),
+            "Delete \"Dentist\" in Calendar. This can't be undone.",
+        ),
+    ];
+    for mode in MODES {
+        for (args, first) in &cases {
+            let mut f = fixture(mode).await;
+            let mut form = call(&mut f.server, args.clone()).await;
+            if mode == Some("reads_and_writes") {
+                form = f.server.handle(answer(&form, "approve")).await.unwrap();
+            }
+            assert_eq!(form["method"], "elicitation/create", "{mode:?}: {form}");
+            assert_eq!(choices(&form), ["approve", "deny"], "{mode:?}");
+            let message = form["params"]["message"].as_str().unwrap();
+            assert_eq!(message.lines().next(), Some(*first), "{mode:?} {args}");
+            assert!(write_paths(&f.remote).await.is_empty());
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_denied_cancelled_or_timed_out_delete_card_sends_nothing() {
     for mode in MODES {
