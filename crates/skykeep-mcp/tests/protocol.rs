@@ -902,7 +902,7 @@ async fn initialize_and_discover_only_notes_and_reminders_tools() {
             &"photos_refresh"
         ]
     );
-    // Contacts are read-only in this phase.
+    // Contacts: four reads and one tool for every change.
     let contacts: Vec<_> = names.iter().filter(|n| n.contains("contacts")).collect();
     assert_eq!(
         contacts,
@@ -910,7 +910,8 @@ async fn initialize_and_discover_only_notes_and_reminders_tools() {
             &"contacts_list",
             &"contacts_search",
             &"contacts_get",
-            &"contacts_refresh"
+            &"contacts_refresh",
+            &"contacts_write"
         ]
     );
     // Calendar: five reads and one tool for every change.

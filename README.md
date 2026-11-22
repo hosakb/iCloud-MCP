@@ -3,8 +3,9 @@
 iCloud-MCP is a local MCP server for Apple Notes, Reminders, Contacts, Calendar, Photos and iCloud Drive. It is a fork of [Skykeep](https://github.com/YashwanthKamireddi/Skykeep) and runs on its Rust engine. The command is `skykeep-mcp`. It speaks newline-delimited JSON-RPC over stdio, keeps its own private library directory and has no network listener. Reads come from a private local SQLite cache.
 
 - Notes and Reminders can be read and changed. Changes wait in a local queue until `sync` sends them. A new reminder can repeat daily and alert at its due time or before it.
-- Contacts and Photos are read-only. Photos gives metadata only, never the pictures.
+- Contacts can be read and changed with `contacts_write`, one card per call. Deletions always need your approval.
 - Calendar events can be read, and created, changed, moved to another calendar or deleted with `calendar_write`. Deletes always need your approval.
+- Photos is read-only. It gives metadata only, never the pictures.
 - iCloud Drive can be read and changed with `drive_write`. File contents move only through one local exchange folder you set up, and deletions always need your approval.
 - `setup` guides you through sign-in in your own terminal. `status` checks the setup and `unlock` opens the protected sign-in file after a restart.
 - A permissions file sets each tool or action to `allow`, `ask` or `deny`. With `ask: client` your MCP client shows a card with "Approve this time", "Deny" and "Always allow this action". The server reads the file at every tool call, so an edit counts from the next call.
@@ -57,7 +58,7 @@ You need a terminal window that you open yourself. Don't run these commands thro
       | --- | --- | --- |
       | 1. Ask before every read and every change (recommended, `reads_and_writes`) | Asks you in the MCP client | Asks you in the MCP client |
       | 2. Read without asking, ask before every change (`writes_only`) | No question | Asks you in the MCP client |
-      | 3. Don't ask, not even before deleting notes or reminders (`yolo`, you type `confirm`) | No question | No question, except Drive deletions, moves and renames of large Drive folders, and Calendar deletes, which wait for `skykeep-mcp approve` in a terminal (see "Drive changes" and "Calendar changes") |
+      | 3. Don't ask, not even before deleting notes or reminders (`yolo`, you type `confirm`) | No question | No question, except Drive and Contacts deletions, moves and renames of large Drive folders, and Calendar deletes, which wait for `skykeep-mcp approve` in a terminal (see "Drive changes", "Contacts changes" and "Calendar changes") |
       | 4. No approval mode, for clients without approval forms (you type `confirm`) | No question | Routine changes: no question. Deletions, and renames and moves of Drive folders with 20 or more items or an unknown count, wait until you run `skykeep-mcp approve` in a terminal |
 
       Choices 1 and 2 need an MCP client that can show iCloud-MCP's approval card. Hermes supports MCP form elicitation and shows the card. In a client or session without approval forms, every request that needs approval fails with `approval_requires_form_client`; use choice 4 or set those actions to `ask: terminal` in the permissions file (see "Permissions file" below). Choice 4 keeps a folder's earlier `require-approval` setting: then every change waits for `skykeep-mcp approve`, and setup and status say so. Once a folder has had choice 1, 2 or 3, it can't go back to 4; set up a new folder instead.
@@ -132,7 +133,7 @@ Configure your MCP client to start that command. Stdout carries protocol message
 | `notes_write` | Queues `create`, `save`, `move`, `pin` or `delete`. Edits to an existing note need the `base_etag` you read, and are refused for locked or read-only notes. |
 | `reminders_lists`, `reminders_list`, `reminders_search`, `reminders_get` | Read the local cache. |
 | `reminders_write` | Queues `create`, `edit`, `tick` (complete or reopen) or `delete`. An `edit` changes only the fields in `patch`; moving a reminder is an edit of `list_guid`. A `create` can also take `repeat`, `due_time_alert`, `early_alert` and `timezone` (see Reminders below). |
-| `contacts_list`, `contacts_search`, `contacts_get` | Read the local Contacts cache. Read-only. |
+| `contacts_list`, `contacts_search`, `contacts_get` | Read the local Contacts cache. `contacts_get` shows each card's `etag`, its version. |
 | `contacts_refresh` | Reads Contacts from Apple into the local cache, replacing it. Never writes to Apple and never opens a sign-in prompt. |
 | `calendar_calendars`, `calendar_events`, `calendar_search`, `calendar_get` | Read the local Calendar cache. Read-only. |
 | `calendar_refresh` | Reads Calendar from Apple into the local cache over a bounded window, replacing it. Never writes to Apple, never answers invitations and never opens a sign-in prompt. |
@@ -142,10 +143,11 @@ Configure your MCP client to start that command. Stdout carries protocol message
 | `drive_list`, `drive_get`, `drive_search` | List a cached iCloud Drive folder, read one item's details, or search names. Paths look like `/Documents/Taxes`. Metadata only: no file contents and no local paths. Read-only. |
 | `drive_refresh` | Reads one Drive folder's item list (and those on its path) from Apple into the local cache. Never changes anything in Drive. |
 | `drive_write` | Changes Drive with one `action`: `create_folder`, `rename`, `move`, `trash`, `delete_forever`, `upload` or `download`. Runs against Apple once it is allowed; see "Drive changes" below. |
+| `contacts_write` | Changes Contacts with one `action`: `create`, `update` or `delete` of one card. Runs against Apple once it is allowed; see "Contacts changes" below. |
 
 Contacts, Calendar, Photos and Drive start empty: call their `*_refresh` tool once to fill the cache, and again whenever you want newer data. Their refresh is not part of `sync`.
 
-Reads come from the local cache and say so (`"source": "local_cache"`). A successful Notes or Reminders write means the change is queued in the library's durable outbox; `remote_verified` is always `false`, because the server does not read each field back from iCloud after sending. Calendar and Drive changes are not queued: see "Calendar changes" and "Drive changes".
+Reads come from the local cache and say so (`"source": "local_cache"`). A successful Notes or Reminders write means the change is queued in the library's durable outbox; `remote_verified` is always `false`, because the server does not read each field back from iCloud after sending. Calendar, Drive and Contacts changes are not queued: see "Calendar changes", "Drive changes" and "Contacts changes".
 
 ## Calendar changes
 
@@ -171,6 +173,15 @@ Approvals. A delete always needs your approval, on the card under `reads_and_wri
 Approvals. `trash` moves an item to Recently Deleted, where Apple keeps it about 30 days. `delete_forever` moves it there and then deletes it for good. Both always need your approval, and so does renaming or moving a folder with 20 or more items, or with an unknown number (a folder not yet read that holds anything, or one with a folder beneath not yet read). The approval shows a preview of what the change reaches: the item, its path, Apple's count of its items, how many are cached beneath it, and the first names. You approve or deny them in one of two places. Under `reads_and_writes` and `writes_only`, every Drive change is asked in the MCP client's approval form. Under `yolo`, or in a folder with no approval mode, these changes return `approval_required` with a request ID, and you approve them with `skykeep-mcp approve --state-dir DIR` in your own terminal. No mode runs a deletion without one of the two. That command runs the change and prints the outcome. A request is used once, and it is refused if the account, the approval mode, the folder, the cached item or the permissions file changed since it was made, or if the file now says `deny`. In a folder with no approval mode, `require-approval` makes every Drive change wait for `approve`.
 
 The permissions file can name `drive_write` and each of its actions (see "Permissions file"). `deny` refuses, and `allow` runs other Drive changes without asking. A deletion, or a rename or move of a large folder, still needs a person whatever the file says: with `allow` it is asked as above, in the form or in the terminal. `ask: terminal` sends any Drive change to `skykeep-mcp approve`, and `ask: client` asks on the card, also under `yolo`. A card approval then counts and is not asked again in the terminal. The card never offers "Always allow" for these changes.
+
+## Contacts changes
+
+`contacts_write` changes one card per call and runs at once once it is allowed. It changes names, company, birthday, notes, the name and work details, emails, phones and web addresses. Postal addresses, photos, contact lists and merging cards are not changed by it.
+
+- `create` takes `fields`. `update` and `delete` take the card's `guid` and `etag` from `contacts_get`. The `etag` must be the cached one and still Apple's: the card is read from Apple first, and a card changed since, on another device or in the cache, is refused with `contact_changed_conflict` and nothing is written. Run `contacts_refresh`, read the card again and ask with its new `etag`.
+- An update changes only the fields it names and lays them over Apple's current card. `null` or an empty string clears a field. A list of emails, phones or web addresses replaces that list. If Apple already holds the values, the reply is `unchanged` and nothing is sent. When `contacts_get` showed the card cut short, an update that replaces its notes or one of those lists is refused (`contact_shown_cut_short_edit_on_device`).
+- `"outcome": "done"` means Apple took the write. `remote_verified: true` means the address book read back from Apple shows the change. `contacts_write_outcome_unknown_run_contacts_refresh` means the connection ended before Apple answered: run `contacts_refresh` and look before trying again, because a second create can make a second card.
+- Contacts has no Recently Deleted, so a deletion is permanent. Every deletion needs a person: on the card under `reads_and_writes` and `writes_only`, with `skykeep-mcp approve` under `yolo` or with no approval mode. An `allow` rule does not change that, and the card never offers "Always allow" for it. The approval shows the card and, for an update, each field with its current and new value.
 
 ### The exchange folder
 
@@ -203,7 +214,7 @@ The create reply says `queued: true`, `cloudkit_accepted: false` and `remote_ver
 
 ## Write approval
 
-`setup` sets the approval mode for you (step 4 under "Get started"). With mode 1 or 2, approval happens in your MCP client's approval form. In a folder with no approval mode (choice 4, or one set up before approval modes existed), approval happens in your terminal with `skykeep-mcp approve`, as described below. With mode 3 (`yolo`), only Drive deletions, moves and renames of large Drive folders, and Calendar deletes are asked, also with `skykeep-mcp approve` (see "Drive changes" and "Calendar changes"). `require-approval` and `allow-routine` apply only to a folder with no approval mode and refuse to run in the others.
+`setup` sets the approval mode for you (step 4 under "Get started"). With mode 1 or 2, approval happens in your MCP client's approval form. In a folder with no approval mode (choice 4, or one set up before approval modes existed), approval happens in your terminal with `skykeep-mcp approve`, as described below. With mode 3 (`yolo`), only Drive and Contacts deletions, moves and renames of large Drive folders, and Calendar deletes are asked, also with `skykeep-mcp approve` (see "Drive changes", "Contacts changes" and "Calendar changes"). `require-approval` and `allow-routine` apply only to a folder with no approval mode and refuse to run in the others.
 
 Deletions never run straight from MCP in such a folder, whatever the permissions file says; the file can only refuse them. For Notes and Reminders, a deletion here means `delete`, a `move` into Recently Deleted (that is how iCloud deletes a note), and a `save` that leaves the note body empty. Creating a note in Recently Deleted is refused. For any of these the tool returns `approval_required` with a request ID, and you approve in your own terminal:
 
@@ -211,9 +222,9 @@ Deletions never run straight from MCP in such a folder, whatever the permissions
 skykeep-mcp approve --state-dir ~/.local/share/skykeep-mcp
 ```
 
-Drive deletions, Drive renames or moves of a large folder, and Calendar deletes wait for `approve` the same way; see "Drive changes" and "Calendar changes" above.
+Drive deletions, Drive renames or moves of a large folder, Contacts deletions and Calendar deletes wait for `approve` the same way; see "Drive changes", "Contacts changes" and "Calendar changes" above.
 
-It asks for the request ID, shows the exact change and allows it only after you type `approve`. A Notes or Reminders change is then queued; a Calendar or Drive change runs at once and the command prints its outcome. To require this for every write, run `skykeep-mcp require-approval --state-dir DIR`; `allow-routine` switches back. Both commands ask you to type `confirm`.
+It asks for the request ID, shows the exact change and allows it only after you type `approve`. A Notes or Reminders change is then queued; a Drive, Contacts or Calendar change runs at once, can't be undone from here, and the command prints its outcome. To require this for every write, run `skykeep-mcp require-approval --state-dir DIR`; `allow-routine` switches back. Both commands ask you to type `confirm`.
 
 There is no volume limit. Under the default policy an agent can queue any number of routine edits, ticks and saves that shorten a note without emptying it. If you want to see every write first, use `require-approval`.
 
@@ -240,7 +251,7 @@ rules:
 | `ask: terminal` | Returns a request ID and waits until you run `skykeep-mcp approve --state-dir FOLDER` in your own terminal, as for deletions today. Use it for clients or sessions without approval forms. Only tools that change something can use it. A request made before the file changed no longer counts, and a later `deny` refuses older requests too. |
 | `deny` | Refuses with `denied_by_permissions` and a sentence saying the file blocks it. |
 
-A name is a tool, such as `contacts_get`, or a tool and one of its actions, such as `notes_write.delete`. A tool's entry covers all its actions, and an action's own entry wins over it. The valid names come from the server's tool list, so a tool added later can be named without other changes. The starter file lists every name, and a wrong name is refused with the list. `auth_status` and `sync_status` always run. A Notes `save` that empties a note and a `move` into Recently Deleted also follow the `notes_write.delete` rule, and the stricter of the two decides. Calendar changes are named the same way, such as `calendar_write.create: allow`; `calendar_write.send_invitations` is a rule of its own, not an action (see "Calendar changes"). Drive changes are named like the others, for example `drive_write.delete_forever: deny` refuses deleting for good; see "Drive changes" for what a rule can't change there.
+A name is a tool, such as `contacts_get`, or a tool and one of its actions, such as `notes_write.delete`. A tool's entry covers all its actions, and an action's own entry wins over it. The valid names come from the server's tool list, so a tool added later can be named without other changes. The starter file lists every name, and a wrong name is refused with the list. `auth_status` and `sync_status` always run. A Notes `save` that empties a note and a `move` into Recently Deleted also follow the `notes_write.delete` rule, and the stricter of the two decides. Calendar changes are named the same way, such as `calendar_write.create: allow`; `calendar_write.send_invitations` is a rule of its own, not an action (see "Calendar changes"). Contacts changes are named `contacts_write.create`, `contacts_write.update` and `contacts_write.delete`; a deletion still needs a person with `allow`. Drive changes are named like the others, for example `drive_write.delete_forever: deny` refuses deleting for good; see "Drive changes" for what a rule can't change there.
 
 Anything the file does not list follows the folder's approval mode. A rule can make an action looser or stricter than the mode. In a folder without an approval mode, deletions always wait for `skykeep-mcp approve`; a rule there can refuse them, never let them run without asking.
 
@@ -271,7 +282,7 @@ It needs a folder that setup has prepared. It prints the rules in use, when the 
 - Notes with structures the engine can't round-trip are refused rather than flattened. Markdown export is not a lossless copy of a note.
 - A write that iCloud accepts is reported as sent, not as verified field by field. Partial reminder writes are a known inherited gap.
 - Note attachments, Notes folder and Reminders list management, and bulk operations are not exposed.
-- Contacts and Photos have no write tools. Calendar has no calendar create or rename, no attendee management and no CalDAV or Nextcloud calendars.
+- Photos has no write tools. `contacts_write` doesn't change postal addresses, photos, contact lists or merged cards. Calendar has no calendar create or rename, no attendee management and no CalDAV or Nextcloud calendars.
 - Mail is not implemented and not planned, because upstream Skykeep has no Mail support.
 - Only Linux is supported. The sign-in is kept in a Secret Service keyring or in the passphrase-protected file; with neither, setup and sign-in stop instead of keeping it in a plain file.
 - The protected file needs the Linux kernel key storage for `unlock`. Some containers block it (Docker's default security profile does); there `unlock` says so and the server stays locked.
@@ -280,8 +291,8 @@ It needs a folder that setup has prepared. It prints the rules in use, when the 
 
 Setup's choices 1 to 3 are the policy modes `reads_and_writes`, `writes_only` and
 `yolo` (the table is under "Get started"). They control reads, Notes, Reminders and
-Calendar and Drive changes, and sync; Drive deletions, large folder moves and renames, and
-Calendar deletes are always asked, see "Drive changes" and "Calendar changes". A folder with no policy (choice 4) keeps the older behaviour in
+Calendar, Drive and Contacts changes, and sync; Drive and Contacts deletions, large folder moves and
+renames, and Calendar deletes are always asked, see "Drive changes", "Contacts changes" and "Calendar changes". A folder with no policy (choice 4) keeps the older behaviour in
 "Write approval" above. MCP clients that can't answer the approval forms need choice 4
 or `ask: terminal` rules in the permissions file.
 

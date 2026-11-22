@@ -1341,7 +1341,7 @@ async fn unchanged_time_fields_are_not_a_time_change_and_errors_name_the_fix() {
 fn the_yolo_description_says_calendar_deletes_still_wait() {
     let yolo = skykeep_mcp::status::describe_mode("yolo");
     assert!(yolo.contains("Calendar deletes"), "{yolo}");
-    assert!(yolo.contains("Drive deletions"), "{yolo}");
+    assert!(yolo.contains("Drive and Contacts deletions"), "{yolo}");
 }
 
 #[tokio::test]

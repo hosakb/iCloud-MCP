@@ -1683,7 +1683,7 @@ async fn a_form_approved_delete_forever_that_stops_half_way_says_what_to_do() {
 #[test]
 fn the_yolo_description_says_drive_deletions_still_wait() {
     let yolo = skykeep_mcp::status::describe_mode("yolo");
-    assert!(yolo.contains("Drive deletions"), "{yolo}");
+    assert!(yolo.contains("Drive and Contacts deletions"), "{yolo}");
     assert!(
         yolo.contains("moves and renames of large Drive folders"),
         "{yolo}"

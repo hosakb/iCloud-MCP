@@ -1072,6 +1072,14 @@ fn runs_as(
             },
             Some("a Calendar delete always needs a person"),
         ),
+        Some(mode) if tool == crate::contacts_write::TOOL && effect == Effect::Allow => (
+            if mode == "yolo" {
+                Effect::AskTerminal
+            } else {
+                Effect::AskClient
+            },
+            Some("a Contacts deletion always needs a person"),
+        ),
         _ => (effect, None),
     }
 }

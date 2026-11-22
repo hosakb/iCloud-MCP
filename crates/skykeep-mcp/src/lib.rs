@@ -3,6 +3,7 @@ pub mod account;
 pub mod calendar;
 pub mod calendar_write;
 pub mod contacts;
+pub mod contacts_write;
 pub mod drive;
 pub mod drive_write;
 pub mod exchange;
@@ -213,10 +214,15 @@ fn gate_for(
     // This comes before the broken-file step below, so a Drive deletion under yolo still
     // waits for the terminal then.
     let gate = match gate {
-        Gate::Run if drive_needs_person(library, name, args)? => match mode {
-            Some(mode) if mode != "yolo" => Gate::Client,
-            _ => Gate::Terminal,
-        },
+        Gate::Run
+            if drive_needs_person(library, name, args)?
+                || contacts_write::needs_person(name, args) =>
+        {
+            match mode {
+                Some(mode) if mode != "yolo" => Gate::Client,
+                _ => Gate::Terminal,
+            }
+        }
         gate => gate,
     };
     let removes = permissions::removal(name, args) != permissions::Removal::None;
@@ -400,6 +406,10 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
             "In your own terminal, run: {}",
             status::with_dir("skykeep-mcp exchange", dir)
         )),
+        // contacts_write's own codes, by their prefix.
+        e if e.starts_with("contact_") || e.starts_with("contacts_write_") => {
+            contacts_write::next_step(e, args)
+        }
         drive_write::UNKNOWN => Some("The connection ended before Apple answered, so the change may or may not have been made. Run drive_refresh on the folder and look at it before trying again.".to_string()),
         drive_write::IN_RECENTLY_DELETED => Some("The item is in Recently Deleted in iCloud Drive but was not deleted for good. Delete it there (iCloud Drive on icloud.com or a Mac), or leave it: Apple deletes it by itself after about 30 days.".to_string()),
         drive_write::IN_RECENTLY_DELETED_LOGIN => Some(format!("The item is in Recently Deleted in iCloud Drive but was not deleted for good, because the sign-in has expired. Sign in again with {} in your own terminal, then delete it from Recently Deleted in iCloud Drive, or leave it: Apple deletes it by itself after about 30 days.", status::with_dir("skykeep-mcp login", dir))),
@@ -611,6 +621,9 @@ pub(crate) fn needs_consent(mode: &str, name: &str) -> Result<bool, &'static str
         "drive_write" => Ok(mode != "yolo"),
         // The same for Calendar changes; deletes then go to the terminal.
         "calendar_write" => Ok(mode != "yolo"),
+        // Every Contacts change is asked in the form, except under yolo; a delete then waits
+        // for the terminal (gate_for).
+        "contacts_write" => Ok(mode != "yolo"),
         _ => Err("unknown_tool"),
     }
 }
@@ -634,6 +647,12 @@ fn resolved_snapshot(
             permissions::invitations_allowed(active),
             false,
         )?});
+        bounded_value(&snapshot, MAX_ARGUMENT_BYTES)?;
+        return Ok(snapshot);
+    }
+    if name == contacts_write::TOOL {
+        // The preview names the card itself; no wrapper around it.
+        let snapshot = contacts_write::preview(library, args)?;
         bounded_value(&snapshot, MAX_ARGUMENT_BYTES)?;
         return Ok(snapshot);
     }
@@ -722,6 +741,7 @@ pub struct Server {
     always_blocked: bool,
     drive: drive_write::Seam,
     calendar: calendar_write::Seam,
+    contacts: contacts_write::Seam,
 }
 
 #[cfg(test)]
@@ -1087,6 +1107,7 @@ impl Server {
                 denied: None,
                 drive: drive_write::Seam::default(),
                 calendar: calendar_write::Seam::default(),
+                contacts: contacts_write::Seam::default(),
             }),
             Err("state_busy_retry") => Ok(Self {
                 library: None,
@@ -1100,6 +1121,7 @@ impl Server {
                 denied: None,
                 drive: drive_write::Seam::default(),
                 calendar: calendar_write::Seam::default(),
+                contacts: contacts_write::Seam::default(),
             }),
             Err(error) => Err(error),
         }
@@ -1125,6 +1147,11 @@ impl Server {
     #[doc(hidden)]
     pub fn set_calendar_seam(&mut self, seam: calendar_write::Seam) {
         self.calendar = seam;
+    }
+
+    #[doc(hidden)]
+    pub fn set_contacts_seam(&mut self, seam: contacts_write::Seam) {
+        self.contacts = seam;
     }
 
     /// Trusted local CLI only, after `approval_details` was shown: runs one approved
@@ -1419,8 +1446,9 @@ impl Server {
     }
 
     /// Trusted local CLI only: what `approve` shows before it asks. A Drive change is said in
-    /// plain lines (what it does, the item and its path, what it reaches); a Notes or
-    /// Reminders change as its JSON. Control and text-direction characters are shown as
+    /// plain lines (what it does, the item and its path, what it reaches), a Contacts change
+    /// too (the card, and each field with its current and new value); a Notes or Reminders
+    /// change as its JSON. Control and text-direction characters are shown as
     /// U+FFFD, so nothing in the text can reorder or hide what the terminal shows.
     pub fn approval_text(&self, id: &str) -> Result<String, &'static str> {
         let raw = self.approval_details(id)?;
@@ -1429,6 +1457,9 @@ impl Server {
             drive_write::plain_preview(&proposal["preview"])
         } else if proposal["tool"] == calendar_write::TOOL {
             calendar_write::plain_preview(&proposal["preview"])
+        } else if proposal["tool"] == contacts_write::TOOL {
+            let library = self.library.as_ref().ok_or("state_busy_retry")?;
+            contacts_write::approval_text(library, &proposal["args"])?
         } else {
             raw
         };
@@ -1525,6 +1556,7 @@ impl Server {
         let terminal = self.terminal.take();
         let drive_seam = self.drive.clone();
         let calendar_seam = self.calendar.clone();
+        let contacts_seam = self.contacts.clone();
         let held = state::PrivateState::open(&self.dir)?;
         let dir = held.path.clone();
         let library = self.ready(&held)?;
@@ -1586,6 +1618,11 @@ impl Server {
                     && name != drive_write::TOOL
                     && name != calendar_write::TOOL =>
             {
+                // A Contacts request that can't run as asked (a version not cached, a card not
+                // cached, a field shown cut short) is refused now, not stored to fail later.
+                if name == contacts_write::TOOL {
+                    contacts_write::preview(library, &args)?;
+                }
                 return terminal_proposal(
                     library,
                     &dir,
@@ -1769,6 +1806,49 @@ impl Server {
                     invitations,
                 )
                 .await
+            }
+            "contacts_write" => {
+                let op = contacts_write::validate(&args)?;
+                library
+                    .state(ACCOUNT_KEY)
+                    .map_err(|_| "library_unavailable")?
+                    .ok_or("login_required")?;
+                // Without a mode or a rule, a delete waits for the terminal, and the folder's
+                // earlier require-approval decides the rest.
+                if legacy
+                    && (contacts_write::needs_person(name, &args)
+                        || library
+                            .state("mcp.require_write_approval")
+                            .map_err(|_| "library_unavailable")?
+                            .as_deref()
+                            == Some("true"))
+                {
+                    contacts_write::preview(library, &args)?;
+                    return terminal_proposal(
+                        library,
+                        &dir,
+                        name,
+                        &args,
+                        policy_raw.as_deref(),
+                        current.identity,
+                        &active.fingerprint,
+                    );
+                }
+                // A delete runs only with a person's approval, whatever let it this far.
+                if !(grant.is_some() || terminal_approved)
+                    && (contacts_write::needs_person(name, &args)
+                        || !matches!(gate, Gate::Run | Gate::Legacy))
+                {
+                    return Err("approval_required");
+                }
+                // A terminal request is used up before anything is sent, as for Drive, so a
+                // second approve can't send it again after an unknown outcome.
+                if let (true, Some(id)) = (terminal_approved, &terminal) {
+                    library
+                        .set_state(&format!("mcp.approval.{id}"), "")
+                        .map_err(|_| "library_unavailable")?;
+                }
+                contacts_write::run(&dir, &contacts_seam, op).await
             }
             "sync_status" => {
                 let _: Empty = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -2742,7 +2822,7 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
 
 const SERVER_TITLE: &str =
     "Skykeep: Apple iCloud Notes, Reminders, Contacts, Calendar, Photos & iCloud Drive";
-const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, and reads the user's Apple iCloud Contacts and Apple iCloud Photos metadata (read-only), reads Apple iCloud Calendar and changes its events with calendar_write, and reads and changes Apple iCloud Drive: folder listings and file details from the cache, and drive_write to create folders, rename, move, trash, delete for good, upload from and download into the exchange folder the user set up in their terminal. Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode. Notes and Reminders changes are queued until sync sends them; a Drive or Calendar change runs once it is allowed and its reply says what Apple confirmed. calendar_write needs the etag from calendar_get, an offset or IANA zone for every time, and scope for a repeating event. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
+const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, reads the user's Apple iCloud Contacts and changes one card at a time with contacts_write, reads Apple iCloud Calendar and changes its events with calendar_write, reads Apple iCloud Photos metadata (read-only), and reads and changes Apple iCloud Drive: folder listings and file details from the cache, and drive_write to create folders, rename, move, trash, delete for good, upload from and download into the exchange folder the user set up in their terminal. Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode. Notes and Reminders changes are queued until sync sends them; a Drive, Contacts or Calendar change runs once it is allowed and its reply says what Apple confirmed. calendar_write needs the etag from calendar_get, an offset or IANA zone for every time, and scope for a repeating event. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
 
 pub(crate) fn tools() -> Vec<Value> {
     // (name, description, parent property, parent required)
@@ -2850,6 +2930,7 @@ pub(crate) fn tools() -> Vec<Value> {
     tools.push(json!({"name":"drive_refresh","description":"Read one Apple iCloud Drive folder's item list from Apple into the local cache, with each folder on its path. Give path or a cached folder id; the top folder by default. Reads names, kinds, sizes and dates only: never file contents, and never uploads, renames, moves or deletes. Sends no queued changes. Never opens a login prompt.","inputSchema":{"type":"object","properties":{"path":cloud_path,"id":id},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}));
     tools.push(drive_write::tool());
     tools.push(calendar_write::tool());
+    tools.push(contacts_write::tool());
     tools.push(json!({"name":"auth_status","description":"Apple iCloud sign-in status and setup instructions. Never accepts secrets or opens a prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools
 }
