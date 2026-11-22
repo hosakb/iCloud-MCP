@@ -51,7 +51,13 @@ pub const CHANGED: &str = "contact_changed_conflict";
 pub const UNKNOWN: &str = "contacts_write_outcome_unknown_run_contacts_refresh";
 const NOT_CACHED: &str = "contact_not_in_cache_run_contacts_refresh";
 const GONE: &str = "contact_not_found_at_apple_run_contacts_refresh";
-const PAUSED: &str = "contacts_paused_approve_on_apple_device";
+const PAUSED: &str = "contacts_write_paused_approve_on_apple_device";
+const REFUSED: &str = "contacts_write_refused_by_apple";
+const TOO_LARGE: &str = "contacts_write_book_too_large_nothing_sent";
+const UNREADABLE: &str = "contacts_write_card_unreadable_nothing_sent";
+const CREATE_REFUSED: &str = "contact_create_refused_try_again";
+/// A stored terminal request no longer matches the cache.
+pub const OUT_OF_DATE: &str = "contacts_write_request_out_of_date";
 const BLANK: &str = "contact_needs_a_name_phone_or_email";
 const CUT_SHORT: &str = "contact_shown_cut_short_edit_on_device";
 const NOTHING_SENT: &str = "contacts_write_read_failed_nothing_sent";
@@ -315,11 +321,26 @@ impl ContactsWrite {
 }
 
 /// Text a person can read as given: no control characters (a line break or tab only in the
-/// notes) and none that hide or reorder text.
+/// notes), none that hide or reorder text, and none that can't be seen.
 fn readable(text: &str, multiline: bool) -> bool {
-    !text
-        .chars()
-        .any(|c| hides_text(c) || (c.is_control() && !(multiline && matches!(c, '\n' | '\t'))))
+    !text.chars().any(|c| {
+        hides_text(c) || unseen(c) || (c.is_control() && !(multiline && matches!(c, '\n' | '\t')))
+    })
+}
+
+/// Characters a person can't see in a contact field that `hides_text` does not name: tag
+/// characters, variation selectors, the soft hyphen and the Unicode line and paragraph
+/// separators.
+fn unseen(c: char) -> bool {
+    matches!(
+        c,
+        '\u{E0000}'..='\u{E007F}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{E0100}'..='\u{E01EF}'
+            | '\u{00AD}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
 }
 
 /// A birthday as Apple's card holds it: `YYYY-MM-DD`, a day the month has. A birthday whose
@@ -857,7 +878,7 @@ fn removes(library: &Library, card: &Card) -> Result<Value, &'static str> {
         .filter(|m| !["email", "phone", "url", "address"].contains(&m.kind.as_str()))
         .count();
     let text = |v: &Option<String>| v.as_deref().map(|t| shown_up_to(t, MAX_TEXT_CHARS));
-    Ok(json!({
+    let mut value = json!({
         "name": shown(&c.display_name(), MAX_TEXT_CHARS),
         "company": text(&c.company),
         "job_title": text(&card.details.job_title),
@@ -869,7 +890,11 @@ fn removes(library: &Library, card: &Card) -> Result<Value, &'static str> {
         "other_entries": others,
         "notes_characters": c.notes.as_deref().map_or(0, |n| n.chars().count()),
         "photo": c.photo_url.is_some(),
-    }))
+    });
+    if let Some(map) = value.as_object_mut() {
+        map.retain(|_, v| !v.is_null());
+    }
+    Ok(value)
 }
 
 /// "1 email", "2 emails".
@@ -976,11 +1001,11 @@ pub(crate) fn plain_preview(preview: &Value) -> String {
 }
 
 /// The terminal approval's text for stored arguments, as the cache shows them now.
-pub(crate) fn approval_text(library: &Library, args: &Value) -> String {
-    match preview(library, args) {
-        Ok(preview) => plain_preview(&preview),
-        Err(error) => format!("Contacts change: {args}\nThe cache can't show it now: {error}"),
-    }
+/// A request the cache no longer matches is out of date and is not shown for approval.
+pub(crate) fn approval_text(library: &Library, args: &Value) -> Result<String, &'static str> {
+    preview(library, args)
+        .map(|preview| plain_preview(&preview))
+        .map_err(|_| OUT_OF_DATE)
 }
 
 /// What the person can do after `error`, a code of this tool, when there is something. `args`
@@ -999,6 +1024,12 @@ pub(crate) fn next_step(error: &str, args: &Value) -> Option<String> {
         BLANK => "A new card needs a name, a company, a phone number or an email address.",
         CUT_SHORT => "contacts_get showed this card cut short, so the notes or a list of emails, phones or web addresses it would replace were not seen in full, and nothing was changed. contacts_get cannot show the card whole. Change those fields on an Apple device or on icloud.com, or change only other fields here.",
         NOTHING_SENT => "Apple's address book could not be read, so nothing was sent. Try again later; if it keeps failing, run contacts_refresh to see why.",
+        PAUSED => "Apple wants this sign-in approved on one of the user's Apple devices before it lets Contacts be changed. Nothing was sent. Ask the user to approve it there, then try again.",
+        REFUSED => "Apple refused the change, so it was not made. Run contacts_refresh and read the card again; if Apple keeps refusing, make the change on an Apple device or on icloud.com.",
+        TOO_LARGE => "The address book or one of its cards is larger than this tool reads, so nothing was sent. Make the change on an Apple device or on icloud.com.",
+        UNREADABLE => "Apple's copy of this card could not be read as a contact, so nothing was sent. Make the change on an Apple device or on icloud.com.",
+        CREATE_REFUSED => "Apple refused the new card because its address book changed while the card was being sent, so nothing was made. Try the create again.",
+        OUT_OF_DATE => "This request is out of date: the card in the local cache changed since it was asked, so it can't be approved. Nothing was sent. Ask for the change again.",
         _ => return None,
     }
     .to_string())
@@ -1053,8 +1084,7 @@ fn apple_error(e: &quince_icloud::Error) -> &'static str {
         E::ReauthRequired => "login_required",
         E::NeedsDeviceApproval => PAUSED,
         E::Conflict => CHANGED,
-        E::Refused(_) => "contacts_write_refused_by_apple",
-        E::Protocol(_) => "contacts_write_refused_by_apple",
+        E::Refused(_) | E::Protocol(_) => REFUSED,
         _ => UNKNOWN,
     }
 }
@@ -1067,6 +1097,9 @@ fn create_error(e: &quince_icloud::Error) -> &'static str {
     match e {
         E::Protocol(why) if why.starts_with("/co/startup") => NOTHING_SENT,
         E::Network(n) if n.url().is_some_and(|u| u.path().ends_with("/co/startup")) => NOTHING_SENT,
+        // A new card carries no version: a conflict is Apple's book moving on while it was
+        // sent, and Apple made nothing.
+        E::Conflict => CREATE_REFUSED,
         other => apple_error(other),
     }
 }
@@ -1074,9 +1107,7 @@ fn create_error(e: &quince_icloud::Error) -> &'static str {
 fn read_stop(stop: Stop) -> &'static str {
     match stop {
         Stop::Reauth => "login_required",
-        Stop::TooLarge | Stop::BookTooLarge | Stop::CardTooLarge => {
-            "contacts_book_too_large_nothing_sent"
-        }
+        Stop::TooLarge | Stop::BookTooLarge | Stop::CardTooLarge => TOO_LARGE,
         Stop::Busy | Stop::Failed => "contacts_write_read_failed_nothing_sent",
     }
 }
@@ -1256,7 +1287,7 @@ async fn write(
             Ok(Sent::Written(guid))
         }
         (ContactsWrite::Update { guid, etag, fields }, Some(existing)) => {
-            let (base, _) = parsed(&existing).ok_or("contacts_card_unreadable_nothing_sent")?;
+            let (base, _) = parsed(&existing).ok_or(UNREADABLE)?;
             if fields.differences(&base).is_empty() {
                 return Ok(Sent::Unchanged(json!({
                     "outcome": "unchanged",
@@ -1465,6 +1496,20 @@ pub(crate) fn tool() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apple_and_read_failures_say_what_to_do() {
+        for code in [
+            "contacts_write_paused_approve_on_apple_device",
+            "contacts_write_refused_by_apple",
+            "contacts_write_book_too_large_nothing_sent",
+            "contacts_write_card_unreadable_nothing_sent",
+            "contacts_write_request_out_of_date",
+            "contact_create_refused_try_again",
+        ] {
+            assert!(next_step(code, &json!({})).is_some(), "{code}");
+        }
+    }
 
     #[test]
     fn only_delete_is_destructive_and_arguments_are_strict() {

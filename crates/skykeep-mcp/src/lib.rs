@@ -629,7 +629,8 @@ fn resolved_snapshot(library: &Library, name: &str, args: &Value) -> Result<Valu
         return Ok(snapshot);
     }
     if name == contacts_write::TOOL {
-        let snapshot = json!({"contact": contacts_write::preview(library, args)?});
+        // The preview names the card itself; no wrapper around it.
+        let snapshot = contacts_write::preview(library, args)?;
         bounded_value(&snapshot, MAX_ARGUMENT_BYTES)?;
         return Ok(snapshot);
     }
@@ -1397,7 +1398,7 @@ impl Server {
             drive_write::plain_preview(&proposal["preview"])
         } else if proposal["tool"] == contacts_write::TOOL {
             let library = self.library.as_ref().ok_or("state_busy_retry")?;
-            contacts_write::approval_text(library, &proposal["args"])
+            contacts_write::approval_text(library, &proposal["args"])?
         } else {
             raw
         };

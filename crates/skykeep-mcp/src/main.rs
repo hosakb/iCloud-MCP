@@ -358,7 +358,16 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
             use std::io::Write;
             let id = terminal::hidden(&mut tty, "Approval request ID: ", Duration::from_secs(180))?;
             let mut server = Server::open(&dir)?;
-            let details = server.approval_text(&id)?;
+            // An out-of-date request is said in words, and nothing is asked.
+            let details = match server.approval_text(&id) {
+                Ok(details) => details,
+                Err(error) => {
+                    if let Some(step) = skykeep_mcp::next_step(error, &dir, &json!(null)) {
+                        writeln!(tty, "{step}").map_err(|_| "terminal_unavailable")?;
+                    }
+                    return Err(error);
+                }
+            };
             writeln!(
                 tty,
                 "Review this exact change:

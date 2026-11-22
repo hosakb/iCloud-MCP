@@ -605,6 +605,38 @@ async fn oversized_or_malformed_arguments_are_refused_before_approval_or_network
             "contact_text_not_allowed",
         ),
         (
+            update_ada(json!({"first_name":"A\u{E0041}da"})),
+            "contact_text_not_allowed",
+        ),
+        (
+            update_ada(json!({"first_name":"A\u{FE0F}da"})),
+            "contact_text_not_allowed",
+        ),
+        (
+            update_ada(json!({"first_name":"A\u{E0100}da"})),
+            "contact_text_not_allowed",
+        ),
+        (
+            update_ada(json!({"first_name":"A\u{00AD}da"})),
+            "contact_text_not_allowed",
+        ),
+        (
+            update_ada(json!({"first_name":"A\u{2028}da"})),
+            "contact_text_not_allowed",
+        ),
+        (
+            update_ada(json!({"first_name":"A\u{2029}da"})),
+            "contact_text_not_allowed",
+        ),
+        (
+            update_ada(json!({"notes":"line\u{2028}break"})),
+            "contact_text_not_allowed",
+        ),
+        (
+            update_ada(json!({"emails":[{"value":"a\u{E0041}@example.com"}]})),
+            "contact_text_not_allowed",
+        ),
+        (
             update_ada(json!({"birthday":"2001-02-31"})),
             "contact_invalid_birthday",
         ),
@@ -1201,4 +1233,61 @@ async fn a_slow_read_before_the_write_sent_nothing() {
 #[test]
 fn yolo_says_contacts_deletions_still_wait() {
     assert!(skykeep_mcp::status::describe_mode("yolo").contains("Drive and Contacts deletions"));
+}
+
+// --- Round three.
+
+#[tokio::test]
+async fn a_stale_terminal_request_says_it_is_out_of_date() {
+    let mut f = fixture(Some("yolo")).await;
+    let waiting = ok(&mut f.server, delete_bob()).await;
+    let id = waiting["request_id"].as_str().unwrap().to_string();
+    {
+        let mut library = quince_core::Library::open(f.dir.path()).unwrap();
+        let mut card = library.cards_by_guid(&[BOB.to_string()]).unwrap().remove(0);
+        card.contact.etag = Some("etag-bob-2".into());
+        library.put_card(&card).unwrap();
+    }
+    assert_eq!(
+        f.server.approval_text(&id),
+        Err("contacts_write_request_out_of_date")
+    );
+    let step = skykeep_mcp::next_step(
+        "contacts_write_request_out_of_date",
+        f.dir.path(),
+        &json!(null),
+    )
+    .unwrap();
+    assert!(step.contains("out of date"), "{step}");
+    assert!(step.contains("again"), "{step}");
+    assert!(f.server.approve_any(&id).await.is_err());
+    assert!(f.writes().is_empty());
+}
+
+#[tokio::test]
+async fn the_card_preview_names_the_contact_once_and_drops_empty_fields() {
+    let mut f = fixture(Some("writes_only")).await;
+    let form = call(&mut f.server, delete_bob()).await;
+    let message = form["params"]["message"].as_str().unwrap();
+    assert_eq!(message.matches("\"contact\":").count(), 1, "{message}");
+    assert!(!message.contains("\"company\": null"), "{message}");
+    assert!(!message.contains("\"birthday\": null"), "{message}");
+    assert!(message.contains("Bob Builder"), "{message}");
+    cancel(&mut f.server, &form).await;
+}
+
+#[tokio::test]
+async fn a_create_apple_refuses_for_a_stale_book_says_nothing_was_made() {
+    let mut f = fixture(Some("yolo")).await;
+    f.book.lock().unwrap().fail_with = Some(409);
+    let e = error(
+        &mut f.server,
+        json!({"action":"create","fields":{"first_name":"Grace"}}),
+    )
+    .await;
+    assert_eq!(e["error"], "contact_create_refused_try_again", "{e}");
+    let step = e["instructions"].as_str().unwrap();
+    assert!(step.contains("nothing was made"), "{step}");
+    assert!(!step.contains("etag"), "{step}");
+    assert_eq!(f.cards_at_apple(), 2);
 }
