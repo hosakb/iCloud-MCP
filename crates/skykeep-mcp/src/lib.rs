@@ -416,7 +416,7 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
                     |folder| format!("A folder inside the exchange folder can be changed by other users. Make it yours alone in your own terminal with: chmod 700 {} and try again.", status::quoted(&folder)),
                 ),
         ),
-        other => calendar_write::next_step(other),
+        other => calendar_write::next_step(other, args),
     }
 }
 

@@ -11,6 +11,8 @@
 //! that version any more, so a change made on another device is never written over. Between
 //! that last read and the save, the guard is Apple's own check of the etag sent in the save's
 //! body (a 409 or 412 answer); that Apple enforces it there is not confirmed against Apple.
+//! The attendee check below is a separate read before the save, so a guest added on another
+//! device between that read and the save could still be sent an update.
 //!
 //! Repeating events. One occurrence (an id `<series>__<start>`) is changed only with `scope`
 //! said: `this_occurrence` or `whole_series`. There is no default. An event that repeats but
@@ -76,6 +78,25 @@ const NOT_REPEATING: &str = "not_a_repeating_event_leave_out_scope";
 const EVENT_NOT_FOUND: &str = "event_not_found_run_calendar_refresh";
 /// Characters of the notes a preview shows.
 const NOTES_SHOWN: usize = 200;
+const FLOATING: &str = "floating_event_needs_timezone";
+const UNKNOWN_FIELD: &str = "calendar_write_unknown_field";
+/// Every field the tool takes.
+const FIELDS: [&str; 14] = [
+    "action",
+    "guid",
+    "etag",
+    "calendar_guid",
+    "title",
+    "location",
+    "notes",
+    "url",
+    "start",
+    "end",
+    "all_day",
+    "timezone",
+    "alerts",
+    "scope",
+];
 
 const MAX_TITLE_BYTES: usize = 1024;
 const MAX_LOCATION_BYTES: usize = 1024;
@@ -257,6 +278,12 @@ fn parse_when(text: &str, all_day: bool) -> Option<When> {
 
 /// Checks the arguments before any approval prompt, cache or network use.
 pub(crate) fn validate(args: &Value) -> Result<CalendarWrite, &'static str> {
+    if args
+        .as_object()
+        .is_some_and(|m| m.keys().any(|k| !FIELDS.contains(&k.as_str())))
+    {
+        return Err(UNKNOWN_FIELD);
+    }
     let op: CalendarWrite =
         serde_json::from_value(args.clone()).map_err(|_| "invalid_arguments")?;
     let guid_ok = |g: &Option<String>| {
@@ -467,6 +494,8 @@ fn times_for(
     let zone_name = match (&op.timezone, before) {
         (Some(z), _) => Some(z.clone()),
         (None, Some(b)) if !b.all_day && b.timezone.is_some() => b.timezone.clone(),
+        // An event without a zone is never pinned to one silently.
+        (None, Some(_)) => return Err(FLOATING),
         _ if offsets_only => Some("UTC".to_string()),
         _ => None,
     };
@@ -930,9 +959,33 @@ pub(crate) fn plain_preview(preview: &Value) -> String {
     lines.join("\n")
 }
 
-/// What the person can do after `error`, when there is something.
-pub(crate) fn next_step(error: &str) -> Option<String> {
+/// What the person can do after `error`, when there is something. `args` are the call's.
+pub(crate) fn next_step(error: &str, args: &Value) -> Option<String> {
     Some(match error {
+        UNKNOWN_FIELD => {
+            let unknown: Vec<String> = args
+                .as_object()
+                .map(|m| {
+                    m.keys()
+                        .filter(|k| !FIELDS.contains(&k.as_str()))
+                        .take(5)
+                        .map(|k| shown(k, 64))
+                        .collect()
+                })
+                .unwrap_or_default();
+            format!(
+                "calendar_write does not take {}. Its fields are {}. It never adds or removes attendees; make such changes in Apple Calendar.",
+                unknown.join(", "),
+                FIELDS.join(", ")
+            )
+        }
+        FLOATING => "This event has no time zone: it is all-day or floating, shown at the same clock time everywhere. New times would tie it to a zone, so give timezone with them, such as timezone: Europe/Berlin, or timezone: UTC to keep offset times as they are.".into(),
+        "unknown_timezone" => "Use an IANA zone name such as Europe/Berlin, America/New_York or UTC.".into(),
+        "invalid_alerts" => "alerts is a list of minutes before the start, 0 at the start. Duplicates, more than 8 alerts, and more than 40320 minutes (four weeks) are refused.".into(),
+        "this_occurrence_needs_an_occurrence_guid" => "this_occurrence needs the guid of one occurrence, such as SERIES__20261109T090000Z from calendar_events. For the series itself use scope: whole_series, or leave scope out for an event that does not repeat.".into(),
+        "calendar_read_only" => "That calendar is read-only (subscribed, or shared with you for reading). Run calendar_calendars and pick one whose read_only is false.".into(),
+        "end_must_be_after_start" => "end must be after start; for an all-day event, end is the day after the last day.".into(),
+        "etag_required_from_calendar_get" => "update, move and delete need the event's etag. Read the event with calendar_get and pass its etag.".into(),
         UNKNOWN => "The connection ended before Apple answered, so the change may or may not have been made. Run calendar_refresh over the event's days and look at it with calendar_events before trying again; a create tried again could make a second event.".into(),
         CHANGED | "etag_not_current_run_calendar_get" | "event_version_unknown_run_calendar_refresh" => "The event is not the version this change was made for. Run calendar_refresh over its days, read it again with calendar_get, and decide again with its current etag.".into(),
         ATTENDEES => format!("Other people are invited to this event, and the change would send them an update or a cancellation. Nothing was sent. To let such changes run, the person sets {INVITATIONS_RULE}: allow in permissions.yaml in their own terminal; otherwise make the change in Apple Calendar."),
@@ -1285,7 +1338,11 @@ async fn read_back(api: &CalendarClient<'_>, asked: &Event, effects: &mut Effect
         .event_detail_body(asked, &day_asked(asked))
         .await
         .map(|body| {
-            body.and_then(|body| {
+            body.and_then(|mut body| {
+                // Apple may send one event as an object rather than a list.
+                if body["Event"].is_object() {
+                    body["Event"] = Value::Array(vec![body["Event"].take()]);
+                }
                 quince_icloud::calendar::parse_snapshot(&body)
                     .events
                     .into_iter()

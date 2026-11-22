@@ -410,7 +410,7 @@ async fn the_tool_is_listed_strict_and_its_actions_are_rule_names() {
             update("E-1", json!({"title":"x","colour":"red"}))
         )
         .await,
-        "invalid_arguments"
+        "calendar_write_unknown_field"
     );
     assert!(write_paths(&f.remote).await.is_empty());
 }
@@ -1059,18 +1059,24 @@ async fn offset_times_without_a_timezone_are_kept_in_utc() {
         said.contains("add timezone") && said.contains("UTC"),
         "{said}"
     );
-    // A floating event: offsets keep it in UTC from now on, a local time needs a zone.
-    assert_eq!(
-        code(
-            &mut f.server,
-            update("FLOAT", json!({"start":"2026-11-14T07:30"}))
-        )
-        .await,
-        "timezone_required"
-    );
+    // A floating event is never pinned to a zone silently: new times need timezone.
+    for start in ["2026-11-14T07:30", "2026-11-14T06:30:00Z"] {
+        let e = error(&mut f.server, update("FLOAT", json!({"start":start}))).await;
+        assert_eq!(e["error"], "floating_event_needs_timezone", "{start}");
+        let said = e["instructions"].as_str().unwrap();
+        assert!(
+            said.contains("timezone: UTC") && said.contains("same clock time"),
+            "{said}"
+        );
+    }
+    assert_eq!(writes(&f.remote).await.len(), 1);
+    // With timezone it runs, and the event is kept in that zone.
     ok(
         &mut f.server,
-        update("FLOAT", json!({"start":"2026-11-14T06:30:00Z"})),
+        update(
+            "FLOAT",
+            json!({"start":"2026-11-14T06:30:00Z","timezone":"UTC"}),
+        ),
     )
     .await;
     let (_, body) = writes(&f.remote).await.pop().unwrap();
@@ -1319,4 +1325,101 @@ async fn unchanged_time_fields_are_not_a_time_change_and_errors_name_the_fix() {
         );
     }
     assert!(write_paths(&fresh.remote).await.is_empty());
+}
+
+// --- Second review.
+
+#[test]
+fn the_yolo_description_says_calendar_deletes_still_wait() {
+    let yolo = skykeep_mcp::status::describe_mode("yolo");
+    assert!(yolo.contains("Calendar deletes"), "{yolo}");
+    assert!(yolo.contains("Drive deletions"), "{yolo}");
+}
+
+#[tokio::test]
+async fn more_errors_name_the_fix() {
+    let mut f = fixture(Some("yolo")).await;
+    let create = |extra: Value| {
+        let mut args = json!({"action":"create","calendar_guid":"cal-work","title":"x","start":"2026-12-01T10:00Z"});
+        for (k, v) in extra.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        args
+    };
+    for (args, why, hint) in [
+        (
+            create(json!({"timezone":"Berlin"})),
+            "unknown_timezone",
+            "Europe/Berlin",
+        ),
+        (create(json!({"alerts":[5,5]})), "invalid_alerts", "40320"),
+        (
+            create(json!({"alerts":[1,2,3,4,5,6,7,8,9]})),
+            "invalid_alerts",
+            "8",
+        ),
+        (
+            create(json!({"end":"2026-12-01T09:00Z"})),
+            "end_must_be_after_start",
+            "after",
+        ),
+        (
+            create(json!({"calendar_guid":"cal-shared"})),
+            "calendar_read_only",
+            "calendar_calendars",
+        ),
+        (
+            update("E-1", json!({"title":"x","scope":"this_occurrence"})),
+            "this_occurrence_needs_an_occurrence_guid",
+            "whole_series",
+        ),
+        (
+            json!({"action":"delete","guid":"E-1"}),
+            "etag_required_from_calendar_get",
+            "calendar_get",
+        ),
+        (
+            create(json!({"attendees":["guest@example.test"]})),
+            "calendar_write_unknown_field",
+            "calendar_guid",
+        ),
+    ] {
+        let e = error(&mut f.server, args.clone()).await;
+        assert_eq!(e["error"], why, "{args}");
+        let said = e["instructions"].as_str().unwrap_or_default();
+        assert!(said.contains(hint), "{args}: {e}");
+    }
+    // The unknown field is named, and attendees are said to be out of reach.
+    let e = error(&mut f.server, create(json!({"attendees":[]}))).await;
+    let said = e["instructions"].as_str().unwrap();
+    assert!(
+        said.contains("attendees") && said.contains("never adds"),
+        "{said}"
+    );
+    assert!(write_paths(&f.remote).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_read_back_answered_with_a_single_event_object_counts() {
+    let mut f = fixture(Some("yolo")).await;
+    Mock::given(method("GET"))
+        .and(path("/ca/eventdetail/cal-work/E-1"))
+        .respond_with(OneObject(f.fake.clone()))
+        .with_priority(1)
+        .mount(&f.remote)
+        .await;
+    let done = ok(&mut f.server, update("E-1", json!({"title":"Dentist!"}))).await;
+    assert_eq!(done["remote_verified"], true, "{done}");
+}
+
+/// `eventdetail` answering with `Event` as one object rather than a list.
+struct OneObject(Fake);
+
+impl Respond for OneObject {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        match self.0.events.lock().unwrap().get("E-1") {
+            Some(e) => ResponseTemplate::new(200).set_body_json(json!({"Event":e})),
+            None => ResponseTemplate::new(404),
+        }
+    }
 }
