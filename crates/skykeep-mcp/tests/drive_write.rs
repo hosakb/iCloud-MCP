@@ -515,6 +515,41 @@ async fn apple_refusing_a_change_is_an_error_without_apple_text() {
     assert!(!shown.contains("SYNTHETIC-TOKEN"), "{shown}");
 }
 
+/// A move asked again after an earlier one whose outcome was unknown: the cache still has the
+/// item in its old folder, but Apple already lists it in the destination. Nothing is sent.
+#[tokio::test]
+async fn a_move_apple_already_shows_done_says_already_in_destination() {
+    let mut f = fixture(None).await;
+    mark_read(
+        f.dir.path(),
+        SMALL,
+        vec![cached_file("FILE::com.apple.CloudDocs::IN", "in")],
+    );
+    serve_listing(
+        &f.remote,
+        DOCS,
+        json!([
+            file(NOTES, DOCS, "notes", "txt", 5),
+            folder(SMALL, "Small", 1)
+        ]),
+        None,
+    )
+    .await;
+    serve_listing(&f.remote, ROOT, root_items(), None).await;
+    let reply = call(
+        &mut f.server,
+        json!({"action":"move","id":SMALL,"destination_id":DOCS}),
+    )
+    .await;
+    let value = text(&reply);
+    assert_eq!(value["error"], "already_in_destination", "{reply}");
+    assert!(value["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("Nothing to do"));
+    assert!(writes(&f.remote).await.is_empty());
+}
+
 #[tokio::test]
 async fn move_of_a_small_folder_runs_and_a_large_one_waits_with_a_preview() {
     let mut f = fixture(None).await;
@@ -1649,6 +1684,10 @@ async fn a_form_approved_delete_forever_that_stops_half_way_says_what_to_do() {
 fn the_yolo_description_says_drive_deletions_still_wait() {
     let yolo = skykeep_mcp::status::describe_mode("yolo");
     assert!(yolo.contains("Drive deletions"), "{yolo}");
+    assert!(
+        yolo.contains("moves and renames of large Drive folders"),
+        "{yolo}"
+    );
     assert!(yolo.contains("skykeep-mcp approve"), "{yolo}");
     assert!(!yolo.contains("Never ask"), "{yolo}");
 }
@@ -1788,18 +1827,157 @@ async fn a_shared_folder_refusal_names_the_fix() {
     );
 }
 
-/// `skykeep-mcp exchange` without --state-dir uses the default folder, as setup does, rather
-/// than stopping at its usage line.
+/// `skykeep-mcp exchange` without --state-dir uses the default private folder, as setup does:
+/// run in a terminal of its own, it sets up both folders and prints the exchange folder.
 #[test]
 fn the_exchange_command_defaults_its_state_folder() {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::process::CommandExt;
     let home = private_dir();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_skykeep-mcp"))
+    std::fs::create_dir_all(home.path().join(".local/share")).unwrap();
+    let (mut master, slave) = {
+        let (mut m, mut s) = (0, 0);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut m,
+                    &mut s,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        unsafe { (std::fs::File::from_raw_fd(m), std::fs::File::from_raw_fd(s)) }
+    };
+    let tty = slave.as_raw_fd();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_skykeep-mcp"));
+    command
         .args(["exchange", "--max-mb", "5"])
         .env("HOME", home.path())
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
-    let said = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success());
-    assert!(!said.contains("usage:"), "{said}");
+        .stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave.try_clone().unwrap());
+    for marker in skykeep_mcp::terminal::AGENT_MARKERS {
+        command.env_remove(marker);
+    }
+    // The terminal becomes the command's own, as a terminal window's is.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0 || libc::ioctl(tty, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    // Every copy of the terminal's far end closes here, so reading ends when the command does.
+    drop(command);
+    drop(slave);
+    let mut said = Vec::new();
+    let mut buf = [0u8; 1024];
+    while let Ok(n) = master.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        said.extend_from_slice(&buf[..n]);
+    }
+    let status = child.wait().unwrap();
+    let said = String::from_utf8_lossy(&said);
+    assert!(status.success(), "{said}");
+    let exchange = home.path().join("Skykeep-Exchange");
+    let real = std::fs::canonicalize(home.path())
+        .unwrap()
+        .join("Skykeep-Exchange");
+    assert!(
+        said.contains(&format!("Drive exchange folder: {}", real.display())),
+        "{said}"
+    );
+    assert!(said.contains("Size limit: 5 MB"), "{said}");
+    assert!(exchange.is_dir());
+    let state = home.path().join(".local/share/skykeep-mcp");
+    let library = quince_core::Library::open(&state).unwrap();
+    let saved: Value =
+        serde_json::from_str(&library.state("mcp.drive.exchange").unwrap().unwrap()).unwrap();
+    assert_eq!(saved["max_bytes"], 5 * 1024 * 1024);
+}
+
+/// A link among the folders above the exchange folder (as /home can be on some systems) is
+/// followed once at setup and the real path kept; the exchange folder itself may not be one,
+/// and the refusal names the real folder to use instead.
+#[test]
+fn a_symbolic_link_above_the_exchange_folder_is_resolved_at_setup() {
+    use skykeep_mcp::exchange::{explain, set_up};
+    let dir = private_dir();
+    let state = dir.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    let real = dir.path().join("real home");
+    std::fs::create_dir(&real).unwrap();
+    let linked = dir.path().join("home");
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    let mut library = quince_core::Library::open(&state).unwrap();
+    let saved = set_up(&mut library, Some(linked.join("Exchange")), None).unwrap();
+    let real_exchange = std::fs::canonicalize(&real).unwrap().join("Exchange");
+    assert_eq!(saved.path, real_exchange);
+    assert!(real_exchange.is_dir());
+    // The exchange folder itself as a link: refused, with the real folder to name.
+    let link_folder = dir.path().join("link-exchange");
+    std::os::unix::fs::symlink(&real_exchange, &link_folder).unwrap();
+    assert_eq!(
+        set_up(&mut library, Some(link_folder.clone()), None),
+        Err("exchange_folder_path_unsafe")
+    );
+    let text = explain("exchange_folder_path_unsafe", Some(&link_folder), &state);
+    assert!(
+        text.contains(&format!("--path '{}'", real_exchange.display())),
+        "{text}"
+    );
+}
+
+/// The terminal approval names an upload's name in iCloud Drive and the local name a
+/// download takes when none is given.
+#[tokio::test]
+async fn the_approval_text_names_both_ends_of_a_transfer() {
+    let mut f = fixture(None).await;
+    {
+        let mut library = quince_core::Library::open(f.dir.path()).unwrap();
+        library
+            .set_state("mcp.require_write_approval", "true")
+            .unwrap();
+    }
+    let up = proposal_id(
+        &ok(
+            &mut f.server,
+            json!({"action":"upload","path":"/Documents","local":"in/plan.txt","name":"Plan.txt"}),
+        )
+        .await,
+    );
+    let text = f.server.approval_text(&up).unwrap();
+    assert!(text.contains("Name in iCloud Drive: Plan.txt"), "{text}");
+    assert!(
+        text.contains("Local file in the exchange folder: in/plan.txt"),
+        "{text}"
+    );
+    let down = proposal_id(&ok(&mut f.server, json!({"action":"download","id":REPORT})).await);
+    let text = f.server.approval_text(&down).unwrap();
+    assert!(
+        text.contains("Local file in the exchange folder: report.pdf"),
+        "{text}"
+    );
+}
+
+/// After a refusal, approve prints what to do next.
+#[test]
+fn common_refusals_say_what_to_do_next() {
+    for code in [
+        "name_taken",
+        "local_file_exists_not_overwritten",
+        "already_has_this_name",
+        "already_in_destination",
+    ] {
+        let step = skykeep_mcp::next_step(code, Path::new("/state"), &Value::Null);
+        assert!(step.as_deref().is_some_and(|s| s.len() > 20), "{code}");
+    }
 }

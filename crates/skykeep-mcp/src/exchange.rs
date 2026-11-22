@@ -108,22 +108,9 @@ pub fn set_up(
             None => default_path().ok_or("home_folder_unknown_give_path")?,
         },
     };
-    // Every name on the way: no `..` and no links, as for the private directory.
-    let mut checked = PathBuf::new();
-    for component in path.components() {
-        if matches!(component, Component::ParentDir | Component::CurDir) {
-            return Err("exchange_folder_path_unsafe");
-        }
-        checked.push(component);
-        if std::fs::symlink_metadata(&checked).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err("exchange_folder_path_unsafe");
-        }
-    }
+    let path = real_path(&path)?;
     if std::fs::symlink_metadata(&path).is_err() {
         use std::os::unix::fs::DirBuilderExt;
-        if !path.parent().is_some_and(Path::is_dir) {
-            return Err("exchange_parent_missing");
-        }
         // Only the folder itself: its parent must exist.
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -171,7 +158,10 @@ pub fn explain(code: &str, path: Option<&Path>, dir: &Path) -> String {
         }
         "exchange_folder_writable_by_others" => format!("Other users can change {folder}. Make it yours alone with: chmod 700 {folder} and run the same command again."),
         "exchange_folder_not_yours" => format!("{folder} belongs to another user. Pick a folder of your own with: skykeep-mcp exchange --state-dir {state} --path DIR"),
-        "exchange_folder_path_unsafe" => format!("The path to {folder} has a symbolic link or .. in it. Give the real path, for example: skykeep-mcp exchange --state-dir {state} --path ~/{DEFAULT_NAME}"),
+        "exchange_folder_path_unsafe" => match path.and_then(|p| std::fs::canonicalize(p).ok()) {
+            Some(real) => format!("{folder} is a symbolic link. Use the real folder it points to: skykeep-mcp exchange --state-dir {state} --path {}", crate::status::quoted(&real)),
+            None => format!("{folder} is a symbolic link or names no folder. Give a real folder, for example: skykeep-mcp exchange --state-dir {state} --path ~/{DEFAULT_NAME}"),
+        },
         "home_folder_unknown_give_path" => format!("Your home folder is not known here. Name the folder with: skykeep-mcp exchange --state-dir {state} --path DIR"),
         "exchange_folder_unavailable" => format!("{folder} could not be created or opened. Check that it is a folder you can open, or pick another with: skykeep-mcp exchange --state-dir {state} --path DIR"),
         "invalid_exchange_setting" => format!("The saved exchange setting is unreadable. Set it again with: skykeep-mcp exchange --state-dir {state} --path DIR"),
@@ -200,6 +190,31 @@ pub(crate) fn shared_folder(state_dir: &Path, local: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// `path` with the folders above it resolved, once, here in the person's own terminal: a link
+/// among them (such as `/home` pointing to `/var/home`) is followed and the real path kept.
+/// The exchange folder itself must not be a link, and every name inside it is opened without
+/// following one at transfer time.
+fn real_path(path: &Path) -> Result<PathBuf, &'static str> {
+    let name = path.file_name().ok_or("exchange_folder_path_unsafe")?;
+    if path
+        .components()
+        .next_back()
+        .is_some_and(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err("exchange_folder_path_unsafe");
+    }
+    let parent = path.parent().ok_or("exchange_folder_path_unsafe")?;
+    let parent = std::fs::canonicalize(parent).map_err(|_| "exchange_parent_missing")?;
+    if !parent.is_dir() {
+        return Err("exchange_parent_missing");
+    }
+    let path = parent.join(name);
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("exchange_folder_path_unsafe");
+    }
+    Ok(path)
 }
 
 /// The folder, opened and checked to be the one set up.

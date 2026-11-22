@@ -189,6 +189,10 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
         drive_write::UNKNOWN => Some("The connection ended before Apple answered, so the change may or may not have been made. Run drive_refresh on the folder and look at it before trying again.".to_string()),
         drive_write::IN_RECENTLY_DELETED => Some("The item is in Recently Deleted in iCloud Drive but was not deleted for good. Delete it there (iCloud Drive on icloud.com or a Mac), or leave it: Apple deletes it by itself after about 30 days.".to_string()),
         drive_write::IN_RECENTLY_DELETED_LOGIN => Some(format!("The item is in Recently Deleted in iCloud Drive but was not deleted for good, because the sign-in has expired. Sign in again with {} in your own terminal, then delete it from Recently Deleted in iCloud Drive, or leave it: Apple deletes it by itself after about 30 days.", status::with_dir("skykeep-mcp login", dir))),
+        "name_taken" => Some("Something with that name is already in that iCloud Drive folder, and it was left as it is. Ask again with another name, or rename or remove the one that is there first.".to_string()),
+        "local_file_exists_not_overwritten" => Some("A file with that name is already in the exchange folder, and it was left as it is. Ask again with another local name, or move that file away first.".to_string()),
+        "already_has_this_name" => Some("Nothing to do: iCloud Drive already shows the item under that name.".to_string()),
+        "already_in_destination" => Some("Nothing to do: the item is already in that folder in iCloud Drive.".to_string()),
         "local_folder_not_private" => Some(
             args["local"]
                 .as_str()

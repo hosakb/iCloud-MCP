@@ -291,7 +291,7 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
         let mut tty = terminal::controlling()?;
         if let Some(mode) = policy_mode {
             use std::io::Write;
-            writeln!(tty, "Set approval mode to {mode} for {}. YOLO runs Notes and Reminders deletions without prompts; Drive deletions and moves of large Drive folders still wait for skykeep-mcp approve. All currently pending writes will be quarantined, including previously approved writes. Old terminal proposals cannot be released under this policy. Type confirm to persist.", dir.display()).map_err(|_| "terminal_unavailable")?;
+            writeln!(tty, "Set approval mode to {mode} for {}. YOLO runs Notes and Reminders deletions without prompts; Drive deletions, and moves and renames of large Drive folders, still wait for skykeep-mcp approve. All currently pending writes will be quarantined, including previously approved writes. Old terminal proposals cannot be released under this policy. Type confirm to persist.", dir.display()).map_err(|_| "terminal_unavailable")?;
             let answer = terminal::hidden(&mut tty, "Confirmation: ", Duration::from_secs(180))?;
             if *answer != "confirm" {
                 return Err("policy_change_cancelled");

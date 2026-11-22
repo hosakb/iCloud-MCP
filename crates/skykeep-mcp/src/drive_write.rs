@@ -480,7 +480,11 @@ pub(crate) fn preview(library: &Library, args: &Value) -> Result<Value, &'static
             value["effect"] = json!("reads one file from the exchange folder and adds it; an existing name is refused, never replaced");
         }
         DriveWrite::Download { local, .. } => {
-            value["local_file"] = json!(local);
+            // Without `local`, the name the download takes: the item's, cleaned.
+            value["local_file"] = json!(local.clone().or_else(|| plan
+                .item
+                .as_ref()
+                .and_then(|i| exchange::local_name_from_apple(&i.display_name()))));
             value["effect"] = json!(
                 "writes one new file into the exchange folder; an existing file is never replaced"
             );
@@ -529,6 +533,12 @@ pub(crate) fn plain_preview(preview: &Value) -> String {
         lines.push(format!(
             "Local file in the exchange folder: {}",
             text(&preview["local_file"])
+        ));
+    }
+    if preview["name_in_drive"].is_string() {
+        lines.push(format!(
+            "Name in iCloud Drive: {}",
+            text(&preview["name_in_drive"])
         ));
     }
     let affects = &preview["affects"];
@@ -1059,8 +1069,10 @@ async fn act(
 }
 
 /// Why the deletion from Recently Deleted failed, once the item is known to be there. Only an
-/// answer that says the item stayed is reported as in Recently Deleted; a dropped connection
-/// or a busy Drive leaves the outcome unknown, and anything else unconfirmed.
+/// answer that says the item stayed is reported as in Recently Deleted. A busy Drive leaves the
+/// outcome unknown. The engine keeps a dropped connection on `deleteItems` as a refusal in its
+/// list of failures, so that comes back as unconfirmed (`drive_write_not_confirmed_run_drive_refresh`),
+/// as does anything else.
 fn delete_forever_error(e: &quince_icloud::Error) -> &'static str {
     match apple(e) {
         "login_required" => IN_RECENTLY_DELETED_LOGIN,
