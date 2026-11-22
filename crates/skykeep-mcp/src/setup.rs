@@ -97,7 +97,6 @@ pub fn plain(code: &'static str) -> &'static str {
         "unsafe_state_contents" => "A file in that folder can be read by others, or is a link. Choose another folder.",
         "unsafe_state_path" => "That folder path goes through a link or '..'. Use the folder's real path.",
         "state_unavailable" | "library_unavailable" => "Setup can't open that folder. Check that its parent folder exists and belongs to you.",
-        "permissions_setup_required" => "This folder isn't set up yet. Run skykeep-mcp setup first.",
         "permissions_file_unavailable" => "Setup couldn't write the permissions file. Run skykeep-mcp status to see why.",
         "policy_unavailable" => "Setup couldn't read or save the approval mode. Run skykeep-mcp status to see why.",
         "authentication_unavailable" => "Sign-in didn't finish. Check your internet connection, then run skykeep-mcp setup again.",

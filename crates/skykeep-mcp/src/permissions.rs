@@ -1,9 +1,11 @@
 //! Per-tool permissions from `permissions.yaml` in the private folder.
 //!
-//! The server reads the file before every tool call, so an edit counts at once. A missing,
-//! unreadable or invalid file is ignored and the folder's approval mode decides. Every load
+//! The server reads the file before every tool call, so an edit counts at once. A missing
+//! file leaves everything to the folder's approval mode. An unusable file never loosens
+//! anything: the last valid rules stay in use, and with none every deletion asks. Every load
 //! that changes the rules is recorded in the library, so `status` and `permissions show` can
-//! say what became looser. No MCP tool reads or writes the file or these records.
+//! say what became looser. No MCP tool reads or writes the file or these records; the server
+//! writes one rule only when the person picks "Always allow" on an approval card.
 use quince_core::Library;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -17,6 +19,10 @@ const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 const LOADED_KEY: &str = "mcp.permissions.loaded";
 const HISTORY_KEY: &str = "mcp.permissions.history";
 const SEEN_KEY: &str = "mcp.permissions.seen";
+/// Looser changes since `permissions show` last ran in the person's terminal, kept apart from
+/// the history so that later edits can't push them out.
+const LOOSER_KEY: &str = "mcp.permissions.looser_unseen";
+const MAX_LOOSER: usize = 20;
 const MAX_HISTORY: usize = 50;
 /// Tools that only report Skykeep's own state; they are never gated.
 pub(crate) const ALWAYS: [&str; 2] = ["auth_status", "sync_status"];
@@ -118,21 +124,49 @@ pub enum Removal {
     Permanent,
 }
 
-/// What an action removes, by its name alone. `trash` can be restored; `delete_forever`,
-/// `purge` and any other delete are treated as permanent, except a Notes delete, which Apple
-/// moves to Recently Deleted.
+/// What an action removes, by the words of its name (split at `_`, so `undelete` is not a
+/// deletion). A `trash` word can be restored. `forever`, `permanent`, `purge` and any other
+/// `delete` are treated as permanent, except a Notes delete, which Apple moves to Recently
+/// Deleted.
 pub fn removal_of(tool: &str, action: &str) -> Removal {
-    if ["forever", "permanent", "purge"]
-        .iter()
-        .any(|w| action.contains(w))
-    {
+    let has = |words: &[&str]| action.split('_').any(|w| words.contains(&w));
+    if has(&["forever", "permanent", "purge"]) {
         Removal::Permanent
-    } else if action.contains("trash") || (tool == "notes_write" && action == "delete") {
+    } else if has(&["trash"]) || (tool == "notes_write" && action == "delete") {
         Removal::Recoverable
-    } else if action.contains("delete") {
+    } else if has(&["delete"]) {
         Removal::Permanent
     } else {
         Removal::None
+    }
+}
+
+/// The sentence a card shows for "Always allow", in plain words.
+pub fn always_sentence(rule: &str) -> String {
+    let what = match rule.split_once('.') {
+        Some((tool, action)) => {
+            let service = tool.split('_').next().unwrap_or(tool);
+            let mut chars = service.chars();
+            let service: String = chars
+                .next()
+                .map(|c| c.to_uppercase().chain(chars).collect())
+                .unwrap_or_default();
+            format!("every {service} {}", action.replace('_', " "))
+        }
+        None => format!("every {rule} request"),
+    };
+    format!("Always allow: {what} runs without asking from now on.")
+}
+
+/// A permissions show error in plain words.
+pub fn plain(code: &'static str) -> &'static str {
+    match code {
+        "permissions_setup_required" => "This folder isn't set up yet. Run skykeep-mcp setup first.",
+        "state_busy_retry" => "The server is using the folder right now. Run skykeep-mcp permissions show again in a moment.",
+        "state_unavailable" => "Skykeep can't open that folder. Check that it exists and belongs to you, or add --state-dir FOLDER.",
+        "unsafe_state_contents" | "state_must_be_owned_and_private" | "unsafe_state_path" => "The folder isn't private to you, or holds a link or a shared file. Run skykeep-mcp status to see what to fix.",
+        "library_unavailable" => "Skykeep couldn't read its records in that folder. Run skykeep-mcp status to see why.",
+        other => other,
     }
 }
 
@@ -301,6 +335,12 @@ pub fn parse(text: &str) -> Result<Rules, String> {
                     "{}" => {}
                     _ => return Err(at("put each rule on its own line under rules:".into())),
                 },
+                other if names().iter().any(|n| n == other) => {
+                    return Err(at(format!(
+                        "{} must be indented under rules:, with spaces in front of it",
+                        shown(other)
+                    )))
+                }
                 other => {
                     return Err(at(format!(
                         "unknown setting {}; the file has version: and rules:",
@@ -357,7 +397,7 @@ pub fn parse(text: &str) -> Result<Rules, String> {
         let line = lines_of.get(name).copied().unwrap_or(0);
         let Some(target) = valid.iter().find(|t| &t.name == name) else {
             return Err(format!(
-                "line {line}: {} is not a Skykeep tool or action. The closest valid name is {}. skykeep-mcp permissions show lists every valid name",
+                "line {line}: {} is not a Skykeep tool or action; the closest valid name is {}.",
                 shown(name),
                 closest(name)
             ));
@@ -528,17 +568,27 @@ pub struct Active {
 }
 
 impl Active {
-    /// A sentence on what Skykeep does while the file can't be used, for tool results.
+    /// A sentence on what Skykeep does while the file can't be used, for tool results and
+    /// status. `permissions show` lists the valid names itself, so it passes `in_show`.
     pub fn fallback(&self) -> Option<String> {
+        self.fallback_in(false)
+    }
+
+    fn fallback_in(&self, in_show: bool) -> Option<String> {
         let problem = self.problem.as_deref()?;
+        let names = if !in_show && problem.contains("is not a Skykeep tool or action") {
+            " To see every valid name, run skykeep-mcp permissions show."
+        } else {
+            ""
+        };
         Some(match self.kept_from {
             Some(at) => format!(
-                "The permissions file can't be used ({}). Skykeep keeps the last valid rules, loaded {}.",
+                "The permissions file can't be used ({}). Skykeep keeps the last valid rules, loaded {}.{names}",
                 shown_problem(problem),
                 when(at)
             ),
             None => format!(
-                "The permissions file can't be used ({}). Skykeep follows the approval mode and asks before every deletion until the file is fixed.",
+                "The permissions file can't be used ({}). Skykeep follows the approval mode and asks before every deletion until the file is fixed.{names}",
                 shown_problem(problem)
             ),
         })
@@ -680,6 +730,10 @@ fn evaluate(
 pub fn load(library: &mut Library, dir: &Path, mode: Option<&str>) -> Result<Active, &'static str> {
     let (active, change) = evaluate(library, dir, mode)?;
     if let Some((record, event)) = change {
+        let mut pending = looser_unseen(library);
+        if let Some(event) = &event {
+            add_looser(&mut pending, event);
+        }
         let mut history = history(library);
         history.extend(event);
         let keep = history.len().saturating_sub(MAX_HISTORY);
@@ -687,11 +741,39 @@ pub fn load(library: &mut Library, dir: &Path, mode: Option<&str>) -> Result<Act
         library
             .atomically(|library| -> quince_core::Result<()> {
                 library.set_state(HISTORY_KEY, &Value::Array(history).to_string())?;
+                library.set_state(LOOSER_KEY, &pending.to_string())?;
                 library.set_state(LOADED_KEY, &record.to_string())
             })
             .map_err(|_| "library_unavailable")?;
     }
     Ok(active)
+}
+
+/// The looser changes not yet seen: `{"count": n, "newest": [change...]}`.
+fn looser_unseen(library: &Library) -> Value {
+    library
+        .state(LOOSER_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({"count":0,"newest":[]}))
+}
+
+fn add_looser(pending: &mut Value, event: &Value) {
+    let looser = event["looser"].as_array().cloned().unwrap_or_default();
+    if looser.is_empty() {
+        return;
+    }
+    let count = pending["count"].as_u64().unwrap_or(0) + looser.len() as u64;
+    let mut newest = pending["newest"].as_array().cloned().unwrap_or_default();
+    for mut change in looser {
+        change["at"] = event["at"].clone();
+        newest.push(change);
+    }
+    let keep = newest.len().saturating_sub(MAX_LOOSER);
+    newest.drain(..keep);
+    *pending = json!({"count":count,"newest":newest});
 }
 
 /// Records that a deletion ran without asking because the file allowed it: tool, action and
@@ -708,11 +790,15 @@ fn log_lines(dir: &Path, limit: usize) -> Vec<Value> {
     use std::os::unix::fs::OpenOptionsExt;
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(dir.join(LOG_NAME))
     else {
         return Vec::new();
     };
+    // Only a regular file is read: a pipe or device in its place is skipped.
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return Vec::new();
+    }
     use std::io::{BufRead, Read};
     let lines: Vec<Value> = std::io::BufReader::new(file.take(MAX_LOG_BYTES + 4096))
         .lines()
@@ -815,15 +901,14 @@ pub fn status(library: &Library, dir: &Path, mode: Option<&str>) -> Vec<(String,
             None,
         )),
     }
-    let mut events = unseen(library);
-    events.extend(change.and_then(|(_, event)| event));
-    let looser: Vec<Value> = events
-        .iter()
-        .flat_map(|e| e["looser"].as_array().cloned().unwrap_or_default())
-        .collect();
-    if let Some(newest) = looser.last() {
-        let more = if looser.len() > 1 {
-            format!(" (and {} earlier)", looser.len() - 1)
+    let mut pending = looser_unseen(library);
+    if let Some(event) = change.and_then(|(_, event)| event) {
+        add_looser(&mut pending, &event);
+    }
+    let count = pending["count"].as_u64().unwrap_or(0);
+    if let Some(newest) = pending["newest"].as_array().and_then(|n| n.last()) {
+        let more = if count > 1 {
+            format!(" (and {} earlier)", count - 1)
         } else {
             String::new()
         };
@@ -836,6 +921,36 @@ pub fn status(library: &Library, dir: &Path, mode: Option<&str>) -> Vec<(String,
         ));
     }
     out
+}
+
+/// A rule and what it does, after the minimum the server keeps: without an approval mode,
+/// deletions always wait for the terminal.
+fn described(name: &str, effect: Effect, mode: Option<&str>) -> String {
+    let all = targets();
+    let target = all.iter().find(|t| t.name == name);
+    let deletes = |tool: &str, action: &str| mode.is_none() && is_deletion(tool, action);
+    let floor = target.and_then(|t| t.action.as_deref().map(|a| deletes(&t.tool, a)));
+    let tool_deletes = target.is_some_and(|t| {
+        t.action.is_none()
+            && all.iter().any(|o| {
+                o.tool == t.tool && o.action.as_deref().is_some_and(|a| deletes(&o.tool, a))
+            })
+    });
+    if floor == Some(true) && effect < Effect::AskTerminal {
+        format!(
+            "{}, but {}, because a folder without an approval mode always asks before deleting",
+            effect.as_str(),
+            Effect::AskTerminal.sentence()
+        )
+    } else if tool_deletes && effect < Effect::AskTerminal {
+        format!(
+            "{}, {}, except deletions, which wait for skykeep-mcp approve in your terminal",
+            effect.as_str(),
+            effect.sentence()
+        )
+    } else {
+        format!("{}, {}", effect.as_str(), effect.sentence())
+    }
 }
 
 fn shown_problem(problem: &str) -> String {
@@ -880,7 +995,7 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
     if let Some(at) = loaded["loaded_at"].as_u64() {
         out.push_str(&format!("Last change loaded: {}\n", when(at)));
     }
-    if let (Some(text), Some(problem)) = (active.fallback(), &active.problem) {
+    if let (Some(text), Some(problem)) = (active.fallback_in(true), &active.problem) {
         out.push_str(&format!("\n{text}\n"));
         if problem.contains("is not a Skykeep tool or action") {
             out.push_str(&format!("Valid names: {}\n", names().join(", ")));
@@ -892,9 +1007,8 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
             out.push_str("\nLast valid rules, still in use:\n");
             for (name, effect) in &active.rules {
                 out.push_str(&format!(
-                    "  {name}: {}, {}\n",
-                    effect.as_str(),
-                    effect.sentence()
+                    "  {name}: {}\n",
+                    described(name, *effect, mode.as_deref())
                 ));
             }
         }
@@ -918,9 +1032,8 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
                     _ => String::new(),
                 };
                 out.push_str(&format!(
-                    "  {name}: {}, {}{from}\n",
-                    effect.as_str(),
-                    effect.sentence()
+                    "  {name}: {}{from}\n",
+                    described(name, *effect, mode.as_deref())
                 ));
             }
         }
@@ -929,10 +1042,25 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
         "Everything not listed follows the approval mode: {mode_text}\n"
     ));
     let unseen = unseen(&library);
-    if unseen.is_empty() {
+    let pending = looser_unseen(&library);
+    let total = pending["count"].as_u64().unwrap_or(0);
+    let listed: u64 = unseen
+        .iter()
+        .map(|e| e["looser"].as_array().map_or(0, |a| a.len() as u64))
+        .sum();
+    if unseen.is_empty() && total == 0 {
         out.push_str("\nNo changes since you last looked.\n");
     } else {
         out.push_str("\nChanges since you last looked:\n");
+        if total > listed {
+            if let Some(newest) = pending["newest"].as_array().and_then(|n| n.last()) {
+                out.push_str(&format!(
+                    "  {} looser changes are older than the history kept here; the newest looser change: {}\n",
+                    total - listed,
+                    change_line(newest)
+                ));
+            }
+        }
         for event in &unseen {
             let at = when(event["at"].as_u64().unwrap_or(0));
             let looser = event["looser"].as_array().cloned().unwrap_or_default();
@@ -989,7 +1117,10 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
             .and_then(|e| e["seq"].as_u64())
             .unwrap_or(0);
         library
-            .set_state(SEEN_KEY, &last.to_string())
+            .atomically(|library| -> quince_core::Result<()> {
+                library.set_state(SEEN_KEY, &last.to_string())?;
+                library.set_state(LOOSER_KEY, "")
+            })
             .map_err(|_| "library_unavailable")?;
     }
     Ok(out)
@@ -1004,13 +1135,14 @@ pub fn starter(mode: Option<&str>) -> String {
          #\n\
          # This file decides, for each tool and action, what Skykeep does:\n\
          #   allow           run without asking\n\
-         #   ask: client     ask in your MCP client, with approve and deny buttons\n\
+         #   ask: client     ask on a card in your MCP client: approve once, deny or always allow\n\
          #   ask: terminal   wait until you run skykeep-mcp approve in your own terminal\n\
          #   deny            always refuse\n\
          #\n\
          # Skykeep reads this file before every tool call, so a change counts at once.\n\
          # Anything not listed follows the folder's approval mode.\n\
-         # If the file has a mistake, Skykeep ignores all of it and follows the approval mode.\n\
+         # If the file has a mistake, Skykeep keeps the last valid rules it loaded. If there are\n\
+         # none, the approval mode decides and every deletion asks.\n\
          # To check it, run: skykeep-mcp permissions show\n\
          #\n\
          # Write ask on its own indented line, as below, or as {ask: terminal}.\n\
@@ -1156,6 +1288,16 @@ pub const BACKUP_NAME: &str = "permissions.yaml.bak";
 /// fingerprint the card was shown under: a file changed since then is left alone. The old
 /// file is kept as `permissions.yaml.bak`. Returns why the rule was not saved.
 pub fn save_allow(dir: &Path, name: &str, expected: &str) -> Result<(), String> {
+    save_allow_checked(dir, name, expected, &|| {})
+}
+
+/// [`save_allow`], with `meanwhile` run just before the last check, as an editor could.
+fn save_allow_checked(
+    dir: &Path,
+    name: &str,
+    expected: &str,
+    meanwhile: &dyn Fn(),
+) -> Result<(), String> {
     if !names().iter().any(|n| n == name) {
         return Err("this action has no rule name".into());
     }
@@ -1195,6 +1337,7 @@ pub fn save_allow(dir: &Path, name: &str, expected: &str) -> Result<(), String> 
     if let Some(bytes) = &old {
         write_atomic(dir, BACKUP_NAME, bytes)?;
     }
+    meanwhile();
     // Last check right before the rename: an edit that landed meanwhile wins.
     let now_print = read_bytes(dir)?
         .as_deref()
@@ -1217,7 +1360,7 @@ fn append_log(dir: &Path, entry: Value) -> Result<(), &'static str> {
         .append(true)
         .create(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(dir.join(LOG_NAME))
         .map_err(|_| "permissions_log_unavailable")?;
     let meta = file.metadata().map_err(|_| "permissions_log_unavailable")?;
@@ -1231,4 +1374,28 @@ fn append_log(dir: &Path, entry: Value) -> Result<(), &'static str> {
     line.push('\n');
     file.write_all(line.as_bytes())
         .map_err(|_| "permissions_log_unavailable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_edit_just_before_the_rename_wins_and_nothing_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(&path, "rules:\n  contacts_get: deny\n").unwrap();
+        let print = read(dir.path()).1;
+        let edited = "rules:\n  contacts_get: deny\n  notes_list: deny\n";
+        let error = save_allow_checked(dir.path(), "notes_list", &print, &|| {
+            std::fs::write(&path, edited).unwrap();
+        })
+        .unwrap_err();
+        assert!(error.contains("changed while the card was open"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        assert!(
+            !dir.path().join(LOG_NAME).exists(),
+            "nothing was saved, so nothing is logged"
+        );
+    }
 }

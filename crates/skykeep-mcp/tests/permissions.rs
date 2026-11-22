@@ -157,11 +157,9 @@ fn every_valid_name_takes_every_effect_and_names_come_from_the_tool_list() {
 #[test]
 fn unknown_names_and_bad_values_are_refused_with_a_plain_message() {
     let error = permissions::parse("rules:\n  notes_write.explode: allow\n").unwrap_err();
-    assert!(error.starts_with("line 2: notes_write.explode is not a Skykeep tool or action. The closest valid name is notes_write"), "{error}");
-    assert!(
-        error.ends_with(". skykeep-mcp permissions show lists every valid name"),
-        "{error}"
-    );
+    assert!(error.starts_with("line 2: notes_write.explode is not a Skykeep tool or action; the closest valid name is notes_write"), "{error}");
+    assert!(error.ends_with('.'), "{error}");
+    assert!(!error.contains("permissions show"), "{error}");
     let error = permissions::parse("rules:\n  reminder_write.creat: allow\n").unwrap_err();
     assert!(
         error.contains("closest valid name is reminders_write.create"),
@@ -180,6 +178,10 @@ fn unknown_names_and_bad_values_are_refused_with_a_plain_message() {
         ),
         ("version: 2\n", "version"),
         ("permissions:\n  notes_list: allow\n", "unknown setting"),
+        (
+            "notes_list: allow\n",
+            "notes_list must be indented under rules:",
+        ),
         ("rules:\n  notes_write.delete:\n", "has no value"),
         (
             "rules:\n  \u{1b}[31mnotes: allow\n",
@@ -191,6 +193,43 @@ fn unknown_names_and_bad_values_are_refused_with_a_plain_message() {
         assert!(
             !error.contains('\u{1b}'),
             "control characters are never echoed"
+        );
+    }
+}
+
+#[test]
+fn removals_are_classified_by_whole_words() {
+    for action in ["undelete", "deleted_view", "trashed_count", "restore"] {
+        assert_eq!(
+            permissions::removal_of("drive_write", action),
+            Removal::None,
+            "{action}"
+        );
+    }
+    assert_eq!(
+        permissions::removal_of("drive_write", "move_to_trash"),
+        Removal::Recoverable
+    );
+    assert_eq!(
+        permissions::removal_of("drive_write", "purge_all"),
+        Removal::Permanent
+    );
+}
+
+#[test]
+fn permissions_show_errors_say_what_to_do_for_this_command() {
+    let busy = permissions::plain("state_busy_retry");
+    assert!(busy.contains("permissions show again"), "{busy}");
+    for code in [
+        "state_unavailable",
+        "unsafe_state_contents",
+        "state_must_be_owned_and_private",
+    ] {
+        let text = permissions::plain(code);
+        assert_ne!(text, code);
+        assert!(
+            !text.contains("setup again") && !text.contains("Choose another folder"),
+            "{text}"
         );
     }
 }
@@ -824,7 +863,7 @@ async fn the_card_approves_once_denies_or_always_allows() {
     assert!(form["params"]["message"]
         .as_str()
         .unwrap()
-        .contains("Always allow saves reminders_write.create: allow"));
+        .contains("Always allow: every Reminders create runs without asking from now on."));
     let reply = f
         .server
         .handle(answer(&form, Some("approve")))
@@ -1070,6 +1109,15 @@ fn the_starter_file_asks_before_deletions_and_lists_every_name() {
     ] {
         let text = permissions::starter(mode);
         let rules = permissions::parse(&text).unwrap();
+        assert!(
+            text.contains("keeps the last valid rules it loaded"),
+            "{text}"
+        );
+        assert!(
+            text.contains("approve once, deny or always allow"),
+            "{text}"
+        );
+        assert!(!text.contains("ignores all of it"), "{text}");
         assert_eq!(rules["notes_write.delete"], ask);
         assert_eq!(rules["reminders_write.delete"], ask);
         assert!(rules.keys().all(|k| k.ends_with("delete")), "{rules:?}");
@@ -1077,4 +1125,161 @@ fn the_starter_file_asks_before_deletions_and_lists_every_name() {
             assert!(text.contains(&format!("#   {name}\n")), "{name}");
         }
     }
+}
+
+#[tokio::test]
+async fn a_notes_move_into_recently_deleted_never_offers_always_allow() {
+    let mut f = folder(Some("yolo"), true).await;
+    let reply = f
+        .server
+        .handle(call(
+            1,
+            "notes_write",
+            json!({"action":"create","body":"Synthetic note"}),
+        ))
+        .await
+        .unwrap();
+    let guid = body(&reply)["guid"].as_str().unwrap().to_string();
+    write_rules(f.path(), "rules:\n  notes_write.move: {ask: client}\n");
+    let trash = json!({"action":"move","guid":guid,"folder_guid":quince_core::notes::TRASH_FOLDER,"base_etag":null});
+    let form = f
+        .server
+        .handle(call(2, "notes_write", trash))
+        .await
+        .unwrap();
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+    assert_eq!(choices(&form), ["approve", "deny"]);
+    let reply = f
+        .server
+        .handle(answer(&form, Some("always_allow")))
+        .await
+        .unwrap();
+    assert_eq!(body(&reply)["error"], "approval_denied");
+    let saved = std::fs::read_to_string(f.path().join(permissions::FILE_NAME)).unwrap();
+    assert!(!saved.contains("notes_write.move: allow"), "{saved}");
+    // Another Notes change still offers it.
+    let other = json!({"action":"pin","guid":guid,"pinned":true,"base_etag":null});
+    write_rules(f.path(), "rules:\n  notes_write.pin: {ask: client}\n");
+    let form = f
+        .server
+        .handle(call(3, "notes_write", other))
+        .await
+        .unwrap();
+    assert_eq!(choices(&form), ["approve", "deny", "always_allow"]);
+}
+
+#[tokio::test]
+async fn permissions_show_describes_deletions_as_the_server_runs_them() {
+    let mut f = folder(None, true).await;
+    write_rules(
+        f.path(),
+        "rules:\n  reminders_write.delete: allow\n  notes_write: allow\n  reminders_write.create: allow\n",
+    );
+    f.server.handle(call(1, "reminders_lists", json!({}))).await;
+    let shown = permissions::show(&f.path().canonicalize().unwrap(), false).unwrap();
+    assert!(shown.contains("reminders_write.delete: allow, but waits for skykeep-mcp approve in your terminal, because a folder without an approval mode always asks before deleting"), "{shown}");
+    assert!(shown.contains("notes_write: allow, runs without asking, except deletions, which wait for skykeep-mcp approve in your terminal"), "{shown}");
+    assert!(
+        shown.contains("reminders_write.create: allow, runs without asking\n"),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn the_looser_notice_survives_many_later_edits() {
+    let mut f = folder(Some("writes_only"), true).await;
+    let dir = f.path().canonicalize().unwrap();
+    write_rules(
+        f.path(),
+        "rules:\n  reminders_write.delete: {ask: terminal}\n",
+    );
+    f.server.handle(call(1, "reminders_lists", json!({}))).await;
+    permissions::show(&dir, true).unwrap();
+    write_rules(f.path(), "rules:\n  reminders_write.delete: allow\n");
+    f.server.handle(call(2, "reminders_lists", json!({}))).await;
+    for n in 0..60 {
+        write_rules(
+            f.path(),
+            &format!("# edit {n}\nrules:\n  reminders_write.delete: allow\n"),
+        );
+        f.server.handle(call(3, "reminders_lists", json!({}))).await;
+    }
+    let lines = permissions::status(&f.library, &dir, Some("writes_only"));
+    let notice = &lines
+        .iter()
+        .find(|(t, _)| t.contains("became looser"))
+        .expect("still reported")
+        .0;
+    assert!(notice.contains("reminders_write.delete"), "{notice}");
+    let shown = permissions::show(&dir, true).unwrap();
+    assert!(
+        shown.contains(
+            "older than the history kept here; the newest looser change: reminders_write.delete"
+        ),
+        "{shown}"
+    );
+    let lines = permissions::status(&f.library, &dir, Some("writes_only"));
+    assert!(
+        lines.iter().all(|(t, _)| !t.contains("became looser")),
+        "{lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_pipe_in_place_of_the_log_never_hangs() {
+    let mut f = folder(Some("writes_only"), true).await;
+    let log = f.path().join(permissions::LOG_NAME);
+    let c = std::ffi::CString::new(log.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    write_rules(f.path(), "rules:\n  reminders_write.delete: allow\n");
+    let dir = f.path().canonicalize().unwrap();
+    let (done, wait) = std::sync::mpsc::channel();
+    let shown_dir = dir.clone();
+    std::thread::spawn(move || {
+        let _ = done.send(permissions::show(&shown_dir, false));
+    });
+    let shown = wait
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("permissions show must not wait on a pipe")
+        .unwrap();
+    assert!(
+        shown.contains("No deletion has run without asking"),
+        "{shown}"
+    );
+    let delete = call(
+        1,
+        "reminders_write",
+        json!({"action":"delete","guid":"R-1"}),
+    );
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(10), f.server.handle(delete))
+        .await
+        .expect("a deletion must not wait on a pipe")
+        .unwrap();
+    let result = body(&reply);
+    assert_eq!(result["status"], "queued", "{reply}");
+    assert!(result["permissions_log"]
+        .as_str()
+        .unwrap()
+        .contains("could not be written"));
+}
+
+#[tokio::test]
+async fn an_unknown_name_points_to_the_name_list_outside_permissions_show_only() {
+    let mut f = folder(Some("writes_only"), true).await;
+    write_rules(f.path(), "rules:\n  notes_write.explode: allow\n");
+    let reply = f
+        .server
+        .handle(call(1, "reminders_lists", json!({})))
+        .await
+        .unwrap();
+    assert!(body(&reply)["permissions_file"]
+        .as_str()
+        .unwrap()
+        .contains("To see every valid name, run skykeep-mcp permissions show."));
+    let shown = permissions::show(&f.path().canonicalize().unwrap(), false).unwrap();
+    assert!(
+        !shown.contains("run skykeep-mcp permissions show"),
+        "{shown}"
+    );
+    assert!(shown.contains("Valid names: "), "{shown}");
 }

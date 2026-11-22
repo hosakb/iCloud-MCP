@@ -130,7 +130,7 @@ async fn guided(command: &str, args: Vec<std::ffi::OsString>) -> Result<(), Stri
         let person = !terminal::agent_marked(|name| std::env::var_os(name))
             && unsafe { libc::isatty(1) } == 1;
         let text = skykeep_mcp::permissions::show(&dir, person)
-            .map_err(|e| setup::plain(e).to_string())?;
+            .map_err(|e| skykeep_mcp::permissions::plain(e).to_string())?;
         print!("{}", skykeep_mcp::status::with_dir(&text, &dir));
         return Ok(());
     }

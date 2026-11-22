@@ -138,7 +138,7 @@ Reads come from the local cache and say so (`"source": "local_cache"`). A succes
 
 `setup` sets the approval mode for you (step 4 under "Get started"). The commands in this section apply only to a folder with no approval mode: one where you chose 4 in setup, or one set up before approval modes existed. In a folder with mode 1, 2 or 3, approval happens in your MCP client, and `require-approval` and `allow-routine` refuse to run.
 
-Deletions never run straight from MCP unless the permissions file allows them. A deletion here means `delete`, a `move` into Recently Deleted (that is how iCloud deletes a note), and a `save` that leaves the note body empty. Creating a note in Recently Deleted is refused. For any of these the tool returns `approval_required` with a request ID, and you approve in your own terminal:
+Deletions never run straight from MCP in such a folder, whatever the permissions file says; the file can only refuse them. A deletion here means `delete`, a `move` into Recently Deleted (that is how iCloud deletes a note), and a `save` that leaves the note body empty. Creating a note in Recently Deleted is refused. For any of these the tool returns `approval_required` with a request ID, and you approve in your own terminal:
 
 ```sh
 skykeep-mcp approve --state-dir ~/.local/share/skykeep-mcp
@@ -171,7 +171,7 @@ rules:
 | `ask: terminal` | Returns a request ID and waits until you run `skykeep-mcp approve --state-dir FOLDER` in your own terminal, as for deletions today. Use it for clients or sessions without approval forms. Only tools that change something can use it. A request made before the file changed no longer counts, and a later `deny` refuses older requests too. |
 | `deny` | Refuses with `denied_by_permissions` and a sentence saying the file blocks it. |
 
-A name is a tool, such as `contacts_get`, or a tool and one of its actions, such as `notes_write.delete`. A tool's entry covers all its actions, and an action's own entry wins over it. The valid names come from the server's tool list, so a tool added later can be named without other changes. The starter file lists every name, and a wrong name is refused with the list. `auth_status` and `sync_status` always run. A Notes `save` that empties a note and a `move` into Recently Deleted also follow the `notes_write.delete` rule, and the stricter of the two decides. Calendar has no write tool yet, so there is no rule for creating events. When Drive writing exists, `drive_write.delete_forever: deny` refuses permanent deletion.
+A name is a tool, such as `contacts_get`, or a tool and one of its actions, such as `notes_write.delete`. A tool's entry covers all its actions, and an action's own entry wins over it. The valid names come from the server's tool list, so a tool added later can be named without other changes. The starter file lists every name, and a wrong name is refused with the list. `auth_status` and `sync_status` always run. A Notes `save` that empties a note and a `move` into Recently Deleted also follow the `notes_write.delete` rule, and the stricter of the two decides. Calendar has no write tool yet, so there is no rule for creating events. Drive writing is not available yet. Until it is, every `drive_write` name is refused, so a file that names one is unusable.
 
 Anything the file does not list follows the folder's approval mode. A rule can make an action looser or stricter than the mode. In a folder without an approval mode, deletions always wait for `skykeep-mcp approve`; a rule there can refuse them, never let them run without asking.
 

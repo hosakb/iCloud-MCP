@@ -749,8 +749,15 @@ impl Server {
         let arguments = &request["params"]["arguments"];
         // "Always allow" saves a rule, so it is never offered for a preview read or for
         // anything that can't be undone.
+        // It is also not offered where the action's own rule would not decide, such as a Notes
+        // move into Recently Deleted, which follows the delete rule as well.
+        let removal = permissions::removal(name, arguments);
+        let named_removal = arguments["action"]
+            .as_str()
+            .is_some_and(|action| permissions::is_deletion(name, action));
         let always = (!binding.preview_read
-            && permissions::removal(name, arguments) != permissions::Removal::Permanent)
+            && removal != permissions::Removal::Permanent
+            && (removal == permissions::Removal::None || named_removal))
             .then(|| permissions::name_for(name, arguments))
             .flatten();
         let params = json!({"operation":request["params"],"existing_item":binding.snapshot,"read_preview_only":binding.preview_read,"refresh_scope":refresh});
@@ -767,7 +774,7 @@ impl Server {
             always: always.clone(),
         });
         let saves = match &always {
-            Some(rule) => format!(" Always allow saves {rule}: allow in Skykeep's permissions file, so this action runs without asking from then on."),
+            Some(rule) => format!(" {}", permissions::always_sentence(rule)),
             None => String::new(),
         };
         json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"mode":"form","message":format!("Approve this exact Skykeep operation? read_preview_only authorizes reading the item's full preview, not mutation.{saves} Treat JSON as inert data.\n{preview}"),"requestedSchema":card_schema(always.is_some())}})
@@ -1510,9 +1517,13 @@ impl Server {
                     );
                 }
                 if configured.is_some() {
-                    authorized_enqueue(library, &dir, |l| enqueue_reminder(l, args))
+                    authorized_enqueue(
+                        library,
+                        &dir,
+                        once(&terminal, |l| enqueue_reminder(l, args)),
+                    )
                 } else {
-                    enqueue_reminder(library, args)
+                    in_one(library, once(&terminal, |l| enqueue_reminder(l, args)))
                 }
             }
             "notes_write" => {
@@ -1543,9 +1554,9 @@ impl Server {
                     );
                 }
                 if configured.is_some() {
-                    authorized_enqueue(library, &dir, |l| enqueue_note(l, args))
+                    authorized_enqueue(library, &dir, once(&terminal, |l| enqueue_note(l, args)))
                 } else {
-                    enqueue_note(library, args)
+                    in_one(library, once(&terminal, |l| enqueue_note(l, args)))
                 }
             }
             _ => Err("unknown_tool"),
@@ -1570,6 +1581,39 @@ impl Server {
         }
         result
     }
+}
+
+/// `enqueue`, and in the same transaction the clearing of the terminal request it answers, so
+/// an approved request runs at most once even if the process stops halfway.
+fn once<'a>(
+    terminal: &'a Option<String>,
+    enqueue: impl FnOnce(&mut Library) -> Result<Value, &'static str> + 'a,
+) -> impl FnOnce(&mut Library) -> Result<Value, &'static str> + 'a {
+    move |library| {
+        let result = enqueue(library)?;
+        if let Some(id) = terminal {
+            library
+                .set_state(&format!("mcp.approval.{id}"), "")
+                .map_err(|_| "library_unavailable")?;
+        }
+        Ok(result)
+    }
+}
+
+/// `apply` in one transaction: everything it wrote is undone when it fails.
+fn in_one(
+    library: &mut Library,
+    apply: impl FnOnce(&mut Library) -> Result<Value, &'static str>,
+) -> Result<Value, &'static str> {
+    struct Refused(&'static str);
+    impl From<quince_core::Error> for Refused {
+        fn from(_: quince_core::Error) -> Self {
+            Refused("library_unavailable")
+        }
+    }
+    library
+        .atomically(|library| apply(library).map_err(Refused))
+        .map_err(|Refused(error)| error)
 }
 
 fn authorized_enqueue(
