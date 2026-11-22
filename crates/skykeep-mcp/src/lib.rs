@@ -2,6 +2,7 @@
 pub mod account;
 pub mod calendar;
 pub mod contacts;
+pub mod contacts_write;
 pub mod drive;
 pub mod drive_write;
 pub mod exchange;
@@ -212,10 +213,15 @@ fn gate_for(
     // This comes before the broken-file step below, so a Drive deletion under yolo still
     // waits for the terminal then.
     let gate = match gate {
-        Gate::Run if drive_needs_person(library, name, args)? => match mode {
-            Some(mode) if mode != "yolo" => Gate::Client,
-            _ => Gate::Terminal,
-        },
+        Gate::Run
+            if drive_needs_person(library, name, args)?
+                || contacts_write::needs_person(name, args) =>
+        {
+            match mode {
+                Some(mode) if mode != "yolo" => Gate::Client,
+                _ => Gate::Terminal,
+            }
+        }
         gate => gate,
     };
     let removes = permissions::removal(name, args) != permissions::Removal::None;
@@ -395,6 +401,7 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
             "In your own terminal, run: {}",
             status::with_dir("skykeep-mcp exchange", dir)
         )),
+        e if contacts_write::next_step(e).is_some() => contacts_write::next_step(e),
         drive_write::UNKNOWN => Some("The connection ended before Apple answered, so the change may or may not have been made. Run drive_refresh on the folder and look at it before trying again.".to_string()),
         drive_write::IN_RECENTLY_DELETED => Some("The item is in Recently Deleted in iCloud Drive but was not deleted for good. Delete it there (iCloud Drive on icloud.com or a Mac), or leave it: Apple deletes it by itself after about 30 days.".to_string()),
         drive_write::IN_RECENTLY_DELETED_LOGIN => Some(format!("The item is in Recently Deleted in iCloud Drive but was not deleted for good, because the sign-in has expired. Sign in again with {} in your own terminal, then delete it from Recently Deleted in iCloud Drive, or leave it: Apple deletes it by itself after about 30 days.", status::with_dir("skykeep-mcp login", dir))),
@@ -604,6 +611,9 @@ pub(crate) fn needs_consent(mode: &str, name: &str) -> Result<bool, &'static str
         // Every Drive change is asked in the form, except under yolo. Deletions and large
         // folder moves are then asked in the terminal instead (drive_write::goes_to_terminal).
         "drive_write" => Ok(mode != "yolo"),
+        // Every Contacts change is asked in the form, except under yolo; a delete then waits
+        // for the terminal (gate_for).
+        "contacts_write" => Ok(mode != "yolo"),
         _ => Err("unknown_tool"),
     }
 }
@@ -612,6 +622,11 @@ fn resolved_snapshot(library: &Library, name: &str, args: &Value) -> Result<Valu
     if name == drive_write::TOOL {
         // Drive has no queue: the preview of what the action reaches is the whole context.
         let snapshot = json!({"drive": drive_write::preview(library, args)?});
+        bounded_value(&snapshot, MAX_ARGUMENT_BYTES)?;
+        return Ok(snapshot);
+    }
+    if name == contacts_write::TOOL {
+        let snapshot = json!({"contact": contacts_write::preview(library, args)?});
         bounded_value(&snapshot, MAX_ARGUMENT_BYTES)?;
         return Ok(snapshot);
     }
@@ -699,6 +714,7 @@ pub struct Server {
     /// allow rule would not stop it asking (a Drive deletion or large folder move).
     always_blocked: bool,
     drive: drive_write::Seam,
+    contacts: contacts_write::Seam,
 }
 
 #[cfg(test)]
@@ -1043,6 +1059,7 @@ impl Server {
                 always_blocked: false,
                 denied: None,
                 drive: drive_write::Seam::default(),
+                contacts: contacts_write::Seam::default(),
             }),
             Err("state_busy_retry") => Ok(Self {
                 library: None,
@@ -1055,6 +1072,7 @@ impl Server {
                 always_blocked: false,
                 denied: None,
                 drive: drive_write::Seam::default(),
+                contacts: contacts_write::Seam::default(),
             }),
             Err(error) => Err(error),
         }
@@ -1074,6 +1092,11 @@ impl Server {
     #[doc(hidden)]
     pub fn set_drive_seam(&mut self, seam: drive_write::Seam) {
         self.drive = seam;
+    }
+
+    #[doc(hidden)]
+    pub fn set_contacts_seam(&mut self, seam: contacts_write::Seam) {
+        self.contacts = seam;
     }
 
     /// Trusted local CLI only, after `approval_details` was shown: runs one approved
@@ -1368,6 +1391,9 @@ impl Server {
         let proposal: Value = serde_json::from_str(&raw).map_err(|_| "approval_not_found")?;
         let text = if proposal["tool"] == drive_write::TOOL {
             drive_write::plain_preview(&proposal["preview"])
+        } else if proposal["tool"] == contacts_write::TOOL {
+            let library = self.library.as_ref().ok_or("state_busy_retry")?;
+            contacts_write::approval_text(library, &proposal["args"])
         } else {
             raw
         };
@@ -1463,6 +1489,7 @@ impl Server {
         let grant = self.grant.take();
         let terminal = self.terminal.take();
         let drive_seam = self.drive.clone();
+        let contacts_seam = self.contacts.clone();
         let held = state::PrivateState::open(&self.dir)?;
         let dir = held.path.clone();
         let library = self.ready(&held)?;
@@ -1655,6 +1682,41 @@ impl Server {
                     && explicit == Some(permissions::Effect::Allow)
                     && !drive_write::needs_person(library, &op)?;
                 drive_write::run(&dir, &drive_seam, op, grant.is_some() || allowed).await
+            }
+            "contacts_write" => {
+                let op = contacts_write::validate(&args)?;
+                library
+                    .state(ACCOUNT_KEY)
+                    .map_err(|_| "library_unavailable")?
+                    .ok_or("login_required")?;
+                // Without a mode or a rule, a delete waits for the terminal, and the folder's
+                // earlier require-approval decides the rest.
+                if legacy
+                    && (contacts_write::needs_person(name, &args)
+                        || library
+                            .state("mcp.require_write_approval")
+                            .map_err(|_| "library_unavailable")?
+                            .as_deref()
+                            == Some("true"))
+                {
+                    return terminal_proposal(
+                        library,
+                        &dir,
+                        name,
+                        &args,
+                        policy_raw.as_deref(),
+                        current.identity,
+                        &active.fingerprint,
+                    );
+                }
+                // A delete runs only with a person's approval, whatever let it this far.
+                if !(grant.is_some() || terminal_approved)
+                    && (contacts_write::needs_person(name, &args)
+                        || !matches!(gate, Gate::Run | Gate::Legacy))
+                {
+                    return Err("approval_required");
+                }
+                contacts_write::run(&dir, &contacts_seam, op).await
             }
             "sync_status" => {
                 let _: Empty = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -2628,7 +2690,7 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
 
 const SERVER_TITLE: &str =
     "Skykeep: Apple iCloud Notes, Reminders, Contacts, Calendar, Photos & iCloud Drive";
-const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, and reads the user's Apple iCloud Contacts, Apple iCloud Calendar and Apple iCloud Photos metadata (read-only), and reads and changes Apple iCloud Drive: folder listings and file details from the cache, and drive_write to create folders, rename, move, trash, delete for good, upload from and download into the exchange folder the user set up in their terminal. Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode. Notes and Reminders changes are queued until sync sends them; a Drive change runs once it is allowed and its reply says what Apple confirmed. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
+const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, reads the user's Apple iCloud Contacts and changes one card at a time with contacts_write, reads Apple iCloud Calendar and Apple iCloud Photos metadata (read-only), and reads and changes Apple iCloud Drive: folder listings and file details from the cache, and drive_write to create folders, rename, move, trash, delete for good, upload from and download into the exchange folder the user set up in their terminal. Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode. Notes and Reminders changes are queued until sync sends them; a Drive or Contacts change runs once it is allowed and its reply says what Apple confirmed. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
 
 pub(crate) fn tools() -> Vec<Value> {
     // (name, description, parent property, parent required)
@@ -2735,6 +2797,7 @@ pub(crate) fn tools() -> Vec<Value> {
     tools.push(json!({"name":"drive_search","description":"Search the names of cached Apple iCloud Drive items in folders drive_refresh has read. At most 1000 matches, most recently changed first. Read-only.","inputSchema":{"type":"object","properties":search,"required":["query"],"additionalProperties":false},"annotations":read}));
     tools.push(json!({"name":"drive_refresh","description":"Read one Apple iCloud Drive folder's item list from Apple into the local cache, with each folder on its path. Give path or a cached folder id; the top folder by default. Reads names, kinds, sizes and dates only: never file contents, and never uploads, renames, moves or deletes. Sends no queued changes. Never opens a login prompt.","inputSchema":{"type":"object","properties":{"path":cloud_path,"id":id},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}));
     tools.push(drive_write::tool());
+    tools.push(contacts_write::tool());
     tools.push(json!({"name":"auth_status","description":"Apple iCloud sign-in status and setup instructions. Never accepts secrets or opens a prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools
 }
