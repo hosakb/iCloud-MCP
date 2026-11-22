@@ -570,7 +570,8 @@ pub(crate) fn plain_preview(preview: &Value) -> String {
 pub struct WriteLimits {
     /// create_folder, rename, move, trash and delete_forever.
     pub change_timeout: Duration,
-    /// upload and download; `None` scales with the size limit ([`transfer_time`]).
+    /// upload and download; `None` scales with the size limit ([`upload_time`],
+    /// [`transfer_time`]).
     pub transfer_timeout: Option<Duration>,
     /// The folder reads made before a change.
     pub read: drive::RefreshLimits,
@@ -590,6 +591,13 @@ impl Default for WriteLimits {
 /// and one second more per 256 KB of the limit (about nine minutes at 100 MB).
 pub fn transfer_time(max_bytes: u64) -> Duration {
     Duration::from_secs(120 + max_bytes / (256 * 1024))
+}
+
+/// How long one upload may take: [`transfer_time`], plus the time Apple may take to answer
+/// once it has every byte ([`quince_icloud::upload::ANSWER`], five minutes), as a Photos
+/// upload has.
+pub fn upload_time(max_bytes: u64) -> Duration {
+    transfer_time(max_bytes) + quince_icloud::upload::ANSWER
 }
 
 /// Makes the session's client for a private directory.
@@ -827,7 +835,8 @@ pub(crate) async fn run(
     let limits = seam.limits;
     let timeout = match &local {
         Local::None => limits.change_timeout,
-        Local::Upload(_, _, max) | Local::Download(_, _, max) => limits
+        Local::Upload(_, _, max) => limits.transfer_timeout.unwrap_or_else(|| upload_time(*max)),
+        Local::Download(_, _, max) => limits
             .transfer_timeout
             .unwrap_or_else(|| transfer_time(*max)),
     };

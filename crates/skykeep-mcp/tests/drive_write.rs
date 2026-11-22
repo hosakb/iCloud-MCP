@@ -1566,6 +1566,21 @@ fn transfers_get_more_time_under_a_larger_limit() {
     assert!(transfer_time(10_240 * 1024 * 1024) > transfer_time(100 * 1024 * 1024));
 }
 
+/// An upload also gets the time Apple may take to answer once every byte is in, as a Photos
+/// upload does; a download does not wait on such an answer and keeps the plain budget.
+#[test]
+fn an_upload_gets_apples_answer_time_on_top_of_the_transfer() {
+    use skykeep_mcp::drive_write::{transfer_time, upload_time};
+    assert_eq!(
+        upload_time(100 * 1024 * 1024),
+        Duration::from_secs(520 + 300)
+    );
+    assert_eq!(
+        upload_time(1) - transfer_time(1),
+        quince_icloud::upload::ANSWER
+    );
+}
+
 /// delete_forever after the move to Recently Deleted: Apple's answer decides what the error
 /// says. Busy (or a dropped connection) leaves the outcome unknown; a refusal that names the
 /// item as kept says it is in Recently Deleted, with what to do next.
