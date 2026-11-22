@@ -59,8 +59,8 @@ More commands (each needs --state-dir FOLDER):
   skykeep-mcp policy --state-dir FOLDER MODE
                           set the approval mode: reads_and_writes, writes_only or yolo
   skykeep-mcp approve     approve one waiting change by its request ID: a Notes or
-                          Reminders change is queued, a Drive or Photos change runs
-                          at once
+                          Reminders change is queued, a Drive, Contacts, Photos or
+                          Calendar change runs at once and can't be undone from here
   skykeep-mcp require-approval
                           folders without an approval mode: every change waits for approve
   skykeep-mcp allow-routine
@@ -318,7 +318,7 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
         let mut tty = terminal::controlling()?;
         if let Some(mode) = policy_mode {
             use std::io::Write;
-            writeln!(tty, "Set approval mode to {mode} for {}. YOLO runs Notes and Reminders deletions without prompts; Drive deletions, moves and renames of large Drive folders, and Photos moves to Recently Deleted still wait for skykeep-mcp approve. All currently pending writes will be quarantined, including previously approved writes. Old terminal proposals cannot be released under this policy. Type confirm to persist.", dir.display()).map_err(|_| "terminal_unavailable")?;
+            writeln!(tty, "Set approval mode to {mode} for {}. YOLO runs Notes and Reminders deletions without prompts; Drive and Contacts deletions, moves and renames of large Drive folders, Calendar deletes and Photos moves to Recently Deleted still wait for skykeep-mcp approve. All currently pending writes will be quarantined, including previously approved writes. Old terminal proposals cannot be released under this policy. Type confirm to persist.", dir.display()).map_err(|_| "terminal_unavailable")?;
             let answer = terminal::hidden(&mut tty, "Confirmation: ", Duration::from_secs(180))?;
             if *answer != "confirm" {
                 return Err("policy_change_cancelled");
@@ -358,7 +358,16 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
             use std::io::Write;
             let id = terminal::hidden(&mut tty, "Approval request ID: ", Duration::from_secs(180))?;
             let mut server = Server::open(&dir)?;
-            let details = server.approval_text(&id)?;
+            // An out-of-date request is said in words, and nothing is asked.
+            let details = match server.approval_text(&id) {
+                Ok(details) => details,
+                Err(error) => {
+                    if let Some(step) = skykeep_mcp::next_step(error, &dir, &json!(null)) {
+                        writeln!(tty, "{step}").map_err(|_| "terminal_unavailable")?;
+                    }
+                    return Err(error);
+                }
+            };
             writeln!(
                 tty,
                 "Review this exact change:
@@ -367,7 +376,7 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
             .map_err(|_| "terminal_unavailable")?;
             let answer = terminal::hidden(
                 &mut tty,
-                "Type approve to allow it (a Notes or Reminders change is queued for the next sync, a Drive or Photos change runs now), or Ctrl-C to cancel: ",
+                "Type approve to allow it (a Notes or Reminders change is queued for the next sync; a Drive, Contacts, Photos or Calendar change runs now and can't be undone from here), or Ctrl-C to cancel: ",
                 Duration::from_secs(180),
             )?;
             if *answer != "approve" {

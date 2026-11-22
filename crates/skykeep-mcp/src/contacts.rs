@@ -17,7 +17,7 @@ const SERVICE: &str = "contacts";
 const DEFAULT_LIMIT: usize = 25;
 pub(crate) const MAX_LIMIT: usize = 100;
 pub(crate) const MAX_QUERY_BYTES: usize = 256;
-const MAX_GUID_BYTES: usize = 512;
+pub(crate) const MAX_GUID_BYTES: usize = 512;
 /// Caps on a tool result's text as encoded in the JSON-RPC frame. A page stops early, with
 /// `next_offset`, rather than grow past its cap.
 const MAX_PAGE_BYTES: usize = 262_144;
@@ -106,6 +106,7 @@ pub(crate) fn validate(name: &str, args: &Value) -> Result<(), &'static str> {
         "contacts_search" => search_args(args).map(|_| ()),
         "contacts_get" => get_args(args).map(|_| ()),
         "contacts_refresh" => parse::<Empty>(args).map(|_| ()),
+        crate::contacts_write::TOOL => crate::contacts_write::validate(args).map(|_| ()),
         _ => Ok(()),
     }
 }
@@ -482,7 +483,7 @@ const PAGE_CARDS: usize = 500;
 
 /// Why a refresh read stopped. Apple's own error bodies are never read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stop {
+pub(crate) enum Stop {
     Reauth,
     Busy,
     Failed,
@@ -630,6 +631,25 @@ async fn whole_book(
     limits: &RefreshLimits,
     budget: &mut usize,
 ) -> Result<(apple::AddressBook, Tokens), Stop> {
+    let (body, tokens) = raw_book(client, root, limits, budget).await?;
+    let book = apple::AddressBook {
+        contacts: apple::parse(&body),
+        lists: apple::parse_lists(&body),
+        me: apple::me_card(&body),
+        addresses: apple::parse_addresses(&body),
+        details: apple::parse_details(&body),
+    };
+    Ok((book, tokens))
+}
+
+/// The book as Apple sent it, every page's cards in its `contacts`, with the tokens a write
+/// carries: what `contacts_write` reads a card from before and after a change.
+pub(crate) async fn raw_book(
+    client: &Client,
+    root: &str,
+    limits: &RefreshLimits,
+    budget: &mut usize,
+) -> Result<(Value, Tokens), Stop> {
     let root = root.trim_end_matches('/');
     let query = base_query(client);
     let response = client
@@ -711,14 +731,7 @@ async fn whole_book(
     {
         return Err(Stop::CardTooLarge);
     }
-    let book = apple::AddressBook {
-        contacts: apple::parse(&body),
-        lists: apple::parse_lists(&body),
-        me: apple::me_card(&body),
-        addresses: apple::parse_addresses(&body),
-        details: apple::parse_details(&body),
-    };
-    Ok((book, tokens))
+    Ok((body, tokens))
 }
 
 /// As the engine's Contacts pass: a cheap changeset check when tokens are kept, and the whole

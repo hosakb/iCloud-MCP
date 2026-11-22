@@ -100,7 +100,24 @@ pub fn targets() -> Vec<Target> {
             }
         }
     }
+    // Not an action: whether a Calendar change may reach other people's calendars.
+    out.push(Target {
+        name: crate::calendar_write::INVITATIONS_RULE.into(),
+        tool: crate::calendar_write::TOOL.into(),
+        action: Some(crate::calendar_write::INVITATIONS.into()),
+    });
     out
+}
+
+/// Whether the rules in force let a Calendar change send updates or cancellations to other
+/// people: only an explicit `calendar_write.send_invitations: allow`. A broken file with no
+/// earlier valid rules has no rules, so it refuses.
+pub fn invitations_allowed(active: &Active) -> bool {
+    active.rules.get(crate::calendar_write::INVITATIONS_RULE) == Some(&Effect::Allow)
+}
+
+fn is_invitations(tool: &str, action: Option<&str>) -> bool {
+    tool == crate::calendar_write::TOOL && action == Some(crate::calendar_write::INVITATIONS)
 }
 
 pub fn names() -> Vec<String> {
@@ -402,6 +419,14 @@ pub fn parse(text: &str) -> Result<Rules, String> {
                 hint(name)
             ));
         };
+        if is_invitations(&target.tool, target.action.as_deref())
+            && !matches!(effect, Effect::Allow | Effect::Deny)
+        {
+            return Err(format!(
+                "line {line}: {} takes allow or deny only",
+                shown(name)
+            ));
+        }
         if *effect == Effect::AskTerminal && !changes(&target.tool) {
             return Err(format!(
                 "line {line}: {} can't use ask: terminal, because skykeep-mcp approve only runs changes; use allow, ask: client or deny",
@@ -510,6 +535,9 @@ pub fn default_effect(
     tool: &str,
     action: Option<&str>,
 ) -> Effect {
+    if is_invitations(tool, action) {
+        return Effect::Deny;
+    }
     match mode {
         Some(mode) => match crate::needs_consent(mode, tool) {
             Ok(true) => Effect::AskClient,
@@ -696,8 +724,16 @@ fn diff(
         }
         let action = t.action.as_deref();
         let default = default_effect(mode, require_all, &t.tool, action);
-        let before = rule_for(old, &t.tool, action).unwrap_or(default);
-        let after = rule_for(new, &t.tool, action).unwrap_or(default);
+        // The invitations rule counts only under its own name, as the server reads it.
+        let rule = |rules: &Rules| {
+            if is_invitations(&t.tool, action) {
+                rules.get(&t.name).copied()
+            } else {
+                rule_for(rules, &t.tool, action)
+            }
+        };
+        let before = rule(old).unwrap_or(default);
+        let after = rule(new).unwrap_or(default);
         // Compared as the server really runs them.
         let really = |e: Effect| match action {
             Some(a) => runs_as(mode, &t.tool, a, e).0,
@@ -915,6 +951,26 @@ pub fn unseen(library: &Library) -> Vec<Value> {
 }
 
 fn change_line(c: &Value) -> String {
+    // Not an action: allow lets changes run, anything else refuses them.
+    if c["name"] == crate::calendar_write::INVITATIONS_RULE {
+        let runs = |key: &str| c[key] == Effect::Allow.as_str();
+        let (was, now) = (
+            if runs("from") {
+                "may run"
+            } else {
+                "were refused"
+            },
+            if runs("to") {
+                "they may run"
+            } else {
+                "they are refused"
+            },
+        );
+        return format!(
+            "{}: changes that would notify invited people {was} before, now {now}",
+            crate::calendar_write::INVITATIONS_RULE
+        );
+    }
     let effect = |key: &str| {
         Effect::from_str(c[key].as_str().unwrap_or_default())
             .map(Effect::sentence)
@@ -1000,23 +1056,38 @@ fn runs_as(
             Effect::AskTerminal,
             Some("a folder without an approval mode always asks before deleting"),
         ),
-        Some(mode)
-            if (tool == crate::drive_write::TOOL || tool == crate::photos_write::TOOL)
-                && effect == Effect::Allow =>
-        {
-            (
-                if mode == "yolo" {
-                    Effect::AskTerminal
-                } else {
-                    Effect::AskClient
-                },
-                Some(if tool == crate::photos_write::TOOL {
-                    "a move to Recently Deleted in Photos always needs a person"
-                } else {
-                    "a Drive deletion always needs a person"
-                }),
-            )
-        }
+        Some(mode) if tool == crate::drive_write::TOOL && effect == Effect::Allow => (
+            if mode == "yolo" {
+                Effect::AskTerminal
+            } else {
+                Effect::AskClient
+            },
+            Some("a Drive deletion always needs a person"),
+        ),
+        Some(mode) if tool == crate::calendar_write::TOOL && effect == Effect::Allow => (
+            if mode == "yolo" {
+                Effect::AskTerminal
+            } else {
+                Effect::AskClient
+            },
+            Some("a Calendar delete always needs a person"),
+        ),
+        Some(mode) if tool == crate::contacts_write::TOOL && effect == Effect::Allow => (
+            if mode == "yolo" {
+                Effect::AskTerminal
+            } else {
+                Effect::AskClient
+            },
+            Some("a Contacts deletion always needs a person"),
+        ),
+        Some(mode) if tool == crate::photos_write::TOOL && effect == Effect::Allow => (
+            if mode == "yolo" {
+                Effect::AskTerminal
+            } else {
+                Effect::AskClient
+            },
+            Some("a move to Recently Deleted in Photos always needs a person"),
+        ),
         _ => (effect, None),
     }
 }
@@ -1038,6 +1109,12 @@ fn described(name: &str, effect: Effect, mode: Option<&str>) -> String {
             })
     });
     let plain = format!("{}, {}", effect.as_str(), effect.sentence());
+    if target.is_some_and(|t| is_invitations(&t.tool, t.action.as_deref())) {
+        return match effect {
+            Effect::Allow => "allow, a Calendar change to an event with other people invited may run and send them an update or cancellation; the change still follows its own rule".into(),
+            _ => "deny, a Calendar change to an event with other people invited is refused".into(),
+        };
+    }
     match own {
         Some((really, Some(why))) => {
             format!(
@@ -1045,6 +1122,9 @@ fn described(name: &str, effect: Effect, mode: Option<&str>) -> String {
                 effect.as_str(),
                 really.sentence()
             )
+        }
+        _ if tool_floored && target.is_some_and(|t| t.tool == crate::calendar_write::TOOL) => {
+            format!("{plain}, except deletions, which still ask; changes that would notify invited people stay refused unless {} is allow", crate::calendar_write::INVITATIONS_RULE)
         }
         _ if tool_floored => format!("{plain}, except deletions, which still ask"),
         _ if drive
@@ -1272,7 +1352,12 @@ pub fn starter(mode: Option<&str>, dir: &Path) -> String {
             out.push_str(&format!("  {}:\n    ask: {ask}\n", t.name));
         }
     }
-    out.push_str("  # reminders_write.create: allow\n#\n# Names you can use:\n");
+    out.push_str("  # reminders_write.create: allow\n");
+    out.push_str(&format!(
+        "#\n# {}: takes allow or deny only; a tool-wide calendar_write: allow does not enable it.\n",
+        crate::calendar_write::INVITATIONS_RULE
+    ));
+    out.push_str("#\n# Names you can use:\n");
     for name in names() {
         out.push_str(&format!("#   {name}\n"));
     }

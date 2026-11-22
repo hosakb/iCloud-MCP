@@ -292,6 +292,8 @@ async fn tools_list_names_apple_icloud_calendar_with_strict_read_only_schemas() 
     let calendar: Vec<&Value> = tools
         .iter()
         .filter(|t| t["name"].as_str().unwrap().starts_with("calendar"))
+        // The one change tool has its own tests (tests/calendar_write.rs).
+        .filter(|t| t["name"] != "calendar_write")
         .collect();
     let names: Vec<&str> = calendar
         .iter()

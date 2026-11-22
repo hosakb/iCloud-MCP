@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+jiff = "0.2.37"
 libc = "0.2"
 zeroize = "1"
 quince-auth = { path = "../quince-auth" }

@@ -903,7 +903,7 @@ async fn initialize_and_discover_only_notes_and_reminders_tools() {
             &"photos_write"
         ]
     );
-    // Contacts are read-only in this phase.
+    // Contacts: four reads and one tool for every change.
     let contacts: Vec<_> = names.iter().filter(|n| n.contains("contacts")).collect();
     assert_eq!(
         contacts,
@@ -911,10 +911,11 @@ async fn initialize_and_discover_only_notes_and_reminders_tools() {
             &"contacts_list",
             &"contacts_search",
             &"contacts_get",
-            &"contacts_refresh"
+            &"contacts_refresh",
+            &"contacts_write"
         ]
     );
-    // Calendar is read-only in this phase.
+    // Calendar: five reads and one tool for every change.
     let calendar: Vec<_> = names.iter().filter(|n| n.contains("calendar")).collect();
     assert_eq!(
         calendar,
@@ -923,7 +924,8 @@ async fn initialize_and_discover_only_notes_and_reminders_tools() {
             &"calendar_events",
             &"calendar_search",
             &"calendar_get",
-            &"calendar_refresh"
+            &"calendar_refresh",
+            &"calendar_write"
         ]
     );
     // Drive: four reads and one tool for every change.
