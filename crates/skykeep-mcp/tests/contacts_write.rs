@@ -35,6 +35,14 @@ struct Book {
     writes: Vec<(String, Option<String>, Value)>,
     /// Answer every write with this status instead.
     fail_with: Option<u16>,
+    /// Apply the next write, then answer it with this status.
+    store_then_fail: Option<u16>,
+    /// The card changes on a phone just before the next write reaches it.
+    edit_on_write: bool,
+    /// Reads of the book so far, and from which read on they fail or are slow.
+    startups: usize,
+    fail_reads_from: Option<usize>,
+    slow_reads_from: Option<usize>,
 }
 
 impl Book {
@@ -59,7 +67,15 @@ impl Respond for Fake {
         let mut book = self.0.lock().unwrap();
         let path = request.url.path();
         if path == "/co/startup" {
-            return ResponseTemplate::new(200).set_body_json(book.body());
+            book.startups += 1;
+            if book.fail_reads_from.is_some_and(|n| book.startups >= n) {
+                return ResponseTemplate::new(503);
+            }
+            let answer = ResponseTemplate::new(200).set_body_json(book.body());
+            if book.slow_reads_from.is_some_and(|n| book.startups >= n) {
+                return answer.set_delay(std::time::Duration::from_secs(5));
+            }
+            return answer;
         }
         if path.trim_end_matches('/') != "/co/contacts/card" {
             return ResponseTemplate::new(404);
@@ -77,6 +93,11 @@ impl Respond for Fake {
         }
         let card = sent["contacts"][0].clone();
         let id = card["contactId"].as_str().unwrap_or_default().to_string();
+        if std::mem::take(&mut book.edit_on_write) {
+            if let Some(c) = book.cards.iter_mut().find(|c| c["contactId"] == id) {
+                c["etag"] = json!("etag-raced");
+            }
+        }
         let at = book.cards.iter().position(|c| c["contactId"] == id);
         let conflict =
             || ResponseTemplate::new(200).set_body_json(json!({"errors":[{"errorCode":409}]}));
@@ -110,6 +131,9 @@ impl Respond for Fake {
             _ => return ResponseTemplate::new(400),
         };
         book.sync += 1;
+        if let Some(status) = book.store_then_fail.take() {
+            return ResponseTemplate::new(status);
+        }
         ResponseTemplate::new(200).set_body_json(json!({
             "syncToken": format!("S-{}", book.sync),
             "prefToken": "PREF-1",
@@ -150,6 +174,14 @@ fn client(dir: &Path, uri: &str) -> Client {
     Client::with(dir, Endpoints::at(uri), store).unwrap()
 }
 
+fn seam(uri: &str) -> Seam {
+    let uri = uri.to_string();
+    Seam {
+        client: Some(Arc::new(move |dir: &Path| Ok(client(dir, &uri)))),
+        ..Seam::default()
+    }
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     server: Server,
@@ -181,6 +213,18 @@ impl Fixture {
         card["firstName"] = json!(first);
         card["etag"] = json!("etag-phone-edit");
         book.sync += 1;
+    }
+    /// Reads of the book fail from the `n`th one after now (1 is the next).
+    fn fail_reads_after(&self, n: usize) {
+        let mut book = self.book.lock().unwrap();
+        book.fail_reads_from = Some(book.startups + n);
+    }
+    fn slow_reads_after(&self, n: usize) {
+        let mut book = self.book.lock().unwrap();
+        book.slow_reads_from = Some(book.startups + n);
+    }
+    fn cards_at_apple(&self) -> usize {
+        self.book.lock().unwrap().cards.len()
     }
     fn cached(&self, id: &str) -> Option<quince_core::contacts::Card> {
         let library = quince_core::Library::open(self.dir.path()).unwrap();
@@ -229,11 +273,7 @@ async fn fixture(policy: Option<&str>) -> Fixture {
     if let Some(mode) = policy {
         server.set_policy(mode).unwrap();
     }
-    let uri = remote.uri();
-    server.set_contacts_seam(Seam {
-        client: Some(Arc::new(move |dir: &Path| Ok(client(dir, &uri)))),
-        ..Seam::default()
-    });
+    server.set_contacts_seam(seam(&remote.uri()));
     init(&mut server).await;
     Fixture {
         dir,
@@ -558,25 +598,53 @@ async fn oversized_or_malformed_arguments_are_refused_before_approval_or_network
             "invalid_text",
         ),
         (update_ada(json!({"first_name":"A\u{7}da"})), "invalid_text"),
-        (update_ada(json!({"photo":"data:"})), "invalid_arguments"),
+        (
+            update_ada(json!({"birthday":"2001-02-31"})),
+            "invalid_birthday",
+        ),
+        (update_ada(json!({"photo":"data:"})), "unknown_field"),
+        (update_ada(json!({"first_name":7})), "invalid_arguments"),
         (
             json!({"action":"update","guid":ADA,"fields":{"first_name":"X"}}),
-            "invalid_arguments",
+            "update_needs_guid_etag_and_fields",
         ),
-        (json!({"action":"delete","guid":BOB}), "invalid_arguments"),
+        (
+            json!({"action":"update","guid":ADA,"etag":"etag-ada-1"}),
+            "update_needs_guid_etag_and_fields",
+        ),
+        (
+            json!({"action":"delete","guid":BOB}),
+            "delete_needs_only_guid_and_etag",
+        ),
+        (
+            json!({"action":"delete","guid":BOB,"etag":"etag-bob-1","fields":{}}),
+            "delete_needs_only_guid_and_etag",
+        ),
         (
             json!({"action":"delete","guid":"g".repeat(513),"etag":"e"}),
-            "invalid_arguments",
+            "invalid_guid_or_etag",
         ),
         (
             json!({"action":"create","guid":"C-CHOSEN","fields":{"first_name":"X"}}),
-            "invalid_arguments",
+            "create_needs_only_fields",
         ),
-        (json!({"action":"merge"}), "invalid_arguments"),
+        (json!({"action":"create"}), "create_needs_only_fields"),
+        (json!({"action":"merge"}), "invalid_action"),
+        (json!({"guid":BOB}), "invalid_action"),
     ] {
         let reply = call(&mut f.server, args.clone()).await;
         assert_ne!(reply["method"], "elicitation/create", "{args}");
-        assert_eq!(text(&reply)["error"], code, "{args}");
+        let e = text(&reply);
+        assert_eq!(e["error"], code, "{args}");
+        if code.contains("needs") || code == "invalid_action" || code == "unknown_field" {
+            assert!(e["instructions"].is_string(), "{args}: {e}");
+        }
+        if code.starts_with("update_") || code.starts_with("delete_") {
+            assert!(
+                e["instructions"].as_str().unwrap().contains("contacts_get"),
+                "{e}"
+            );
+        }
     }
     assert_eq!(f.remote.received_requests().await.unwrap().len(), before);
 }
@@ -780,5 +848,199 @@ async fn reads_and_writes_shows_the_cached_card_before_the_change_card() {
     }
     let reply = f.server.handle(decide(&second, "approve")).await.unwrap();
     assert_eq!(text(&reply)["error"], "approval_policy_changed", "{reply}");
+    assert!(f.writes().is_empty());
+}
+
+// --- Running at most once, and saying what is known.
+
+#[tokio::test]
+async fn a_terminal_approval_runs_once_even_when_apple_answers_with_an_error() {
+    let mut f = fixture(Some("yolo")).await;
+    rules(
+        f.dir.path(),
+        "rules:\n  contacts_write.create: {ask: terminal}\n",
+    );
+    let waiting = ok(
+        &mut f.server,
+        json!({"action":"create","fields":{"first_name":"Grace"}}),
+    )
+    .await;
+    let id = waiting["request_id"].as_str().unwrap().to_string();
+    // Apple files the card, then the answer is lost in a server error.
+    f.book.lock().unwrap().store_then_fail = Some(500);
+    assert_eq!(
+        f.server.approve_any(&id).await,
+        Err("contacts_write_outcome_unknown_run_contacts_refresh")
+    );
+    assert_eq!(f.cards_at_apple(), 3);
+    // The request is used up: approving it again makes no second card.
+    assert!(f.server.approve_any(&id).await.is_err());
+    assert_eq!(f.cards_at_apple(), 3);
+    assert_eq!(f.writes().len(), 1);
+}
+
+#[tokio::test]
+async fn a_card_changed_between_the_read_and_the_write_is_a_conflict_and_the_cache_is_kept() {
+    let mut f = fixture(Some("yolo")).await;
+    f.book.lock().unwrap().edit_on_write = true;
+    let e = error(&mut f.server, update_ada(json!({"first_name":"Augusta"}))).await;
+    assert_eq!(e["error"], "contact_changed_conflict", "{e}");
+    assert_eq!(f.writes().len(), 1, "Apple refused the one write sent");
+    let cached = f.cached(ADA).unwrap();
+    assert_eq!(cached.contact.etag.as_deref(), Some("etag-ada-1"));
+    assert_eq!(cached.contact.first_name.as_deref(), Some("Ada"));
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_leaves_the_cache_as_it_was() {
+    let mut f = fixture(Some("yolo")).await;
+    f.book.lock().unwrap().store_then_fail = Some(503);
+    let e = error(&mut f.server, update_ada(json!({"first_name":"Augusta"}))).await;
+    assert_eq!(
+        e["error"], "contacts_write_outcome_unknown_run_contacts_refresh",
+        "{e}"
+    );
+    let cached = f.cached(ADA).unwrap();
+    assert_eq!(cached.contact.etag.as_deref(), Some("etag-ada-1"));
+    assert_eq!(cached.contact.first_name.as_deref(), Some("Ada"));
+}
+
+#[tokio::test]
+async fn a_failed_read_back_says_done_but_not_verified() {
+    let mut f = fixture(Some("yolo")).await;
+    // The read before the update works; the read after it fails.
+    f.fail_reads_after(2);
+    let done = ok(&mut f.server, update_ada(json!({"first_name":"Augusta"}))).await;
+    assert_eq!(done["outcome"], "done", "{done}");
+    assert_eq!(done["remote_verified"], false, "{done}");
+    assert_eq!(done["cache_updated"], false, "{done}");
+    assert_eq!(f.card_at_apple(ADA).unwrap()["firstName"], "Augusta");
+}
+
+#[tokio::test]
+async fn a_slow_read_back_says_done_but_not_verified() {
+    let mut f = fixture(Some("yolo")).await;
+    f.server.set_contacts_seam(Seam {
+        check_timeout: std::time::Duration::from_secs(1),
+        ..seam(&f.remote.uri())
+    });
+    f.slow_reads_after(2);
+    let done = ok(&mut f.server, update_ada(json!({"nickname":"Countess"}))).await;
+    assert_eq!(done["outcome"], "done", "{done}");
+    assert_eq!(done["remote_verified"], false, "{done}");
+    assert_eq!(f.card_at_apple(ADA).unwrap()["nickName"], "Countess");
+}
+
+#[tokio::test]
+async fn a_failed_read_before_a_create_sends_nothing() {
+    let mut f = fixture(Some("yolo")).await;
+    f.fail_reads_after(1);
+    let e = error(
+        &mut f.server,
+        json!({"action":"create","fields":{"first_name":"Grace"}}),
+    )
+    .await;
+    assert_eq!(e["error"], "contacts_read_failed_nothing_sent", "{e}");
+    assert!(f.writes().is_empty());
+}
+
+// --- What the person sees before approving.
+
+#[tokio::test]
+async fn the_terminal_text_shows_each_change_with_its_current_value() {
+    let mut f = fixture(Some("yolo")).await;
+    rules(
+        f.dir.path(),
+        "rules:\n  contacts_write.update: {ask: terminal}\n  contacts_write.create: {ask: terminal}\n",
+    );
+    let waiting = ok(
+        &mut f.server,
+        update_ada(json!({"first_name":"Augusta","company":null,"phones":[{"label":"WORK","value":"+1 555 0199"}]})),
+    )
+    .await;
+    let id = waiting["request_id"].as_str().unwrap().to_string();
+    let shown = f.server.approval_text(&id).unwrap();
+    for line in [
+        "Set first_name to Augusta (now: Ada)",
+        "Clear company (now: Analytical Engines)",
+        "Replace phones: remove MOBILE +1 555 0100; add WORK +1 555 0199",
+    ] {
+        assert!(shown.contains(line), "{line}\n{shown}");
+    }
+    assert!(!shown.contains('"'), "{shown}");
+    // Notes are shown whole, up to their limit.
+    let notes = "n".repeat(4000) + "END";
+    let waiting = ok(
+        &mut f.server,
+        json!({"action":"create","fields":{"first_name":"Grace","notes":notes}}),
+    )
+    .await;
+    let id = waiting["request_id"].as_str().unwrap().to_string();
+    let shown = f.server.approval_text(&id).unwrap();
+    assert!(shown.contains(&notes), "{}", shown.len());
+}
+
+#[tokio::test]
+async fn the_update_card_shows_what_is_replaced() {
+    let mut f = fixture(Some("writes_only")).await;
+    let form = call(
+        &mut f.server,
+        update_ada(json!({"company":null,"phones":[{"value":"+1 555 0199"}]})),
+    )
+    .await;
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+    let message = form["params"]["message"].as_str().unwrap();
+    assert!(message.contains("Analytical Engines"), "{message}");
+    assert!(message.contains("+1 555 0100"), "{message}");
+    cancel(&mut f.server, &form).await;
+}
+
+#[tokio::test]
+async fn a_list_or_notes_contacts_get_cut_short_is_not_replaced() {
+    let mut f = fixture(Some("writes_only")).await;
+    {
+        let mut library = quince_core::Library::open(f.dir.path()).unwrap();
+        let mut card = library.cards_by_guid(&[ADA.to_string()]).unwrap().remove(0);
+        card.contact.notes = Some("n".repeat(600_000));
+        for i in 0..150 {
+            card.contact
+                .methods
+                .push(quince_core::contacts::ContactMethod {
+                    kind: "email".into(),
+                    label: None,
+                    value: format!("a{i}@example.com"),
+                });
+        }
+        library.put_card(&card).unwrap();
+    }
+    let got = text(
+        &f.server
+            .handle(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"contacts_get","arguments":{"guid":ADA}}}))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(got["card_truncated"], true, "the fixture is cut short");
+    for fields in [
+        json!({"notes":"short"}),
+        json!({"notes":null}),
+        json!({"emails":[{"value":"x@example.com"}]}),
+    ] {
+        let reply = call(&mut f.server, update_ada(fields.clone())).await;
+        assert_ne!(reply["method"], "elicitation/create", "{fields}");
+        let e = text(&reply);
+        assert_eq!(
+            e["error"], "contact_shown_cut_short_edit_on_device",
+            "{fields}"
+        );
+        assert!(e["instructions"].is_string());
+    }
+    // Fields contacts_get showed whole can still change.
+    let form = call(
+        &mut f.server,
+        update_ada(json!({"phones":[{"value":"+1 555 0199"}]})),
+    )
+    .await;
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+    cancel(&mut f.server, &form).await;
     assert!(f.writes().is_empty());
 }

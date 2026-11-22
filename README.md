@@ -28,11 +28,11 @@ It asks for the state folder, where to keep the sign-in, your Apple Account sign
 
 ## Tools and approval
 
-The [MCP reference](crates/skykeep-mcp/README.md#tools) lists every tool, its fields and its errors. A permissions file in the state folder sets each tool or action to `allow`, `ask: client`, `ask: terminal` or `deny`. `ask: client` shows an approval card in the MCP client, `ask: terminal` waits for `skykeep-mcp approve` in your own terminal. Drive deletions and Contacts deletes always need a person, in every approval mode, and their card offers no "Always allow". A broken permissions file never loosens a rule: the last valid rules stay in use, and with none every deletion asks.
+The [MCP reference](crates/skykeep-mcp/README.md#tools) lists the tools, their fields and their errors. It does not cover `contacts_write` yet; this README and the tool's own description do. A permissions file in the state folder sets each tool or action to `allow`, `ask: client`, `ask: terminal` or `deny`. `ask: client` shows an approval card in the MCP client, `ask: terminal` waits for `skykeep-mcp approve` in your own terminal. Drive deletions and Contacts deletions always need a person, in every approval mode, and their card offers no "Always allow". A broken permissions file never loosens a rule: the last valid rules stay in use, and with none every deletion asks.
 
 Approval protects against clients limited to MCP tools, not agents with shell access as the owner of the state directory. Such an agent can edit local state or invoke terminal helpers.
 
-A successful Notes or Reminders write means queued locally, not verified in iCloud. A Contacts change runs at once. An update or delete needs the card's `etag` from `contacts_get`; if the card changed since, Skykeep refuses with `contact_changed_conflict` and writes nothing. An update changes only the fields it names. The reply says `remote_verified: true` only when the book read back from Apple shows the change. See the [MCP reference](crates/skykeep-mcp/README.md) for sign-in, approval, the permissions file and limitations.
+A successful Notes or Reminders write means queued locally, not verified in iCloud. A Contacts change runs at once. An update or deletion needs the card's `etag` from `contacts_get`; if the card changed since, Skykeep refuses with `contact_changed_conflict` and writes nothing. An update changes only the fields it names. Contacts has no Recently Deleted, so a deletion is permanent. The reply says `remote_verified: true` only when the address book read back from Apple shows the change. See the [MCP reference](crates/skykeep-mcp/README.md) for sign-in, approval, the permissions file and limitations.
 
 ## Development
 

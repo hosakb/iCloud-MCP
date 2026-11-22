@@ -53,6 +53,8 @@ const NOT_CACHED: &str = "contact_not_in_cache_run_contacts_refresh";
 const GONE: &str = "contact_not_found_at_apple_run_contacts_refresh";
 const PAUSED: &str = "contacts_paused_approve_on_apple_device";
 const BLANK: &str = "contact_needs_a_name_phone_or_email";
+const CUT_SHORT: &str = "contact_shown_cut_short_edit_on_device";
+const NOTHING_SENT: &str = "contacts_read_failed_nothing_sent";
 
 /// The Contacts actions that remove something, as the permissions rules decide it for every
 /// tool (`permissions::removal_of`): `delete`, which is permanent.
@@ -188,25 +190,6 @@ impl Fields {
         self.texts().is_empty() && self.lists().is_empty() && self.is_company.is_none()
     }
 
-    /// The names of the fields given, for the preview.
-    fn named(&self) -> Value {
-        let mut out = serde_json::Map::new();
-        for (name, value, _) in self.texts() {
-            out.insert(name.into(), json!(value.as_deref().map(|v| shown(v, 256))));
-        }
-        if let Some(is_company) = self.is_company {
-            out.insert("is_company".into(), json!(is_company));
-        }
-        for (name, _, list) in self.lists() {
-            let shown_list: Vec<Value> = list
-                .iter()
-                .map(|e| json!({"label": e.label.as_deref().map(|l| shown(l, MAX_LABEL_CHARS)), "value": shown(&e.value, MAX_VALUE_CHARS)}))
-                .collect();
-            out.insert(name.into(), json!(shown_list));
-        }
-        Value::Object(out)
-    }
-
     /// `card` with these fields laid over it.
     fn apply(&self, card: &mut Card) {
         let set = |slot: &mut Option<String>, value: &Option<Option<String>>| {
@@ -334,19 +317,30 @@ fn readable(text: &str, multiline: bool) -> bool {
         .any(|c| hides_text(c) || (c.is_control() && !(multiline && matches!(c, '\n' | '\t'))))
 }
 
-/// A birthday as Apple's card holds it: `YYYY-MM-DD`.
+/// A birthday as Apple's card holds it: `YYYY-MM-DD`, a day the month has. A birthday whose
+/// year is not known is written with the year 1604, as Apple's own apps write it.
 fn birthday(text: &str) -> bool {
     let b = text.as_bytes();
-    let digits = |r: std::ops::Range<usize>| b[r].iter().all(u8::is_ascii_digit);
-    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' || !digits(0..4) {
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
         return false;
     }
-    if !digits(5..7) || !digits(8..10) {
+    let number = |r: std::ops::Range<usize>| -> Option<u32> {
+        b[r].iter().try_fold(0u32, |n, d| {
+            d.is_ascii_digit().then(|| n * 10 + u32::from(d - b'0'))
+        })
+    };
+    let (Some(year), Some(month), Some(day)) = (number(0..4), number(5..7), number(8..10)) else {
         return false;
-    }
-    let month = (b[5] - b'0') * 10 + (b[6] - b'0');
-    let day = (b[8] - b'0') * 10 + (b[9] - b'0');
-    (1..=12).contains(&month) && (1..=31).contains(&day)
+    };
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&day)
 }
 
 fn check_fields(fields: &Fields) -> Result<(), &'static str> {
@@ -388,16 +382,64 @@ fn check_fields(fields: &Fields) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The field names `fields` takes.
+const FIELD_NAMES: [&str; 18] = [
+    "first_name",
+    "middle_name",
+    "last_name",
+    "company",
+    "is_company",
+    "birthday",
+    "notes",
+    "prefix",
+    "suffix",
+    "nickname",
+    "phonetic_first_name",
+    "phonetic_last_name",
+    "phonetic_company",
+    "job_title",
+    "department",
+    "emails",
+    "phones",
+    "urls",
+];
+
+/// Why arguments that don't parse were refused, as a code that says what each action takes.
+fn shape_error(args: &Value) -> &'static str {
+    let Some(object) = args.as_object() else {
+        return "invalid_arguments";
+    };
+    let only = |keys: &[&str]| {
+        object.keys().all(|k| keys.contains(&k.as_str()))
+            && keys.iter().all(|k| object.contains_key(*k))
+    };
+    let fields_error = || match object.get("fields").and_then(Value::as_object) {
+        Some(fields) if fields.keys().any(|k| !FIELD_NAMES.contains(&k.as_str())) => {
+            "unknown_field"
+        }
+        _ => "invalid_arguments",
+    };
+    match object.get("action").and_then(Value::as_str) {
+        Some("create") if !only(&["action", "fields"]) => "create_needs_only_fields",
+        Some("update") if !only(&["action", "guid", "etag", "fields"]) => {
+            "update_needs_guid_etag_and_fields"
+        }
+        Some("delete") if !only(&["action", "guid", "etag"]) => "delete_needs_only_guid_and_etag",
+        Some("create" | "update") => fields_error(),
+        Some("delete") => "invalid_arguments",
+        _ => "invalid_action",
+    }
+}
+
 /// Checks the arguments before any approval prompt, cache or network use.
 pub(crate) fn validate(args: &Value) -> Result<ContactsWrite, &'static str> {
-    let op: ContactsWrite =
-        serde_json::from_value(args.clone()).map_err(|_| "invalid_arguments")?;
+    let op: ContactsWrite = serde_json::from_value(args.clone()).map_err(|_| shape_error(args))?;
     if let Some((guid, etag)) = op.target() {
         if guid.is_empty() || guid.len() > contacts::MAX_GUID_BYTES {
-            return Err("invalid_arguments");
+            return Err("invalid_guid_or_etag");
         }
         if etag.is_empty() || etag.len() > MAX_ETAG_BYTES || !readable(etag, false) {
-            return Err("invalid_arguments");
+            return Err("invalid_guid_or_etag");
         }
     }
     match &op {
@@ -465,49 +507,213 @@ fn cached(library: &Library, guid: &str, etag: &str) -> Result<Card, &'static st
 
 fn show_card(card: &Card) -> Value {
     let c = &card.contact;
-    let count = |kind: &str| c.methods.iter().filter(|m| m.kind == kind).count();
     json!({
         "guid": c.guid,
-        "display_name": shown(&c.display_name(), 256),
-        "first_name": c.first_name.as_deref().map(|v| shown(v, 256)),
-        "last_name": c.last_name.as_deref().map(|v| shown(v, 256)),
-        "company": c.company.as_deref().map(|v| shown(v, 256)),
+        "display_name": shown(&c.display_name(), MAX_TEXT_CHARS),
         "etag": c.etag,
-        "emails": count("email"),
-        "phones": count("phone"),
     })
 }
 
-/// What the approval shows and is bound to: the action, the cached card it reaches, and the
-/// fields it sets. The same arguments over the same cache give the same preview.
+/// `text` as shown for approval: whole up to `cap` characters, then a count of the rest.
+fn shown_up_to(text: &str, cap: usize) -> String {
+    let total = text.chars().count();
+    let mut out = shown(text, cap);
+    if total > cap {
+        out.push_str(&format!(" ({} more characters)", total - cap));
+    }
+    out
+}
+
+fn entry_text(label: Option<&str>, value: &str) -> String {
+    match label {
+        Some(label) => format!(
+            "{} {}",
+            shown_up_to(label, MAX_LABEL_CHARS),
+            shown_up_to(value, MAX_VALUE_CHARS)
+        ),
+        None => shown_up_to(value, MAX_VALUE_CHARS),
+    }
+}
+
+/// Old entries shown when a list is replaced.
+const SHOWN_ENTRIES: usize = 100;
+
+/// Each field the call sets, with the value the cached card holds now (`None` for a create):
+/// `{"field", "to"}` or `{"field", "clear": true}`, with `"now"`; for a list, the entries it
+/// removes and adds.
+fn changes(fields: &Fields, now: Option<&Card>) -> Vec<Value> {
+    let mut out = Vec::new();
+    let cap = |name: &str| {
+        if name == "notes" {
+            MAX_NOTES_CHARS
+        } else {
+            MAX_TEXT_CHARS
+        }
+    };
+    let current = |name: &str| -> Option<String> {
+        let card = now?;
+        let c = &card.contact;
+        match name {
+            "first_name" => c.first_name.clone(),
+            "middle_name" => c.middle_name.clone(),
+            "last_name" => c.last_name.clone(),
+            "company" => c.company.clone(),
+            "birthday" => c.birthday.clone(),
+            "notes" => c.notes.clone(),
+            other => DETAILS
+                .iter()
+                .find(|(n, _)| *n == other)
+                .and_then(|(_, key)| card.details.get(key).cloned().flatten()),
+        }
+    };
+    for (name, value, _) in fields.texts() {
+        let mut row = match clean(value.as_deref()) {
+            Some(to) => json!({"field": name, "to": shown_up_to(&to, cap(name))}),
+            None => json!({"field": name, "clear": true}),
+        };
+        if now.is_some() {
+            row["now"] = json!(current(name).map(|v| shown_up_to(&v, cap(name))));
+        }
+        out.push(row);
+    }
+    if let Some(is_company) = fields.is_company {
+        let mut row = json!({"field": "is_company", "to": is_company});
+        if let Some(card) = now {
+            row["now"] = json!(card.contact.is_company);
+        }
+        out.push(row);
+    }
+    for (name, kind, list) in fields.lists() {
+        let mut add: Vec<(Option<String>, String)> = list
+            .iter()
+            .map(|e| (clean(e.label.as_deref()), e.value.trim().to_string()))
+            .collect();
+        let mut remove = Vec::new();
+        for m in now
+            .map(|c| c.contact.methods.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter(|m| m.kind == kind)
+        {
+            match add.iter().position(|(l, v)| *v == m.value && *l == m.label) {
+                Some(i) => {
+                    add.remove(i);
+                }
+                None => remove.push(entry_text(m.label.as_deref(), &m.value)),
+            }
+        }
+        let more = remove.len().saturating_sub(SHOWN_ENTRIES);
+        remove.truncate(SHOWN_ENTRIES);
+        if more > 0 {
+            remove.push(format!("({more} more entries)"));
+        }
+        let add: Vec<String> = add
+            .iter()
+            .map(|(l, v)| entry_text(l.as_deref(), v))
+            .collect();
+        out.push(json!({"field": name, "remove": remove, "add": add}));
+    }
+    out
+}
+
+/// The fields of the cached card `contacts_get` shows cut short: the notes, or a kind of
+/// entry with more entries or longer text than it shows. A call that replaces one of them
+/// would remove what nobody was shown.
+fn cut_short(library: &Library, card: &Card) -> Result<Vec<&'static str>, &'static str> {
+    let shown_card = contacts::get(library, json!({"guid": card.contact.guid}));
+    let (chars, entries) = match &shown_card {
+        Ok(v) if v["card_truncated"] != true => return Ok(Vec::new()),
+        Ok(v) => (
+            v["truncation"]["max_chars_per_text"].as_u64().unwrap_or(0) as usize,
+            v["truncation"]["max_entries_per_list"]
+                .as_u64()
+                .unwrap_or(0) as usize,
+        ),
+        // Too large to show at all: nothing of it was seen.
+        Err(_) => (0, 0),
+    };
+    let long = |t: &str| t.chars().count() > chars;
+    let mut out = Vec::new();
+    if card.contact.notes.as_deref().is_some_and(long) {
+        out.push("notes");
+    }
+    for (name, kind) in [("emails", "email"), ("phones", "phone"), ("urls", "url")] {
+        let of: Vec<&ContactMethod> = card
+            .contact
+            .methods
+            .iter()
+            .filter(|m| m.kind == kind)
+            .collect();
+        if of.len() > entries
+            || of
+                .iter()
+                .any(|m| long(&m.value) || m.label.as_deref().is_some_and(long))
+        {
+            out.push(name);
+        }
+    }
+    Ok(out)
+}
+
+/// The cached card an update or delete reaches, checked: at the version given, and for an
+/// update, not replacing anything `contacts_get` showed cut short.
+fn planned(library: &Library, op: &ContactsWrite) -> Result<Option<Card>, &'static str> {
+    let Some((guid, etag)) = op.target() else {
+        return Ok(None);
+    };
+    let card = cached(library, guid, etag)?;
+    if let ContactsWrite::Update { fields, .. } = op {
+        let cut = cut_short(library, &card)?;
+        let replaces = |name: &str| match name {
+            "notes" => fields.notes.is_some(),
+            "emails" => fields.emails.is_some(),
+            "phones" => fields.phones.is_some(),
+            _ => fields.urls.is_some(),
+        };
+        if cut.iter().any(|n| replaces(n)) {
+            return Err(CUT_SHORT);
+        }
+    }
+    Ok(Some(card))
+}
+
+/// What the approval shows and is bound to: the action, the cached card it reaches, and each
+/// field it sets with the value it has now. The same arguments over the same cache give the
+/// same preview.
 pub(crate) fn preview(library: &Library, args: &Value) -> Result<Value, &'static str> {
     let op = validate(args)?;
+    let card = planned(library, &op)?;
     let mut value = json!({
         "action": op.action(),
         "destructive": is_destructive(op.action()),
     });
-    if let Some((guid, etag)) = op.target() {
-        value["contact"] = show_card(&cached(library, guid, etag)?);
+    if let Some(card) = &card {
+        value["contact"] = show_card(card);
     }
     match &op {
         ContactsWrite::Create { fields } => {
-            value["fields"] = fields.named();
+            value["changes"] = json!(changes(fields, None));
             value["effect"] = json!("adds one new card to Apple iCloud Contacts");
         }
         ContactsWrite::Update { fields, .. } => {
-            value["fields"] = fields.named();
+            value["changes"] = json!(changes(fields, card.as_ref()));
             value["effect"] = json!("changes only these fields on the card at Apple, if it is still at this version; the rest of the card stays as it is");
         }
         ContactsWrite::Delete { .. } => {
-            value["effect"] = json!("deletes the card from Apple iCloud Contacts on every device; it cannot be undone here");
+            value["effect"] = json!("deletes the card from Apple iCloud Contacts on every device; Contacts has no Recently Deleted, so it cannot be undone");
         }
     }
     Ok(value)
 }
 
-/// A preview in plain lines, for the terminal approval.
+/// A preview in plain lines, for the terminal approval: values without quotes, and each
+/// change with what the card holds now.
 pub(crate) fn plain_preview(preview: &Value) -> String {
-    let text = |v: &Value| v.as_str().unwrap_or("?").to_string();
+    let text = |v: &Value| match v {
+        Value::String(s) => s.clone(),
+        Value::Null => "nothing".to_string(),
+        other => other.to_string(),
+    };
     let mut lines = vec![format!(
         "Contacts change: {}{}",
         text(&preview["action"]),
@@ -529,10 +735,36 @@ pub(crate) fn plain_preview(preview: &Value) -> String {
             text(&contact["etag"])
         ));
     }
-    if let Some(fields) = preview["fields"].as_object() {
-        for (name, value) in fields {
-            lines.push(format!("Set {name}: {value}"));
-        }
+    for change in preview["changes"].as_array().into_iter().flatten() {
+        let field = text(&change["field"]);
+        let now = change
+            .get("now")
+            .map(|n| format!(" (now: {})", text(n)))
+            .unwrap_or_default();
+        let line = if let Some(add) = change["add"].as_array() {
+            let list = |v: &Value| {
+                v.as_array()
+                    .map(|a| a.iter().map(text).collect::<Vec<_>>().join("; "))
+                    .unwrap_or_default()
+            };
+            let mut parts = Vec::new();
+            if change["remove"].as_array().is_some_and(|r| !r.is_empty()) {
+                parts.push(format!("remove {}", list(&change["remove"])));
+            }
+            if !add.is_empty() {
+                parts.push(format!("add {}", list(&change["add"])));
+            }
+            if parts.is_empty() {
+                format!("Replace {field}: no change")
+            } else {
+                format!("Replace {field}: {}", parts.join("; "))
+            }
+        } else if change["clear"] == true {
+            format!("Clear {field}{now}")
+        } else {
+            format!("Set {field} to {}{now}", text(&change["to"]))
+        };
+        lines.push(line);
     }
     lines.join("\n")
 }
@@ -553,6 +785,15 @@ pub(crate) fn next_step(error: &str) -> Option<String> {
         NOT_CACHED => "The card is not in the local cache. Run contacts_refresh, then find it with contacts_search or contacts_get.",
         GONE => "Apple no longer has this card; it may have been deleted on another device. Run contacts_refresh.",
         BLANK => "A new card needs a name, a company, a phone number or an email address.",
+        CUT_SHORT => "contacts_get showed this card cut short, so the notes or a list of emails, phones or URLs it would replace were not seen in full, and nothing was changed. contacts_get cannot show the card whole. Change those fields on an Apple device or on icloud.com, or change only other fields here.",
+        NOTHING_SENT => "Apple's address book could not be read, so nothing was sent. Try again later; if it keeps failing, run contacts_refresh to see why.",
+        "invalid_action" => "action must be create, update or delete.",
+        "create_needs_only_fields" => "create takes action and fields only, such as {\"action\":\"create\",\"fields\":{\"first_name\":\"Ada\"}}. The new card's guid is in the reply.",
+        "update_needs_guid_etag_and_fields" => "update takes action, guid, etag and fields. Take guid and etag from contacts_get, and name in fields only what changes.",
+        "delete_needs_only_guid_and_etag" => "delete takes action, guid and etag only. Take guid and etag from contacts_get.",
+        "invalid_guid_or_etag" => "guid and etag must be as contacts_get shows them: guid at most 512 bytes, etag at most 256.",
+        "unknown_field" => "fields takes first_name, middle_name, last_name, company, is_company, birthday, notes, prefix, suffix, nickname, phonetic_first_name, phonetic_last_name, phonetic_company, job_title, department, emails, phones and urls. contacts_get's details are given flat in fields; postal addresses, photos and lists can't be changed here.",
+        "invalid_birthday" => "birthday is YYYY-MM-DD with a day the month has. If the year is not known, use 1604, as Apple does.",
         _ => return None,
     }
     .to_string())
@@ -567,8 +808,10 @@ pub struct Seam {
     pub client: Option<MakeClient>,
     /// Each read of the book, before and after the change.
     pub read: RefreshLimits,
-    /// The whole action.
+    /// The change: the read before it and the write.
     pub timeout: Duration,
+    /// The read back from Apple after the write.
+    pub check_timeout: Duration,
 }
 
 impl Default for Seam {
@@ -577,6 +820,7 @@ impl Default for Seam {
             client: None,
             read: RefreshLimits::default(),
             timeout: Duration::from_secs(120),
+            check_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -604,6 +848,18 @@ fn apple_error(e: &quince_icloud::Error) -> &'static str {
         E::Refused(_) => "contacts_write_refused_by_apple",
         E::Protocol(_) => "contacts_write_refused_by_apple",
         _ => UNKNOWN,
+    }
+}
+
+/// A create's error: one from the engine's own read of the book, made before it writes,
+/// means nothing was sent. A busy answer can't be told apart from the write's, so it stays
+/// unknown.
+fn create_error(e: &quince_icloud::Error) -> &'static str {
+    use quince_icloud::Error as E;
+    match e {
+        E::Protocol(why) if why.starts_with("/co/startup") => NOTHING_SENT,
+        E::Network(n) if n.url().is_some_and(|u| u.path().ends_with("/co/startup")) => NOTHING_SENT,
+        other => apple_error(other),
     }
 }
 
@@ -688,9 +944,7 @@ fn settle(dir: &Path, dsid: &str, what: Settle) -> bool {
 pub(crate) async fn run(dir: &Path, seam: &Seam, op: ContactsWrite) -> Result<Value, &'static str> {
     {
         let library = Library::open(dir).map_err(|_| "library_unavailable")?;
-        if let Some((guid, etag)) = op.target() {
-            cached(&library, guid, etag)?;
-        }
+        planned(&library, &op)?;
     }
     let mut client = client_for(dir, seam)?;
     if !client
@@ -715,14 +969,15 @@ pub(crate) async fn run(dir: &Path, seam: &Seam, op: ContactsWrite) -> Result<Va
         .service_url("contacts")
         .ok_or("contacts_service_unavailable")?;
     let mut after = Settle::Nothing;
-    let result = match tokio::time::timeout(
-        seam.timeout,
-        act(&client, &root, &op, &seam.read, &mut after),
-    )
-    .await
-    {
-        Ok(result) => result,
+    // Timed apart: once Apple took the write, a slow or failed read back is done, unverified.
+    let sent = tokio::time::timeout(seam.timeout, send(&client, &root, &op, &seam.read)).await;
+    let result = match sent {
         Err(_) => Err(UNKNOWN),
+        Ok(Err(error)) => Err(error),
+        Ok(Ok(Sent::Unchanged(value))) => Ok(value),
+        Ok(Ok(Sent::Written(guid))) => {
+            Ok(checked(&client, &root, &guid, &op, seam, &mut after).await)
+        }
     };
     let cached = settle(dir, &dsid, after);
     result.map(|mut value| {
@@ -737,45 +992,59 @@ pub(crate) async fn run(dir: &Path, seam: &Seam, op: ContactsWrite) -> Result<Va
     })
 }
 
-async fn act(
+/// What a change did at Apple: nothing was needed, or the write to this card was taken.
+enum Sent {
+    Unchanged(Value),
+    Written(String),
+}
+
+/// The read before the change and the write.
+async fn send(
     client: &Client,
     root: &str,
     op: &ContactsWrite,
     limits: &RefreshLimits,
-    after: &mut Settle,
-) -> Result<Value, &'static str> {
+) -> Result<Sent, &'static str> {
     let http = client.http();
     let params = || client.service_params();
-    let (guid, fields) = match op {
-        ContactsWrite::Create { fields } => {
+    // Apple's card as it is now; a create reads the book too, so a book that can't be read
+    // is said to have sent nothing.
+    let (cards, tokens) = book(client, root, limits).await.map_err(read_stop)?;
+    let existing = match op.target() {
+        Some((guid, etag)) => {
+            let existing = find(&cards, guid).ok_or(GONE)?;
+            if existing.get("etag").and_then(Value::as_str) != Some(etag) {
+                return Err(CHANGED);
+            }
+            Some(existing)
+        }
+        None => None,
+    };
+    drop(cards);
+    match (op, existing) {
+        (ContactsWrite::Create { fields }, _) => {
             let guid = apple::new_contact_id();
             let mut card = blank_card();
             fields.apply(&mut card);
             card.contact.guid = guid.clone();
-            let ledger = apple::Ledger::new();
+            let ledger = apple::Ledger::holding(tokens);
             apple::create_card_named(http, root, params(), &ledger, &guid, &card)
                 .await
-                .map_err(|e| apple_error(&e))?;
-            (guid, Some(fields))
+                .map_err(|e| create_error(&e))?;
+            Ok(Sent::Written(guid))
         }
-        ContactsWrite::Update { guid, etag, fields } => {
-            let (cards, tokens) = book(client, root, limits).await.map_err(read_stop)?;
-            let existing = find(&cards, guid).ok_or(GONE)?;
-            drop(cards);
-            if existing.get("etag").and_then(Value::as_str) != Some(etag.as_str()) {
-                return Err(CHANGED);
-            }
+        (ContactsWrite::Update { guid, etag, fields }, Some(existing)) => {
             let (base, _) = parsed(&existing).ok_or("contacts_card_unreadable_nothing_sent")?;
-            let mut card = base.clone();
-            fields.apply(&mut card);
             if fields.differences(&base).is_empty() {
-                return Ok(json!({
+                return Ok(Sent::Unchanged(json!({
                     "outcome": "unchanged",
                     "contact": {"guid": guid, "etag": etag},
                     "checked": "Apple's card, read just now, already holds these values; nothing was sent",
                     "remote_verified": true,
-                }));
+                })));
             }
+            let mut card = base.clone();
+            fields.apply(&mut card);
             let ledger = apple::Ledger::holding(tokens);
             apple::update_card(
                 http,
@@ -788,62 +1057,94 @@ async fn act(
             )
             .await
             .map_err(|e| apple_error(&e))?;
-            (guid.clone(), Some(fields))
+            Ok(Sent::Written(guid.clone()))
         }
-        ContactsWrite::Delete { guid, etag } => {
-            let (cards, tokens) = book(client, root, limits).await.map_err(read_stop)?;
-            let existing = find(&cards, guid).ok_or(GONE)?;
-            drop(cards);
-            if existing.get("etag").and_then(Value::as_str) != Some(etag.as_str()) {
-                return Err(CHANGED);
-            }
+        (ContactsWrite::Delete { guid, .. }, Some(existing)) => {
             // Sent against the version just checked, so Apple refuses it if the card moves
             // on in between. The engine's `delete` would send Apple's newest version instead.
             let ledger = apple::Ledger::holding(tokens);
             apple::merge::delete_card(http, root, params(), &ledger, &existing)
                 .await
                 .map_err(|e| apple_error(&e))?;
-            (guid.clone(), None)
+            Ok(Sent::Written(guid.clone()))
         }
+        _ => Err(GONE),
+    }
+}
+
+/// [`check`] under its own time limit.
+async fn checked(
+    client: &Client,
+    root: &str,
+    guid: &str,
+    op: &ContactsWrite,
+    seam: &Seam,
+    after: &mut Settle,
+) -> Value {
+    let fields = match op {
+        ContactsWrite::Create { fields } | ContactsWrite::Update { fields, .. } => Some(fields),
+        ContactsWrite::Delete { .. } => None,
     };
-    // Apple took the write. The book is read back to see it there.
-    let unverified = |why: &str| {
-        json!({
-            "outcome": "done",
-            "contact": {"guid": guid},
-            "checked": format!("Apple accepted the write, but {why}"),
-            "remote_verified": false,
-        })
-    };
+    let read_back = check(client, root, guid, fields, &seam.read, after);
+    match tokio::time::timeout(seam.check_timeout, read_back).await {
+        Ok(value) => value,
+        Err(_) => unverified(
+            guid,
+            "the book could not be read back in time to check it; run contacts_refresh",
+        ),
+    }
+}
+
+/// Apple took the write, and it could not be checked.
+fn unverified(guid: &str, why: &str) -> Value {
+    json!({
+        "outcome": "done",
+        "contact": {"guid": guid},
+        "checked": format!("Apple accepted the write, but {why}"),
+        "remote_verified": false,
+    })
+}
+
+/// The book read back after the write: what it shows of the change, and what the cache keeps.
+/// `fields` is `None` for a delete.
+async fn check(
+    client: &Client,
+    root: &str,
+    guid: &str,
+    fields: Option<&Fields>,
+    limits: &RefreshLimits,
+    after: &mut Settle,
+) -> Value {
     let cards = match book(client, root, limits).await {
         Ok((cards, _)) => cards,
         Err(_) => {
-            return Ok(unverified(
+            return unverified(
+                guid,
                 "the book could not be read back to check it; run contacts_refresh",
-            ))
+            )
         }
     };
-    let found = find(&cards, &guid);
+    let found = find(&cards, guid);
     drop(cards);
     let Some(fields) = fields else {
         if found.is_some() {
-            return Ok(unverified("the book read back still holds the card"));
+            return unverified(guid, "the book read back still holds the card");
         }
-        *after = Settle::Forget(guid.clone());
-        return Ok(json!({
+        *after = Settle::Forget(guid.to_string());
+        return json!({
             "outcome": "done",
             "contact": {"guid": guid},
             "checked": "the book was read back from Apple and no longer holds the card",
             "remote_verified": true,
-        }));
+        });
     };
     let Some((card, addresses)) = found.as_ref().and_then(parsed) else {
-        return Ok(unverified("the book read back does not hold the card"));
+        return unverified(guid, "the book read back does not hold the card");
     };
     let differ = fields.differences(&card);
     let reply = json!({
         "outcome": "done",
-        "contact": {"guid": guid, "etag": card.contact.etag, "display_name": shown(&card.contact.display_name(), 256)},
+        "contact": {"guid": guid, "etag": card.contact.etag, "display_name": shown(&card.contact.display_name(), MAX_TEXT_CHARS)},
         "checked": if differ.is_empty() {
             "the book was read back from Apple and the card holds every field as asked".to_string()
         } else {
@@ -853,7 +1154,7 @@ async fn act(
         "remote_verified": differ.is_empty(),
     });
     *after = Settle::Store(Box::new(card), addresses);
-    Ok(reply)
+    reply
 }
 
 /// The tool's entry in `tools/list`.
@@ -881,7 +1182,10 @@ pub(crate) fn tool() -> Value {
         ("middle_name", "Middle name."),
         ("last_name", "Last name."),
         ("company", "Company."),
-        ("birthday", "Birthday as YYYY-MM-DD."),
+        (
+            "birthday",
+            "Birthday as YYYY-MM-DD. If the year is not known, use 1604, as Apple does.",
+        ),
         ("prefix", "Name prefix, such as Dr."),
         ("suffix", "Name suffix, such as Jr."),
         ("nickname", "Nickname."),
@@ -915,7 +1219,7 @@ pub(crate) fn tool() -> Value {
     );
     json!({
         "name": TOOL,
-        "description": "Change the user's Apple iCloud Contacts, one card per call: create (fields), update (guid, etag, fields) or delete (guid, etag). Take guid and etag from contacts_get; the etag is the card's version. An update or delete of a card that changed since, on another device or in the cache, is refused with contact_changed_conflict and nothing is written: run contacts_refresh, read the card again and ask with its new etag. An update changes only the fields it names; null or an empty string clears a field, and a list of emails, phones or URLs replaces that list. Postal addresses, photos, contact lists and merging cards are not changed by this tool. Deletes are permanent and always need the user's approval, in the approval form or with skykeep-mcp approve in their terminal; every change follows the approval mode and the rules the user set. The reply says done with what was checked, unchanged when Apple already holds the values, or an error; an unknown outcome means run contacts_refresh and look before trying again.",
+        "description": "Change the user's Apple iCloud Contacts, one card per call: create (fields), update (guid, etag, fields) or delete (guid, etag). Take guid and etag from contacts_get; the etag is the card's version. An update or delete of a card that changed since, on another device or in the cache, is refused with contact_changed_conflict and nothing is written: run contacts_refresh, read the card again and ask with its new etag. An update changes only the fields it names; null or an empty string clears a field, and a list of emails, phones or URLs replaces that list. When contacts_get showed the card cut short (card_truncated), an update that replaces its notes or a list of emails, phones or URLs is refused, because part of it was not seen; change those on an Apple device. Postal addresses, photos, contact lists and merging cards are not changed by this tool. Contacts has no Recently Deleted, so a delete is permanent; every delete needs the user's approval, in the approval form or with skykeep-mcp approve in their terminal; every change follows the approval mode and the rules the user set. The reply says done with what was checked, unchanged when Apple already holds the values, or an error; an unknown outcome means run contacts_refresh and look before trying again.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -923,7 +1227,7 @@ pub(crate) fn tool() -> Value {
                 "guid": {"description": "Contact GUID from contacts_list, contacts_search or contacts_get. update and delete only.", "type": "string", "minLength": 1, "maxLength": contacts::MAX_GUID_BYTES},
                 "etag": {"description": "The card's version, the etag contacts_get shows. update and delete only.", "type": "string", "minLength": 1, "maxLength": MAX_ETAG_BYTES},
                 "fields": {
-                    "description": "create and update only. A field left out stays as it is.",
+                    "description": "create and update only. A field left out stays as it is; null or an empty string clears it. contacts_get's first_name, middle_name, last_name, company, is_company, birthday and notes have the same names here, and its details (prefix, suffix, nickname, phonetic_*, job_title, department) are given flat in fields. emails and phones are contacts_get's lists of the same name, and urls are its other_methods of kind url. Postal addresses and the other kinds of other_methods can't be changed here.",
                     "type": "object",
                     "properties": fields,
                     "additionalProperties": false,
@@ -948,11 +1252,11 @@ mod tests {
         assert!(validate(&json!({"action":"delete","guid":"g","etag":"e"})).is_ok());
         assert_eq!(
             validate(&json!({"action":"delete","guid":"g","etag":"e","fields":{}})),
-            Err("invalid_arguments")
+            Err("delete_needs_only_guid_and_etag")
         );
         assert_eq!(
             validate(&json!({"action":"create","fields":{"photo":"x"}})),
-            Err("invalid_arguments")
+            Err("unknown_field")
         );
     }
 
@@ -974,7 +1278,7 @@ mod tests {
 
     #[test]
     fn birthdays_are_dates() {
-        for good in ["1990-03-14", "2000-12-31"] {
+        for good in ["1990-03-14", "2000-12-31", "1604-02-29", "2000-02-29"] {
             assert!(birthday(good), "{good}");
         }
         for bad in [
@@ -983,6 +1287,10 @@ mod tests {
             "14/03/1990",
             "--03-14",
             "1990-00-10",
+            "2001-02-31",
+            "2001-02-29",
+            "1900-02-29",
+            "2001-04-31",
         ] {
             assert!(!birthday(bad), "{bad}");
         }

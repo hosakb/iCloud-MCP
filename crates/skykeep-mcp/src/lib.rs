@@ -1383,8 +1383,9 @@ impl Server {
     }
 
     /// Trusted local CLI only: what `approve` shows before it asks. A Drive change is said in
-    /// plain lines (what it does, the item and its path, what it reaches); a Notes or
-    /// Reminders change as its JSON. Control and text-direction characters are shown as
+    /// plain lines (what it does, the item and its path, what it reaches), a Contacts change
+    /// too (the card, and each field with its current and new value); a Notes or Reminders
+    /// change as its JSON. Control and text-direction characters are shown as
     /// U+FFFD, so nothing in the text can reorder or hide what the terminal shows.
     pub fn approval_text(&self, id: &str) -> Result<String, &'static str> {
         let raw = self.approval_details(id)?;
@@ -1715,6 +1716,13 @@ impl Server {
                         || !matches!(gate, Gate::Run | Gate::Legacy))
                 {
                     return Err("approval_required");
+                }
+                // A terminal request is used up before anything is sent, as for Drive, so a
+                // second approve can't send it again after an unknown outcome.
+                if let (true, Some(id)) = (terminal_approved, &terminal) {
+                    library
+                        .set_state(&format!("mcp.approval.{id}"), "")
+                        .map_err(|_| "library_unavailable")?;
                 }
                 contacts_write::run(&dir, &contacts_seam, op).await
             }
