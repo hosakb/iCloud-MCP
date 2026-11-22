@@ -888,6 +888,38 @@ async fn odd_answers_are_refused_and_the_cache_kept() {
     }
 }
 
+/// Apple's 421 is a lapsed session, as its 450 is (#59). A 421 whose body says Advanced Data
+/// Protection still pauses, because that body is read first.
+#[tokio::test]
+async fn a_421_listing_is_a_lapsed_session_unless_its_body_names_data_protection() {
+    let cases = [
+        (
+            ResponseTemplate::new(421)
+                .set_body_string(r#"{"reason":"Missing X-APPLE-WEBAUTH-TOKEN cookie","error":1}"#),
+            "login_required",
+        ),
+        (
+            ResponseTemplate::new(421).set_body_string(
+                r#"{"errorReason":"Missing PCS cookies from the request","errorCode":421}"#,
+            ),
+            "drive_paused_approve_on_apple_device",
+        ),
+    ];
+    for (answer, code) in cases {
+        let (dir, _server, _old) = refreshed(Some("yolo")).await;
+        let kept = cached(dir.path());
+        let remote = apple().await;
+        serve(&remote, ROOT, answer).await;
+        assert_eq!(
+            refresh(dir.path(), &remote.uri(), json!({}))
+                .await
+                .unwrap_err(),
+            code
+        );
+        assert_eq!(cached(dir.path()), kept, "{code}");
+    }
+}
+
 #[tokio::test]
 async fn oversized_answers_and_too_many_items_are_refused_and_the_cache_kept() {
     let small = || skykeep_mcp::drive::RefreshLimits {
