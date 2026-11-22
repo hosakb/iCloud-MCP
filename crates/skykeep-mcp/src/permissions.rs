@@ -1,17 +1,28 @@
-//! Per-tool permissions from `permissions.yaml` in the private folder.
+//! Per-tool permissions from `permissions.yaml` in the private folder, and two settings
+//! beside them: the approval mode (`approval_mode:`) and the exchange folder
+//! (`exchange_folder:`). A setting in the file wins over the one stored by setup or the older
+//! terminal commands; `skykeep-mcp policy` and `skykeep-mcp exchange` edit the file's line.
 //!
 //! The server reads the file before every tool call, so an edit counts at once. A missing
 //! file leaves everything to the folder's approval mode. An unusable file never loosens
-//! anything: the last valid rules stay in use, and with none every deletion asks. Every load
-//! that changes the rules is recorded in the library, so `status` and `permissions show` can
-//! say what became looser. No MCP tool reads or writes the file or these records; the server
-//! writes one rule only when the person picks "Always allow" on an approval card.
+//! anything: the last valid rules and settings stay in use, and with none every deletion asks.
+//! Every load that changes them is recorded in the library, so `status` and `permissions
+//! show` can say what became looser. No MCP tool reads or writes the file or these records;
+//! the server writes one rule only when the person picks "Always allow" on an approval card.
+//! An agent that can write files can still edit it: the looser changes it makes are listed
+//! until the person runs `permissions show` in their own terminal.
 use quince_core::Library;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::Path;
 
 pub const FILE_NAME: &str = "permissions.yaml";
+/// The file's line for the approval mode.
+pub const MODE_KEY: &str = "approval_mode";
+/// The file's line for the exchange folder.
+pub const EXCHANGE_KEY: &str = "exchange_folder";
+/// The approval modes the file accepts, strictest first.
+const MODE_NAMES: [&str; 3] = ["reads_and_writes", "writes_only", "yolo"];
 /// Append-only lines for rules saved from a card (older folders may also hold lines for
 /// deletions that ran because the file allowed them).
 pub const LOG_NAME: &str = "permissions-log.jsonl";
@@ -290,9 +301,67 @@ fn inline_value(text: &str) -> Option<Effect> {
 
 const VALUE_HELP: &str = "use allow, deny, {ask: client} or {ask: terminal}";
 
-/// The rules in a permissions file. A strict YAML subset: `version: 1` and a `rules:` map of
-/// names to `allow`, `deny` or an `ask:` map, with spaces for indentation.
+/// What a permissions file says: its rules and the two settings, as written.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Settings {
+    pub rules: Rules,
+    /// `approval_mode:`, one of reads_and_writes, writes_only and yolo.
+    pub mode: Option<String>,
+    /// `exchange_folder:` as written: a full path, or one that starts with `~/`.
+    pub exchange: Option<String>,
+}
+
+/// The rules in a permissions file (see [`parse_settings`]).
 pub fn parse(text: &str) -> Result<Rules, String> {
+    parse_settings(text).map(|s| s.rules)
+}
+
+/// A top-level name that looks like a secret. Passwords, codes and the passphrase are typed
+/// only in the person's own terminal, never kept in this file.
+fn secret_like(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("password")
+        || key.contains("passphrase")
+        || key
+            .split(['_', '-'])
+            .any(|part| ["passwd", "code", "token", "secret", "pin"].contains(&part))
+}
+
+/// The exchange folder as the file may name it: a full path or `~/...`, without `.` or `..`
+/// and without control or hiding characters. Whether it is a safe folder is checked when it
+/// is used, by [`crate::exchange::checked`].
+fn folder_value(text: &str) -> Result<String, String> {
+    let value = unquote(text).to_string();
+    let full = value.starts_with('/') || value == "~" || value.starts_with("~/");
+    if !full {
+        return Err(format!(
+            "{EXCHANGE_KEY} takes a full path, such as ~/Skykeep-Exchange or /home/you/Skykeep-Exchange"
+        ));
+    }
+    if value
+        .chars()
+        .any(|c| c.is_control() || crate::exchange::hides_text(c))
+    {
+        return Err(format!(
+            "{EXCHANGE_KEY} holds a control or hidden character; type the path again"
+        ));
+    }
+    if value.len() > crate::exchange::MAX_LOCAL_BYTES {
+        return Err(format!("{EXCHANGE_KEY} is longer than 1024 bytes"));
+    }
+    if value.split('/').any(|n| n == "." || n == "..") {
+        return Err(format!(
+            "{EXCHANGE_KEY} can't contain . or .. ; give the folder's full path"
+        ));
+    }
+    Ok(value)
+}
+
+/// A permissions file. A strict YAML subset: `version: 1`, optionally `approval_mode:` and
+/// `exchange_folder:`, and a `rules:` map of names to `allow`, `deny` or an `ask:` map, with
+/// spaces for indentation.
+pub fn parse_settings(text: &str) -> Result<Settings, String> {
+    let mut settings = Settings::default();
     let mut rules = Rules::new();
     let mut lines_of: BTreeMap<String, usize> = BTreeMap::new();
     let mut in_rules = false;
@@ -353,6 +422,27 @@ pub fn parse(text: &str) -> Result<Rules, String> {
                     "{}" => {}
                     _ => return Err(at("put each rule on its own line under rules:".into())),
                 },
+                MODE_KEY => {
+                    if settings.mode.is_some() {
+                        return Err(at(format!("{MODE_KEY} is listed twice")));
+                    }
+                    let mode = unquote(value);
+                    if !MODE_NAMES.contains(&mode) {
+                        return Err(at(format!(
+                            "{MODE_KEY} takes reads_and_writes, writes_only or yolo"
+                        )));
+                    }
+                    settings.mode = Some(mode.to_string());
+                }
+                EXCHANGE_KEY => {
+                    if settings.exchange.is_some() {
+                        return Err(at(format!("{EXCHANGE_KEY} is listed twice")));
+                    }
+                    settings.exchange = Some(folder_value(value).map_err(at)?);
+                }
+                other if secret_like(other) => {
+                    return Err(at("passwords, codes and the passphrase never go in this file; type them only in your own terminal, when skykeep-mcp setup, login or unlock asks".into()))
+                }
                 other if names().iter().any(|n| n == other) => {
                     return Err(at(format!(
                         "{} must be indented under rules:, with spaces in front of it",
@@ -361,7 +451,7 @@ pub fn parse(text: &str) -> Result<Rules, String> {
                 }
                 other => {
                     return Err(at(format!(
-                        "unknown setting {}; the file has version: and rules:",
+                        "unknown setting {}; the file has version:, {MODE_KEY}:, {EXCHANGE_KEY}: and rules:",
                         shown(other)
                     )))
                 }
@@ -435,7 +525,8 @@ pub fn parse(text: &str) -> Result<Rules, String> {
             ));
         }
     }
-    Ok(rules)
+    settings.rules = rules;
+    Ok(settings)
 }
 
 /// Single-character edits from `a` to `b`.
@@ -556,7 +647,7 @@ pub fn default_effect(
 /// The file as the server reads it.
 pub enum Source {
     Missing,
-    Rules(Rules),
+    Rules(Settings),
     Invalid(String),
 }
 
@@ -621,8 +712,8 @@ pub fn read(dir: &Path) -> (Source, String) {
             format!("invalid:{print}"),
         );
     };
-    match parse(&text) {
-        Ok(rules) => (Source::Rules(rules), print),
+    match parse_settings(&text) {
+        Ok(settings) => (Source::Rules(settings), print),
         Err(problem) => (Source::Invalid(problem), format!("invalid:{print}")),
     }
 }
@@ -640,10 +731,18 @@ fn fingerprint(bytes: &[u8]) -> String {
     quince_sync::queue::account_tag(&format!("skykeep-permissions:{hex}"))
 }
 
-/// The rules in force for one call.
+/// The rules and settings in force for one call.
+#[derive(Clone)]
 pub struct Active {
     /// The file's rules; while the file is unusable, the last valid rules loaded, if any.
     pub rules: Rules,
+    /// The approval mode in force: the file's, else the one setup stored.
+    pub mode: Option<String>,
+    /// Whether [`Self::mode`] comes from the file (or the last valid file).
+    pub mode_in_file: bool,
+    /// The file's exchange folder as written (or the last valid file's). `None` leaves the
+    /// folder set up with `skykeep-mcp exchange`, if any.
+    pub exchange: Option<String>,
     /// Changes whenever the file's bytes change; binds approvals to the rules they saw.
     pub fingerprint: String,
     pub problem: Option<String>,
@@ -763,8 +862,83 @@ fn require_all(library: &Library) -> bool {
 /// A load that changes the record: the new record, and the history entry it adds.
 type Change = (Value, Option<Value>);
 
+/// How strict an approval mode is, for telling a looser change from a stricter one. A folder
+/// without a mode counts as between writes_only and yolo, or as writes_only after
+/// `require-approval`.
+pub(crate) fn mode_rank(mode: Option<&str>, require_all: bool) -> u8 {
+    match mode {
+        Some("reads_and_writes") => 4,
+        Some("writes_only") => 3,
+        None if require_all => 3,
+        None => 2,
+        _ => 1,
+    }
+}
+
+/// The exchange folder `skykeep-mcp exchange` stored, for comparing with the file's.
+fn stored_exchange(library: &Library) -> Option<String> {
+    crate::exchange::configured(library)
+        .ok()
+        .flatten()
+        .map(|e| e.path.display().to_string())
+}
+
+/// The changes in the two settings: the approval mode, then the exchange folder. A different
+/// folder counts as looser, because its files become reachable; no folder counts as stricter.
+fn setting_changes(
+    library: &Library,
+    stored: &Value,
+    settings: &Settings,
+    mode: Option<&str>,
+    require_all: bool,
+) -> (Vec<Value>, Vec<Value>) {
+    let (mut looser, mut stricter) = (Vec::new(), Vec::new());
+    let before = stored[MODE_KEY].as_str().or(mode);
+    let after = settings.mode.as_deref().or(mode);
+    if before != after {
+        let change =
+            json!({"name":MODE_KEY,"from":before.unwrap_or("none"),"to":after.unwrap_or("none")});
+        if mode_rank(after, require_all) < mode_rank(before, require_all) {
+            looser.push(change);
+        } else {
+            stricter.push(change);
+        }
+    }
+    let legacy = stored_exchange(library);
+    let before = stored[EXCHANGE_KEY]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| legacy.clone());
+    let after = settings.exchange.clone().or(legacy);
+    if before != after {
+        let change = json!({"name":EXCHANGE_KEY,"from":before.as_deref().unwrap_or("none"),"to":after.as_deref().unwrap_or("none")});
+        if after.is_some() {
+            looser.push(change);
+        } else {
+            stricter.push(change);
+        }
+    }
+    (looser, stricter)
+}
+
+fn settings_value(settings: &Settings) -> Value {
+    json!({"rules":rules_value(&settings.rules),MODE_KEY:settings.mode,EXCHANGE_KEY:settings.exchange})
+}
+
+fn settings_from(value: &Value) -> Settings {
+    Settings {
+        rules: rules_from(&value["rules"]),
+        mode: value[MODE_KEY]
+            .as_str()
+            .filter(|m| MODE_NAMES.contains(m))
+            .map(str::to_string),
+        exchange: value[EXCHANGE_KEY].as_str().map(str::to_string),
+    }
+}
+
 /// What the file means right now, read without writing anything, and the record a load
-/// would write when the file's bytes changed since the last load.
+/// would write when the file's bytes changed since the last load. `mode` is the approval mode
+/// setup stored, which the file's `approval_mode:` replaces.
 fn evaluate(
     library: &Library,
     dir: &Path,
@@ -778,24 +952,29 @@ fn evaluate(
         .unwrap_or(Value::Null);
     let changed = stored["fingerprint"].as_str() != Some(print.as_str());
     let at = now();
-    // The last valid rules from a file, kept while a later file can't be used.
+    // The last valid rules and settings from a file, kept while a later file can't be used.
     let last_valid = stored["valid"].clone();
-    let (rules, problem, valid) = match source {
-        Source::Missing => (Rules::new(), None, Value::Null),
-        Source::Rules(rules) => {
+    let (settings, problem, valid) = match source {
+        Source::Missing => (Settings::default(), None, Value::Null),
+        Source::Rules(settings) => {
             let valid = if changed {
-                json!({"rules":rules_value(&rules),"at":at})
+                let mut v = settings_value(&settings);
+                v["at"] = json!(at);
+                v
             } else {
                 last_valid
             };
-            (rules, None, valid)
+            (settings, None, valid)
         }
-        Source::Invalid(problem) => (rules_from(&last_valid["rules"]), Some(problem), last_valid),
+        Source::Invalid(problem) => (settings_from(&last_valid), Some(problem), last_valid),
     };
     let kept_from = problem.as_ref().and(valid["at"].as_u64());
     let active = Active {
         strict: problem.is_some() && valid.is_null(),
-        rules,
+        rules: settings.rules.clone(),
+        mode: settings.mode.clone().or(mode.map(str::to_string)),
+        mode_in_file: settings.mode.is_some(),
+        exchange: settings.exchange.clone(),
         fingerprint: print.clone(),
         problem,
         kept_from,
@@ -805,18 +984,37 @@ fn evaluate(
     }
     let first = stored.is_null();
     let old = rules_from(&stored["rules"]);
-    let (looser, stricter) = diff(&old, &active.rules, mode, require_all(library));
+    let require_all = require_all(library);
+    let (mut looser, mut stricter) =
+        setting_changes(library, &stored, &settings, mode, require_all);
+    let (rules_looser, rules_stricter) =
+        diff(&old, &active.rules, active.mode.as_deref(), require_all);
+    looser.extend(rules_looser);
+    stricter.extend(rules_stricter);
     let seq = stored["seq"].as_u64().unwrap_or(0) + 1;
     // A folder that never had a file has nothing to report.
     let quiet = first && print == "missing";
-    let record = json!({"fingerprint":print,"rules":rules_value(&active.rules),
-        "problem":active.problem,"loaded_at":if quiet { Value::Null } else { json!(at) },
-        "seq":if quiet { seq - 1 } else { seq },"valid":valid});
+    let mut record = settings_value(&settings);
+    for (key, value) in [
+        ("fingerprint", json!(print)),
+        ("problem", json!(active.problem)),
+        ("loaded_at", if quiet { Value::Null } else { json!(at) }),
+        ("seq", json!(if quiet { seq - 1 } else { seq })),
+        ("valid", valid),
+    ] {
+        record[key] = value;
+    }
     let event = (!quiet).then(|| {
         json!({"seq":seq,"at":at,"looser":looser,"stricter":stricter,
             "problem":active.problem,"kept":active.kept_from,"missing":print == "missing"})
     });
     Ok((active, Some((record, event))))
+}
+
+/// The rules and settings in force, read the way the server reads them, without recording
+/// anything. `mode` is the approval mode setup stored.
+pub fn peek(library: &Library, dir: &Path, mode: Option<&str>) -> Result<Active, &'static str> {
+    evaluate(library, dir, mode).map(|(active, _)| active)
 }
 
 /// Reads the file and, when its bytes changed since the last load, records the load and what
@@ -942,6 +1140,17 @@ pub fn unseen(library: &Library) -> Vec<Value> {
 }
 
 fn change_line(c: &Value) -> String {
+    let text = |key: &str| shown(c[key].as_str().unwrap_or("none"));
+    if c["name"] == MODE_KEY {
+        return format!("approval mode: {} before, now {}", text("from"), text("to"));
+    }
+    if c["name"] == EXCHANGE_KEY {
+        return format!(
+            "exchange folder: {} before, now {}",
+            text("from"),
+            text("to")
+        );
+    }
     // Not an action: allow lets changes run, anything else refuses them.
     if c["name"] == crate::calendar_write::INVITATIONS_RULE {
         let runs = |key: &str| c[key] == Effect::Allow.as_str();
@@ -1006,6 +1215,7 @@ pub fn status(library: &Library, dir: &Path, mode: Option<&str>) -> Vec<(String,
             None,
         )),
     }
+    out.push(exchange_line(library, dir, &active));
     let mut pending = looser_unseen(library);
     if let Some(event) = change.and_then(|(_, event)| event) {
         add_looser(&mut pending, &event);
@@ -1026,6 +1236,49 @@ pub fn status(library: &Library, dir: &Path, mode: Option<&str>) -> Vec<(String,
         ));
     }
     out
+}
+
+/// The status line for the exchange folder in force, with the fix when it can't be used.
+fn exchange_line(library: &Library, dir: &Path, active: &Active) -> (String, Option<String>) {
+    let legacy = crate::exchange::configured(library).ok().flatten();
+    let file = dir.join(FILE_NAME);
+    let (written, from) = match (&active.exchange, &legacy) {
+        (Some(written), _) => (written.clone(), "set in permissions.yaml"),
+        (None, Some(e)) => (
+            e.path.display().to_string(),
+            "set up with skykeep-mcp exchange",
+        ),
+        (None, None) => {
+            return (
+                format!(
+                    "Exchange folder: not set up, so Drive and Photos uploads and Drive downloads are refused. To set one, add {EXCHANGE_KEY}: to {} or run skykeep-mcp exchange.",
+                    file.display()
+                ),
+                None,
+            )
+        }
+    };
+    match crate::exchange::in_force(library, dir) {
+        Ok(Some(e)) => (
+            format!(
+                "Exchange folder: {}, {from}. Drive and Photos uploads read from it and Drive downloads write into it.",
+                e.path.display()
+            ),
+            None,
+        ),
+        Ok(None) => (
+            "Exchange folder: not set up, so Drive and Photos uploads and Drive downloads are refused.".into(),
+            Some("Run skykeep-mcp exchange.".into()),
+        ),
+        Err(code) => (
+            format!(
+                "Exchange folder: {} ({from}) {}, so Drive and Photos uploads and Drive downloads are refused.",
+                shown_problem(&written),
+                crate::exchange::problem(code)
+            ),
+            Some(crate::exchange::fix(code, dir, active.exchange.as_deref())),
+        ),
+    }
 }
 
 /// What the server really does for `effect` on one action, and why when that differs: a
@@ -1100,10 +1353,10 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
     let held = crate::state::PrivateState::open(dir)?;
     let dir = held.path.as_path();
     let mut library = crate::setup(dir)?;
-    let (mode, mode_text) = match crate::policy(&library, dir) {
-        Ok(Some((p, _))) => (
-            Some(p.mode.clone()),
-            crate::status::describe_mode(&p.mode).to_string(),
+    let (mode, mode_text) = match crate::stored_mode(&library, dir) {
+        Ok(Some(m)) => (
+            Some(m.clone()),
+            crate::status::describe_mode(&m).to_string(),
         ),
         Ok(None) => (
             None,
@@ -1115,6 +1368,10 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
         Err(_) => (None, "the approval mode can't be read".into()),
     };
     let active = load(&mut library, dir, mode.as_deref())?;
+    let mode_text = match (&active.mode, active.mode_in_file) {
+        (Some(m), true) => crate::status::describe_mode(m).to_string(),
+        _ => mode_text,
+    };
     let loaded: Value = library
         .state(LOADED_KEY)
         .map_err(|_| "library_unavailable")?
@@ -1165,6 +1422,20 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
     out.push_str(&format!(
         "Everything not listed follows the approval mode: {mode_text}\n"
     ));
+    match (&active.mode, active.mode_in_file) {
+        (Some(m), true) => out.push_str(&format!(
+            "Approval mode: {m}, set in permissions.yaml ({MODE_KEY}:). It replaces the mode chosen in setup.\n"
+        )),
+        (Some(m), false) => out.push_str(&format!(
+            "Approval mode: {m}, chosen in setup. A {MODE_KEY}: line in the file would replace it.\n"
+        )),
+        (None, _) => {}
+    }
+    let (exchange, fix) = exchange_line(&library, dir, &active);
+    out.push_str(&format!("{exchange}\n"));
+    if let Some(fix) = fix {
+        out.push_str(&format!("  Next step: {fix}\n"));
+    }
     let unseen = unseen(&library);
     let pending = looser_unseen(&library);
     let total = pending["count"].as_u64().unwrap_or(0);
@@ -1275,7 +1546,17 @@ pub fn starter(dir: &Path) -> String {
          # To check it, run: SKYKEEP_SHOW\n\
          #\n\
          # Write ask on its own indented line, as below, or as {ask: client}.\n\
+         #\n\
+         # Two settings can stand beside the rules. Each replaces what setup or the older\n\
+         # terminal commands stored, and skykeep-mcp policy and skykeep-mcp exchange edit them:\n\
+         #   approval_mode: reads_and_writes, writes_only or yolo. Deletions ask in every mode.\n\
+         #   exchange_folder: the one folder Drive and Photos uploads read from and Drive\n\
+         #     downloads write into. A private folder of your own, not a link, not a system\n\
+         #     folder and not inside a hidden folder such as .ssh or the private folder.\n\
+         # Passwords, codes and the passphrase never go in this file.\n\
          version: 1\n\
+         # approval_mode: writes_only\n\
+         # exchange_folder: ~/Skykeep-Exchange\n\
          rules:\n",
     )
     .replace("SKYKEEP_SHOW", &show);
@@ -1485,6 +1766,128 @@ fn save_allow_checked(
         dir,
         json!({"at":now(),"name":name,"rule":"allow","source":"card"}),
     );
+    Ok(())
+}
+
+/// `text` with the top-level `key: value` set: an existing line is rewritten in place,
+/// keeping its comment; a new one goes after the `version:` line, or before the first setting.
+fn with_setting(text: &str, key: &str, value: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let content = |l: &str| uncommented(l).trim_end().to_string();
+    let top_key = |l: &str| {
+        let c = content(l);
+        (!c.is_empty() && !c.starts_with(' '))
+            .then(|| c.split_once(':').map(|(k, _)| unquote(k).to_string()))
+            .flatten()
+    };
+    let line = format!("{key}: {value}");
+    if let Some(i) = lines
+        .iter()
+        .position(|l| top_key(l).as_deref() == Some(key))
+    {
+        let comment = lines[i][content(&lines[i]).len()..].to_string();
+        lines[i] = format!("{line}{comment}");
+    } else if let Some(i) = lines
+        .iter()
+        .position(|l| top_key(l).as_deref() == Some("version"))
+    {
+        lines.insert(i + 1, line);
+    } else {
+        let first = lines
+            .iter()
+            .position(|l| top_key(l).is_some())
+            .unwrap_or(lines.len());
+        lines.insert(first, line);
+    }
+    lines.join("\n") + "\n"
+}
+
+/// A value as the file writes it: plain, or in double quotes when it would not read back.
+fn written(value: &str) -> String {
+    let plain = !value.contains(" #")
+        && !value.contains(": ")
+        && value.trim() == value
+        && !value.starts_with(['"', '\'', '{', '[', '&', '*', '!', '|', '>', '%', '@']);
+    if plain {
+        value.to_string()
+    } else {
+        format!("\"{value}\"")
+    }
+}
+
+/// The value of `key` in the file as it is now, when the file can be used.
+pub fn setting_in_file(dir: &Path, key: &str) -> Option<String> {
+    let bytes = read_bytes(dir).ok()??;
+    let settings = parse_settings(&String::from_utf8(bytes).ok()?).ok()?;
+    match key {
+        MODE_KEY => settings.mode,
+        EXCHANGE_KEY => settings.exchange,
+        _ => None,
+    }
+}
+
+/// Whether [`set_setting`] could edit the file now: it is missing, or a usable file.
+pub fn editable(dir: &Path) -> Result<(), String> {
+    match read_bytes(dir).map_err(|p| format!("the file can't be used: {p}"))? {
+        None => Ok(()),
+        Some(bytes) => {
+            let text = String::from_utf8(bytes)
+                .map_err(|_| "the file has a mistake: it is not UTF-8 text".to_string())?;
+            parse_settings(&text)
+                .map(|_| ())
+                .map_err(|p| format!("the file has a mistake: {}", shown_problem(&p)))
+        }
+    }
+}
+
+/// Sets `approval_mode:` or `exchange_folder:` in the file, for `skykeep-mcp policy`,
+/// `skykeep-mcp exchange` and setup, in the person's own terminal. Every other line and
+/// comment stays as it was; the old file is kept as `permissions.yaml.bak`, and the new one is
+/// written whole and private. A missing file becomes a short one; a file with a mistake is
+/// left alone. Returns why nothing was written.
+pub fn set_setting(dir: &Path, key: &str, value: &str) -> Result<(), String> {
+    if ![MODE_KEY, EXCHANGE_KEY].contains(&key) {
+        return Err(format!("{} is not a setting of this file", shown(key)));
+    }
+    editable(dir)?;
+    let old = read_bytes(dir)?;
+    let print = old
+        .as_deref()
+        .map_or_else(|| "missing".to_string(), fingerprint);
+    let text = match &old {
+        Some(bytes) => {
+            String::from_utf8(bytes.clone()).map_err(|_| "the file is not UTF-8 text")?
+        }
+        None => String::from("version: 1\n"),
+    };
+    let mut want = parse_settings(&text)?;
+    match key {
+        MODE_KEY => want.mode = Some(value.to_string()),
+        _ => want.exchange = Some(value.to_string()),
+    }
+    let new = with_setting(&text, key, &written(value));
+    match parse_settings(&new) {
+        Ok(got) if got == want && new.len() as u64 <= MAX_FILE_BYTES => {}
+        Ok(_) => return Err("the file's layout can't be edited safely".into()),
+        Err(problem) => {
+            return Err(format!(
+                "{} can't be written there: {}",
+                shown(value),
+                shown_problem(&problem)
+            ))
+        }
+    }
+    if let Some(bytes) = &old {
+        write_atomic(dir, BACKUP_NAME, bytes)?;
+    }
+    // An edit that landed meanwhile wins.
+    let now_print = read_bytes(dir)?
+        .as_deref()
+        .map_or_else(|| "missing".to_string(), fingerprint);
+    if now_print != print {
+        return Err("the file changed while it was being edited; run the command again".into());
+    }
+    write_atomic(dir, FILE_NAME, new.as_bytes())?;
     Ok(())
 }
 

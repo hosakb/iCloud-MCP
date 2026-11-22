@@ -279,7 +279,11 @@ fn survey(env: &Env, dir: &Path) -> Result<Found, &'static str> {
             }
         }
     }
+    // The mode in force: the permissions file's approval_mode, else the stored one.
     let mode = match crate::policy(&library, dir) {
+        Ok(_) if file_mode(&library, dir).is_some() => file_mode(&library, dir),
+        // Taken over from a file line that is gone: back to no approval mode.
+        Ok(Some(_)) if crate::adopted(&library) => Some("none".into()),
         Ok(Some((p, _))) => Some(p.mode),
         Ok(None) if no_mode_chosen(&library) => Some("none".into()),
         _ => None,
@@ -290,6 +294,15 @@ fn survey(env: &Env, dir: &Path) -> Result<Found, &'static str> {
         account,
         mode,
     })
+}
+
+/// The approval mode `permissions.yaml` sets in `dir` (or its last valid one), if it sets one.
+fn file_mode(library: &quince_core::Library, dir: &Path) -> Option<String> {
+    let stored = crate::stored_mode(library, dir).ok().flatten();
+    crate::permissions::peek(library, dir, stored.as_deref())
+        .ok()
+        .filter(|a| a.mode_in_file)
+        .and_then(|a| a.mode)
 }
 
 /// The mode in words; "none" says what it does in this folder, from `library`.
@@ -384,10 +397,12 @@ async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcom
         }
         let mode = {
             let held = PrivateState::open(&dir)?;
-            describe(
-                found.mode.as_deref().unwrap_or_default(),
-                &crate::setup(&held.path)?,
-            )
+            let library = crate::setup(&held.path)?;
+            let mut text = describe(found.mode.as_deref().unwrap_or_default(), &library);
+            if file_mode(&library, &held.path).is_some() {
+                text.push_str(" (set in permissions.yaml)");
+            }
+            text
         };
         c.say(&format!(
             "\nThis folder is already set up. Sign-in kept in the {}, signed in as {}, approval mode: {mode}",
@@ -831,7 +846,7 @@ const CARD_NOTE: &str = "The client must be able to show Skykeep's approval card
 
 /// Step 4. Runs after the sign-in: a policy saved before sign-in is bound to no account.
 fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str> {
-    console.say(&format!("\nStep 4 of 5: Approval mode\nThis decides when the assistant has to ask you before it acts. Every choice asks on the approval card in your MCP client. {CARD_NOTE}"))?;
+    console.say(&format!("\nStep 4 of 5: Approval mode\nThis decides when the assistant has to ask you before it acts. Every choice asks on the approval card in your MCP client. {CARD_NOTE} You can change it later with an {}: line in permissions.yaml in this folder; a line there wins over what you choose here, and setup keeps it in step.", crate::permissions::MODE_KEY))?;
     let held = PrivateState::open(dir)?;
     let library = crate::setup(&held.path)?;
     if library
@@ -842,7 +857,36 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
         return Err("login_required");
     }
     let existing = crate::policy(&library, &held.path);
+    let in_file = file_mode(&library, &held.path);
+    // The file's mode, kept with Enter in a folder that has no stored mode yet: it is stored
+    // too, so queued changes are bound to it.
+    let mut keep = None;
     match &existing {
+        Ok(_) if in_file.is_some() => {
+            let answer = console.ask(&format!(
+                "Current mode: {} It is set in permissions.yaml ({}:), which replaces the mode chosen here; a new choice changes that line.\nPress Enter to keep it, or type change: ",
+                status::describe_mode(in_file.as_deref().unwrap_or_default()),
+                crate::permissions::MODE_KEY
+            ))?;
+            if answer.trim().is_empty() {
+                if matches!(existing, Ok(Some(_))) {
+                    return Ok(());
+                }
+                keep = MODES
+                    .iter()
+                    .map(|(m, _)| *m)
+                    .find(|m| Some(*m) == in_file.as_deref());
+            }
+        }
+        Ok(Some(_)) if crate::adopted(&library) => {
+            let answer = console.ask(&format!(
+                "Current mode: {}\nPress Enter to keep it, or type change: ",
+                describe("none", &library)
+            ))?;
+            if answer.trim().is_empty() {
+                return Ok(());
+            }
+        }
         Ok(Some((policy, _))) => {
             let answer = console.ask(&format!(
                 "Current mode: {}\nPress Enter to keep it, or type change: ",
@@ -871,19 +915,31 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
     let raw = library
         .state("mcp.policy")
         .map_err(|_| "policy_unavailable")?;
-    let offer_none = raw.is_none();
+    // A mode line in permissions.yaml would still apply, so no-mode is not offered then.
+    let offer_none = raw.is_none() && in_file.is_none();
     let mut menu = format!(
         "  1. {} Recommended.\n  2. {}\n  3. {}\n",
         MODES[0].1, MODES[1].1, MODES[2].1
     );
     if offer_none {
         menu.push_str(&format!("  4. No approval mode (older behaviour). {} Once you pick 1, 2 or 3, this folder can't go back to 4. Most people should pick 1.\nChoose 1, 2, 3 or 4 (Enter picks 1): ", status::no_mode_choice(&library)));
+    } else if in_file.is_some() {
+        if keep.is_none() {
+            console.say(&format!(
+                "permissions.yaml sets {}:, so there is no choice without an approval mode.",
+                crate::permissions::MODE_KEY
+            ))?;
+        }
+        menu.push_str("Choose 1, 2 or 3 (Enter picks 1): ");
     } else {
         console.say("This folder has had an approval mode, so there is no choice without one.")?;
         menu.push_str("Choose 1, 2 or 3 (Enter picks 1): ");
     }
     let count = if offer_none { 4 } else { 3 };
     let mode = loop {
+        if let Some(keep) = keep {
+            break Some(keep);
+        }
         let n = choose(console, &menu, count, Some(1))?;
         if n == 3
             && console
@@ -920,7 +976,12 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
     loop {
         let ids: Vec<i64> = {
             let held = PrivateState::open(dir)?;
-            crate::setup(&held.path)?
+            let library = crate::setup(&held.path)?;
+            // Kept from the file: an edit made while setup was asking wins, and nothing is saved.
+            if keep.is_some() && file_mode(&library, &held.path).as_deref() != keep {
+                return Err("permissions.yaml changed while setup was asking, so the approval mode was not saved. Run skykeep-mcp setup again to see the mode the file names now.");
+            }
+            library
                 .outbox_all_pending()
                 .map_err(|_| "library_unavailable")?
                 .iter()
@@ -942,10 +1003,21 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
             Ok(saved) => {
                 let held = PrivateState::open(dir)?;
                 let _ = crate::setup(&held.path)?.set_state(NO_MODE_KEY, "");
-                return console.say(&format!(
+                console.say(&format!(
                     "Approval mode saved: {}",
                     status::describe_mode(saved["mode"].as_str().unwrap_or_default())
-                ));
+                ))?;
+                // A line in the file would win over the choice, so it is changed to match.
+                let key = crate::permissions::MODE_KEY;
+                // Kept from the file: the file already holds it and is never rewritten here.
+                if keep.is_none() && crate::permissions::setting_in_file(&held.path, key).is_some()
+                {
+                    match crate::permissions::set_setting(&held.path, key, mode) {
+                        Ok(()) => console.say(&format!("permissions.yaml now says {key}: {mode}."))?,
+                        Err(reason) => console.say(&format!("permissions.yaml could not be changed to match ({reason}); its {key}: line still wins. Change it there."))?,
+                    }
+                }
+                return Ok(());
             }
             Err("pending_changed") => {
                 console.say("More changes were queued while you were answering.")?

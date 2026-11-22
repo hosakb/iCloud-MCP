@@ -1198,7 +1198,7 @@ pub(crate) async fn run(
         return Err("login_required");
     }
     if !approved {
-        let mode = crate::policy(&library, dir)?.map(|(p, _)| p.mode);
+        let mode = crate::mode_in_force(&library, dir)?;
         if mode.as_deref().is_some_and(|m| m != "yolo") || is_destructive(op.action()) {
             return Err("approval_required");
         }

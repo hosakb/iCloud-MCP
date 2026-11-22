@@ -936,6 +936,55 @@ fn leftovers(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The folder in permissions.yaml wins over the one set up in the terminal; a bad one there
+/// refuses the transfer with what to change, and never falls back to the older folder.
+#[tokio::test]
+async fn the_exchange_folder_in_permissions_yaml_wins_and_a_bad_one_never_falls_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = fixture(None).await;
+    serve_download(&f.remote, b"hello world".to_vec()).await;
+    let other = f.exchange.with_extension("yaml");
+    std::fs::create_dir(&other).unwrap();
+    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let file = f.dir.path().join("permissions.yaml");
+    let write = |folder: &Path| {
+        std::fs::write(
+            &file,
+            format!("version: 1\nexchange_folder: {}\n", folder.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    write(&other);
+    ok(&mut f.server, json!({"action":"download","id":REPORT})).await;
+    assert_eq!(
+        std::fs::read(other.join("report.pdf")).unwrap(),
+        b"hello world"
+    );
+    assert!(!f.exchange.join("report.pdf").exists());
+    std::os::unix::fs::symlink(&f.exchange, other.join("link")).unwrap();
+    for (folder, code) in [
+        (other.join("gone"), "exchange_folder_missing"),
+        (other.join("link"), "exchange_folder_is_a_link"),
+        (f.dir.path().to_path_buf(), "exchange_folder_private_state"),
+    ] {
+        write(&folder);
+        let reply = call(
+            &mut f.server,
+            json!({"action":"download","id":REPORT,"local":"again.pdf"}),
+        )
+        .await;
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        let body = text(&reply);
+        assert_eq!(body["error"], code, "{body}");
+        let next = body["instructions"].as_str().unwrap();
+        assert!(next.contains("permissions.yaml"), "{next}");
+        assert!(!f.exchange.join("again.pdf").exists(), "no fallback");
+        assert!(!other.join("again.pdf").exists());
+    }
+    std::fs::remove_dir_all(&other).unwrap();
+}
+
 #[tokio::test]
 async fn download_writes_a_new_file_and_never_overwrites() {
     let mut f = fixture(None).await;
@@ -1997,6 +2046,19 @@ fn the_exchange_command_defaults_its_state_folder() {
     let saved: Value =
         serde_json::from_str(&library.state("mcp.drive.exchange").unwrap().unwrap()).unwrap();
     assert_eq!(saved["max_bytes"], 5 * 1024 * 1024);
+    // The folder is the file's setting now; the command said so.
+    assert_eq!(
+        skykeep_mcp::permissions::setting_in_file(
+            &state.canonicalize().unwrap(),
+            skykeep_mcp::permissions::EXCHANGE_KEY
+        )
+        .as_deref(),
+        Some(real.to_str().unwrap())
+    );
+    assert!(
+        said.contains("permissions.yaml now says exchange_folder:"),
+        "{said}"
+    );
 }
 
 /// A link among the folders above the exchange folder (as /home can be on some systems) is
@@ -2554,4 +2616,27 @@ async fn a_drive_deletion_card_starts_with_a_plain_sentence() {
         first.ends_with(" in iCloud Drive. This can't be undone."),
         "{first}"
     );
+}
+
+/// The file's approval_mode is the mode in force for Drive too: yolo there runs a change
+/// without a card where setup stored writes_only, and a trash still asks.
+#[tokio::test]
+async fn the_files_yolo_runs_a_drive_change_unasked_and_trash_still_asks() {
+    let mut f = fixture(Some("writes_only")).await;
+    rules(f.dir.path(), "version: 1\napproval_mode: yolo\n");
+    serve_listing(&f.remote, DOCS, docs_items(), None).await;
+    answer(
+        &f.remote,
+        "/createFolders",
+        json!({"folders":[{"drivewsid":"FOLDER::com.apple.CloudDocs::NEW","name":"Taxes","type":"FOLDER","status":"OK"}]}),
+    )
+    .await;
+    let done = ok(
+        &mut f.server,
+        json!({"action":"create_folder","path":"/Documents","name":"Taxes"}),
+    )
+    .await;
+    assert_eq!(done["outcome"], "done", "{done}");
+    let form = call(&mut f.server, json!({"action":"trash","id":REPORT})).await;
+    assert_eq!(form["method"], "elicitation/create", "{form}");
 }

@@ -6,7 +6,7 @@ iCloud-MCP is a local MCP server for Apple Notes, Reminders, Contacts, Calendar,
 - Contacts can be read and changed with `contacts_write`, one card per call. Deletions always need your approval.
 - Calendar events can be read, and created, changed, moved to another calendar or deleted with `calendar_write`. Deletes always need your approval.
 - Photos reads give metadata only, never the pictures. `photos_write` changes photo details and albums, uploads a file from the exchange folder, and moves a photo to Recently Deleted only with your approval.
-- iCloud Drive can be read and changed with `drive_write`. File contents move only through one local exchange folder you set up, and deletions always need your approval.
+- iCloud Drive can be read and changed with `drive_write`. File contents move only through one local exchange folder you name, and deletions always need your approval.
 - `setup` guides you through sign-in in your own terminal. `status` checks the setup and `unlock` opens the protected sign-in file after a restart.
 - Every approval happens on a card in your MCP client, in every approval mode. Hermes shows it. A client without the card, or a session where nobody answers it, can't run actions that need approval; they are refused and nothing runs.
 - A permissions file sets each tool or action to `allow`, `ask` or `deny`. With `ask: client` your MCP client shows a card with "Approve this time", "Deny" and, where an allow rule would stop the asking, "Always allow this action". The server reads the file at every tool call, so an edit counts from the next call.
@@ -62,7 +62,7 @@ You need a terminal window that you open yourself. Don't run these commands thro
       | 3. Don't ask before reads or changes (`yolo`, you type `confirm`) | No question | No question, except deletions, moves to Recently Deleted and moves and renames of large Drive folders, which ask in the MCP client |
       | 4. No approval mode, the older behaviour (you type `confirm`) | No question | Like choice 3. You can later run `skykeep-mcp require-approval` to make every change ask. Most people should pick 1 |
 
-      Every choice asks on iCloud-MCP's approval card in the MCP client. Hermes supports MCP form elicitation and shows the card. In a client without the card, a request that needs approval is refused with `approval_requires_form_client`, and nothing runs. A session where nobody answers, such as a scheduled job, gets `approval_timeout` after 3 minutes, and nothing runs either. Choice 4 keeps a folder's earlier `require-approval` setting: then every change asks on the card, and setup and status say so. Once a folder has had choice 1, 2 or 3, it can't go back to 4; set up a new folder instead.
+      Every choice asks on iCloud-MCP's approval card in the MCP client. Hermes supports MCP form elicitation and shows the card. In a client without the card, a request that needs approval is refused with `approval_requires_form_client`, and nothing runs. A session where nobody answers, such as a scheduled job, gets `approval_timeout` after 3 minutes, and nothing runs either. Choice 4 keeps a folder's earlier `require-approval` setting: then every change asks on the card, and setup and status say so. Once a folder has had choice 1, 2 or 3, it can't go back to 4; set up a new folder instead. You can change the mode later with an `approval_mode:` line in `permissions.yaml` (see "Settings in the permissions file"). A line there wins over the choice made here, and setup changes that line to match when you choose again.
    After step 4, setup offers to write a starter permissions file. In it every deletion asks on the card. Press Enter to skip it.
    5. **Check.** Setup checks everything it set up and prints what to paste into your MCP client's settings: a JSON line for most clients, and a `config.yaml` block for Hermes.
 
@@ -187,13 +187,15 @@ The permissions file can name `drive_write` and each of its actions (see "Permis
 
 ### The exchange folder
 
-Uploads read from, and downloads write into, one local folder. Set it up in your own terminal:
+Uploads read from, and downloads write into, one local folder. Name it with an `exchange_folder:` line in `permissions.yaml` (see "Settings in the permissions file"), or set it up in your own terminal:
 
 ```sh
 skykeep-mcp exchange --state-dir ~/.local/share/skykeep-mcp
 ```
 
-Like `setup`, `status` and `unlock`, it uses `~/.local/share/skykeep-mcp` when `--state-dir` is left out, and its flags can come in any order. A symbolic link among the folders above it (such as `/home` pointing to `/var/home`) is followed once, here, and the real path is kept; the exchange folder itself must not be a link. It creates `~/Skykeep-Exchange` (mode `0700`) if needed and prints the folder and the size limit. Nothing else changes. `--path DIR` picks another folder (its parent must exist) and `--max-mb N` changes the limit, 100 MB by default. No MCP argument can name the folder or change the limit. Until it is set up, `upload` and `download` are refused.
+Like `setup`, `status` and `unlock`, it uses `~/.local/share/skykeep-mcp` when `--state-dir` is left out, and its flags can come in any order. A symbolic link among the folders above it (such as `/home` pointing to `/var/home`) is followed once, here, and the real path is kept; the exchange folder itself must not be a link. It creates `~/Skykeep-Exchange` (mode `0700`) if needed, writes its full path into the `exchange_folder:` line of `permissions.yaml` and prints the folder and the size limit. `--path DIR` picks another folder (its parent must exist); without it, the command keeps the folder the file names. `--max-mb N` changes the limit, 100 MB by default; the limit is set only here, not in the file. No MCP argument can name the folder or change the limit. Until a folder is named, `upload` and `download` are refused.
+
+The folder is checked before every upload and download. It must exist and be a folder of yours that no one else can change. It can't be a symbolic link, a system folder such as `/etc` or `/usr`, your home folder or a folder above it, or a folder inside a hidden folder (a name that starts with a dot, such as `.ssh`, `.gnupg` or `.aws`) or a folder whose name has "credential" or "keyring" in it. It also can't be iCloud-MCP's own folder, a folder inside it, or a folder that holds it. A folder that fails is refused with what is wrong and what to change; iCloud-MCP never falls back to another folder, such as the one `skykeep-mcp exchange` set up earlier. `status` shows the folder in use and says where it comes from.
 
 The `local` argument names a file inside the folder as a relative path, such as `report.pdf` or `in/report.pdf`. Absolute paths, `..` and symbolic links anywhere on the way are refused; each name is opened with no-follow semantics, and the folder must still be the one you set up. An upload must be a regular file with no other hard link. A download never replaces an existing file: it arrives as a hidden partial file and takes its name only if the name is still free. Without `local`, a download takes the item's name with control and text-direction characters removed, and a name that could leave the folder is refused. The limit is checked while bytes are read or arrive, not afterwards, and a stopped transfer leaves nothing behind; a partial download left by a crash is removed by the next download into that folder once it is ten minutes old. The exchange folder, and every folder inside it on the way to the file, must be yours and not writable by others; a refusal says the exact `chmod 700` line that fixes it. The folders above the exchange folder are not checked. One upload or download may take two minutes plus one second per 256 KB of the limit, about nine minutes at 100 MB; past that it stops and keeps nothing.
 
@@ -276,17 +278,37 @@ nano ~/.local/share/skykeep-mcp/permissions.yaml
 
 Use your folder if it is another one. nano keeps the file's mode 600, so only you can read or change it. A new file gets your usual mode, often 664 on Ubuntu, and iCloud-MCP then reports it with the `chmod 600` command to run. Some editors leave a backup copy such as `permissions.yaml~` next to it; if others can read that copy, iCloud-MCP refuses the whole folder and names the file to delete or `chmod 600`.
 
- This means a client or agent that can edit this file can change its own approval level, for example to delete without asking. That is a deliberate choice for ease of use. If you don't want it, don't give the agent file access to the folder. The rules themselves are never visible or changeable through iCloud-MCP's MCP tools.
+ This means a client or agent that can edit this file can change its own approval level, for example to skip the card for routine changes, switch the approval mode to `yolo` or point the exchange folder at another folder of yours. Deletions still ask on the card whatever the file says. That is a deliberate choice for ease of use. If you don't want it, don't give the agent file access to the folder. The rules and settings are never visible or changeable through iCloud-MCP's MCP tools, and every looser change is listed until you run `permissions show` in your own terminal.
 
-**When the file is wrong.** iCloud-MCP reads only a regular file in the folder that belongs to you and that no one else can change. It never follows a link and reads at most 64 KiB. The format is a strict part of YAML: `version: 1`, `rules:`, and one rule per line indented with spaces. A broken file never makes anything looser. iCloud-MCP keeps the last valid rules it loaded from the file. If there are none, the approval mode decides and every deletion asks, even under `yolo`. Each tool result says so while the file is unusable, and `status` and `permissions show` say what is wrong. A file that others can change, which is common on Ubuntu with mode 664, is reported with the command that fixes it: `chmod 600 FOLDER/permissions.yaml`.
+**When the file is wrong.** iCloud-MCP reads only a regular file in the folder that belongs to you and that no one else can change. It never follows a link and reads at most 64 KiB. The format is a strict part of YAML: `version: 1`, the two settings below, `rules:`, and one rule per line indented with spaces. A broken file never makes anything looser. iCloud-MCP keeps the last valid rules and settings it loaded from the file. If there are none, the approval mode decides and every deletion asks, even under `yolo`. Each tool result says so while the file is unusable, and `status` and `permissions show` say what is wrong. A file that others can change, which is common on Ubuntu with mode 664, is reported with the command that fixes it: `chmod 600 FOLDER/permissions.yaml`.
 
-**Seeing what changed.** Each time the file's content changes, iCloud-MCP records when it loaded it and what became looser or stricter. `skykeep-mcp status` reports looser changes, for example `reminders_write.create: asks in your MCP client before, now runs without asking`, until you look. `status` only reads; it never records anything.
+**Seeing what changed.** Each time the file's content changes, iCloud-MCP records when it loaded it and what became looser or stricter. `skykeep-mcp status` reports looser changes, for example `reminders_write.create: asks in your MCP client before, now runs without asking`, `approval mode: writes_only before, now yolo` or a new exchange folder, until you look. `status` only reads; it never records anything.
 
 ```sh
 skykeep-mcp permissions show --state-dir FOLDER
 ```
 
 It needs a folder that setup has prepared. It prints the rules in use, when the last change was loaded, any problem with the file, every change since you last ran it in your own terminal, and the newest lines of `permissions-log.jsonl`. That log gets one line, with the rule name and time but no content, for each rule saved from a card. A deletion never runs without asking, so the log has no lines for that. A run through an agent's terminal shows the changes but does not mark them as seen. An agent that can edit files can also edit the log, so it is a record, not a protection.
+
+### Settings in the permissions file
+
+Two settings can stand next to the rules, each on its own line without indentation:
+
+```yaml
+version: 1
+approval_mode: writes_only            # reads_and_writes, writes_only or yolo
+exchange_folder: ~/Skykeep-Exchange   # a full path, or one that starts with ~/
+rules:
+  notes_write.delete:
+    ask: client
+```
+
+- `approval_mode:` replaces the mode chosen in setup. The modes are the ones in the table under "Get started". Every deletion, move to Recently Deleted and move or rename of a large Drive folder still asks on the card in every mode. Without the line, the mode from setup applies. In a folder where setup stored no mode, the first tool call after sign-in stores the file's mode so that queued changes are bound to it, and sets aside changes already waiting (`skykeep-mcp quarantine` lists them). That stored mode still counts only while the line is there.
+- `exchange_folder:` names the exchange folder (see "The exchange folder" for the checks). Without the line, the folder set up with `skykeep-mcp exchange` applies, if there is one.
+
+A line in the file wins. `skykeep-mcp policy` and `skykeep-mcp exchange` still work: each changes its line in the file, keeps every other line and comment, keeps the previous file as `permissions.yaml.bak` and writes the new one in one step with mode 600. A file with a mistake is left alone, and the command changes nothing and says what to fix. An edit counts at the next tool call, like a rule. A broken file keeps the last valid settings; if there are none, the mode from setup and the folder from `skykeep-mcp exchange` stay. `status` and `permissions show` say which mode and folder are in use and where each comes from.
+
+Passwords, verification codes and the passphrase never go in the file. A line that looks like one (`password:`, `passphrase:`, `code:`, `token:` and similar) makes the file unusable, and the message does not repeat it. `setup`, `login`, `logout` and `unlock` stay terminal-only, and `approve` is only for actions set to `ask: terminal`.
 
 ## Limitations
 
@@ -313,7 +335,8 @@ deletion and large Drive folder move or rename, like choice 3. The difference is
 The human-only command is `skykeep-mcp policy --state-dir DIR MODE`, where MODE is
 `reads_and_writes`, `writes_only`, or `yolo`. It requires a user-owned terminal,
 literal `confirm`, persists a fresh revision bound to the account and directory
-device/inode, and prints the saved record. It is never exposed as an MCP tool.
+device/inode, writes `approval_mode: MODE` into `permissions.yaml`, and prints the saved
+record. It refuses before asking anything when the file has a mistake. It is never exposed as an MCP tool.
 Account changes or copied policies fail closed until the human explicitly migrates
 again. Existing terminal policy commands cannot override an activated new policy.
 No migration back to legacy is provided. In each mode that asks, every approval is

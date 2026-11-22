@@ -740,7 +740,7 @@ pub(crate) async fn run(
         return Err("login_required");
     }
     if !approved {
-        let mode = crate::policy(&library, dir)?.map(|(p, _)| p.mode);
+        let mode = crate::mode_in_force(&library, dir)?;
         if mode.as_deref().is_some_and(|m| m != "yolo") || needs_person(&op) {
             return Err("approval_required");
         }
@@ -771,7 +771,7 @@ pub(crate) async fn run(
     // The local side first: nothing is asked of Apple for a file that cannot be read.
     let staged = match &op {
         PhotosWrite::Upload { local } => {
-            let exchange = exchange::configured(&library)?.ok_or(NO_EXCHANGE)?;
+            let exchange = exchange::in_force(&library, dir)?.ok_or(NO_EXCHANGE)?;
             let (file, size) = exchange::open_upload(&exchange, local)?;
             let name = local.rsplit('/').next().ok_or("invalid_local_path")?;
             if let Some(refused) = upload::refusal(name, size) {

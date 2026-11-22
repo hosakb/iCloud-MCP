@@ -109,6 +109,7 @@ pub fn with_dir(text: &str, dir: &Path) -> String {
             "quarantine",
             "permissions",
             "exchange",
+            "policy",
         ]
         .contains(&word.as_str());
         // `permissions show` is one command: the folder goes after both words.
@@ -308,10 +309,30 @@ pub fn check(env: &Env, dir: &Path) -> Report {
         (Some(_), _) => report.ok("The folder is tied to one Apple Account."),
     }
 
+    // The file's approval_mode, when it names one, replaces the mode stored by setup.
+    let in_file = library.as_ref().and_then(|l| {
+        let stored = crate::stored_mode(l, dir).ok().flatten();
+        crate::permissions::peek(l, dir, stored.as_deref())
+            .ok()
+            .filter(|a| a.mode_in_file)
+            .and_then(|a| a.mode)
+    });
     match library.as_ref().map(|l| crate::policy(l, dir)) {
-        Some(Ok(Some((policy, _)))) => {
-            report.ok(format!("Approval mode: {}", describe_mode(&policy.mode)))
-        }
+        Some(Ok(_)) if in_file.is_some() => report.ok(format!(
+            "Approval mode: {} Set in permissions.yaml ({}:), which replaces the mode chosen in setup; skykeep-mcp policy edits that line.",
+            describe_mode(in_file.as_deref().unwrap_or_default()),
+            crate::permissions::MODE_KEY
+        )),
+        Some(Ok(Some(_))) if library.as_ref().is_some_and(crate::adopted) => report.ok(format!(
+            "Approval mode: none. {} A mode taken over from an earlier {}: line in permissions.yaml counts only while the file names one.",
+            library.as_ref().map(no_mode_effect).unwrap_or_default(),
+            crate::permissions::MODE_KEY
+        )),
+        Some(Ok(Some((policy, _)))) => report.ok(format!(
+            "Approval mode: {} Chosen in setup; an {}: line in permissions.yaml would replace it.",
+            describe_mode(&policy.mode),
+            crate::permissions::MODE_KEY
+        )),
         Some(Ok(None))
             if library
                 .as_ref()
@@ -343,10 +364,7 @@ pub fn check(env: &Env, dir: &Path) -> Report {
     }
     // Read only: status never records a load; the server does that at its next tool call.
     if let Some(library) = library.as_ref() {
-        let mode = crate::policy(library, dir)
-            .ok()
-            .flatten()
-            .map(|(p, _)| p.mode);
+        let mode = crate::stored_mode(library, dir).ok().flatten();
         for (text, next) in crate::permissions::status(library, dir, mode.as_deref()) {
             match next {
                 Some(next) => report.fix(text, next),
