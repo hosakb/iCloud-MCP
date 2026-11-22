@@ -554,9 +554,10 @@ fn card_headline(name: &str, args: &Value, snapshot: Option<&Value>) -> String {
         let short: String = t.chars().take(120).collect();
         inert_preview(&json!(short)).unwrap_or_default()
     });
-    let removal = permissions::removal(name, args);
+    let removal = bound_removal(name, args, snapshot);
     let verb = match (name, action, removal) {
         ("notes_write", "save", permissions::Removal::Permanent) => "Erase all text of".to_string(),
+        ("notes_write", "delete", permissions::Removal::Permanent) => "Delete forever".to_string(),
         (_, _, permissions::Removal::Recoverable) => "Move to Recently Deleted".to_string(),
         (_, "delete_forever", _) => "Delete forever".to_string(),
         _ => {
@@ -568,7 +569,25 @@ fn card_headline(name: &str, args: &Value, snapshot: Option<&Value>) -> String {
                 .unwrap_or_default()
         }
     };
-    let what = label.map(|l| format!(" {l}")).unwrap_or_default();
+    // A Calendar delete names its scope: one occurrence or the whole series.
+    let scope = if name == calendar_write::TOOL && action == "delete" {
+        snap["calendar"]["scope"].as_str()
+    } else {
+        None
+    };
+    let series = label.as_deref().unwrap_or("the series");
+    let (what, rest) = match (scope, &label) {
+        (Some("whole_series"), _) => (
+            format!(" every occurrence of {series}, past and future,"),
+            "",
+        ),
+        (Some("this_occurrence"), _) => (
+            format!(" one occurrence of {series}"),
+            "; the rest of the series stays",
+        ),
+        (_, Some(l)) => (format!(" {l}"), ""),
+        (_, None) => (String::new(), ""),
+    };
     let after = match removal {
         permissions::Removal::Permanent => " This can't be undone.",
         permissions::Removal::Recoverable => {
@@ -576,7 +595,19 @@ fn card_headline(name: &str, args: &Value, snapshot: Option<&Value>) -> String {
         }
         permissions::Removal::None => "",
     };
-    format!("{verb}{what} in {service}.{after}")
+    format!("{verb}{what} in {service}{rest}.{after}")
+}
+
+/// What a call removes, judged against the item the card binds. A Notes delete of a note that
+/// is already in Recently Deleted is Apple's "Delete Now", which is permanent.
+fn bound_removal(name: &str, args: &Value, snapshot: Option<&Value>) -> permissions::Removal {
+    let in_trash = snapshot.is_some_and(|snap| {
+        snap["item"]["folderGuid"].as_str() == Some(quince_core::notes::TRASH_FOLDER)
+    });
+    if name == "notes_write" && args["action"] == "delete" && in_trash {
+        return permissions::Removal::Permanent;
+    }
+    permissions::removal(name, args)
 }
 
 /// What the person chose on an approval card.
@@ -1061,7 +1092,7 @@ impl Server {
         // "Always allow" saves a rule, so it is never offered for a preview read, for any
         // deletion, trash or move to Recently Deleted, or where an allow rule would still ask
         // (prepare_consent).
-        let removal = permissions::removal(name, arguments);
+        let removal = bound_removal(name, arguments, binding.snapshot.as_ref());
         let always = (!binding.preview_read
             && removal == permissions::Removal::None
             && !self.always_blocked)
