@@ -791,7 +791,7 @@ pub(crate) async fn run(
     // name that is taken.
     let local = match &op {
         DriveWrite::Upload { local, name, .. } => {
-            let exchange = exchange::configured(&library)?.ok_or(NO_EXCHANGE)?;
+            let exchange = exchange::in_force(&library, dir)?.ok_or(NO_EXCHANGE)?;
             let (file, size) = exchange::open_upload(&exchange, local)?;
             let name = name
                 .clone()
@@ -801,7 +801,7 @@ pub(crate) async fn run(
             Local::Upload(staged, name, exchange.max_bytes)
         }
         DriveWrite::Download { local, .. } => {
-            let exchange = exchange::configured(&library)?.ok_or(NO_EXCHANGE)?;
+            let exchange = exchange::in_force(&library, dir)?.ok_or(NO_EXCHANGE)?;
             let item = plan.item.as_ref().ok_or("not_found")?;
             if item
                 .size

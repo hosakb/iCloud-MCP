@@ -831,7 +831,7 @@ const CARD_NOTE: &str = "The client must be able to show Skykeep's approval card
 
 /// Step 4. Runs after the sign-in: a policy saved before sign-in is bound to no account.
 fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str> {
-    console.say(&format!("\nStep 4 of 5: Approval mode\nThis decides when the assistant has to ask you before it acts. Every choice asks on the approval card in your MCP client. {CARD_NOTE}"))?;
+    console.say(&format!("\nStep 4 of 5: Approval mode\nThis decides when the assistant has to ask you before it acts. Every choice asks on the approval card in your MCP client. {CARD_NOTE} You can change it later with an {}: line in permissions.yaml in this folder; a line there wins over what you choose here, and setup keeps it in step.", crate::permissions::MODE_KEY))?;
     let held = PrivateState::open(dir)?;
     let library = crate::setup(&held.path)?;
     if library
@@ -942,10 +942,19 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
             Ok(saved) => {
                 let held = PrivateState::open(dir)?;
                 let _ = crate::setup(&held.path)?.set_state(NO_MODE_KEY, "");
-                return console.say(&format!(
+                console.say(&format!(
                     "Approval mode saved: {}",
                     status::describe_mode(saved["mode"].as_str().unwrap_or_default())
-                ));
+                ))?;
+                // A line in the file would win over the choice, so it is changed to match.
+                let key = crate::permissions::MODE_KEY;
+                if crate::permissions::setting_in_file(&held.path, key).is_some() {
+                    match crate::permissions::set_setting(&held.path, key, mode) {
+                        Ok(()) => console.say(&format!("permissions.yaml now says {key}: {mode}."))?,
+                        Err(reason) => console.say(&format!("permissions.yaml could not be changed to match ({reason}); its {key}: line still wins. Change it there."))?,
+                    }
+                }
+                return Ok(());
             }
             Err("pending_changed") => {
                 console.say("More changes were queued while you were answering.")?

@@ -1,8 +1,12 @@
 //! The one local folder Drive and Photos uploads read from and Drive downloads write into.
 //!
-//! The person sets it up in their own terminal (`skykeep-mcp exchange`); no MCP argument can
-//! name or change it, or its size limit. Until it is set up, uploads and downloads are
-//! refused. A tool argument names a file inside it by a relative path of plain names: an
+//! The person names it in `permissions.yaml` (`exchange_folder:`) or sets it up in their own
+//! terminal (`skykeep-mcp exchange`, which writes that line); the file's value wins. No MCP
+//! argument can name or change it, or its size limit, which only the terminal sets. Until it
+//! is set up, uploads and downloads are refused. Before every transfer the folder is checked
+//! ([`checked`]): an existing private folder of this user, not a link, not a system folder or
+//! the home folder, not inside a hidden, credentials or keyring folder, and apart from the
+//! private state folder. A folder that fails is refused; nothing falls back to another one. A tool argument names a file inside it by a relative path of plain names: an
 //! absolute path, `..`, `.`, empty names, control and text-direction characters are refused.
 //! Every name on the way is opened relative to the folder before it, without following a
 //! symbolic link (`openat` with `O_NOFOLLOW`), so a link swapped in at any moment is refused
@@ -47,7 +51,235 @@ pub fn default_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(DEFAULT_NAME))
 }
 
-/// The folder as set up, `None` before it is.
+/// Folders that belong to the system. One of them, or anything inside one, is never an
+/// exchange folder, unless it is inside the home folder (as `/var/home/NAME` can be).
+const SYSTEM: [&str; 17] = [
+    "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32", "/opt", "/proc",
+    "/root", "/run", "/sbin", "/snap", "/srv", "/sys", "/usr",
+];
+/// Shared folders that are never an exchange folder themselves.
+const SHARED: [&str; 6] = ["/home", "/media", "/mnt", "/tmp", "/var", "/var/tmp"];
+
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The rules on where the folder is, applied to its real path.
+fn place_rules(real: &Path, state_dir: &Path) -> Result<(), &'static str> {
+    let home = home().and_then(|h| std::fs::canonicalize(h).ok());
+    let in_home = home
+        .as_ref()
+        .is_some_and(|h| real.starts_with(h) && real != h);
+    // The root, the home folder and every folder above it hold far more than an exchange.
+    if real.parent().is_none()
+        || home.as_ref().is_some_and(|h| h.starts_with(real))
+        || SHARED.iter().any(|s| real == Path::new(s))
+        || (!in_home && SYSTEM.iter().any(|s| real.starts_with(s)))
+        || (!in_home && real.starts_with("/var") && !real.starts_with("/var/home"))
+    {
+        return Err("exchange_folder_system_folder");
+    }
+    let state = std::fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
+    if real.starts_with(&state) || state.starts_with(real) {
+        return Err("exchange_folder_private_state");
+    }
+    // Inside the home folder, only the names below it count: the person picks those.
+    let below = match &home {
+        Some(h) if in_home => real.strip_prefix(h).unwrap_or(real),
+        _ => real,
+    };
+    let hidden = below.components().any(|c| match c {
+        Component::Normal(name) => {
+            let name = name.to_string_lossy().to_lowercase();
+            name.starts_with('.') || name.contains("credential") || name.contains("keyring")
+        }
+        _ => false,
+    });
+    if hidden {
+        return Err("exchange_folder_hidden_or_credentials");
+    }
+    Ok(())
+}
+
+/// The path `written` names, with a leading `~` as the home folder.
+pub fn expand(written: &str) -> Result<PathBuf, &'static str> {
+    Ok(match written.strip_prefix('~') {
+        Some("") => home().ok_or("exchange_folder_home_unknown")?,
+        Some(rest) if rest.starts_with('/') => home()
+            .ok_or("exchange_folder_home_unknown")?
+            .join(rest.trim_start_matches('/')),
+        _ => PathBuf::from(written),
+    })
+}
+
+/// The folder `written` names (a full path or `~/...`), checked as it is now: see the module
+/// notes. `state_dir` is the private state folder; `max_bytes` the size limit to use.
+pub fn checked(written: &str, state_dir: &Path, max_bytes: u64) -> Result<Exchange, &'static str> {
+    let path = expand(written)?;
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err("exchange_folder_not_a_full_path");
+    }
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => "exchange_folder_missing",
+        _ => "exchange_folder_unavailable",
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err("exchange_folder_is_a_link");
+    }
+    if !meta.is_dir() {
+        return Err("exchange_folder_not_a_folder");
+    }
+    let raw = CString::new(path.to_str().ok_or("exchange_folder_unavailable")?)
+        .map_err(|_| "exchange_folder_unavailable")?;
+    let fd = open_dir_at(None, &raw).map_err(|e| match e.raw_os_error() {
+        Some(libc::ELOOP) => "exchange_folder_is_a_link",
+        Some(libc::ENOENT) => "exchange_folder_missing",
+        Some(libc::ENOTDIR) => "exchange_folder_not_a_folder",
+        _ => "exchange_folder_unavailable",
+    })?;
+    // Where the open folder really is, links above it followed, as the kernel sees it.
+    let real = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        .map_err(|_| "exchange_folder_unavailable")?;
+    place_rules(&real, state_dir)?;
+    let st = fstat(fd.as_raw_fd()).map_err(|_| "exchange_folder_unavailable")?;
+    if st.st_uid != unsafe { libc::geteuid() } {
+        return Err("exchange_folder_not_yours");
+    }
+    if !private_enough(&st) {
+        return Err("exchange_folder_writable_by_others");
+    }
+    Ok(Exchange {
+        path: real,
+        identity: (st.st_dev as u64, st.st_ino as u64),
+        max_bytes,
+    })
+}
+
+/// The folder uploads and downloads use now, checked: the one `permissions.yaml` names (or
+/// its last valid one while the file can't be used), else the one `skykeep-mcp exchange` set
+/// up, else `None`. A folder that fails the checks is refused, never replaced by another.
+pub fn in_force(
+    library: &quince_core::Library,
+    state_dir: &Path,
+) -> Result<Option<Exchange>, &'static str> {
+    let active = crate::permissions::peek(library, state_dir, None)?;
+    let stored = configured(library);
+    let max_bytes = stored
+        .as_ref()
+        .ok()
+        .and_then(|s| s.as_ref())
+        .map_or(DEFAULT_MAX_BYTES, |s| s.max_bytes);
+    if let Some(written) = &active.exchange {
+        return checked(written, state_dir, max_bytes).map(Some);
+    }
+    let Some(stored) = stored? else {
+        return Ok(None);
+    };
+    let text = stored
+        .path
+        .to_str()
+        .ok_or("exchange_folder_changed_run_skykeep_mcp_exchange")?;
+    let now = checked(text, state_dir, stored.max_bytes).map_err(|e| match e {
+        "exchange_folder_missing" => "exchange_folder_missing_run_skykeep_mcp_exchange",
+        other => other,
+    })?;
+    if now.identity != stored.identity || now.path != stored.path {
+        return Err("exchange_folder_changed_run_skykeep_mcp_exchange");
+    }
+    Ok(Some(stored))
+}
+
+/// What is wrong with the folder, after its name, for `code` from [`checked`].
+pub fn problem(code: &str) -> &'static str {
+    match code {
+        "exchange_folder_missing" | "exchange_folder_missing_run_skykeep_mcp_exchange" => {
+            "does not exist"
+        }
+        "exchange_folder_not_a_folder" => "is not a folder",
+        "exchange_folder_is_a_link" => "is a symbolic link",
+        "exchange_folder_not_yours" => "belongs to another user",
+        "exchange_folder_writable_by_others" => "can be changed by other users",
+        "exchange_folder_system_folder" => {
+            "is a system or shared folder, your home folder or a folder above it"
+        }
+        "exchange_folder_hidden_or_credentials" => "is inside a hidden folder (a name that starts with a dot, such as .ssh or .gnupg) or a credentials or keyring folder",
+        "exchange_folder_private_state" => "is Skykeep's private folder, is inside it or holds it",
+        "exchange_folder_home_unknown" => "starts with ~, but the home folder is not known here",
+        "exchange_folder_not_a_full_path" => "is not a full path",
+        "exchange_folder_changed_run_skykeep_mcp_exchange" => {
+            "is no longer the folder that was set up"
+        }
+        _ => "can't be opened",
+    }
+}
+
+/// The next step for `code`. `written` is the folder the file names, when it names one.
+pub fn fix(code: &str, dir: &Path, written: Option<&str>) -> String {
+    let file = crate::status::quoted(&dir.join(crate::permissions::FILE_NAME));
+    let terminal = crate::status::with_dir("skykeep-mcp exchange --path DIR", dir);
+    let Some(written) = written else {
+        return format!(
+            "In your own terminal, run: {terminal} with a private folder of your own, or name one with {}: in {file}.",
+            crate::permissions::EXCHANGE_KEY
+        );
+    };
+    let folder = crate::status::quoted(Path::new(written));
+    let change = format!(
+        "change {}: in {file} to a private folder of your own, such as ~/{DEFAULT_NAME}, or run {terminal} in your own terminal",
+        crate::permissions::EXCHANGE_KEY
+    );
+    match code {
+        "exchange_folder_missing" => {
+            format!("Create it in your own terminal with: mkdir -m 700 {folder} or {change}.")
+        }
+        "exchange_folder_writable_by_others" => {
+            format!("Make it yours alone with: chmod 700 {folder} or {change}.")
+        }
+        _ => {
+            let mut text = change;
+            text[..1].make_ascii_uppercase();
+            format!("{text}.")
+        }
+    }
+}
+
+/// The instructions a tool result carries for an exchange folder error.
+pub fn next_step(code: &str, dir: &Path) -> String {
+    // Read only: a folder without a library gets none made here.
+    let written = if dir.join("library.db").is_file() {
+        quince_core::Library::open(dir)
+            .ok()
+            .and_then(|l| crate::permissions::peek(&l, dir, None).ok())
+            .and_then(|a| a.exchange)
+    } else {
+        crate::permissions::setting_in_file(dir, crate::permissions::EXCHANGE_KEY)
+    };
+    if code == "exchange_folder_not_set_up_run_skykeep_mcp_exchange_in_a_terminal" {
+        return fix(code, dir, None);
+    }
+    match &written {
+        Some(w) => format!(
+            "The exchange folder {} in {} {}, so nothing was uploaded or downloaded. {}",
+            crate::status::quoted(Path::new(w)),
+            crate::permissions::FILE_NAME,
+            problem(code),
+            fix(code, dir, Some(w))
+        ),
+        None => format!(
+            "The exchange folder {}, so nothing was uploaded or downloaded. {}",
+            problem(code),
+            fix(code, dir, None)
+        ),
+    }
+}
+
+/// The folder as `skykeep-mcp exchange` stored it, `None` before it is.
 pub fn configured(library: &quince_core::Library) -> Result<Option<Exchange>, &'static str> {
     match library.state(KEY).map_err(|_| "library_unavailable")? {
         None => Ok(None),
@@ -100,6 +332,26 @@ pub fn set_up(
     path: Option<PathBuf>,
     max_mb: Option<u64>,
 ) -> Result<Exchange, &'static str> {
+    set_up_in(library, None, path, max_mb)
+}
+
+/// [`set_up`] for the terminal command: the folder must also pass [`checked`] for the private
+/// folder `state_dir`, before anything is saved.
+pub fn set_up_checked(
+    library: &mut quince_core::Library,
+    state_dir: &Path,
+    path: Option<PathBuf>,
+    max_mb: Option<u64>,
+) -> Result<Exchange, &'static str> {
+    set_up_in(library, Some(state_dir), path, max_mb)
+}
+
+fn set_up_in(
+    library: &mut quince_core::Library,
+    state_dir: Option<&Path>,
+    path: Option<PathBuf>,
+    max_mb: Option<u64>,
+) -> Result<Exchange, &'static str> {
     let before = configured(library).ok().flatten();
     let path = match path {
         Some(path) => std::path::absolute(path).map_err(|_| "exchange_folder_unavailable")?,
@@ -109,6 +361,10 @@ pub fn set_up(
         },
     };
     let path = real_path(&path)?;
+    if let Some(state_dir) = state_dir {
+        // Where the folder would be is checked before it is created.
+        place_rules(&path, state_dir)?;
+    }
     if std::fs::symlink_metadata(&path).is_err() {
         use std::os::unix::fs::DirBuilderExt;
         // Only the folder itself: its parent must exist.
@@ -131,6 +387,10 @@ pub fn set_up(
         Some(_) => return Err("exchange_limit_out_of_range"),
         None => before.map_or(DEFAULT_MAX_BYTES, |b| b.max_bytes),
     };
+    if let Some(state_dir) = state_dir {
+        let text = path.to_str().ok_or("exchange_folder_path_unsafe")?;
+        checked(text, state_dir, max_bytes)?;
+    }
     let exchange = Exchange {
         path,
         identity: (st.st_dev as u64, st.st_ino as u64),
@@ -166,6 +426,8 @@ pub fn explain(code: &str, path: Option<&Path>, dir: &Path) -> String {
         "exchange_folder_unavailable" => format!("{folder} could not be created or opened. Check that it is a folder you can open, or pick another with: skykeep-mcp exchange --state-dir {state} --path DIR"),
         "invalid_exchange_setting" => format!("The saved exchange setting is unreadable. Set it again with: skykeep-mcp exchange --state-dir {state} --path DIR"),
         "exchange_path_required" => "--path needs a folder after it, for example: --path ~/Skykeep-Exchange".to_string(),
+        "exchange_folder_system_folder" | "exchange_folder_hidden_or_credentials" | "exchange_folder_private_state" | "exchange_folder_is_a_link" | "exchange_folder_not_a_folder" | "exchange_folder_home_unknown" => format!("{folder} {}. Pick a private folder of your own, for example: skykeep-mcp exchange --state-dir {state} --path ~/{DEFAULT_NAME}", problem(code)),
+        "permissions_file_unusable" => format!("permissions.yaml in {state} can't be edited, so nothing was changed. Run skykeep-mcp permissions show --state-dir {state} to see what to fix, then run the same command again."),
         "state_busy_retry" => "Another Skykeep command is using the private folder. Run the same command again in a moment.".to_string(),
         other => format!("The exchange folder was not set up ({other}). Run skykeep-mcp status --state-dir {state} to check the private folder."),
     }
@@ -176,7 +438,7 @@ pub fn explain(code: &str, path: Option<&Path>, dir: &Path) -> String {
 pub(crate) fn shared_folder(state_dir: &Path, local: &str) -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
     let library = quince_core::Library::open(state_dir).ok()?;
-    let exchange = configured(&library).ok()??;
+    let exchange = in_force(&library, state_dir).ok()??;
     let names = local_names(local).ok()?;
     let mut at = exchange.path;
     for name in names.split_last()?.1 {

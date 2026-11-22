@@ -419,10 +419,7 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
     }
     match error {
         "unsafe_state_contents" => state::unsafe_entry_sentence(dir),
-        e if e.starts_with("exchange_folder_") => Some(format!(
-            "In your own terminal, run: {}",
-            status::with_dir("skykeep-mcp exchange", dir)
-        )),
+        e if e.starts_with("exchange_folder_") => Some(exchange::next_step(e, dir)),
         // contacts_write's own codes, by their prefix.
         e if e.starts_with("contact_") || e.starts_with("contacts_write_") => {
             contacts_write::next_step(e, args)
@@ -948,8 +945,10 @@ impl Server {
         let dir = held.path.clone();
         let library = self.ready(&held)?;
         let configured = policy(library, &held.path)?;
-        let mode = configured.as_ref().map(|(p, _)| p.mode.clone());
-        let active = permissions::load(library, &dir, mode.as_deref())?;
+        let stored = configured.as_ref().map(|(p, _)| p.mode.clone());
+        let active = permissions::load(library, &dir, stored.as_deref())?;
+        // The file's approval_mode, when it names one, replaces the mode setup stored.
+        let mode = active.mode.clone();
         let name = params["name"].as_str().ok_or("invalid_tool")?;
         let (gate, _) = gate_for(
             library,
@@ -980,10 +979,9 @@ impl Server {
                 rules.insert(rule, permissions::Effect::Allow);
                 let allowed = permissions::Active {
                     rules,
-                    fingerprint: active.fingerprint.clone(),
                     problem: None,
                     kept_from: None,
-                    strict: active.strict,
+                    ..active.clone()
                 };
                 gate_for(
                     library,
@@ -1351,8 +1349,9 @@ impl Server {
         }
         // The permissions file as it is now: a later deny refuses, and any edit since the
         // request makes it stale, as for other terminal requests.
-        let mode = policy(library, &dir)?.map(|(p, _)| p.mode);
-        let active = permissions::load(library, &dir, mode.as_deref())?;
+        let stored = policy(library, &dir)?.map(|(p, _)| p.mode);
+        let active = permissions::load(library, &dir, stored.as_deref())?;
+        let mode = active.mode.clone();
         if gate_for(library, mode.as_deref(), &active, &tool, &proposal["args"])?.0 == Gate::Deny {
             return Err(DENIED);
         }
@@ -1703,8 +1702,10 @@ impl Server {
         let dir = held.path.clone();
         let library = self.ready(&held)?;
         let configured = policy(library, &dir)?;
-        let mode = configured.as_ref().map(|(p, _)| p.mode.clone());
-        let active = permissions::load(library, &dir, mode.as_deref())?;
+        let stored = configured.as_ref().map(|(p, _)| p.mode.clone());
+        let active = permissions::load(library, &dir, stored.as_deref())?;
+        // The file's approval_mode, when it names one, replaces the mode setup stored.
+        let mode = active.mode.clone();
         let (gate, explicit) = gate_for(library, mode.as_deref(), &active, name, &args)?;
         if gate == Gate::Deny {
             self.denied = Some(deny_rule(&active.rules, name, &args));
