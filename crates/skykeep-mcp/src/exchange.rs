@@ -1,4 +1,4 @@
-//! The one local folder Drive uploads read from and downloads write into.
+//! The one local folder Drive and Photos uploads read from and Drive downloads write into.
 //!
 //! The person sets it up in their own terminal (`skykeep-mcp exchange`); no MCP argument can
 //! name or change it, or its size limit. Until it is set up, uploads and downloads are

@@ -1080,6 +1080,14 @@ fn runs_as(
             },
             Some("a Contacts deletion always needs a person"),
         ),
+        Some(mode) if tool == crate::photos_write::TOOL && effect == Effect::Allow => (
+            if mode == "yolo" {
+                Effect::AskTerminal
+            } else {
+                Effect::AskClient
+            },
+            Some("a move to Recently Deleted in Photos always needs a person"),
+        ),
         _ => (effect, None),
     }
 }

@@ -238,7 +238,11 @@ async fn tools_list_names_apple_icloud_photos_with_strict_read_only_schemas() {
     let tools = list["result"]["tools"].as_array().unwrap();
     let photos: Vec<&Value> = tools
         .iter()
-        .filter(|t| t["name"].as_str().unwrap().starts_with("photos"))
+        // photos_write is the one tool that changes Photos (tests/photos_write.rs).
+        .filter(|t| {
+            let name = t["name"].as_str().unwrap();
+            name.starts_with("photos") && name != "photos_write"
+        })
         .collect();
     let names: Vec<&str> = photos.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(names, NAMES);

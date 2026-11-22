@@ -11,6 +11,7 @@ pub mod keyhold;
 pub mod login;
 pub mod permissions;
 pub mod photos;
+pub mod photos_write;
 mod preserve;
 pub mod scheduler;
 pub mod setup;
@@ -237,10 +238,13 @@ fn gate_for(
     Ok((gate, explicit))
 }
 
-/// A Drive change that needs a person whatever the rules say (`drive_write::needs_person`).
-/// A Calendar delete too (`calendar_write::needs_person`).
+/// A Drive, Calendar or Photos change that needs a person whatever the rules say
+/// (`drive_write::needs_person`, `calendar_write::needs_person`, `photos_write::needs_person`).
 /// Arguments that don't validate are left to the tool, which refuses them.
 fn drive_needs_person(library: &Library, name: &str, args: &Value) -> Result<bool, &'static str> {
+    if name == photos_write::TOOL {
+        return Ok(photos_write::validate(args).is_ok_and(|op| photos_write::needs_person(&op)));
+    }
     if name == calendar_write::TOOL {
         return Ok(calendar_write::needs_person(args));
     }
@@ -293,16 +297,24 @@ fn terminal_proposal(
         .map_err(|_| "library_unavailable")?
         .ok_or("login_required")?;
     let id = uuid::Uuid::new_v4().to_string();
-    let proposal = json!({"tool":name,"args":args,"account":account,
+    let mut proposal = json!({"tool":name,"args":args,"account":account,
         "binding":{"policy":policy,"state_identity":identity,"rules":rules}});
+    // A Photos change carries what it reaches as cached, for the terminal to show and for the
+    // approval to hold to; a photo or album not in the cache is refused here, at once.
+    let photos = name == photos_write::TOOL;
+    if photos {
+        proposal["preview"] = photos_write::preview(library, args)?;
+    }
     library
         .set_state(&format!("mcp.approval.{id}"), &proposal.to_string())
         .map_err(|_| "library_unavailable")?;
-    Ok(
-        json!({"status":"approval_required","request_id":id,"approval":"terminal",
+    let mut reply = json!({"status":"approval_required","request_id":id,"approval":"terminal",
         "next":status::with_dir("Ask the person to run skykeep-mcp approve in their own terminal and type this request ID there.", dir),
-        "remote_verified":false}),
-    )
+        "remote_verified":false});
+    if photos {
+        reply["approve_in_terminal"] = json!(status::with_dir("skykeep-mcp approve", dir));
+    }
+    Ok(reply)
 }
 
 /// The terminal approval `id` names exactly this call under the current mode and folder.
@@ -400,6 +412,9 @@ fn error_value(error: &'static str, dir: &Path, args: &Value) -> Value {
 /// result carries as `instructions` and the terminal approval prints. `args` are the call's
 /// arguments (`Value::Null` when there are none).
 pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
+    if let Some(text) = photos_write::next_step(error, dir, args) {
+        return Some(text);
+    }
     match error {
         "unsafe_state_contents" => state::unsafe_entry_sentence(dir),
         e if e.starts_with("exchange_folder_") => Some(format!(
@@ -619,6 +634,8 @@ pub(crate) fn needs_consent(mode: &str, name: &str) -> Result<bool, &'static str
         // Every Drive change is asked in the form, except under yolo. Deletions and large
         // folder moves are then asked in the terminal instead (drive_write::goes_to_terminal).
         "drive_write" => Ok(mode != "yolo"),
+        // Photos changes too; a move to Recently Deleted then waits for the terminal.
+        "photos_write" => Ok(mode != "yolo"),
         // The same for Calendar changes; deletes then go to the terminal.
         "calendar_write" => Ok(mode != "yolo"),
         // Every Contacts change is asked in the form, except under yolo; a delete then waits
@@ -637,6 +654,11 @@ fn resolved_snapshot(
     if name == drive_write::TOOL {
         // Drive has no queue: the preview of what the action reaches is the whole context.
         let snapshot = json!({"drive": drive_write::preview(library, args)?});
+        bounded_value(&snapshot, MAX_ARGUMENT_BYTES)?;
+        return Ok(snapshot);
+    }
+    if name == photos_write::TOOL {
+        let snapshot = json!({"photos": photos_write::preview(library, args)?});
         bounded_value(&snapshot, MAX_ARGUMENT_BYTES)?;
         return Ok(snapshot);
     }
@@ -864,6 +886,9 @@ impl Server {
         calendar::validate(name, &params["arguments"])?;
         photos::validate(name, &params["arguments"])?;
         drive::validate(name, &params["arguments"])?;
+        if name == photos_write::TOOL {
+            photos_write::validate(&params["arguments"])?;
+        }
         if gate != Gate::Client {
             return Ok(None);
         }
@@ -1455,6 +1480,8 @@ impl Server {
         let proposal: Value = serde_json::from_str(&raw).map_err(|_| "approval_not_found")?;
         let text = if proposal["tool"] == drive_write::TOOL {
             drive_write::plain_preview(&proposal["preview"])
+        } else if proposal["tool"] == photos_write::TOOL {
+            photos_write::plain_preview(&proposal["preview"])
         } else if proposal["tool"] == calendar_write::TOOL {
             calendar_write::plain_preview(&proposal["preview"])
         } else if proposal["tool"] == contacts_write::TOOL {
@@ -1581,6 +1608,11 @@ impl Server {
                 exact.snapshot = Some(resolved_snapshot(library, name, &args, &active)?);
             }
             if grant != &exact {
+                // A Photos card approved for the photo or album as it was cached, which
+                // changed since: the same code as a stale terminal request, with what to do.
+                if name == photos_write::TOOL && grant.snapshot != exact.snapshot {
+                    return Err(photos_write::STALE);
+                }
                 return Err("approval_policy_changed");
             }
         }
@@ -1760,6 +1792,62 @@ impl Server {
                     && explicit == Some(permissions::Effect::Allow)
                     && !drive_write::needs_person(library, &op)?;
                 drive_write::run(&dir, &drive_seam, op, grant.is_some() || allowed).await
+            }
+            "photos_write" => {
+                let op = photos_write::validate(&args)?;
+                if library
+                    .state(ACCOUNT_KEY)
+                    .map_err(|_| "library_unavailable")?
+                    .is_none()
+                {
+                    return Err("login_required");
+                }
+                // A folder without an approval mode and no rule: a move to Recently Deleted, or
+                // any change where every change needs approval, waits for the terminal.
+                if legacy
+                    && (photos_write::needs_person(&op)
+                        || library
+                            .state("mcp.require_write_approval")
+                            .map_err(|_| "library_unavailable")?
+                            .as_deref()
+                            == Some("true"))
+                {
+                    return terminal_proposal(
+                        library,
+                        &dir,
+                        name,
+                        &args,
+                        policy_raw.as_deref(),
+                        current.identity,
+                        &active.fingerprint,
+                    );
+                }
+                // A terminal request holds to the preview it showed, and is used up before it
+                // runs, so it runs once.
+                if let (true, Some(id)) = (terminal_approved, &terminal) {
+                    let stored: Value = library
+                        .state(&format!("mcp.approval.{id}"))
+                        .map_err(|_| "library_unavailable")?
+                        .and_then(|raw| serde_json::from_str(&raw).ok())
+                        .unwrap_or(Value::Null);
+                    if stored["preview"] != photos_write::preview(library, &args)? {
+                        return Err(photos_write::STALE);
+                    }
+                    library
+                        .set_state(&format!("mcp.approval.{id}"), "")
+                        .map_err(|_| "library_unavailable")?;
+                }
+                // An allow rule counts as approval only where Photos needs no person.
+                let allowed = gate == Gate::Run
+                    && explicit == Some(permissions::Effect::Allow)
+                    && !photos_write::needs_person(&op);
+                photos_write::run(
+                    &dir,
+                    &drive_seam,
+                    op,
+                    grant.is_some() || terminal_approved || allowed,
+                )
+                .await
             }
             "calendar_write" => {
                 let op = calendar_write::validate(&args)?;
@@ -2822,7 +2910,7 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
 
 const SERVER_TITLE: &str =
     "Skykeep: Apple iCloud Notes, Reminders, Contacts, Calendar, Photos & iCloud Drive";
-const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, reads the user's Apple iCloud Contacts and changes one card at a time with contacts_write, reads Apple iCloud Calendar and changes its events with calendar_write, reads Apple iCloud Photos metadata (read-only), and reads and changes Apple iCloud Drive: folder listings and file details from the cache, and drive_write to create folders, rename, move, trash, delete for good, upload from and download into the exchange folder the user set up in their terminal. Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode. Notes and Reminders changes are queued until sync sends them; a Drive, Contacts or Calendar change runs once it is allowed and its reply says what Apple confirmed. calendar_write needs the etag from calendar_get, an offset or IANA zone for every time, and scope for a repeating event. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
+const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, reads the user's Apple iCloud Contacts and changes one card at a time with contacts_write, reads Apple iCloud Calendar and changes its events with calendar_write, reads Apple iCloud Photos metadata and changes it with photos_write (upload from the exchange folder, favorite, title and caption, rating, keywords, date, new and renamed albums, move to Recently Deleted), and reads and changes Apple iCloud Drive: folder listings and file details from the cache, and drive_write to create folders, rename, move, trash, delete for good, upload from and download into the exchange folder the user set up in their terminal. Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces; the Photos tools other than photos_write are read-only. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode. Notes and Reminders changes are queued until sync sends them; a Drive, Contacts, Calendar or Photos change runs once it is allowed and its reply says what Apple confirmed. calendar_write needs the etag from calendar_get, an offset or IANA zone for every time, and scope for a repeating event. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
 
 pub(crate) fn tools() -> Vec<Value> {
     // (name, description, parent property, parent required)
@@ -2929,6 +3017,7 @@ pub(crate) fn tools() -> Vec<Value> {
     tools.push(json!({"name":"drive_search","description":"Search the names of cached Apple iCloud Drive items in folders drive_refresh has read. At most 1000 matches, most recently changed first. Read-only.","inputSchema":{"type":"object","properties":search,"required":["query"],"additionalProperties":false},"annotations":read}));
     tools.push(json!({"name":"drive_refresh","description":"Read one Apple iCloud Drive folder's item list from Apple into the local cache, with each folder on its path. Give path or a cached folder id; the top folder by default. Reads names, kinds, sizes and dates only: never file contents, and never uploads, renames, moves or deletes. Sends no queued changes. Never opens a login prompt.","inputSchema":{"type":"object","properties":{"path":cloud_path,"id":id},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}));
     tools.push(drive_write::tool());
+    tools.push(photos_write::tool());
     tools.push(calendar_write::tool());
     tools.push(contacts_write::tool());
     tools.push(json!({"name":"auth_status","description":"Apple iCloud sign-in status and setup instructions. Never accepts secrets or opens a prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
