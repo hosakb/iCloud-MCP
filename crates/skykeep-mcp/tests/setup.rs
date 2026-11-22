@@ -166,8 +166,10 @@ enum Answer {
     Cancel,
     /// A shown answer, typed after something else happened meanwhile.
     AskAfter(&'static str, Box<dyn FnOnce() + Send>),
+    /// The answer to the optional starter permissions file. Without one, the script skips it.
+    Starter(&'static str),
 }
-use Answer::{Ask, AskAfter, Cancel, Secret};
+use Answer::{Ask, AskAfter, Cancel, Secret, Starter};
 
 fn leak(text: String) -> &'static str {
     Box::leak(text.into_boxed_str())
@@ -213,8 +215,22 @@ impl Console for Script {
     }
     fn ask(&mut self, label: &str) -> Result<String, &'static str> {
         self.screen.push_str(label);
+        if label.ends_with(setup::STARTER_CHOICE) {
+            let answer = match self.answers.front() {
+                Some(Starter(a)) => {
+                    let a = *a;
+                    self.answers.pop_front();
+                    a
+                }
+                _ => "",
+            };
+            self.screen.push_str(answer);
+            self.screen.push('\n');
+            return Ok(answer.into());
+        }
         let answer = match self.answers.pop_front() {
             Some(Ask(a)) => a,
+            Some(Starter(_)) => panic!("expected the starter offer at {label:?}\n{}", self.screen),
             Some(AskAfter(a, meanwhile)) => {
                 meanwhile();
                 a
@@ -233,7 +249,7 @@ impl Console for Script {
         match self.answers.pop_front() {
             Some(Secret(a)) => Ok(Zeroizing::new(a.into())),
             Some(Cancel) => Err("input_cancelled"),
-            Some(Ask(_)) | Some(AskAfter(..)) => {
+            Some(Ask(_)) | Some(AskAfter(..)) | Some(Starter(_)) => {
                 panic!("expected a shown prompt at {label:?}\n{}", self.screen)
             }
             None => panic!("unexpected prompt {label:?}\n{}", self.screen),
@@ -379,6 +395,51 @@ async fn tool(dir: &Path, name: &str) -> Value {
 }
 
 #[tokio::test]
+async fn setup_offers_a_starter_permissions_file_and_writes_it_only_when_asked() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    let script = first_run_with_keyring(&dir, &server).await;
+    assert!(
+        script.screen.contains("Optional: a permissions file says"),
+        "{}",
+        script.screen
+    );
+    let file = dir.join(skykeep_mcp::permissions::FILE_NAME);
+    assert!(!file.exists(), "Enter skips");
+
+    let (_parent, dir) = folder();
+    let mut answers = folder_answers(&dir);
+    answers.push(Ask(""));
+    answers.extend(sign_in_answers());
+    answers.push(Ask(""));
+    answers.push(Starter("1"));
+    let script = ready(answers, &dir, &server).await;
+    assert!(
+        script.screen.contains("Starter permissions file written"),
+        "{}",
+        script.screen
+    );
+    let file = dir.join(skykeep_mcp::permissions::FILE_NAME);
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
+    let rules = skykeep_mcp::permissions::parse(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(
+        rules["notes_write.delete"],
+        skykeep_mcp::permissions::Effect::AskClient
+    );
+    assert!(skykeep_mcp::status::check(storage::env(), &dir).ready());
+    // A second run never offers it again.
+    let mut script = Script::new(vec![Ask(""), Ask("")]);
+    run(&mut script, &dir, &server).await.unwrap();
+    assert!(
+        !script.screen.contains("Optional: a permissions file says"),
+        "{}",
+        script.screen
+    );
+}
+
+#[tokio::test]
 async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client_forms() {
     let _one = serial().await;
     let server = apple().await;
@@ -391,7 +452,11 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client
     }
     assert!(screen.contains(&format!("Create {}? [Y/n]", dir.display())));
     assert!(screen.contains("1. Ask me before every read and every change. Recommended."));
-    assert!(screen.contains("Hermes can't yet"), "{screen}");
+    assert!(
+        screen.contains("Hermes should show them; if no card appears there, choose 4"),
+        "{screen}"
+    );
+    assert!(!screen.contains("Hermes can't"), "{screen}");
     assert!(
         screen.contains("Signed in as f***@e***.invalid"),
         "{screen}"
@@ -1058,7 +1123,9 @@ async fn no_approval_mode_leaves_the_folder_without_a_policy_and_counts_as_done(
     answers.extend(sign_in_answers());
     answers.extend([Ask("4"), Ask("no"), Ask("4"), Ask("confirm")]);
     let script = ready(answers, &dir, &server).await;
-    assert!(script.screen.contains("  4. No approval mode, for MCP clients that can't show approval forms (such as Hermes today)."));
+    assert!(script
+        .screen
+        .contains("  4. No approval mode, for MCP clients that can't show approval forms."));
     assert!(script
         .screen
         .contains("deletions wait until you approve them with skykeep-mcp approve --state-dir"));
@@ -1327,5 +1394,9 @@ async fn status_quotes_the_folder_in_its_chmod_commands() {
     std::fs::write(&shared, b"x").unwrap();
     std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o644)).unwrap();
     let text = skykeep_mcp::status::check(storage::env(), &dir).render();
-    assert!(text.contains(&format!("chmod 600 {quoted}/*")), "{text}");
+    // The file itself is named, in one piece.
+    assert!(
+        text.contains(&format!("chmod 600 '{}'", shared.display())),
+        "{text}"
+    );
 }

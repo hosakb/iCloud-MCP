@@ -97,6 +97,7 @@ pub fn plain(code: &'static str) -> &'static str {
         "unsafe_state_contents" => "A file in that folder can be read by others, or is a link. Choose another folder.",
         "unsafe_state_path" => "That folder path goes through a link or '..'. Use the folder's real path.",
         "state_unavailable" | "library_unavailable" => "Setup can't open that folder. Check that its parent folder exists and belongs to you.",
+        "permissions_file_unavailable" => "Setup couldn't write the permissions file. Run skykeep-mcp status to see why.",
         "policy_unavailable" => "Setup couldn't read or save the approval mode. Run skykeep-mcp status to see why.",
         "authentication_unavailable" => "Sign-in didn't finish. Check your internet connection, then run skykeep-mcp setup again.",
         "login_incomplete" | "login_required" => "Sign-in didn't finish. Run skykeep-mcp setup again.",
@@ -416,6 +417,7 @@ async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcom
         step_sign_in(c, env, &dir, &options.endpoints, again).await?;
         step_policy(c, &dir)?;
     }
+    offer_permissions(c, &dir)?;
     c.say("\nStep 5 of 5: Check")?;
     let report = status::check(env, &dir);
     c.say(report.render().trim_end())?;
@@ -439,7 +441,7 @@ async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcom
         done.push_str(" After each restart of this computer, run skykeep-mcp unlock once.");
     }
     match mode.as_str() {
-        "reads_and_writes" | "writes_only" => done.push_str(" Your approval mode asks in your MCP client, which must be able to show Skykeep's approval forms. Hermes can't yet: with it every request that needs approval fails. For such a client, run skykeep-mcp setup --state-dir NEW_FOLDER and choose 4 there."),
+        "reads_and_writes" | "writes_only" => done.push_str(" Your approval mode asks on a card in your MCP client, which must be able to show Skykeep's approval forms. Hermes should show it. If no card appears, set those actions to ask: terminal in the permissions file, or run skykeep-mcp setup --state-dir NEW_FOLDER and choose 4 there."),
         "none" => {
             let held = PrivateState::open(&dir)?;
             done.push(' ');
@@ -818,7 +820,7 @@ async fn step_sign_in(
 
 /// Step 4. Runs after the sign-in: a policy saved before sign-in is bound to no account.
 fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str> {
-    console.say("\nStep 4 of 5: Approval mode\nThis decides when the assistant has to ask you before it acts. Choices 1 and 2 ask in your MCP client, so the client must be able to show Skykeep's approval forms. Hermes can't yet: with it, every request that needs approval fails. Choice 4 is for such clients.")?;
+    console.say("\nStep 4 of 5: Approval mode\nThis decides when the assistant has to ask you before it acts. Choices 1 and 2 ask on a card in your MCP client, so the client must be able to show Skykeep's approval forms. Hermes should show them; if no card appears there, choose 4, or later set those actions to ask: terminal in the permissions file.")?;
     let held = PrivateState::open(dir)?;
     let library = crate::setup(&held.path)?;
     if library
@@ -864,7 +866,7 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
         MODES[0].1, MODES[1].1, MODES[2].1
     );
     if offer_none {
-        menu.push_str(&format!("  4. No approval mode, for MCP clients that can't show approval forms (such as Hermes today). {} Once you pick 1, 2 or 3, this folder can't go back to 4.\nChoose 1, 2, 3 or 4 (Enter picks 1): ", status::no_mode_effect(&library)));
+        menu.push_str(&format!("  4. No approval mode, for MCP clients that can't show approval forms. {} Once you pick 1, 2 or 3, this folder can't go back to 4.\nChoose 1, 2, 3 or 4 (Enter picks 1): ", status::no_mode_effect(&library)));
     } else {
         console.say("This folder has had an approval mode, so there is no choice without one. For a client without approval forms, set up a new folder with skykeep-mcp setup --state-dir NEW_FOLDER.")?;
         menu.push_str("Choose 1, 2 or 3 (Enter picks 1): ");
@@ -940,4 +942,41 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
             Err(other) => return Err(other),
         }
     }
+}
+
+/// The starter label setup shows; tests answer it by this text.
+pub const STARTER_CHOICE: &str =
+    "  1. Write the starter file\n  2. Skip\nChoose 1 or 2 (Enter skips): ";
+
+/// Offers a starter permissions file when the folder has none. Never replaces one.
+fn offer_permissions(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str> {
+    let held = PrivateState::open(dir)?;
+    let path = held.path.join(crate::permissions::FILE_NAME);
+    if path.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    let library = crate::setup(&held.path)?;
+    let mode = crate::policy(&library, &held.path)
+        .ok()
+        .flatten()
+        .map(|(p, _)| p.mode);
+    let ask = if mode.as_deref().is_some_and(|m| m != "yolo") {
+        "on a card in your MCP client"
+    } else {
+        "in your terminal, with skykeep-mcp approve"
+    };
+    let n = choose(
+        console,
+        &format!(
+            "\nOptional: a permissions file says, for each tool and action, whether Skykeep runs it, asks you first or refuses it. Setup can write a starter file to {}. In it, every deletion asks {ask}, and it lists every name you can use. Skykeep uses the file as soon as it exists, and you can change it later.\n{STARTER_CHOICE}",
+            path.display()
+        ),
+        2,
+        Some(2),
+    )?;
+    if n == 1 {
+        crate::permissions::write_starter(&held.path, mode.as_deref())?;
+        console.say("Starter permissions file written. To see the rules in use, run skykeep-mcp permissions show.")?;
+    }
+    Ok(())
 }

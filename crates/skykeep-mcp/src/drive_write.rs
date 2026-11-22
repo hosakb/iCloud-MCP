@@ -45,9 +45,10 @@ pub const ACTIONS: [&str; 7] = [
     "download",
 ];
 
-/// The Drive actions that remove something. The one place they are named.
+/// The Drive actions that remove something, as the permissions rules decide it for every
+/// tool (`permissions::removal_of`): `trash` and `delete_forever`.
 pub fn is_destructive(action: &str) -> bool {
-    matches!(action, "trash" | "delete_forever")
+    crate::permissions::is_deletion(TOOL, action)
 }
 
 /// A folder with at least this many items (or an unknown number) is renamed or moved only

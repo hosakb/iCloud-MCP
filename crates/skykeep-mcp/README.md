@@ -49,7 +49,8 @@ You need a terminal window that you open yourself. Don't run these commands thro
       | 3. Don't ask, not even before deleting notes or reminders (`yolo`, you type `confirm`) | No question | No question, except Drive deletions, and moves and renames of large Drive folders, which wait for `skykeep-mcp approve` in a terminal (see "Drive changes") |
       | 4. No approval mode, for clients without approval forms (you type `confirm`) | No question | Routine changes: no question. Deletions, and renames and moves of Drive folders with 20 or more items or an unknown count, wait until you run `skykeep-mcp approve` in a terminal |
 
-      Choices 1 and 2 need an MCP client that can show Skykeep's approval forms. Hermes can't yet: with it, every request that needs approval fails with `approval_requires_form_client`. Use choice 4 for such a client. Choice 4 keeps a folder's earlier `require-approval` setting: then every change waits for `skykeep-mcp approve`, and setup and status say so. Once a folder has had choice 1, 2 or 3, it can't go back to 4; set up a new folder instead.
+      Choices 1 and 2 need an MCP client that can show Skykeep's approval card. Hermes should show it; if no card appears, use choice 4 or `ask: terminal` rules. In a client or session without approval forms, every request that needs approval fails with `approval_requires_form_client`; use choice 4 or set those actions to `ask: terminal` in the permissions file (see "Permissions file" below). Choice 4 keeps a folder's earlier `require-approval` setting: then every change waits for `skykeep-mcp approve`, and setup and status say so. Once a folder has had choice 1, 2 or 3, it can't go back to 4; set up a new folder instead.
+   After step 4, setup offers to write a starter permissions file. In it every deletion asks the way your approval mode already asks, or more strictly. Press Enter to skip it.
    5. **Check.** Setup checks everything it set up and prints what to paste into your MCP client's settings: a JSON line for most clients, and a `config.yaml` block for Hermes.
 
    You can run `setup` again at any time. It checks the saved sign-in with Apple, then asks whether to keep the setup, sign in again in the same folder (same Apple Account), switch to another Apple Account, or quit. If Apple no longer accepts the saved sign-in, setup says so and goes straight to signing in again. A folder belongs to one Apple Account, so switching sets up a new folder for the other account and leaves the first one as it is. If setup stopped part way, the next run continues with the first step that is not done.
@@ -97,7 +98,7 @@ What is kept afterwards:
 - The session and trust tokens, in the storage chosen above. With the system keyring they are under the service name `skykeep-mcp`, one entry per folder. The server never imports a session from the Skykeep desktop app.
 - A one-way account tag in the library, so a folder can't be reused for another Apple Account. Use a new folder for a different account.
 
-The folder must be owned by you, mode `0700`, and contain no symlinks or files readable by others. The server and the helper commands take an exclusive lock on it for each operation. If a command meets a request in progress it stops with `state_busy_retry`; run it again. A running server picks up the new session on its next request, without a restart.
+The folder must be owned by you, mode `0700`, and contain no symlinks or files readable by others. The one exception is `permissions.yaml`: a shared or linked copy doesn't stop the folder, and Skykeep treats that file as unusable (see "Permissions file"). The server and the helper commands take an exclusive lock on it for each operation. If a command meets a request in progress it stops with `state_busy_retry`; run it again. A running server picks up the new session on its next request, without a restart.
 
 `logout` erases the stored session and the cookie file, which is sealed with a key kept beside the session. Cached data stays in the folder until you delete it. If the system keyring is locked, the sign-out is recorded and finished the next time the keyring answers; until then no session is loaded. With the protected file, run `unlock` first.
 
@@ -143,7 +144,9 @@ Reads come from the local cache and say so (`"source": "local_cache"`). A succes
 - Before a change, the folder is read from Apple. A new folder or upload whose name is already there is refused (`name_taken`, compared without case). A rename Apple already shows says `already_has_this_name`, and a move already made says `already_in_destination`. Apple's listing can lag a moment behind a file it has just filed: an upload retried in that moment is filed under a free name such as `plan 2.txt`, never over the first, and its reply says `renamed_by_apple: true`. Look at the folder and remove the extra copy if you don't want it. An item that changed at Apple since it was cached is left alone (`drive_item_changed_run_drive_refresh`).
 - Afterwards the folders the change touched read as not yet refreshed, until `drive_refresh` reads them again.
 
-Approvals. `trash` moves an item to Recently Deleted, where Apple keeps it about 30 days. `delete_forever` moves it there and then deletes it for good. Both always need your approval, and so does renaming or moving a folder with 20 or more items, or with an unknown number (a folder not yet read that holds anything, or one with a folder beneath not yet read). The approval shows a preview of what the change reaches: the item, its path, Apple's count of its items, how many are cached beneath it, and the first names. You approve or deny them in one of two places. Under `reads_and_writes` and `writes_only`, every Drive change is asked in the MCP client's approval form. Under `yolo`, or in a folder with no approval mode, these changes return `approval_required` with a request ID, and you approve them with `skykeep-mcp approve --state-dir DIR` in your own terminal. No mode runs a deletion without one of the two. That command runs the change and prints the outcome. A request is used once, and it is refused if the account, the approval mode, the folder or the cached item changed since it was made. In a folder with no approval mode, `require-approval` makes every Drive change wait for `approve`.
+Approvals. `trash` moves an item to Recently Deleted, where Apple keeps it about 30 days. `delete_forever` moves it there and then deletes it for good. Both always need your approval, and so does renaming or moving a folder with 20 or more items, or with an unknown number (a folder not yet read that holds anything, or one with a folder beneath not yet read). The approval shows a preview of what the change reaches: the item, its path, Apple's count of its items, how many are cached beneath it, and the first names. You approve or deny them in one of two places. Under `reads_and_writes` and `writes_only`, every Drive change is asked in the MCP client's approval form. Under `yolo`, or in a folder with no approval mode, these changes return `approval_required` with a request ID, and you approve them with `skykeep-mcp approve --state-dir DIR` in your own terminal. No mode runs a deletion without one of the two. That command runs the change and prints the outcome. A request is used once, and it is refused if the account, the approval mode, the folder, the cached item or the permissions file changed since it was made, or if the file now says `deny`. In a folder with no approval mode, `require-approval` makes every Drive change wait for `approve`.
+
+The permissions file can name `drive_write` and each of its actions (see "Permissions file"). `deny` refuses, and `allow` runs other Drive changes without asking. A deletion, or a rename or move of a large folder, still needs a person whatever the file says: with `allow` it is asked as above, in the form or in the terminal. `ask: terminal` sends any Drive change to `skykeep-mcp approve`, and `ask: client` asks on the card, also under `yolo`. A card approval then counts and is not asked again in the terminal. The card never offers "Always allow" for these changes.
 
 ### The exchange folder
 
@@ -178,7 +181,7 @@ The create reply says `queued: true`, `cloudkit_accepted: false` and `remote_ver
 
 `setup` sets the approval mode for you (step 4 under "Get started"). With mode 1 or 2, approval happens in your MCP client's approval form. In a folder with no approval mode (choice 4, or one set up before approval modes existed), approval happens in your terminal with `skykeep-mcp approve`, as described below. With mode 3 (`yolo`), only Drive deletions, and moves and renames of large Drive folders, are asked, also with `skykeep-mcp approve` (see "Drive changes"). `require-approval` and `allow-routine` apply only to a folder with no approval mode and refuse to run in the others.
 
-Deletions never run straight from MCP. For Notes and Reminders, a deletion here means `delete`, a `move` into Recently Deleted (that is how iCloud deletes a note), and a `save` that leaves the note body empty. Creating a note in Recently Deleted is refused. For any of these the tool returns `approval_required` with a request ID, and you approve in your own terminal:
+Deletions never run straight from MCP in such a folder, whatever the permissions file says; the file can only refuse them. For Notes and Reminders, a deletion here means `delete`, a `move` into Recently Deleted (that is how iCloud deletes a note), and a `save` that leaves the note body empty. Creating a note in Recently Deleted is refused. For any of these the tool returns `approval_required` with a request ID, and you approve in your own terminal:
 
 ```sh
 skykeep-mcp approve --state-dir ~/.local/share/skykeep-mcp
@@ -192,6 +195,53 @@ There is no volume limit. Under the default policy an agent can queue any number
 
 What approval protects against: an agent that reaches this server only through MCP. It cannot approve its own requests, change the policy or sign in, because none of that is exposed as a tool. It does not protect against an agent that can run shell commands as your user. Such an agent can clear the marker variables and run `approve` or `allow-routine` in a pseudo-terminal, or edit the library file directly. The agent-marker check in `login` and the helper commands is a guard against accidents, not a security boundary. Don't give an agent shell access to the account that owns the state directory if you rely on approval.
 
+## Permissions file
+
+One file in the folder decides, for each tool and action, whether Skykeep runs it, asks first or refuses it: `permissions.yaml`, so by default `~/.local/share/skykeep-mcp/permissions.yaml`. Skykeep reads it before every tool call, so an edit counts at once. There is no apply step.
+
+```yaml
+version: 1
+rules:
+  reminders_write.create: allow        # runs without asking
+  notes_write.delete:
+    ask: client                        # a card in your MCP client
+  reminders_write.delete: {ask: terminal}   # waits for skykeep-mcp approve
+  contacts_get: deny                   # always refused
+```
+
+| Value | What Skykeep does |
+| --- | --- |
+| `allow` | Runs the action without asking. |
+| `ask: client` | Shows the approval card in your MCP client. This is meant to be the normal way in Hermes: its CLI and desktop app are expected to show the card with its buttons, which was not tested here. If no card appears, use `ask: terminal` for that action. Cron jobs and other unattended sessions are expected to decline it, so nothing runs there; this was not tested with Hermes. |
+| `ask: terminal` | Returns a request ID and waits until you run `skykeep-mcp approve --state-dir FOLDER` in your own terminal, as for deletions today. Use it for clients or sessions without approval forms. Only tools that change something can use it. A request made before the file changed no longer counts, and a later `deny` refuses older requests too. |
+| `deny` | Refuses with `denied_by_permissions` and a sentence saying the file blocks it. |
+
+A name is a tool, such as `contacts_get`, or a tool and one of its actions, such as `notes_write.delete`. A tool's entry covers all its actions, and an action's own entry wins over it. The valid names come from the server's tool list, so a tool added later can be named without other changes. The starter file lists every name, and a wrong name is refused with the list. `auth_status` and `sync_status` always run. A Notes `save` that empties a note and a `move` into Recently Deleted also follow the `notes_write.delete` rule, and the stricter of the two decides. Calendar has no write tool yet, so there is no rule for creating events. Drive changes are named like the others, for example `drive_write.delete_forever: deny` refuses deleting for good; see "Drive changes" for what a rule can't change there.
+
+Anything the file does not list follows the folder's approval mode. A rule can make an action looser or stricter than the mode. In a folder without an approval mode, deletions always wait for `skykeep-mcp approve`; a rule there can refuse them, never let them run without asking.
+
+**The approval card.** The card offers three choices: "Approve this time", "Deny" and "Always allow this action". A card closed without a choice, declined or cancelled counts as Deny, and nothing runs. "Always allow" runs the action and then writes `allow` for that tool and action into the file. The server writes it only because the person picked it on the card; no MCP tool can do it. Permanent deletions offer only "Approve this time" and "Deny": `delete_forever` and similar actions, a Reminders delete and a Notes save that empties a note. The server changes only that one line, or adds it after the last rule, and keeps every other line and comment as it was. It keeps the previous file as `permissions.yaml.bak` and replaces the file in one step, so a reader never sees half a file. If the file has a mistake or can't be written, the action still runs once and the reply says the rule was not saved and why. If the file changed while the card was open, the card no longer counts and nothing runs.
+
+**Editing the file from Hermes.** Ask the assistant to change the file, or edit it yourself; the next tool call uses it. To edit it yourself, open it in a terminal:
+
+```sh
+nano ~/.local/share/skykeep-mcp/permissions.yaml
+```
+
+Use your folder if it is another one. nano keeps the file's mode 600, so only you can read or change it. A new file gets your usual mode, often 664 on Ubuntu, and Skykeep then reports it with the `chmod 600` command to run. Some editors leave a backup copy such as `permissions.yaml~` next to it; if others can read that copy, Skykeep refuses the whole folder and names the file to delete or `chmod 600`.
+
+ This means a client or agent that can edit this file can change its own approval level, for example to delete without asking. That is a deliberate choice for ease of use. If you don't want it, don't give the agent file access to the folder. The rules themselves are never visible or changeable through Skykeep's MCP tools.
+
+**When the file is wrong.** Skykeep reads only a regular file in the folder that belongs to you and that no one else can change. It never follows a link and reads at most 64 KiB. The format is a strict part of YAML: `version: 1`, `rules:`, and one rule per line indented with spaces. A broken file never makes anything looser. Skykeep keeps the last valid rules it loaded from the file. If there are none, the approval mode decides and every deletion asks, even under `yolo`. Each tool result says so while the file is unusable, and `status` and `permissions show` say what is wrong. A file that others can change, which is common on Ubuntu with mode 664, is reported with the command that fixes it: `chmod 600 FOLDER/permissions.yaml`.
+
+**Seeing what changed.** Each time the file's content changes, Skykeep records when it loaded it and what became looser or stricter. `skykeep-mcp status` reports looser changes, for example `reminders_write.delete: waits for skykeep-mcp approve in your terminal before, now runs without asking`, until you look. `status` only reads; it never records anything.
+
+```sh
+skykeep-mcp permissions show --state-dir FOLDER
+```
+
+It needs a folder that setup has prepared. It prints the rules in use, when the last change was loaded, any problem with the file, every change since you last ran it in your own terminal, and the newest lines of `permissions-log.jsonl`. That log gets one line, with tool, action and time but no content, for each deletion that ran without asking because the file allowed it, and for each rule saved from a card. A run through an agent's terminal shows the changes but does not mark them as seen. An agent that can edit files can also edit the log, so it is a record, not a protection.
+
 ## Limitations
 
 ### Approval modes in detail
@@ -200,8 +250,8 @@ Setup's choices 1 to 3 are the policy modes `reads_and_writes`, `writes_only` an
 `yolo` (the table is under "Get started"). They control reads, Notes, Reminders and
 Drive changes, and sync; Drive deletions and large folder moves and renames are always asked, see
 "Drive changes". A folder with no policy (choice 4) keeps the older behaviour in
-"Write approval" above. MCP clients that can't answer the approval forms, Hermes
-among them today (see below), need choice 4.
+"Write approval" above. MCP clients that can't answer the approval forms need choice 4
+or `ask: terminal` rules in the permissions file.
 
 The human-only command is `skykeep-mcp policy --state-dir DIR MODE`, where MODE is
 `reads_and_writes`, `writes_only`, or `yolo`. It requires a user-owned terminal,
@@ -213,8 +263,9 @@ No migration back to legacy is provided. In each mode that asks, every approval 
 a one-shot form in the MCP client.
 
 2025-11-25 clients advertising `elicitation: {}` or `form: {}` receive standard
-`elicitation/create` with a required boolean. Only `accept` with exactly
-`content: {"approve": true}` authorizes execution. Unsupported versions, URL-only,
+`elicitation/create` with one required choice, `decision`. Only `accept` with exactly
+`content: {"decision": "approve"}`, or `"always_allow"` where the card offers it,
+authorizes execution. Unsupported versions, URL-only,
 absent, malformed and unknown-only capabilities fail closed when consent is needed.
 Legacy terminal proposals continue to work only in legacy state.
 
@@ -295,12 +346,11 @@ terminal (id, service, kind, record, reason; no payloads) and deletes exactly th
 listed rows after the literal answer `retire`. Retired writes are never sent. No
 MCP tool can resend, release or retire a refused write.
 
-Canonical read-only Hermes `tools/mcp_tool_sampling.py` currently returns empty
-content on accept (`ElicitationHandler._result`). That cannot satisfy this server's
-required boolean. Minimal owner-directed Hermes integration: collect the boolean
-through the native form callback, return the actual validated content, and expose
-the full inert preview on each supported surface. Until then Hermes acceptance
-fails closed. No Hermes files were edited and no rendered UI was tested. OpenClaw
+Hermes 0.23.3 sends `initialize` with protocol `2025-11-25` and
+`elicitation: {form: {}, url: {}}`, so the server shows it the approval card. How
+each Hermes surface renders the three choices, and whether it returns the chosen
+value, was not tested here; a card answered without a choice counts as Deny. No
+Hermes files were edited. OpenClaw
 runtime interoperability is untested. The candidate is based on cleanup main;
 deleted app files have not been restored. Independent security re-review is required.
 

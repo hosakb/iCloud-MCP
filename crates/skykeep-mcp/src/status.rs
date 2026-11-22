@@ -95,13 +95,21 @@ pub fn with_dir(text: &str, dir: &Path) -> String {
             "logout",
             "approve",
             "quarantine",
+            "permissions",
             "exchange",
         ]
         .contains(&word.as_str());
-        let tail = &after[word.len()..];
+        // `permissions show` is one command: the folder goes after both words.
+        let sub = if word == "permissions" && after[word.len()..].starts_with(" show") {
+            " show"
+        } else {
+            ""
+        };
+        let tail = &after[word.len() + sub.len()..];
         out.push_str("skykeep-mcp ");
         out.push_str(&word);
-        let knows_default = ["setup", "status", "unlock"].contains(&word.as_str());
+        out.push_str(sub);
+        let knows_default = ["setup", "status", "unlock", "permissions"].contains(&word.as_str());
         if known && !(default && knows_default) && !tail.starts_with(" --state-dir") {
             out.push_str(&flag);
         }
@@ -197,13 +205,26 @@ pub fn check(env: &Env, dir: &Path) -> Report {
                         quoted(dir)
                     ),
                 ),
-                "unsafe_state_contents" => (
-                    format!("A file in {shown} can be read by others, or is a link."),
-                    format!(
-                        "Run: chmod 600 {}/* and remove any links from the folder.",
-                        quoted(dir)
+                "unsafe_state_contents" => match crate::state::unsafe_entry(dir) {
+                    Some((path, true)) => (
+                        format!("{} is a link inside the folder.", path.display()),
+                        format!("Remove the link: rm {}", quoted(&path)),
                     ),
-                ),
+                    Some((path, false)) => (
+                        format!("Others can read or change {}.", path.display()),
+                        format!(
+                            "Delete it if it is an editor's backup copy, or run: chmod 600 {}",
+                            quoted(&path)
+                        ),
+                    ),
+                    None => (
+                        format!("A file in {shown} can be read by others, or is a link."),
+                        format!(
+                            "Run: chmod 600 {}/* and remove any links from the folder.",
+                            quoted(dir)
+                        ),
+                    ),
+                },
                 "unsafe_state_path" => (
                     format!("The path {shown} goes through a link or '..'."),
                     "Use the folder's real path.".to_string(),
@@ -307,6 +328,19 @@ pub fn check(env: &Env, dir: &Path) -> Report {
             "The approval mode setting can't be read.",
             "Run skykeep-mcp setup to choose it again.",
         ),
+    }
+    // Read only: status never records a load; the server does that at its next tool call.
+    if let Some(library) = library.as_ref() {
+        let mode = crate::policy(library, dir)
+            .ok()
+            .flatten()
+            .map(|(p, _)| p.mode);
+        for (text, next) in crate::permissions::status(library, dir, mode.as_deref()) {
+            match next {
+                Some(next) => report.fix(text, next),
+                None => report.ok(text),
+            }
+        }
     }
     report
 }

@@ -44,6 +44,11 @@ impl PrivateState {
         for entry in std::fs::read_dir(&absolute).map_err(|_| "state_unavailable")? {
             let entry = entry.map_err(|_| "state_unavailable")?;
             let m = std::fs::symlink_metadata(entry.path()).map_err(|_| "state_unavailable")?;
+            // The permissions file holds no secret. Editors and agents often save it shared
+            // or as a link; its own reader refuses it then, and the folder stays usable.
+            if entry.file_name() == crate::permissions::FILE_NAME {
+                continue;
+            }
             if m.file_type().is_symlink() || m.uid() != meta.uid() || m.mode() & 0o077 != 0 {
                 return Err("unsafe_state_contents");
             }
@@ -63,4 +68,35 @@ impl PrivateState {
             _lock: lock,
         })
     }
+}
+
+/// The first entry that makes [`PrivateState::open`] refuse a folder with
+/// `unsafe_state_contents`, so a message can name it, and whether it is a link.
+pub fn unsafe_entry(dir: &Path) -> Option<(PathBuf, bool)> {
+    let meta = std::fs::symlink_metadata(dir).ok()?;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        if entry.file_name() == crate::permissions::FILE_NAME {
+            continue;
+        }
+        let m = std::fs::symlink_metadata(entry.path()).ok()?;
+        let link = m.file_type().is_symlink();
+        if link || m.uid() != meta.uid() || m.mode() & 0o077 != 0 {
+            return Some((entry.path(), link));
+        }
+    }
+    None
+}
+
+/// One sentence on the entry that keeps Skykeep from using the folder, and how to fix it.
+pub fn unsafe_entry_sentence(dir: &Path) -> Option<String> {
+    let (path, link) = unsafe_entry(dir)?;
+    let shown = crate::status::quoted(&path);
+    Some(if link {
+        format!(
+            "Skykeep won't use its folder because {shown} is a link. Remove the link: rm {shown}"
+        )
+    } else {
+        format!("Skykeep won't use its folder because others can read or change {shown}. Delete it if it is an editor's backup copy, or run: chmod 600 {shown}")
+    })
 }

@@ -42,7 +42,7 @@ async fn note_confirmation_exposes_existing_runs_and_rejects_changed_formatting(
         .set_note_runs(guid, &json!([{"length":11,"underline":true}]).to_string())
         .unwrap();
     let reply = server
-        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
         .await
         .unwrap();
     assert_eq!(
@@ -55,7 +55,7 @@ async fn note_confirmation_exposes_existing_runs_and_rejects_changed_formatting(
         .await
         .unwrap();
     let reply = server
-        .handle(json!({"jsonrpc":"2.0","id":fresh["id"],"result":{"action":"accept","content":{}}}))
+        .handle(json!({"jsonrpc":"2.0","id":fresh["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
         .await
         .unwrap();
     assert_eq!(reply["result"]["isError"], false, "{reply}");
@@ -78,7 +78,7 @@ async fn note_confirmation_exposes_existing_runs_and_rejects_changed_formatting(
 }
 
 #[tokio::test]
-async fn confirmation_accepts_empty_content_and_inert_result_metadata_only() {
+async fn confirmation_accepts_an_approve_choice_and_inert_result_metadata_only() {
     for metadata in [
         None,
         Some(json!({"arguments":{"body":"must not replace original"},"action":"decline"})),
@@ -95,9 +95,9 @@ async fn confirmation_accepts_empty_content_and_inert_result_metadata_only() {
             .unwrap();
         assert_eq!(
             form["params"]["requestedSchema"],
-            json!({"type":"object","properties":{}})
+            json!({"type":"object","properties":{"decision":{"type":"string","title":"Decision","oneOf":[{"const":"approve","title":"Approve this time"},{"const":"deny","title":"Deny"},{"const":"always_allow","title":"Always allow this action"}]}},"required":["decision"]})
         );
-        let mut result = json!({"action":"accept","content":{}});
+        let mut result = json!({"action":"accept","content":{"decision":"approve"}});
         if let Some(meta) = metadata {
             result["_meta"] = meta;
         }
@@ -118,7 +118,7 @@ async fn confirmation_accepts_empty_content_and_inert_result_metadata_only() {
         assert_eq!(library.outbox_count().unwrap(), 1);
         assert!(server
             .handle(
-                json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}})
+                json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}})
             )
             .await
             .is_none());
@@ -133,10 +133,14 @@ async fn confirmation_rejects_missing_nonempty_or_malformed_content_and_ambiguou
         json!({"action":"accept","content":[]}),
         json!({"action":"accept","content":false}),
         json!({"action":"accept","content":{"approve":true}}),
-        json!({"action":"accept","content":{},"_meta":null}),
-        json!({"action":"accept","content":{},"_meta":[]}),
-        json!({"action":"accept","content":{},"other":true}),
-        json!({"content":{}}),
+        json!({"action":"accept","content":{}}),
+        json!({"action":"accept","content":{"decision":"deny"}}),
+        json!({"action":"accept","content":{"decision":"Approve"}}),
+        json!({"action":"accept","content":{"decision":"approve","extra":1}}),
+        json!({"action":"accept","content":{"decision":"approve"},"_meta":null}),
+        json!({"action":"accept","content":{"decision":"approve"},"_meta":[]}),
+        json!({"action":"accept","content":{"decision":"approve"},"other":true}),
+        json!({"content":{"decision":"approve"}}),
     ] {
         let (_dir, mut server, library) =
             configured("writes_only", json!({"elicitation":{}}), "2025-11-25").await;
@@ -170,8 +174,7 @@ async fn confirmation_rejects_missing_nonempty_or_malformed_content_and_ambiguou
             ))
             .await
             .unwrap();
-        let mut reply =
-            json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}});
+        let mut reply = json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}});
         reply
             .as_object_mut()
             .unwrap()
@@ -287,7 +290,7 @@ async fn configured_note_mutations_require_exact_forms_and_yolo_deletion_does_no
         assert_eq!(library.outbox_count().unwrap(), count);
         let reply = server
             .handle(
-                json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}),
+                json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}),
             )
             .await
             .unwrap();
@@ -362,7 +365,7 @@ async fn read_write_policy_requires_read_consent_before_resolved_mutation_previe
         .unwrap()
         .contains("private resolved title"));
     let second = server
-        .handle(json!({"jsonrpc":"2.0","id":first["id"],"result":{"action":"accept","content":{}}}))
+        .handle(json!({"jsonrpc":"2.0","id":first["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
         .await
         .unwrap();
     assert_ne!(first["id"], second["id"]);
@@ -373,7 +376,7 @@ async fn read_write_policy_requires_read_consent_before_resolved_mutation_previe
     assert_eq!(library.outbox_count().unwrap(), 0);
     let reply = server
         .handle(
-            json!({"jsonrpc":"2.0","id":second["id"],"result":{"action":"accept","content":{}}}),
+            json!({"jsonrpc":"2.0","id":second["id"],"result":{"action":"accept","content":{"decision":"approve"}}}),
         )
         .await
         .unwrap();
@@ -489,7 +492,7 @@ async fn existing_reminder_preview_is_complete_and_stale_consent_cannot_mutate()
         })
         .unwrap();
     let reply = server
-        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
         .await
         .unwrap();
     assert_eq!(reply["result"]["isError"], true);
@@ -499,7 +502,7 @@ async fn existing_reminder_preview_is_complete_and_stale_consent_cannot_mutate()
         .await
         .unwrap();
     let reply = server
-        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
         .await
         .unwrap();
     assert_eq!(reply["result"]["isError"], false, "{reply}");
@@ -640,7 +643,7 @@ async fn accepted_operation_is_single_use_and_legacy_queue_stays_quarantined() {
         ))
         .await
         .unwrap();
-    let accept = json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}});
+    let accept = json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}});
     let reply = server.handle(accept.clone()).await.unwrap();
     let result: serde_json::Value =
         serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
@@ -671,7 +674,7 @@ async fn read_consent_is_required_before_returning_cached_content() {
         .unwrap();
     assert_eq!(form["method"], "elicitation/create");
     let reply = server
-        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
         .await
         .unwrap();
     assert_eq!(reply["id"], 2);
@@ -741,7 +744,7 @@ async fn consent_decline_cancel_malformed_mismatch_replay_and_policy_change() {
             .await
             .unwrap();
         assert!(server
-            .handle(json!({"id":2,"result":{"action":"accept","content":{}}}))
+            .handle(json!({"id":2,"result":{"action":"accept","content":{"decision":"approve"}}}))
             .await
             .is_none());
         assert_eq!(
@@ -759,7 +762,7 @@ async fn consent_decline_cancel_malformed_mismatch_replay_and_policy_change() {
         assert_eq!(denied["result"]["isError"], true);
         assert!(server
             .handle(
-                json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}})
+                json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}})
             )
             .await
             .is_none());
@@ -777,7 +780,7 @@ async fn consent_decline_cancel_malformed_mismatch_replay_and_policy_change() {
         .unwrap();
     server.set_policy("yolo").unwrap();
     let reply = server
-        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
         .await
         .unwrap();
     assert_eq!(reply["result"]["isError"], true);
@@ -824,7 +827,7 @@ async fn incapable_clients_fail_closed_and_pending_calls_cancel() {
         .unwrap();
     assert_eq!(cancelled["id"], 2);
     assert!(server
-        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
         .await
         .is_none());
     assert_eq!(library.outbox_count().unwrap(), 0);
@@ -837,7 +840,7 @@ async fn unsolicited_consent_responses_are_never_requests() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut server = Server::open(dir.path()).unwrap();
     for message in [
-        json!({"jsonrpc":"2.0","id":1,"result":{"action":"accept","content":{}}}),
+        json!({"jsonrpc":"2.0","id":1,"result":{"action":"accept","content":{"decision":"approve"}}}),
         json!({"jsonrpc":"2.0","id":"approval-1","error":{"code":-32603,"message":"cancelled"}}),
     ] {
         assert!(

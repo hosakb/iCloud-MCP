@@ -7,6 +7,7 @@ pub mod drive_write;
 pub mod exchange;
 pub mod keyhold;
 pub mod login;
+pub mod permissions;
 pub mod photos;
 mod preserve;
 pub mod scheduler;
@@ -107,6 +108,8 @@ struct ApprovalBinding {
     identity: (u64, u64),
     snapshot: Option<Value>,
     preview_read: bool,
+    /// The permissions file's fingerprint when the card was shown; any edit makes it stale.
+    rules: Option<String>,
 }
 
 struct PendingConsent {
@@ -114,6 +117,210 @@ struct PendingConsent {
     request: Value,
     binding: ApprovalBinding,
     deadline: std::time::Instant,
+    /// The rule name "Always allow" would save, when the card offers it.
+    always: Option<String>,
+}
+
+/// The error for a call the permissions file sets to deny.
+pub const DENIED: &str = "denied_by_permissions";
+
+/// A tool error with a sentence for the permission codes a person has to act on.
+fn plain_error(error: &str) -> Value {
+    let mut value = json!({"error":error});
+    let message = match error {
+        DENIED => "The permissions file in Skykeep's folder sets this action to deny, so it did not run.",
+        "approval_requires_form_client" => "This action needs approval on a card in the MCP client, and this client did not offer approval forms when it connected. Approve it in a client or session that shows the card, or change the rule for this action in permissions.yaml to ask: terminal (approve it with skykeep-mcp approve in your own terminal), allow or deny.",
+        _ => return value,
+    };
+    value["message"] = json!(message);
+    value
+}
+
+/// Who decides a call, after the permissions file and the approval mode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Gate {
+    Run,
+    Client,
+    Terminal,
+    Deny,
+    /// A folder without an approval mode and no rule: the older behaviour decides.
+    Legacy,
+}
+
+/// The rule the permissions file sets for this call, or `None` when no rule applies. A Notes
+/// save that empties a note, or a move into Recently Deleted, also follows the delete rule:
+/// the stricter of the two decides.
+fn decide(
+    mode: Option<&str>,
+    require_all: bool,
+    rules: &permissions::Rules,
+    name: &str,
+    args: &Value,
+) -> Option<permissions::Effect> {
+    let action = args["action"].as_str();
+    let own = permissions::rule_for(rules, name, action);
+    if name != "notes_write"
+        || action == Some("delete")
+        || permissions::removal(name, args) == permissions::Removal::None
+    {
+        return own;
+    }
+    let delete = permissions::rule_for(rules, name, Some("delete"));
+    if own.is_none() && delete.is_none() {
+        return None;
+    }
+    let or_default = |effect: Option<permissions::Effect>, action: &str| {
+        effect.unwrap_or_else(|| permissions::default_effect(mode, require_all, name, Some(action)))
+    };
+    Some(or_default(own, action.unwrap_or_default()).max(or_default(delete, "delete")))
+}
+
+fn gate_for(
+    library: &Library,
+    mode: Option<&str>,
+    active: &permissions::Active,
+    name: &str,
+    args: &Value,
+) -> Result<(Gate, Option<permissions::Effect>), &'static str> {
+    let require_all = library
+        .state("mcp.require_write_approval")
+        .map_err(|_| "library_unavailable")?
+        .as_deref()
+        == Some("true");
+    let explicit = if permissions::ALWAYS.contains(&name) {
+        None
+    } else {
+        decide(mode, require_all, &active.rules, name, args)
+    };
+    use permissions::Effect;
+    let gate = match explicit {
+        Some(Effect::Allow) => Gate::Run,
+        Some(Effect::AskClient) => Gate::Client,
+        Some(Effect::AskTerminal) => Gate::Terminal,
+        Some(Effect::Deny) => Gate::Deny,
+        None => match mode {
+            Some(mode) if needs_consent(mode, name)? => Gate::Client,
+            Some(_) => Gate::Run,
+            None => {
+                needs_consent("yolo", name)?;
+                Gate::Legacy
+            }
+        },
+    };
+    // Drive deletions and renames or moves of large folders always need a person: an allow
+    // rule (or yolo) can't let them run unasked. The approval mode decides where it is asked.
+    // This comes before the broken-file step below, so a Drive deletion under yolo still
+    // waits for the terminal then.
+    let gate = match gate {
+        Gate::Run if drive_needs_person(library, name, args)? => match mode {
+            Some(mode) if mode != "yolo" => Gate::Client,
+            _ => Gate::Terminal,
+        },
+        gate => gate,
+    };
+    let removes = permissions::removal(name, args) != permissions::Removal::None;
+    let gate = match (gate, mode) {
+        // Without an approval mode, deletions always wait for skykeep-mcp approve: a rule
+        // can make them stricter, never looser.
+        (Gate::Run | Gate::Client, None) if removes => Gate::Terminal,
+        // A broken file with no earlier valid rules: every deletion asks.
+        (Gate::Run, Some(_)) if removes && active.strict => Gate::Client,
+        (gate, _) => gate,
+    };
+    Ok((gate, explicit))
+}
+
+/// A Drive change that needs a person whatever the rules say (`drive_write::needs_person`).
+/// Arguments that don't validate are left to the tool, which refuses them.
+fn drive_needs_person(library: &Library, name: &str, args: &Value) -> Result<bool, &'static str> {
+    if name != drive_write::TOOL {
+        return Ok(false);
+    }
+    match drive_write::validate(args) {
+        Ok(op) => drive_write::needs_person(library, &op),
+        Err(_) => Ok(false),
+    }
+}
+
+/// What an approval is bound to right now: the approval mode (none in a folder without one),
+/// the account and the permissions file.
+fn current_binding(
+    library: &Library,
+    configured: Option<&(Policy, ApprovalBinding)>,
+    active: &permissions::Active,
+) -> Result<ApprovalBinding, &'static str> {
+    let mut binding = match configured {
+        Some((_, binding)) => binding.clone(),
+        None => ApprovalBinding {
+            policy: String::new(),
+            account: library
+                .state(ACCOUNT_KEY)
+                .map_err(|_| "policy_unavailable")?,
+            identity: (0, 0),
+            snapshot: None,
+            preview_read: false,
+            rules: None,
+        },
+    };
+    binding.rules = Some(active.fingerprint.clone());
+    Ok(binding)
+}
+
+/// A terminal approval request made because the permissions file says ask: terminal. Bound
+/// to the approval mode's revision and the folder, like the request it answers.
+fn terminal_proposal(
+    library: &mut Library,
+    dir: &Path,
+    name: &str,
+    args: &Value,
+    policy: Option<&str>,
+    identity: (u64, u64),
+    rules: &str,
+) -> Result<Value, &'static str> {
+    let account = library
+        .state(ACCOUNT_KEY)
+        .map_err(|_| "library_unavailable")?
+        .ok_or("login_required")?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let proposal = json!({"tool":name,"args":args,"account":account,
+        "binding":{"policy":policy,"state_identity":identity,"rules":rules}});
+    library
+        .set_state(&format!("mcp.approval.{id}"), &proposal.to_string())
+        .map_err(|_| "library_unavailable")?;
+    Ok(
+        json!({"status":"approval_required","request_id":id,"approval":"terminal",
+        "next":status::with_dir("Ask the person to run skykeep-mcp approve in their own terminal and type this request ID there.", dir),
+        "remote_verified":false}),
+    )
+}
+
+/// The terminal approval `id` names exactly this call under the current mode and folder.
+fn terminal_check(
+    library: &Library,
+    id: &str,
+    name: &str,
+    args: &Value,
+    policy: Option<&str>,
+    identity: (u64, u64),
+    rules: &str,
+) -> Result<(), &'static str> {
+    let raw = library
+        .state(&format!("mcp.approval.{id}"))
+        .map_err(|_| "library_unavailable")?
+        .filter(|s| !s.is_empty())
+        .ok_or("approval_not_found")?;
+    let value: Value = serde_json::from_str(&raw).map_err(|_| "approval_not_found")?;
+    let account = library
+        .state(ACCOUNT_KEY)
+        .map_err(|_| "library_unavailable")?;
+    if value["tool"] != name
+        || value["args"] != *args
+        || value["account"] != json!(account)
+        || value["binding"] != json!({"policy":policy,"state_identity":identity,"rules":rules})
+    {
+        return Err("approval_policy_changed");
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -161,6 +368,7 @@ fn policy(
             identity: (0, 0),
             snapshot: None,
             preview_read: false,
+            rules: None,
         },
     )))
 }
@@ -170,7 +378,7 @@ fn policy(
 /// The same for a few Drive outcomes that leave the person something to do, and for a folder
 /// inside the exchange folder that others can change (`args` are the call's arguments).
 fn error_value(error: &'static str, dir: &Path, args: &Value) -> Value {
-    let mut value = json!({"error":error});
+    let mut value = plain_error(error);
     if let Some(instructions) = next_step(error, dir, args) {
         value["instructions"] = json!(instructions);
     }
@@ -182,6 +390,7 @@ fn error_value(error: &'static str, dir: &Path, args: &Value) -> Value {
 /// arguments (`Value::Null` when there are none).
 pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
     match error {
+        "unsafe_state_contents" => state::unsafe_entry_sentence(dir),
         e if e.starts_with("exchange_folder_") => Some(format!(
             "In your own terminal, run: {}",
             status::with_dir("skykeep-mcp exchange", dir)
@@ -206,38 +415,81 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
     }
 }
 
-/// [`tool_reply`] with [`error_value`]'s instructions.
+/// [`tool_reply`] with [`error_value`]'s instructions, and the rule that denied the call.
 fn tool_reply_in(
     id: Value,
     result: Result<Value, &'static str>,
     dir: &Path,
     args: &Value,
+    denied: Option<String>,
 ) -> Value {
     match result {
         Err(error) => {
-            json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":error_value(error, dir, args).to_string()}],"isError":true}})
+            let value = with_rule(error_value(error, dir, args), denied);
+            json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":value.to_string()}],"isError":true}})
         }
         ok => tool_reply(id, ok),
     }
 }
 
+/// A deny error names the rule in the permissions file that refused the call.
+fn with_rule(mut value: Value, denied: Option<String>) -> Value {
+    if let (Some(rule), true) = (denied, value["error"] == DENIED) {
+        value["message"] = json!(format!(
+            "The rule {rule}: deny in the permissions file refuses this action, so it did not run."
+        ));
+        value["rule"] = json!(rule);
+    }
+    value
+}
+
+/// The entry in the permissions file that denies this call: the action's own, the tool's, or
+/// for a Notes change that deletes, `notes_write.delete`.
+fn deny_rule(rules: &permissions::Rules, name: &str, args: &Value) -> String {
+    use permissions::Effect;
+    let denies = |key: &str| rules.get(key) == Some(&Effect::Deny);
+    let own = args["action"].as_str().map(|a| format!("{name}.{a}"));
+    match own {
+        Some(own) if denies(&own) => own,
+        _ if denies(name) => name.to_string(),
+        _ if name == "notes_write" && denies("notes_write.delete") => "notes_write.delete".into(),
+        _ => name.to_string(),
+    }
+}
+
 fn tool_reply(id: Value, result: Result<Value, &'static str>) -> Value {
     let failed = result.is_err();
-    let value = result.unwrap_or_else(|error| json!({"error":error}));
+    let value = result.unwrap_or_else(plain_error);
     json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":value.to_string()}],"isError":failed}})
 }
 
-fn accepts_confirmation(response: &Value) -> bool {
-    // This continuation only emits an empty confirmation form. An old checkbox
-    // answer or omitted content is not an answer to that form. Result metadata
-    // may describe the response but never supplies operation arguments or consent.
-    let Some(envelope) = response.as_object() else {
-        return false;
-    };
-    let Some(result) = response.get("result").and_then(Value::as_object) else {
-        return false;
-    };
-    envelope
+/// What the person chose on an approval card.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Decision {
+    Approve,
+    AlwaysAllow,
+}
+
+/// The card's choices. "Always allow" only where `always` says the card offers it.
+fn card_schema(always: bool) -> Value {
+    let mut choices = vec![
+        json!({"const":"approve","title":"Approve this time"}),
+        json!({"const":"deny","title":"Deny"}),
+    ];
+    if always {
+        choices.push(json!({"const":"always_allow","title":"Always allow this action"}));
+    }
+    json!({"type":"object","properties":{"decision":{"type":"string","title":"Decision","oneOf":choices}},"required":["decision"]})
+}
+
+fn decision(response: &Value, always: bool) -> Option<Decision> {
+    // The answer to the card is exactly one offered choice. No choice, a declined or
+    // cancelled card, or anything else means deny. Result metadata may describe the response
+    // but never supplies operation arguments or consent.
+    let envelope = response.as_object()?;
+    let result = response.get("result").and_then(Value::as_object)?;
+    let content = result.get("content").and_then(Value::as_object)?;
+    let well_formed = envelope
         .keys()
         .all(|key| ["jsonrpc", "id", "result"].contains(&key.as_str()))
         && response["jsonrpc"] == "2.0"
@@ -247,11 +499,16 @@ fn accepts_confirmation(response: &Value) -> bool {
         && result
             .get("action")
             .is_some_and(|action| action == "accept")
-        && result
-            .get("content")
-            .and_then(Value::as_object)
-            .is_some_and(|content| content.is_empty())
-        && result.get("_meta").is_none_or(Value::is_object)
+        && content.len() == 1
+        && result.get("_meta").is_none_or(Value::is_object);
+    if !well_formed {
+        return None;
+    }
+    match content.get("decision").and_then(Value::as_str)? {
+        "approve" => Some(Decision::Approve),
+        "always_allow" if always => Some(Decision::AlwaysAllow),
+        _ => None,
+    }
 }
 
 fn directory_identity(dir: &Path) -> Result<(u64, u64), &'static str> {
@@ -320,7 +577,7 @@ fn inert_preview(params: &Value) -> Result<String, &'static str> {
     Ok(preview)
 }
 
-fn needs_consent(mode: &str, name: &str) -> Result<bool, &'static str> {
+pub(crate) fn needs_consent(mode: &str, name: &str) -> Result<bool, &'static str> {
     match name {
         "auth_status" | "sync_status" => Ok(false),
         "notes_write" | "reminders_write" => Ok(mode != "yolo"),
@@ -434,6 +691,13 @@ pub struct Server {
     forms: bool,
     pending: Option<PendingConsent>,
     grant: Option<ApprovalBinding>,
+    /// The terminal approval request `skykeep-mcp approve` is running, if any.
+    terminal: Option<String>,
+    /// The rule that denied the last call, for its error message.
+    denied: Option<String>,
+    /// Set by the last consent check: the card must not offer "Always allow", because an
+    /// allow rule would not stop it asking (a Drive deletion or large folder move).
+    always_blocked: bool,
     drive: drive_write::Seam,
 }
 
@@ -456,7 +720,7 @@ mod consent_tests {
         assert_eq!(server.expire_consent().unwrap()["id"], 2);
         assert!(server
             .handle(
-                json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}})
+                json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}})
             )
             .await
             .is_none());
@@ -466,7 +730,7 @@ mod consent_tests {
         let mut reopened = Server::open(dir.path()).unwrap();
         assert!(reopened
             .handle(
-                json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}})
+                json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}})
             )
             .await
             .is_none());
@@ -516,7 +780,7 @@ mod consent_tests {
             assert!(expired.to_string().contains("approval_timeout"));
             assert!(!expired.to_string().contains("SYNTHETIC-PRIVATE"));
             assert!(server
-                .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+                .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
                 .await
                 .is_none());
         }
@@ -537,24 +801,37 @@ impl Server {
         let held = state::PrivateState::open(&self.dir)?;
         let dir = held.path.clone();
         let library = self.ready(&held)?;
-        let Some((p, mut binding)) = policy(library, &held.path)? else {
-            return Ok(None);
-        };
+        let configured = policy(library, &held.path)?;
+        let mode = configured.as_ref().map(|(p, _)| p.mode.clone());
+        let active = permissions::load(library, &dir, mode.as_deref())?;
         let name = params["name"].as_str().ok_or("invalid_tool")?;
+        let (gate, _) = gate_for(
+            library,
+            mode.as_deref(),
+            &active,
+            name,
+            &params["arguments"],
+        )?;
+        if gate == Gate::Deny {
+            self.denied = Some(deny_rule(&active.rules, name, &params["arguments"]));
+            return Err(DENIED);
+        }
         // Malformed Contacts arguments are refused before anyone is asked to approve them.
         contacts::validate(name, &params["arguments"])?;
         calendar::validate(name, &params["arguments"])?;
         photos::validate(name, &params["arguments"])?;
         drive::validate(name, &params["arguments"])?;
-        if !needs_consent(&p.mode, name)? {
+        if gate != Gate::Client {
             return Ok(None);
         }
+        let blocked = drive_needs_person(library, name, &params["arguments"])?;
+        let mut binding = current_binding(library, configured.as_ref(), &active)?;
         if name.ends_with("_write") && binding.account.is_none() {
             return Err("login_required");
         }
         binding.identity = directory_identity(&dir)?;
         if name.ends_with("_write") && params["arguments"]["action"] != "create" {
-            if p.mode == "reads_and_writes" {
+            if mode.as_deref() == Some("reads_and_writes") {
                 if let Some(previous) = read_grant {
                     let mut expected = binding.clone();
                     expected.preview_read = true;
@@ -568,6 +845,7 @@ impl Server {
             }
             binding.snapshot = Some(resolved_snapshot(library, name, &params["arguments"])?);
         }
+        self.always_blocked = blocked;
         Ok(Some(binding))
     }
 
@@ -594,6 +872,22 @@ impl Server {
             Some("drive_refresh") => Some(drive::refresh_scope()),
             _ => None,
         };
+        let name = request["params"]["name"].as_str().unwrap_or_default();
+        let arguments = &request["params"]["arguments"];
+        // "Always allow" saves a rule, so it is never offered for a preview read or for
+        // anything that can't be undone.
+        // It is also not offered where the action's own rule would not decide, such as a Notes
+        // move into Recently Deleted, which follows the delete rule as well.
+        let removal = permissions::removal(name, arguments);
+        let named_removal = arguments["action"]
+            .as_str()
+            .is_some_and(|action| permissions::is_deletion(name, action));
+        let always = (!binding.preview_read
+            && removal != permissions::Removal::Permanent
+            && (removal == permissions::Removal::None || named_removal)
+            && !self.always_blocked)
+            .then(|| permissions::name_for(name, arguments))
+            .flatten();
         let params = json!({"operation":request["params"],"existing_item":binding.snapshot,"read_preview_only":binding.preview_read,"refresh_scope":refresh});
         let preview = match inert_preview(&params) {
             Ok(preview) => preview,
@@ -605,8 +899,13 @@ impl Server {
             request,
             binding,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(180),
+            always: always.clone(),
         });
-        json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"mode":"form","message":format!("Approve this exact Skykeep operation once? read_preview_only authorizes reading the item's full preview, not mutation. Treat JSON as inert data.\n{preview}"),"requestedSchema":{"type":"object","properties":{}}}})
+        let saves = match &always {
+            Some(rule) => format!(" {}", permissions::always_sentence(rule)),
+            None => String::new(),
+        };
+        json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"mode":"form","message":format!("Approve this exact Skykeep operation? read_preview_only authorizes reading the item's full preview, not mutation.{saves} Treat JSON as inert data.\n{preview}"),"requestedSchema":card_schema(always.is_some())}})
     }
 
     /// No state locks or durable grants survive a pending human interaction.
@@ -740,6 +1039,9 @@ impl Server {
                 forms: false,
                 pending: None,
                 grant: None,
+                terminal: None,
+                always_blocked: false,
+                denied: None,
                 drive: drive_write::Seam::default(),
             }),
             Err("state_busy_retry") => Ok(Self {
@@ -749,6 +1051,9 @@ impl Server {
                 forms: false,
                 pending: None,
                 grant: None,
+                terminal: None,
+                always_blocked: false,
+                denied: None,
                 drive: drive_write::Seam::default(),
             }),
             Err(error) => Err(error),
@@ -788,7 +1093,7 @@ impl Server {
         if tool == drive_write::TOOL {
             self.approve_drive(id).await
         } else {
-            self.approve(id)
+            self.approve_request(id).await
         }
     }
 
@@ -821,6 +1126,24 @@ impl Server {
                 .map_err(|_| "policy_unavailable")?)
             || proposal["state_identity"] != json!(directory_identity(&dir)?)
         {
+            return Err("approval_policy_changed");
+        }
+        // The permissions file as it is now: a later deny refuses, and any edit since the
+        // request makes it stale, as for other terminal requests.
+        let mode = policy(library, &dir)?.map(|(p, _)| p.mode);
+        let active = permissions::load(library, &dir, mode.as_deref())?;
+        if gate_for(
+            library,
+            mode.as_deref(),
+            &active,
+            drive_write::TOOL,
+            &proposal["args"],
+        )?
+        .0 == Gate::Deny
+        {
+            return Err(DENIED);
+        }
+        if proposal["rules"] != json!(active.fingerprint) {
             return Err("approval_policy_changed");
         }
         if drive_write::preview(library, &proposal["args"])? != proposal["preview"] {
@@ -862,14 +1185,14 @@ impl Server {
                 return None;
             }
             let pending = self.pending.take().unwrap();
-            let accepted =
-                accepts_confirmation(&request) && std::time::Instant::now() < pending.deadline;
-            if !accepted {
+            let chosen = decision(&request, pending.always.is_some())
+                .filter(|_| std::time::Instant::now() < pending.deadline);
+            let Some(chosen) = chosen else {
                 return Some(tool_reply(
                     pending.request["id"].clone(),
                     Err("approval_denied"),
                 ));
-            }
+            };
             if pending.binding.preview_read {
                 return Some(
                     match self.prepare_consent(&pending.request["params"], Some(&pending.binding)) {
@@ -881,6 +1204,7 @@ impl Server {
                     },
                 );
             }
+            let fingerprint = pending.binding.rules.clone().unwrap_or_default();
             self.grant = Some(pending.binding);
             let params = &pending.request["params"];
             let result = self
@@ -890,11 +1214,30 @@ impl Server {
                 )
                 .await;
             self.grant = None;
+            let result = match (chosen, pending.always, result) {
+                (Decision::AlwaysAllow, Some(rule), Ok(mut value)) => {
+                    // The person chose this on the card; the agent can't answer the card.
+                    let saved = state::PrivateState::open(&self.dir)
+                        .map_err(|e| e.to_string())
+                        .and_then(|held| permissions::save_allow(&held.path, &rule, &fingerprint));
+                    if value.is_object() {
+                        value["permission_rule"] = match saved {
+                            Ok(()) => json!({"saved":true,"rule":format!("{rule}: allow")}),
+                            Err(reason) => {
+                                json!({"saved":false,"rule":format!("{rule}: allow"),"reason":format!("The action ran once, but the rule was not saved: {reason}.")})
+                            }
+                        };
+                    }
+                    Ok(value)
+                }
+                (_, _, result) => result,
+            };
             return Some(tool_reply_in(
                 pending.request["id"].clone(),
                 result,
                 &self.dir,
                 &pending.request["params"]["arguments"],
+                self.denied.take(),
             ));
         }
         // Batches and other non-object messages are not supported; say so instead of dropping them.
@@ -964,7 +1307,16 @@ impl Server {
                         }
                         return Some(self.consent_form(request, binding));
                     }
-                    Err(error) => return Some(tool_reply(id, Err(error))),
+                    Err(error) => {
+                        let denied = self.denied.take();
+                        return Some(tool_reply_in(
+                            id,
+                            Err(error),
+                            &self.dir,
+                            &params["arguments"],
+                            denied,
+                        ));
+                    }
                     Ok(None) => {}
                 }
                 let result = self
@@ -975,7 +1327,13 @@ impl Server {
                     .await;
                 let (value, failed) = match result {
                     Ok(value) => (value, false),
-                    Err(error) => (error_value(error, &self.dir, &params["arguments"]), true),
+                    Err(error) => (
+                        with_rule(
+                            error_value(error, &self.dir, &params["arguments"]),
+                            self.denied.take(),
+                        ),
+                        true,
+                    ),
                 };
                 Ok(json!({"content":[{"type":"text","text":value.to_string()}],"isError":failed}))
             }
@@ -1032,6 +1390,21 @@ impl Server {
         }
         uuid::Uuid::parse_str(id).map_err(|_| "invalid_request_id")?;
         let key = format!("mcp.approval.{id}");
+        // A request made before the permissions file said deny is refused too.
+        {
+            let library = self.ready(&held)?;
+            let request: Value = library
+                .state(&key)
+                .map_err(|_| "library_unavailable")?
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or(Value::Null);
+            if let Some(tool) = request["tool"].as_str() {
+                let active = permissions::load(library, &held.path, None)?;
+                if gate_for(library, None, &active, tool, &request["args"])?.0 == Gate::Deny {
+                    return Err(DENIED);
+                }
+            }
+        }
         self.ready(&held)?
             .atomically(|library| {
                 let raw = library.state(&key)?.ok_or_else(|| {
@@ -1061,35 +1434,81 @@ impl Server {
             .map_err(|_| "approval_refused")
     }
 
+    /// `skykeep-mcp approve`: runs a queued request once. A request made because the
+    /// permissions file says ask: terminal runs through the same checks as any tool call; an
+    /// older request goes through [`Self::approve`] as before.
+    pub async fn approve_request(&mut self, id: &str) -> Result<Value, &'static str> {
+        uuid::Uuid::parse_str(id).map_err(|_| "invalid_request_id")?;
+        let value: Value = {
+            let held = state::PrivateState::open(&self.dir)?;
+            let raw = self
+                .ready(&held)?
+                .state(&format!("mcp.approval.{id}"))
+                .map_err(|_| "library_unavailable")?
+                .filter(|s| !s.is_empty())
+                .ok_or("approval_not_found")?;
+            serde_json::from_str(&raw).map_err(|_| "approval_not_found")?
+        };
+        if value.get("binding").is_none() {
+            return self.approve(id);
+        }
+        let tool = value["tool"].as_str().ok_or("invalid_tool")?.to_string();
+        self.terminal = Some(id.to_string());
+        let result = self.call(&tool, value["args"].clone()).await;
+        self.terminal = None;
+        result
+    }
+
     async fn call(&mut self, name: &str, args: Value) -> Result<Value, &'static str> {
         let grant = self.grant.take();
+        let terminal = self.terminal.take();
         let drive_seam = self.drive.clone();
         let held = state::PrivateState::open(&self.dir)?;
         let dir = held.path.clone();
         let library = self.ready(&held)?;
         let configured = policy(library, &dir)?;
+        let mode = configured.as_ref().map(|(p, _)| p.mode.clone());
+        let active = permissions::load(library, &dir, mode.as_deref())?;
+        let (gate, explicit) = gate_for(library, mode.as_deref(), &active, name, &args)?;
+        if gate == Gate::Deny {
+            self.denied = Some(deny_rule(&active.rules, name, &args));
+            return Err(DENIED);
+        }
+        let mut current = current_binding(library, configured.as_ref(), &active)?;
+        current.identity = directory_identity(&dir)?;
         if let Some(ref grant) = grant {
-            let mut current = configured
-                .as_ref()
-                .map(|(_, b)| b.clone())
-                .ok_or("approval_policy_changed")?;
-            current.identity = directory_identity(&dir)?;
             let mut expected = grant.clone();
             expected.snapshot = None;
             if current != expected {
                 return Err("approval_policy_changed");
             }
+            let mut exact = current.clone();
             if grant.snapshot.is_some() {
-                current.snapshot = Some(resolved_snapshot(library, name, &args)?);
+                exact.snapshot = Some(resolved_snapshot(library, name, &args)?);
             }
-            if grant != &current {
+            if grant != &exact {
                 return Err("approval_policy_changed");
             }
         }
-        if let Some((ref p, ref binding)) = configured {
-            if needs_consent(&p.mode, name)? {
-                let mut binding = binding.clone();
-                binding.identity = directory_identity(&dir)?;
+        let policy_raw = configured.as_ref().map(|(_, b)| b.policy.clone());
+        let terminal_approved = match &terminal {
+            Some(id) => {
+                terminal_check(
+                    library,
+                    id,
+                    name,
+                    &args,
+                    policy_raw.as_deref(),
+                    current.identity,
+                    &active.fingerprint,
+                )?;
+                true
+            }
+            None => false,
+        };
+        match gate {
+            Gate::Client if !terminal_approved => {
+                let mut binding = current.clone();
                 if name.ends_with("_write") && args["action"] != "create" {
                     binding.snapshot = Some(resolved_snapshot(library, name, &args)?);
                 }
@@ -1097,10 +1516,38 @@ impl Server {
                     return Err("approval_required_or_stale");
                 }
             }
-        } else if grant.is_some() {
-            return Err("approval_policy_changed");
+            // A Drive change gets Drive's own request, bound to its preview, below.
+            Gate::Terminal if !terminal_approved && name != drive_write::TOOL => {
+                return terminal_proposal(
+                    library,
+                    &dir,
+                    name,
+                    &args,
+                    policy_raw.as_deref(),
+                    current.identity,
+                    &active.fingerprint,
+                )
+                .map(|mut reply| {
+                    if let Some(text) = active.fallback() {
+                        reply["permissions_file"] = json!(text);
+                    }
+                    reply
+                });
+            }
+            _ => {}
         }
-        match name {
+        // A refresh needs approval under reads_and_writes; a rule or a card can give it.
+        let approved = grant.is_some() || terminal_approved || gate == Gate::Run;
+        // The older no-mode behaviour applies only where no rule decided.
+        let legacy = gate == Gate::Legacy && !terminal_approved;
+        // A deletion that runs only because the file allows it is logged once it ran.
+        let logged = (gate == Gate::Run
+            && explicit == Some(permissions::Effect::Allow)
+            && grant.is_none()
+            && !terminal_approved
+            && permissions::removal(name, &args) != permissions::Removal::None)
+            .then(|| args["action"].as_str().unwrap_or_default().to_string());
+        let result = match name {
             "sync" => {
                 let _: Empty = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
                 if library
@@ -1110,7 +1557,7 @@ impl Server {
                 {
                     return Err("login_required");
                 }
-                sync::run_authorized(&dir, grant.is_some()).await
+                sync::run_authorized(&dir, approved).await
             }
             "contacts_list" => contacts::list(library, args),
             "contacts_search" => contacts::search(library, args),
@@ -1124,7 +1571,7 @@ impl Server {
                 {
                     return Err("login_required");
                 }
-                contacts::refresh(&dir, grant.is_some()).await
+                contacts::refresh(&dir, approved).await
             }
             "calendar_calendars" => calendar::calendars(library, args),
             "calendar_events" => calendar::events(library, args),
@@ -1139,7 +1586,7 @@ impl Server {
                 {
                     return Err("login_required");
                 }
-                calendar::refresh(&dir, grant.is_some(), args).await
+                calendar::refresh(&dir, approved, args).await
             }
             "photos_albums" => photos::albums(library, args),
             "photos_list" => photos::list(library, args),
@@ -1154,7 +1601,7 @@ impl Server {
                 {
                     return Err("login_required");
                 }
-                photos::refresh(&dir, grant.is_some()).await
+                photos::refresh(&dir, approved).await
             }
             "drive_list" => drive::list(library, args),
             "drive_get" => drive::get(library, args),
@@ -1168,7 +1615,7 @@ impl Server {
                 {
                     return Err("login_required");
                 }
-                drive::refresh(&dir, grant.is_some(), args).await
+                drive::refresh(&dir, approved, args).await
             }
             "drive_write" => {
                 let op = drive_write::validate(&args)?;
@@ -1177,19 +1624,23 @@ impl Server {
                     .map_err(|_| "library_unavailable")?
                     .ok_or("login_required")?;
                 let mode = configured.as_ref().map(|(p, _)| p.mode.as_str());
-                let terminal = drive_write::goes_to_terminal(library, mode, &op)?
-                    || (configured.is_none()
-                        && library
-                            .state("mcp.require_write_approval")
-                            .map_err(|_| "library_unavailable")?
-                            .as_deref()
-                            == Some("true"));
+                // A card the person approved is that person's approval: no second ask.
+                let terminal = grant.is_none()
+                    && (gate == Gate::Terminal
+                        || drive_write::goes_to_terminal(library, mode, &op)?
+                        || (configured.is_none()
+                            && library
+                                .state("mcp.require_write_approval")
+                                .map_err(|_| "library_unavailable")?
+                                .as_deref()
+                                == Some("true")));
                 if terminal {
                     let id = uuid::Uuid::new_v4().to_string();
                     let args = serde_json::to_value(&op).map_err(|_| "invalid_arguments")?;
                     let proposal = json!({"tool":name,"args":args,"account":account,
                         "policy":library.state("mcp.policy").map_err(|_| "policy_unavailable")?,
                         "state_identity":directory_identity(&dir)?,
+                        "rules":active.fingerprint,
                         "preview":drive_write::preview(library, &args)?});
                     library
                         .set_state(&format!("mcp.approval.{id}"), &proposal.to_string())
@@ -1198,7 +1649,12 @@ impl Server {
                         "approve_in_terminal":status::with_dir("skykeep-mcp approve", &dir),
                         "remote_verified":false}));
                 }
-                drive_write::run(&dir, &drive_seam, op, grant.is_some()).await
+                // An allow rule counts as approval only where Drive needs no person; run
+                // checks that again itself.
+                let allowed = gate == Gate::Run
+                    && explicit == Some(permissions::Effect::Allow)
+                    && !drive_write::needs_person(library, &op)?;
+                drive_write::run(&dir, &drive_seam, op, grant.is_some() || allowed).await
             }
             "sync_status" => {
                 let _: Empty = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -1233,9 +1689,9 @@ impl Server {
                     .map_err(|_| "library_unavailable")?
                     .is_some();
                 // Every follow-up names this folder, so it can be typed as shown.
-                let here = status::with_dir("skykeep-mcp setup", &self.dir);
-                if let Some(closed) = storage::protected_problem(&self.dir) {
-                    let text = status::with_dir(storage::tool_text(&closed), &self.dir);
+                let here = status::with_dir("skykeep-mcp setup", &dir);
+                if let Some(closed) = storage::protected_problem(&dir) {
+                    let text = status::with_dir(storage::tool_text(&closed), &dir);
                     return Ok(
                         json!({"status":if closed == storage::Closed::Locked {"locked"} else {"storage_problem"},"instructions":format!("{text}. Open your own trusted terminal, outside agent/tool capture, and type any passphrase there. Never send passwords, codes or passphrases to MCP or chat."),"session_checked":false}),
                     );
@@ -1352,7 +1808,7 @@ impl Server {
                 {
                     return Err("login_required");
                 }
-                if configured.is_none()
+                if legacy
                     && (matches!(args, ReminderWrite::Delete { .. })
                         || library
                             .state("mcp.require_write_approval")
@@ -1370,9 +1826,13 @@ impl Server {
                     );
                 }
                 if configured.is_some() {
-                    authorized_enqueue(library, &dir, |l| enqueue_reminder(l, args))
+                    authorized_enqueue(
+                        library,
+                        &dir,
+                        once(&terminal, |l| enqueue_reminder(l, args)),
+                    )
                 } else {
-                    enqueue_reminder(library, args)
+                    in_one(library, once(&terminal, |l| enqueue_reminder(l, args)))
                 }
             }
             "notes_write" => {
@@ -1385,7 +1845,7 @@ impl Server {
                 {
                     return Err("login_required");
                 }
-                if configured.is_none()
+                if legacy
                     && (args.is_destructive()
                         || library
                             .state("mcp.require_write_approval")
@@ -1403,14 +1863,66 @@ impl Server {
                     );
                 }
                 if configured.is_some() {
-                    authorized_enqueue(library, &dir, |l| enqueue_note(l, args))
+                    authorized_enqueue(library, &dir, once(&terminal, |l| enqueue_note(l, args)))
                 } else {
-                    enqueue_note(library, args)
+                    in_one(library, once(&terminal, |l| enqueue_note(l, args)))
                 }
             }
             _ => Err("unknown_tool"),
+        };
+        if terminal_approved && result.is_ok() {
+            if let Some(id) = &terminal {
+                library
+                    .set_state(&format!("mcp.approval.{id}"), "")
+                    .map_err(|_| "library_unavailable")?;
+            }
+        }
+        let mut result = result;
+        if let Some(value) = result.as_mut().ok().filter(|v| v.is_object()) {
+            if let Some(action) = &logged {
+                if let Err(error) = permissions::log_allowed(&dir, name, action) {
+                    value["permissions_log"] = json!(format!("The deletion ran, but it could not be written to the permissions log: {error}."));
+                }
+            }
+            if let Some(text) = active.fallback() {
+                value["permissions_file"] = json!(text);
+            }
+        }
+        result
+    }
+}
+
+/// `enqueue`, and in the same transaction the clearing of the terminal request it answers, so
+/// an approved request runs at most once even if the process stops halfway.
+fn once<'a>(
+    terminal: &'a Option<String>,
+    enqueue: impl FnOnce(&mut Library) -> Result<Value, &'static str> + 'a,
+) -> impl FnOnce(&mut Library) -> Result<Value, &'static str> + 'a {
+    move |library| {
+        let result = enqueue(library)?;
+        if let Some(id) = terminal {
+            library
+                .set_state(&format!("mcp.approval.{id}"), "")
+                .map_err(|_| "library_unavailable")?;
+        }
+        Ok(result)
+    }
+}
+
+/// `apply` in one transaction: everything it wrote is undone when it fails.
+fn in_one(
+    library: &mut Library,
+    apply: impl FnOnce(&mut Library) -> Result<Value, &'static str>,
+) -> Result<Value, &'static str> {
+    struct Refused(&'static str);
+    impl From<quince_core::Error> for Refused {
+        fn from(_: quince_core::Error) -> Self {
+            Refused("library_unavailable")
         }
     }
+    library
+        .atomically(|library| apply(library).map_err(Refused))
+        .map_err(|Refused(error)| error)
 }
 
 fn authorized_enqueue(
@@ -1503,7 +2015,10 @@ fn setup(path: &Path) -> Result<Library, &'static str> {
     use std::os::unix::fs::PermissionsExt;
     for file in std::fs::read_dir(path).map_err(|_| "state_unavailable")? {
         let file = file.map_err(|_| "state_unavailable")?;
-        if file.file_type().map_err(|_| "state_unavailable")?.is_file() {
+        // The permissions file keeps the mode its owner gave it; its reader reports a shared one.
+        if file.file_type().map_err(|_| "state_unavailable")?.is_file()
+            && file.file_name() != permissions::FILE_NAME
+        {
             std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600))
                 .map_err(|_| "state_unavailable")?;
         }
@@ -2115,7 +2630,7 @@ const SERVER_TITLE: &str =
     "Skykeep: Apple iCloud Notes, Reminders, Contacts, Calendar, Photos & iCloud Drive";
 const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, and reads the user's Apple iCloud Contacts, Apple iCloud Calendar and Apple iCloud Photos metadata (read-only), and reads and changes Apple iCloud Drive: folder listings and file details from the cache, and drive_write to create folders, rename, move, trash, delete for good, upload from and download into the exchange folder the user set up in their terminal. Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode. Notes and Reminders changes are queued until sync sends them; a Drive change runs once it is allowed and its reply says what Apple confirmed. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
 
-fn tools() -> Vec<Value> {
+pub(crate) fn tools() -> Vec<Value> {
     // (name, description, parent property, parent required)
     let lists = [
         (

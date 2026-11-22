@@ -26,7 +26,9 @@ async fn main() {
         }
         return;
     }
-    if let Some(command) = first.filter(|c| ["setup", "status", "unlock"].contains(&c.as_str())) {
+    if let Some(command) =
+        first.filter(|c| ["setup", "status", "unlock", "permissions"].contains(&c.as_str()))
+    {
         all.remove(0);
         if let Err(error) = guided(&command, all).await {
             eprintln!("skykeep-mcp: {error}");
@@ -47,6 +49,9 @@ Start here, in a terminal window you opened yourself:
   skykeep-mcp status [--state-dir FOLDER]   check this computer's setup; no network, no passwords
   skykeep-mcp unlock [--state-dir FOLDER] [--hours N]
                                             after a restart, open the protected file with its passphrase
+  skykeep-mcp permissions show [--state-dir FOLDER]
+                                            the rules from permissions.yaml in use, what changed
+                                            since you last looked, and deletions that ran without asking
 
 More commands (each needs --state-dir FOLDER):
   skykeep-mcp login       sign in to Apple again
@@ -156,17 +161,21 @@ impl setup::Console for Tty {
     }
 }
 
-/// `setup`, `status` and `unlock`: `[--state-dir DIR]`, and `[--hours N]` for unlock.
+/// `setup`, `status`, `unlock` and `permissions show`: `[--state-dir DIR]`, and
+/// `[--hours N]` for unlock.
 async fn guided(command: &str, args: Vec<std::ffi::OsString>) -> Result<(), String> {
     let mut dir = None;
     let mut hours = None;
+    let mut show = false;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
             print!("{HELP}");
             return Ok(());
         }
-        if arg == "--state-dir" && dir.is_none() {
+        if arg == "show" && command == "permissions" && !show {
+            show = true;
+        } else if arg == "--state-dir" && dir.is_none() {
             dir = Some(PathBuf::from(
                 args.next().ok_or("state_directory_required")?,
             ));
@@ -181,6 +190,7 @@ async fn guided(command: &str, args: Vec<std::ffi::OsString>) -> Result<(), Stri
             return Err(match command {
                 "unlock" => "usage: skykeep-mcp unlock [--state-dir FOLDER] [--hours N]",
                 "status" => "usage: skykeep-mcp status [--state-dir FOLDER]",
+                "permissions" => "usage: skykeep-mcp permissions show [--state-dir FOLDER]",
                 _ => "usage: skykeep-mcp setup [--state-dir FOLDER]",
             }
             .into());
@@ -190,6 +200,22 @@ async fn guided(command: &str, args: Vec<std::ffi::OsString>) -> Result<(), Stri
         .map(|d| std::path::absolute(d).map_err(|_| "state_unavailable"))
         .transpose()?;
     let env = storage::env();
+    if command == "permissions" {
+        if !show {
+            return Err("usage: skykeep-mcp permissions show [--state-dir FOLDER]".into());
+        }
+        let dir = dir
+            .or_else(setup::default_dir)
+            .ok_or("permissions can't find your home folder: add --state-dir FOLDER")?;
+        // Only the person's own terminal marks the changes as seen: an agent that runs this
+        // command can't clear the notice status shows.
+        let person = !terminal::agent_marked(|name| std::env::var_os(name))
+            && unsafe { libc::isatty(1) } == 1;
+        let text = skykeep_mcp::permissions::show(&dir, person)
+            .map_err(|e| skykeep_mcp::permissions::plain(e).to_string())?;
+        print!("{}", skykeep_mcp::status::with_dir(&text, &dir));
+        return Ok(());
+    }
     if command == "status" {
         let dir = match dir.or_else(setup::default_dir) {
             Some(dir) => dir,

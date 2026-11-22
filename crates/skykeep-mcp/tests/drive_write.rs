@@ -682,7 +682,7 @@ async fn deletions_need_approval_under_every_mode() {
             // First the preview read, then the change.
             let next = f
                 .server
-                .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+                .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
                 .await
                 .unwrap();
             assert_eq!(next["method"], "elicitation/create", "{next}");
@@ -1665,7 +1665,7 @@ async fn a_form_approved_delete_forever_that_stops_half_way_says_what_to_do() {
     .await;
     let reply = f
         .server
-        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
         .await
         .unwrap();
     let value = text(&reply);
@@ -1980,4 +1980,279 @@ fn common_refusals_say_what_to_do_next() {
         let step = skykeep_mcp::next_step(code, Path::new("/state"), &Value::Null);
         assert!(step.as_deref().is_some_and(|s| s.len() > 20), "{code}");
     }
+}
+
+fn rules(dir: &Path, text: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(skykeep_mcp::permissions::FILE_NAME);
+    std::fs::write(&path, text).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn choices(form: &Value) -> Vec<String> {
+    form["params"]["requestedSchema"]["properties"]["decision"]["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["const"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn approve(form: &Value) -> Value {
+    json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}})
+}
+
+/// The answers a rename of the report needs: as cached before, renamed after.
+async fn serve_rename(remote: &MockServer) {
+    serve_listing(remote, ROOT, root_items(), Some(1)).await;
+    serve_listing(
+        remote,
+        ROOT,
+        json!([
+            file(REPORT, ROOT, "final", "pdf", 11),
+            folder(DOCS, "Documents", 2)
+        ]),
+        None,
+    )
+    .await;
+    answer(remote, "/renameItems", ok_items(REPORT)).await;
+}
+
+/// The answers a trash of the report needs.
+async fn serve_trash(remote: &MockServer) {
+    serve_listing(remote, ROOT, root_items(), Some(2)).await;
+    serve_listing(remote, ROOT, json!([folder(DOCS, "Documents", 2)]), None).await;
+    answer(remote, "/moveItemsToTrash", ok_items(REPORT)).await;
+}
+
+#[test]
+fn drive_write_actions_are_rule_names_and_deletions_are_decided_in_one_place() {
+    use skykeep_mcp::permissions::{self, Removal};
+    let names = permissions::names();
+    assert!(names.iter().any(|n| n == "drive_write"));
+    for action in skykeep_mcp::drive_write::ACTIONS {
+        assert!(
+            names.iter().any(|n| *n == format!("drive_write.{action}")),
+            "{action}"
+        );
+        // Pinned: only trash and delete_forever remove something.
+        let removes = matches!(action, "trash" | "delete_forever");
+        assert_eq!(
+            skykeep_mcp::drive_write::is_destructive(action),
+            removes,
+            "{action}"
+        );
+        assert_eq!(
+            permissions::is_deletion("drive_write", action),
+            removes,
+            "{action}"
+        );
+    }
+    assert_eq!(skykeep_mcp::drive_write::ACTIONS.len(), 7);
+    assert_eq!(
+        permissions::removal_of("drive_write", "trash"),
+        Removal::Recoverable
+    );
+    assert_eq!(
+        permissions::removal_of("drive_write", "delete_forever"),
+        Removal::Permanent
+    );
+    assert!(permissions::parse("rules:\n  drive_write.delete_forever: deny\n").is_ok());
+    let starter = permissions::parse(&permissions::starter(
+        Some("writes_only"),
+        Path::new("/srv/sky"),
+    ))
+    .unwrap();
+    assert!(
+        starter.contains_key("drive_write.trash")
+            && starter.contains_key("drive_write.delete_forever")
+    );
+}
+
+#[tokio::test]
+async fn deny_refuses_drive_changes_and_their_waiting_terminal_requests() {
+    let mut f = fixture(None).await;
+    rules(f.dir.path(), "rules:\n  drive_write.rename: deny\n");
+    assert_eq!(
+        error(
+            &mut f.server,
+            json!({"action":"rename","path":"/report.pdf","name":"final.pdf"})
+        )
+        .await,
+        "denied_by_permissions"
+    );
+    rules(f.dir.path(), "rules:\n  drive_write: deny\n");
+    assert_eq!(
+        error(
+            &mut f.server,
+            json!({"action":"create_folder","path":"/New"})
+        )
+        .await,
+        "denied_by_permissions"
+    );
+    std::fs::remove_file(f.dir.path().join(skykeep_mcp::permissions::FILE_NAME)).unwrap();
+    let id = proposal_id(&ok(&mut f.server, json!({"action":"trash","id":REPORT})).await);
+    rules(f.dir.path(), "rules:\n  drive_write.trash: deny\n");
+    assert_eq!(
+        f.server.approve_any(&id).await,
+        Err("denied_by_permissions")
+    );
+    assert!(writes(&f.remote).await.is_empty());
+}
+
+#[tokio::test]
+async fn allow_runs_a_small_drive_change_unasked_but_never_a_deletion_or_large_move() {
+    let mut f = fixture(Some("writes_only")).await;
+    let rename = json!({"action":"rename","path":"/report.pdf","name":"final.pdf"});
+    let form = call(&mut f.server, rename.clone()).await;
+    assert_eq!(
+        form["method"], "elicitation/create",
+        "without a rule the mode asks"
+    );
+    assert_eq!(choices(&form), ["approve", "deny", "always_allow"]);
+    f.server
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"cancel"}}))
+        .await;
+    rules(f.dir.path(), "rules:\n  drive_write: allow\n");
+    serve_rename(&f.remote).await;
+    let done = ok(&mut f.server, rename).await;
+    assert_eq!(done["outcome"], "done", "{done}");
+    assert_eq!(writes(&f.remote).await, ["/renameItems"]);
+    // A deletion and a large folder move still ask, and the card offers no Always allow.
+    for args in [
+        json!({"action":"trash","id":REPORT}),
+        json!({"action":"delete_forever","id":REPORT}),
+        json!({"action":"move","id":BIG,"destination_id":DOCS}),
+    ] {
+        let form = call(&mut f.server, args.clone()).await;
+        assert_eq!(form["method"], "elicitation/create", "{args}: {form}");
+        assert_eq!(choices(&form), ["approve", "deny"], "{args}");
+        f.server
+            .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"cancel"}}))
+            .await;
+    }
+    assert_eq!(writes(&f.remote).await, ["/renameItems"]);
+    // Under yolo and without a mode they wait for the terminal.
+    for mode in [Some("yolo"), None] {
+        let mut f = fixture(mode).await;
+        rules(f.dir.path(), "rules:\n  drive_write: allow\n");
+        for action in ["trash", "delete_forever"] {
+            proposal_id(&ok(&mut f.server, json!({"action":action,"id":REPORT})).await);
+        }
+        proposal_id(
+            &ok(
+                &mut f.server,
+                json!({"action":"move","id":BIG,"destination_id":DOCS}),
+            )
+            .await,
+        );
+        assert!(writes(&f.remote).await.is_empty(), "{mode:?}");
+        assert!(!f
+            .dir
+            .path()
+            .join(skykeep_mcp::permissions::LOG_NAME)
+            .exists());
+    }
+}
+
+#[tokio::test]
+async fn ask_terminal_for_a_drive_change_uses_its_preview_and_goes_stale_on_an_edit() {
+    let mut f = fixture(Some("writes_only")).await;
+    let rename = json!({"action":"rename","path":"/report.pdf","name":"final.pdf"});
+    rules(
+        f.dir.path(),
+        "rules:\n  drive_write.rename: {ask: terminal}\n",
+    );
+    let id = proposal_id(&ok(&mut f.server, rename.clone()).await);
+    let details: Value = serde_json::from_str(&f.server.approval_details(&id).unwrap()).unwrap();
+    assert!(details["preview"].is_object(), "{details}");
+    rules(
+        f.dir.path(),
+        "# edited\nrules:\n  drive_write.rename: {ask: terminal}\n",
+    );
+    assert_eq!(
+        f.server.approve_any(&id).await,
+        Err("approval_policy_changed")
+    );
+    let id = proposal_id(&ok(&mut f.server, rename).await);
+    assert!(writes(&f.remote).await.is_empty());
+    serve_rename(&f.remote).await;
+    let done = f.server.approve_any(&id).await.unwrap();
+    assert_eq!(done["outcome"], "done", "{done}");
+    assert_eq!(writes(&f.remote).await, ["/renameItems"]);
+}
+
+#[tokio::test]
+async fn a_card_approval_of_a_drive_deletion_under_yolo_is_not_asked_again() {
+    let mut f = fixture(Some("yolo")).await;
+    rules(f.dir.path(), "rules:\n  drive_write.trash: {ask: client}\n");
+    let form = call(&mut f.server, json!({"action":"trash","id":REPORT})).await;
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+    assert_eq!(choices(&form), ["approve", "deny"]);
+    serve_trash(&f.remote).await;
+    let reply = f.server.handle(approve(&form)).await.unwrap();
+    let done = text(&reply);
+    assert_eq!(done["outcome"], "done", "{done}");
+    assert_eq!(writes(&f.remote).await, ["/moveItemsToTrash"]);
+}
+
+#[tokio::test]
+async fn permissions_show_says_drive_deletions_and_large_moves_still_ask() {
+    let f = fixture(Some("writes_only")).await;
+    rules(
+        f.dir.path(),
+        "rules:\n  drive_write.trash: allow\n  drive_write.rename: allow\n",
+    );
+    let shown =
+        skykeep_mcp::permissions::show(&f.dir.path().canonicalize().unwrap(), false).unwrap();
+    assert!(
+        shown.contains("drive_write.trash: allow, but asks in your MCP client, because a Drive deletion always needs a person"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("drive_write.rename: allow, runs without asking, except renaming or moving a large folder, which still asks"),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn a_broken_file_under_yolo_still_sends_drive_deletions_to_the_terminal() {
+    let mut f = fixture(Some("yolo")).await;
+    rules(f.dir.path(), "rules:\n  bogus_name: allow\n");
+    for action in ["trash", "delete_forever"] {
+        let reply = call(&mut f.server, json!({"action":action,"id":REPORT})).await;
+        assert_ne!(reply["method"], "elicitation/create", "{action}: {reply}");
+        proposal_id(&text(&reply));
+    }
+    assert!(writes(&f.remote).await.is_empty());
+}
+
+#[tokio::test]
+async fn permissions_show_and_the_history_match_what_runs_for_drive_deletions_under_yolo() {
+    let mut f = fixture(Some("yolo")).await;
+    let dir = f.dir.path().canonicalize().unwrap();
+    rules(
+        f.dir.path(),
+        "rules:\n  drive_write.trash: {ask: client}\n  drive_write.delete_forever: allow\n",
+    );
+    call(
+        &mut f.server,
+        json!({"action":"create_folder","path":"/x/y"}),
+    )
+    .await;
+    let shown = skykeep_mcp::permissions::show(&dir, false).unwrap();
+    assert!(
+        shown.contains("drive_write.trash: ask: client, asks in your MCP client\n"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("drive_write.delete_forever: allow, but waits for skykeep-mcp approve in your terminal, because a Drive deletion always needs a person"),
+        "{shown}"
+    );
+    // Under yolo a trash otherwise waits for the terminal, so the card is looser.
+    assert!(shown.contains("looser: drive_write.trash: waits for skykeep-mcp approve in your terminal before, now asks in your MCP client"), "{shown}");
+    assert!(
+        !shown.contains("drive_write.delete_forever: waits"),
+        "{shown}"
+    );
 }
