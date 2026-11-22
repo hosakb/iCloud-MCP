@@ -806,20 +806,15 @@ async fn the_preview_says_who_would_be_told_and_what_changes() {
 #[tokio::test]
 async fn deletes_always_ask_and_never_offer_always_allow() {
     let delete = json!({"action":"delete","guid":"E-1","etag":"etag-E-1"});
-    // yolo and no mode: the terminal, even with an allow rule.
+    // yolo and no mode: the card too, even with an allow rule.
     for mode in [None, Some("yolo")] {
         let mut f = fixture(mode).await;
         rules(f.dir.path(), "rules:\n  calendar_write.delete: allow\n");
-        let id = proposal_id(&ok(&mut f.server, delete.clone()).await);
+        let form = call(&mut f.server, delete.clone()).await;
+        assert_eq!(form["method"], "elicitation/create", "{mode:?}: {form}");
+        assert_eq!(choices(&form), ["approve", "deny"], "{mode:?}");
         assert!(write_paths(&f.remote).await.is_empty(), "{mode:?}");
-        let shown = f.server.approval_text(&id).unwrap();
-        assert!(
-            shown.contains("Calendar change: delete, a deletion"),
-            "{shown}"
-        );
-        assert!(shown.contains("Dentist"), "{shown}");
-        assert!(shown.contains("cannot undo"), "{shown}");
-        let done = f.server.approve_any(&id).await.unwrap();
+        let done = text(&f.server.handle(answer(&form, "approve")).await.unwrap());
         assert_eq!(done["remote_verified"], true, "{done}");
         assert_eq!(
             write_paths(&f.remote).await,
@@ -827,7 +822,7 @@ async fn deletes_always_ask_and_never_offer_always_allow() {
         );
         assert!(cached(f.dir.path(), "E-1").is_none());
         // Used up: it runs once.
-        assert!(f.server.approve_any(&id).await.is_err());
+        assert!(f.server.handle(answer(&form, "approve")).await.is_none());
     }
     // The other modes: the card, with approve and deny only, even with an allow rule.
     for mode in ["writes_only", "reads_and_writes"] {
@@ -853,6 +848,11 @@ async fn deletes_always_ask_and_never_offer_always_allow() {
 #[tokio::test]
 async fn a_terminal_approval_is_stale_after_the_event_changes_in_the_cache() {
     let mut f = fixture(Some("yolo")).await;
+    // The terminal is an opt-in: an ask: terminal rule.
+    rules(
+        f.dir.path(),
+        "rules:\n  calendar_write.delete: {ask: terminal}\n",
+    );
     let id = proposal_id(
         &ok(
             &mut f.server,
@@ -860,6 +860,13 @@ async fn a_terminal_approval_is_stale_after_the_event_changes_in_the_cache() {
         )
         .await,
     );
+    let shown = f.server.approval_text(&id).unwrap();
+    assert!(
+        shown.contains("Calendar change: delete, a deletion"),
+        "{shown}"
+    );
+    assert!(shown.contains("Dentist"), "{shown}");
+    assert!(shown.contains("cannot undo"), "{shown}");
     {
         let mut library = quince_core::Library::open(f.dir.path()).unwrap();
         let mut e = library.event("E-1").unwrap().unwrap();
@@ -889,6 +896,10 @@ async fn a_terminal_approval_is_stale_after_the_event_changes_in_the_cache() {
 #[tokio::test]
 async fn deleting_one_occurrence_or_the_whole_series() {
     let mut f = fixture(Some("yolo")).await;
+    rules(
+        f.dir.path(),
+        "rules:\n  calendar_write.delete: {ask: terminal}\n",
+    );
     let args = json!({"action":"delete","guid":OCCURRENCE,"etag":format!("etag-{OCCURRENCE}"),"scope":"this_occurrence"});
     let id = proposal_id(&ok(&mut f.server, args).await);
     assert!(f
@@ -1026,14 +1037,14 @@ async fn permissions_show_says_how_the_calendar_rules_run() {
     let shown =
         skykeep_mcp::permissions::show(&f.dir.path().canonicalize().unwrap(), false).unwrap();
     assert!(
-        shown.contains("calendar_write.delete: allow, but asks in your MCP client, because a Calendar delete always needs a person"),
+        shown.contains("calendar_write.delete: allow, but asks in your MCP client, because a deletion always needs a person"),
         "{shown}"
     );
     assert!(
         shown.contains("calendar_write.send_invitations: allow, a Calendar change to an event with other people invited may run"),
         "{shown}"
     );
-    let starter = skykeep_mcp::permissions::starter(Some("writes_only"), Path::new("/srv/sky"));
+    let starter = skykeep_mcp::permissions::starter(Path::new("/srv/sky"));
     let parsed = skykeep_mcp::permissions::parse(&starter).unwrap();
     assert!(parsed.contains_key("calendar_write.delete"));
     assert!(!parsed.contains_key("calendar_write.send_invitations"));
@@ -1208,7 +1219,7 @@ async fn a_tool_wide_allow_is_not_reported_as_allowing_invitations() {
         shown.contains("changes that would notify invited people stay refused"),
         "{shown}"
     );
-    let starter = skykeep_mcp::permissions::starter(Some("writes_only"), Path::new("/srv/sky"));
+    let starter = skykeep_mcp::permissions::starter(Path::new("/srv/sky"));
     assert!(
         starter.contains("calendar_write.send_invitations: takes allow or deny only"),
         "{starter}"
@@ -1340,8 +1351,8 @@ async fn unchanged_time_fields_are_not_a_time_change_and_errors_name_the_fix() {
 #[test]
 fn the_yolo_description_says_calendar_deletes_still_wait() {
     let yolo = skykeep_mcp::status::describe_mode("yolo");
-    assert!(yolo.contains("Calendar deletes"), "{yolo}");
-    assert!(yolo.contains("Drive and Contacts deletions"), "{yolo}");
+    assert!(yolo.contains("Deletions"), "{yolo}");
+    assert!(yolo.contains("still ask on the approval card"), "{yolo}");
 }
 
 #[tokio::test]
@@ -1532,6 +1543,10 @@ async fn a_slow_read_back_is_done_but_not_verified() {
 #[tokio::test]
 async fn terminal_requests_say_what_to_do_and_errors_name_the_fix() {
     let mut f = fixture(Some("yolo")).await;
+    rules(
+        f.dir.path(),
+        "rules:\n  calendar_write.delete: {ask: terminal}\n",
+    );
     let reply = ok(
         &mut f.server,
         json!({"action":"delete","guid":"E-1","etag":"etag-E-1"}),
@@ -1606,4 +1621,171 @@ fn the_approve_help_says_a_calendar_change_runs_at_once() {
         .unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("Calendar change runs at once"), "{text}");
+}
+
+// --- The approval card in every mode (issue 62).
+
+const MODES: [Option<&str>; 4] = [
+    Some("reads_and_writes"),
+    Some("writes_only"),
+    Some("yolo"),
+    None,
+];
+
+fn delete_e1() -> Value {
+    json!({"action":"delete","guid":"E-1","etag":"etag-E-1"})
+}
+
+/// The card that approves deleting E-1. Under reads_and_writes the preview read is approved
+/// first. `timeout` applies to the change card.
+async fn delete_card(f: &mut Fixture, mode: Option<&str>, timeout: Duration) -> Value {
+    if mode == Some("reads_and_writes") {
+        let preview = call(&mut f.server, delete_e1()).await;
+        assert_eq!(preview["method"], "elicitation/create", "{preview}");
+        f.server.set_card_timeout(timeout);
+        return f.server.handle(answer(&preview, "approve")).await.unwrap();
+    }
+    f.server.set_card_timeout(timeout);
+    call(&mut f.server, delete_e1()).await
+}
+
+const WAIT: Duration = Duration::from_secs(180);
+
+#[tokio::test]
+async fn a_delete_asks_on_the_card_in_every_mode_and_runs_once() {
+    for mode in MODES {
+        let mut f = fixture(mode).await;
+        let form = delete_card(&mut f, mode, WAIT).await;
+        assert_eq!(form["method"], "elicitation/create", "{mode:?}: {form}");
+        assert_eq!(choices(&form), ["approve", "deny"], "{mode:?}");
+        assert!(!form.to_string().contains("request_id"), "{mode:?}");
+        assert!(write_paths(&f.remote).await.is_empty());
+        let done = text(&f.server.handle(answer(&form, "approve")).await.unwrap());
+        assert_eq!(done["outcome"], "done", "{mode:?}: {done}");
+        assert!(cached(f.dir.path(), "E-1").is_none());
+        // A second use of the same answer is ignored.
+        assert!(f.server.handle(answer(&form, "approve")).await.is_none());
+        assert_eq!(
+            write_paths(&f.remote).await,
+            ["DELETE /ca/events/cal-work/E-1"],
+            "{mode:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_denied_cancelled_or_timed_out_delete_card_sends_nothing() {
+    for mode in MODES {
+        let mut f = fixture(mode).await;
+        // Deny.
+        let form = delete_card(&mut f, mode, WAIT).await;
+        let e = text(&f.server.handle(answer(&form, "deny")).await.unwrap());
+        assert_eq!(e["error"], "approval_denied", "{mode:?}: {e}");
+        assert!(
+            e["message"].as_str().unwrap().contains("nothing ran"),
+            "{e}"
+        );
+        // Cancelled by the client.
+        let form = delete_card(&mut f, mode, WAIT).await;
+        assert_eq!(form["method"], "elicitation/create", "{mode:?}: {form}");
+        let reply = f
+            .server
+            .handle(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}))
+            .await
+            .unwrap();
+        assert_eq!(text(&reply)["error"], "approval_cancelled", "{reply}");
+        assert!(f.server.handle(answer(&form, "approve")).await.is_none());
+        // Nobody answers in time, as in a scheduled job.
+        let form = delete_card(&mut f, mode, Duration::ZERO).await;
+        assert_eq!(form["method"], "elicitation/create", "{mode:?}: {form}");
+        let expired = text(&f.server.expire_consent().unwrap());
+        assert_eq!(expired["error"], "approval_timeout", "{expired}");
+        assert!(
+            expired["message"]
+                .as_str()
+                .unwrap()
+                .contains("scheduled job"),
+            "{expired}"
+        );
+        assert!(f.server.handle(answer(&form, "approve")).await.is_none());
+        assert!(write_paths(&f.remote).await.is_empty(), "{mode:?}");
+        assert!(cached(f.dir.path(), "E-1").is_some());
+    }
+}
+
+#[tokio::test]
+async fn a_card_for_an_event_changed_meanwhile_is_refused() {
+    for mode in MODES {
+        let mut f = fixture(mode).await;
+        let form = delete_card(&mut f, mode, WAIT).await;
+        {
+            let mut library = quince_core::Library::open(f.dir.path()).unwrap();
+            let mut e = library.event("E-1").unwrap().unwrap();
+            e.title = "Dentist (renamed elsewhere)".into();
+            library.put_events(&[e]).unwrap();
+        }
+        let reply = f.server.handle(answer(&form, "approve")).await.unwrap();
+        assert_eq!(reply["result"]["isError"], true, "{mode:?}: {reply}");
+        assert!(write_paths(&f.remote).await.is_empty(), "{mode:?}");
+    }
+}
+
+#[tokio::test]
+async fn without_card_support_a_delete_is_refused_and_no_request_is_made() {
+    for mode in MODES {
+        let f = fixture(mode).await;
+        let mut plain = Server::open(f.dir.path()).unwrap();
+        plain.set_calendar_seam(seam(&f.remote.uri(), WriteLimits::default()));
+        init(&mut plain, false).await;
+        let e = error(&mut plain, delete_e1()).await;
+        assert_eq!(e["error"], "approval_requires_form_client", "{mode:?}: {e}");
+        let message = e["message"].as_str().unwrap();
+        assert!(!message.contains("skykeep-mcp approve"), "{message}");
+        assert!(message.contains("nothing ran"), "{message}");
+        assert!(e.get("request_id").is_none(), "{e}");
+        assert!(write_paths(&f.remote).await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn ask_terminal_stays_an_opt_in_that_still_works() {
+    for mode in MODES {
+        let mut f = fixture(mode).await;
+        rules(
+            f.dir.path(),
+            "rules:\n  calendar_write.delete: {ask: terminal}\n",
+        );
+        let id = proposal_id(&ok(&mut f.server, delete_e1()).await);
+        assert!(write_paths(&f.remote).await.is_empty());
+        let done = f.server.approve_any(&id).await.unwrap();
+        assert_eq!(done["outcome"], "done", "{mode:?}: {done}");
+        assert!(f.server.approve_any(&id).await.is_err());
+        assert_eq!(write_paths(&f.remote).await.len(), 1, "{mode:?}");
+    }
+}
+
+/// A folder without an approval mode, set to approve every change: a Calendar create asks on
+/// the card, even where a rule allows it, and runs once when approved.
+#[tokio::test]
+async fn require_approval_without_a_mode_asks_every_calendar_change_on_the_card() {
+    for rule in ["", "rules:\n  calendar_write.create: allow\n"] {
+        let mut f = fixture(None).await;
+        quince_core::Library::open(f.dir.path())
+            .unwrap()
+            .set_state("mcp.require_write_approval", "true")
+            .unwrap();
+        if !rule.is_empty() {
+            rules(f.dir.path(), rule);
+        }
+        let args = json!({"action":"create","calendar_guid":"cal-work","title":"Flight","start":"2026-12-01T07:15:00Z","end":"2026-12-01T09:00:00Z","timezone":"Europe/Lisbon"});
+        let form = call(&mut f.server, args.clone()).await;
+        assert_eq!(form["method"], "elicitation/create", "{rule}: {form}");
+        assert_eq!(choices(&form), ["approve", "deny"], "{rule}");
+        assert!(!form.to_string().contains("request_id"));
+        assert!(writes(&f.remote).await.is_empty());
+        let done = text(&f.server.handle(answer(&form, "approve")).await.unwrap());
+        assert_eq!(done["outcome"], "done", "{rule}: {done}");
+        assert!(f.server.handle(answer(&form, "approve")).await.is_none());
+        assert_eq!(writes(&f.remote).await.len(), 1, "{rule}");
+    }
 }

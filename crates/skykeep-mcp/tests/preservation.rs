@@ -584,12 +584,46 @@ async fn reminder_edit_without_base_etag_says_it_was_not_checked() {
 }
 
 #[tokio::test]
-async fn reminder_edit_base_etag_survives_terminal_approval() {
+async fn reminder_edit_base_etag_survives_card_and_terminal_approval() {
+    // On the card: a newer copy arriving before the answer makes the approval stale.
     let (_dir, mut server, mut library) = setup();
     rich_reminder(&mut library);
     library
         .set_state("mcp.require_write_approval", "true")
         .unwrap();
+    server.handle(json!({"id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}}}})).await;
+    let form = server
+        .handle(json!({"id":2,"method":"tools/call","params":{"name":"reminders_write","arguments":edit(json!({"title":"Later"}))}}))
+        .await
+        .unwrap();
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+    let newer = |library: &mut Library, etag: &str| {
+        let mut newer = library.reminder("r").unwrap().unwrap();
+        newer.etag = Some(etag.into());
+        newer.raw = Some("{}".into());
+        library.put_reminders(&[newer]).unwrap();
+    };
+    newer(&mut library, "etag-2");
+    let reply = server
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
+        .await
+        .unwrap();
+    assert!(
+        reply.to_string().contains("approval_policy_changed"),
+        "{reply}"
+    );
+    assert_eq!(library.outbox_count().unwrap(), 0);
+
+    // Opted in to the terminal: the waiting request keeps its base etag the same way.
+    let (dir, mut server, mut library) = setup();
+    rich_reminder(&mut library);
+    let rules = dir.path().join("permissions.yaml");
+    std::fs::write(
+        &rules,
+        "version: 1\nrules:\n  reminders_write: {ask: terminal}\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o600)).unwrap();
     let result = call(
         &mut server,
         "reminders_write",
@@ -598,12 +632,8 @@ async fn reminder_edit_base_etag_survives_terminal_approval() {
     .await;
     assert_eq!(result["status"], "approval_required", "{result}");
     let id = result["request_id"].as_str().unwrap().to_string();
-    // A newer copy arrives while the request waits for the terminal.
-    let mut newer = library.reminder("r").unwrap().unwrap();
-    newer.etag = Some("etag-2".into());
-    newer.raw = Some("{}".into());
-    library.put_reminders(&[newer]).unwrap();
-    assert!(server.approve(&id).is_err());
+    newer(&mut library, "etag-2");
+    assert!(server.approve_request(&id).await.is_err());
     assert_eq!(library.outbox_count().unwrap(), 0);
 }
 

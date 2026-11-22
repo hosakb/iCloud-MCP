@@ -37,6 +37,27 @@ async fn call(server: &mut Server, name: &str, args: Value) -> Value {
     serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
 }
 
+/// Initializes as a client that shows the approval card.
+async fn init_cards(server: &mut Server) {
+    server.handle(json!({"id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}}}})).await;
+}
+
+/// The raw reply to one call, for a card.
+async fn raw(server: &mut Server, name: &str, args: Value) -> Value {
+    server
+        .handle(json!({"id":2,"method":"tools/call","params":{"name":name,"arguments":args}}))
+        .await
+        .unwrap()
+}
+
+async fn accept(server: &mut Server, form: &Value) -> Value {
+    let response = server
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
+        .await
+        .unwrap();
+    serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
 async fn create_note(server: &mut Server, body: &str) -> String {
     let created = call(
         server,
@@ -48,24 +69,26 @@ async fn create_note(server: &mut Server, body: &str) -> String {
 }
 
 #[tokio::test]
-async fn moving_a_note_into_the_trash_requires_terminal_approval() {
+async fn moving_a_note_into_the_trash_asks_on_the_card() {
     let (_dir, mut server, library) = setup();
+    init_cards(&mut server).await;
     let guid = create_note(&mut server, "Synthetic\nkeep me").await;
     let queued = library.outbox_count().unwrap();
-    let r = call(
+    let form = raw(
         &mut server,
         "notes_write",
         json!({"action":"move","guid":guid,"folder_guid":TRASH_FOLDER,"base_etag":null}),
     )
     .await;
-    assert_eq!(r["status"], "approval_required", "{r}");
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+    assert!(!form.to_string().contains("always_allow"), "{form}");
     assert_eq!(library.outbox_count().unwrap(), queued);
     assert_eq!(
         library.note(&guid).unwrap().unwrap().folder_guid.as_deref(),
         Some("DefaultFolder-CloudKit")
     );
-    let approved = server.approve(r["request_id"].as_str().unwrap()).unwrap();
-    assert_eq!(approved["status"], "queued");
+    let approved = accept(&mut server, &form).await;
+    assert_eq!(approved["status"], "queued", "{approved}");
     assert_eq!(
         library.note(&guid).unwrap().unwrap().folder_guid.as_deref(),
         Some(TRASH_FOLDER)
@@ -99,18 +122,25 @@ async fn creating_a_note_in_a_missing_folder_returns_folder_not_found() {
 }
 
 #[tokio::test]
-async fn saving_an_empty_body_requires_terminal_approval() {
+async fn saving_an_empty_body_asks_on_the_card() {
     let (_dir, mut server, library) = setup();
+    init_cards(&mut server).await;
     let guid = create_note(&mut server, "Synthetic\nkeep me").await;
     let queued = library.outbox_count().unwrap();
     for body in ["", "  \n\t"] {
-        let r = call(
+        let form = raw(
             &mut server,
             "notes_write",
             json!({"action":"save","guid":guid,"base_etag":null,"body":body}),
         )
         .await;
-        assert_eq!(r["status"], "approval_required", "{body:?}: {r}");
+        assert_eq!(form["method"], "elicitation/create", "{body:?}: {form}");
+        // Closed without a choice: Deny, and nothing runs.
+        let reply = server
+            .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"cancel"}}))
+            .await
+            .unwrap();
+        assert!(reply.to_string().contains("approval_denied"), "{reply}");
     }
     assert_eq!(library.outbox_count().unwrap(), queued);
     assert_eq!(

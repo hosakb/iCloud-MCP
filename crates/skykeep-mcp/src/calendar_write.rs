@@ -32,7 +32,8 @@
 //! with no earlier valid rules refuses it.
 //!
 //! Who approves. A delete (`permissions::removal_of` decides it, as for every tool) always
-//! needs the person's approval, on the card or with `skykeep-mcp approve`, and the card never
+//! needs the person's approval, on the card (or with `skykeep-mcp approve` under an
+//! `ask: terminal` rule), and the card never
 //! offers "Always allow" for it. Other actions follow the approval mode and the rules.
 use crate::account::{binding, Binding};
 use crate::calendar;
@@ -422,12 +423,6 @@ pub(crate) fn validate(args: &Value) -> Result<CalendarWrite, &'static str> {
 /// Whether this action needs the person's approval whatever the rules and the mode say.
 pub(crate) fn needs_person(args: &Value) -> bool {
     validate(args).is_ok_and(|op| is_destructive(op.action()))
-}
-
-/// Whether the approval is asked in the terminal: when the approval mode has no form for it
-/// (no mode set, or `yolo`). The other modes ask every Calendar change in the form.
-pub(crate) fn goes_to_terminal(mode: Option<&str>, op: &CalendarWrite) -> bool {
-    mode.is_none_or(|m| m == "yolo") && is_destructive(op.action())
 }
 
 // --- Times.

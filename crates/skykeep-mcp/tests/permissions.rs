@@ -399,11 +399,15 @@ async fn ask_client_shows_the_card_where_forms_exist_and_says_what_to_do_where_n
         .unwrap();
     let result = body(&reply);
     assert_eq!(result["error"], "approval_requires_form_client");
+    assert!(result.get("request_id").is_none(), "{result}");
     let message = result["message"].as_str().unwrap();
-    for option in ["ask: terminal", "allow", "deny", "skykeep-mcp approve"] {
-        assert!(message.contains(option), "{message}");
+    for said in ["approval card", "nothing ran", "Hermes"] {
+        assert!(message.contains(said), "{message}");
     }
-    assert!(!message.contains("Hermes"));
+    // Nothing sends the person to the terminal by default.
+    for not_said in ["ask: terminal", "skykeep-mcp approve"] {
+        assert!(!message.contains(not_said), "{message}");
+    }
     assert_eq!(f.library.outbox_count().unwrap(), 0);
 
     // A folder without an approval mode can ask in the client too.
@@ -640,25 +644,56 @@ async fn a_broken_file_with_no_earlier_rules_makes_every_deletion_ask() {
 }
 
 #[tokio::test]
-async fn without_an_approval_mode_deletions_wait_for_the_terminal_whatever_the_file_says() {
+async fn without_an_approval_mode_deletions_ask_on_the_card_whatever_the_file_says() {
     let mut f = folder(None, true).await;
     let delete = json!({"action":"delete","guid":"R-1"});
-    for rule in ["allow", "{ask: client}"] {
-        write_rules(
-            f.path(),
-            &format!("rules:\n  reminders_write.delete: {rule}\n"),
-        );
-        let reply = f
+    // No rule, allow, ask: client, and a broken file that would allow it: always the card,
+    // never "Always allow", never a terminal request.
+    for rule in [
+        None,
+        Some("rules:\n  reminders_write.delete: allow\n"),
+        Some("rules:\n  reminders_write.delete: {ask: client}\n"),
+        Some("rules:\n\treminders_write.delete: allow\n"),
+    ] {
+        match rule {
+            Some(text) => write_rules(f.path(), text),
+            None => {
+                let _ = std::fs::remove_file(f.path().join(permissions::FILE_NAME));
+            }
+        }
+        let form = f
             .server
             .handle(call(1, "reminders_write", delete.clone()))
             .await
             .unwrap();
-        let result = body(&reply);
-        assert_eq!(result["status"], "approval_required", "{rule}: {reply}");
-        assert_eq!(result["approval"], "terminal");
+        assert_eq!(form["method"], "elicitation/create", "{rule:?}: {form}");
+        assert_eq!(choices(&form), ["approve", "deny"], "{rule:?}");
+        assert!(!form.to_string().contains("request_id"), "{rule:?}");
+        f.server
+            .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"decline"}}))
+            .await;
         assert_eq!(f.library.outbox_count().unwrap(), 0);
     }
     assert!(!f.path().join(permissions::LOG_NAME).exists());
+    // Approved on the card, it runs once.
+    write_rules(f.path(), "rules:\n  reminders_write.delete: allow\n");
+    let form = f
+        .server
+        .handle(call(1, "reminders_write", delete.clone()))
+        .await
+        .unwrap();
+    let reply = f
+        .server
+        .handle(answer(&form, Some("approve")))
+        .await
+        .unwrap();
+    assert_eq!(body(&reply)["status"], "queued", "{reply}");
+    assert!(f
+        .server
+        .handle(answer(&form, Some("approve")))
+        .await
+        .is_none());
+    assert_eq!(f.library.outbox_count().unwrap(), 1);
     // Routine changes still follow the rule.
     write_rules(f.path(), "rules:\n  reminders_write.create: allow\n");
     let reply = f
@@ -667,6 +702,17 @@ async fn without_an_approval_mode_deletions_wait_for_the_terminal_whatever_the_f
         .await
         .unwrap();
     assert_eq!(body(&reply)["status"], "queued");
+    // A client without cards gets a refusal, and no terminal request is made.
+    let mut f = folder(None, false).await;
+    let reply = f
+        .server
+        .handle(call(1, "reminders_write", delete))
+        .await
+        .unwrap();
+    let result = body(&reply);
+    assert_eq!(result["error"], "approval_requires_form_client", "{reply}");
+    assert!(result.get("request_id").is_none(), "{result}");
+    assert_eq!(f.library.outbox_count().unwrap(), 0);
 }
 
 #[tokio::test]
@@ -691,8 +737,10 @@ async fn terminal_requests_go_stale_when_the_file_changes_and_older_ones_respect
         Err("approval_policy_changed")
     );
     assert_eq!(f.library.outbox_count().unwrap(), 0);
-    // A request from before the permissions file, in a folder without an approval mode.
+    // A request from the ask: terminal opt-in, in a folder without an approval mode.
     let mut f = folder(None, false).await;
+    let opt_in = "rules:\n  reminders_write.delete: {ask: terminal}\n";
+    write_rules(f.path(), opt_in);
     let reply = f
         .server
         .handle(call(
@@ -710,7 +758,8 @@ async fn terminal_requests_go_stale_when_the_file_changes_and_older_ones_respect
     );
     assert_eq!(f.server.approve(&id), Err("denied_by_permissions"));
     assert_eq!(f.library.outbox_count().unwrap(), 0);
-    std::fs::remove_file(f.path().join(permissions::FILE_NAME)).unwrap();
+    // The same file as when it was asked: it counts again, once.
+    write_rules(f.path(), opt_in);
     assert_eq!(
         f.server.approve_request(&id).await.unwrap()["status"],
         "queued"
@@ -806,24 +855,24 @@ async fn a_looser_change_is_reported_until_the_person_looks() {
     let dir = f.path().canonicalize().unwrap();
     write_rules(
         f.path(),
-        "rules:\n  reminders_write.delete: {ask: terminal}\n",
+        "rules:\n  reminders_write.create: {ask: terminal}\n",
     );
     f.server.handle(call(1, "reminders_lists", json!({}))).await;
     permissions::show(&dir, true).unwrap();
     assert!(permissions::status(&f.library, &dir, Some("writes_only"))
         .iter()
         .all(|(_, next)| next.is_none()));
-    write_rules(f.path(), "rules:\n  reminders_write.delete: allow\n");
+    write_rules(f.path(), "rules:\n  reminders_write.create: allow\n");
     f.server.handle(call(2, "reminders_lists", json!({}))).await;
     let lines = permissions::status(&f.library, &dir, Some("writes_only"));
     let looser = lines
         .iter()
         .find(|(t, _)| t.contains("became looser"))
         .expect("reported");
-    assert!(looser.0.contains("reminders_write.delete: waits for skykeep-mcp approve in your terminal before, now runs without asking"), "{}", looser.0);
+    assert!(looser.0.contains("reminders_write.create: waits for skykeep-mcp approve in your terminal before, now runs without asking"), "{}", looser.0);
     assert!(looser.1.as_deref().unwrap().contains("permissions show"));
     let shown = permissions::show(&dir, true).unwrap();
-    assert!(shown.contains("looser: reminders_write.delete"), "{shown}");
+    assert!(shown.contains("looser: reminders_write.create"), "{shown}");
     assert!(shown.contains("Last change loaded: "), "{shown}");
     assert!(permissions::status(&f.library, &dir, Some("writes_only"))
         .iter()
@@ -834,45 +883,65 @@ async fn a_looser_change_is_reported_until_the_person_looks() {
     assert!(shown.contains("the file was removed"), "{shown}");
 }
 
+/// An allow rule never lets a deletion run unasked, in any mode: a Notes or Reminders delete
+/// still shows the card with approve and deny only, runs nothing until it is approved, and is
+/// never written to the log as having run without asking.
 #[tokio::test]
-async fn deletions_allowed_by_the_file_are_logged_without_content() {
-    let mut f = folder(Some("writes_only"), true).await;
-    write_rules(f.path(), "rules:\n  reminders_write.delete: allow\n");
-    // A deletion that fails is not logged: only what ran.
-    let reply = f
-        .server
-        .handle(call(
-            1,
-            "reminders_write",
-            json!({"action":"delete","guid":"missing"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(reply["result"]["isError"], true, "{reply}");
-    assert!(!f.path().join(permissions::LOG_NAME).exists());
-    let reply = f
-        .server
-        .handle(call(
-            1,
-            "reminders_write",
-            json!({"action":"delete","guid":"R-1"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(body(&reply)["status"], "queued", "{reply}");
-    let log = std::fs::read_to_string(f.path().join(permissions::LOG_NAME)).unwrap();
-    let line: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
-    assert_eq!(line["tool"], "reminders_write");
-    assert_eq!(line["action"], "delete");
-    assert!(!log.contains("R-1") && !log.contains("Synthetic"), "{log}");
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(f.path().join(permissions::LOG_NAME)).unwrap();
-    assert_eq!(meta.mode() & 0o777, 0o600);
-    let shown = permissions::show(&f.path().canonicalize().unwrap(), false).unwrap();
-    assert!(
-        shown.contains("ran without asking: reminders_write.delete"),
-        "{shown}"
-    );
+async fn an_allowed_deletion_still_asks_on_the_card_and_is_never_logged() {
+    for mode in [Some("writes_only"), Some("yolo"), None] {
+        let mut f = folder(mode, true).await;
+        write_rules(
+            f.path(),
+            "rules:\n  notes_write.create: allow\n  notes_write.delete: allow\n  reminders_write.delete: allow\n",
+        );
+        let reply = f
+            .server
+            .handle(call(
+                1,
+                "notes_write",
+                json!({"action":"create","body":"Synthetic note"}),
+            ))
+            .await
+            .unwrap();
+        let guid = body(&reply)["guid"].as_str().unwrap().to_string();
+        let start = f.library.outbox_count().unwrap();
+        for (n, (tool, args)) in [
+            (
+                "notes_write",
+                json!({"action":"delete","guid":guid,"base_etag":null}),
+            ),
+            ("reminders_write", json!({"action":"delete","guid":"R-1"})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let form = f.server.handle(call(2, tool, args)).await.unwrap();
+            assert_eq!(
+                form["method"], "elicitation/create",
+                "{mode:?} {tool}: {form}"
+            );
+            assert_eq!(choices(&form), ["approve", "deny"], "{mode:?} {tool}");
+            assert_eq!(
+                f.library.outbox_count().unwrap(),
+                start + n,
+                "{mode:?} {tool}"
+            );
+            let reply = f
+                .server
+                .handle(answer(&form, Some("approve")))
+                .await
+                .unwrap();
+            assert_eq!(body(&reply)["status"], "queued", "{mode:?} {tool}: {reply}");
+            assert_eq!(f.library.outbox_count().unwrap(), start + n + 1);
+        }
+        assert!(!f.path().join(permissions::LOG_NAME).exists(), "{mode:?}");
+        let shown = permissions::show(&f.path().canonicalize().unwrap(), false).unwrap();
+        assert!(
+            shown.contains("reminders_write.delete: allow, but asks in your MCP client, because a deletion always needs a person"),
+            "{shown}"
+        );
+        assert!(!shown.contains("ran without asking:"), "{shown}");
+    }
 }
 
 #[tokio::test]
@@ -1128,12 +1197,12 @@ async fn no_mcp_tool_reads_or_changes_the_rules() {
 
 #[test]
 fn the_starter_file_asks_before_deletions_and_lists_every_name() {
-    for (mode, ask) in [
-        (Some("writes_only"), Effect::AskClient),
-        (Some("yolo"), Effect::AskTerminal),
-        (None, Effect::AskTerminal),
-    ] {
-        let text = permissions::starter(mode, Path::new("/srv/sky"));
+    // Every deletion asks on the card, whatever the mode; ask: terminal is only described.
+    {
+        let ask = Effect::AskClient;
+        let text = permissions::starter(Path::new("/srv/sky"));
+        assert!(!text.contains("\n    ask: terminal"), "{text}");
+        assert!(text.contains("ask: terminal   opt-in"), "{text}");
         assert!(
             text.contains(
                 "# To check it, run: skykeep-mcp permissions show --state-dir /srv/sky\n"
@@ -1146,7 +1215,7 @@ fn the_starter_file_asks_before_deletions_and_lists_every_name() {
             "{text}"
         );
         assert!(
-            text.contains("approve once, deny or always allow"),
+            text.contains("ask on the approval card in your MCP client"),
             "{text}"
         );
         assert!(!text.contains("ignores all of it"), "{text}");
@@ -1217,7 +1286,8 @@ async fn permissions_show_describes_deletions_as_the_server_runs_them() {
     );
     f.server.handle(call(1, "reminders_lists", json!({}))).await;
     let shown = permissions::show(&f.path().canonicalize().unwrap(), false).unwrap();
-    assert!(shown.contains("reminders_write.delete: allow, but waits for skykeep-mcp approve in your terminal, because a folder without an approval mode always asks before deleting"), "{shown}");
+    assert!(shown.contains("reminders_write.delete: allow, but asks in your MCP client, because a deletion always needs a person"), "{shown}");
+    assert!(!shown.contains("skykeep-mcp approve"), "{shown}");
     assert!(
         shown
             .contains("notes_write: allow, runs without asking, except deletions, which still ask"),
@@ -1299,12 +1369,18 @@ async fn a_pipe_in_place_of_the_log_never_hangs() {
         .await
         .expect("a deletion must not wait on a pipe")
         .unwrap();
+    // The deletion asks on the card; approved, it runs and writes nothing to the log.
+    assert_eq!(reply["method"], "elicitation/create", "{reply}");
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        f.server.handle(answer(&reply, Some("approve"))),
+    )
+    .await
+    .expect("a deletion must not wait on a pipe")
+    .unwrap();
     let result = body(&reply);
     assert_eq!(result["status"], "queued", "{reply}");
-    assert!(result["permissions_log"]
-        .as_str()
-        .unwrap()
-        .contains("could not be written"));
+    assert!(result.get("permissions_log").is_none(), "{result}");
 }
 
 #[tokio::test]
@@ -1401,4 +1477,80 @@ async fn a_shared_side_file_is_named_with_the_fix_in_the_tool_result_and_status(
         rendered.contains(&format!("chmod 600 {quoted}")),
         "{rendered}"
     );
+}
+
+/// The terminal stays as an opt-in: an ask: terminal rule, for a change or a deletion, returns
+/// a request ID in every mode, and skykeep-mcp approve runs it once.
+#[tokio::test]
+async fn an_ask_terminal_rule_still_uses_the_terminal_in_every_mode() {
+    for mode in [
+        Some("reads_and_writes"),
+        Some("writes_only"),
+        Some("yolo"),
+        None,
+    ] {
+        let mut f = folder(mode, true).await;
+        write_rules(
+            f.path(),
+            "rules:\n  reminders_write.create: {ask: terminal}\n  reminders_write.delete:\n    ask: terminal\n",
+        );
+        for (n, args) in [create_reminder(), json!({"action":"delete","guid":"R-1"})]
+            .into_iter()
+            .enumerate()
+        {
+            let reply = f
+                .server
+                .handle(call(1, "reminders_write", args.clone()))
+                .await
+                .unwrap();
+            assert_ne!(reply["method"], "elicitation/create", "{mode:?}: {reply}");
+            let result = body(&reply);
+            assert_eq!(result["status"], "approval_required", "{mode:?}: {reply}");
+            let id = result["request_id"].as_str().unwrap().to_string();
+            assert_eq!(f.library.outbox_count().unwrap(), n, "{mode:?}");
+            let approved = f.server.approve_request(&id).await.unwrap();
+            assert_eq!(approved["status"], "queued", "{mode:?}: {args}");
+            assert!(f.server.approve_request(&id).await.is_err(), "used once");
+            assert_eq!(f.library.outbox_count().unwrap(), n + 1, "{mode:?}");
+        }
+    }
+}
+
+/// A Notes delete moves the note to Recently Deleted, yet as a deletion its card offers no
+/// "Always allow", and an answer that tries it anyway counts as Deny.
+#[tokio::test]
+async fn a_notes_delete_card_never_offers_always_allow() {
+    let mut f = folder(Some("writes_only"), true).await;
+    write_rules(f.path(), "rules:\n  notes_write.create: allow\n");
+    let reply = f
+        .server
+        .handle(call(
+            1,
+            "notes_write",
+            json!({"action":"create","body":"Synthetic note"}),
+        ))
+        .await
+        .unwrap();
+    let guid = body(&reply)["guid"].as_str().unwrap().to_string();
+    let before = f.library.outbox_count().unwrap();
+    let form = f
+        .server
+        .handle(call(
+            2,
+            "notes_write",
+            json!({"action":"delete","guid":guid,"base_etag":null}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+    assert_eq!(choices(&form), ["approve", "deny"]);
+    let reply = f
+        .server
+        .handle(answer(&form, Some("always_allow")))
+        .await
+        .unwrap();
+    assert_eq!(body(&reply)["error"], "approval_denied");
+    assert_eq!(f.library.outbox_count().unwrap(), before);
+    let saved = std::fs::read_to_string(f.path().join(permissions::FILE_NAME)).unwrap();
+    assert!(!saved.contains("notes_write.delete"), "{saved}");
 }

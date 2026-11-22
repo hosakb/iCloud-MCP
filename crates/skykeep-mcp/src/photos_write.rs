@@ -15,8 +15,9 @@
 //! `remote_verified` stays false.
 //!
 //! Who approves. [`is_destructive`] (the permissions rules' own classification) names `trash`
-//! as the only removal. It always needs the person's approval, in the approval form or with
-//! `skykeep-mcp approve` in their terminal, and its card never offers "Always allow". Every
+//! as the only removal. It always needs the person's approval on the approval card (or with
+//! `skykeep-mcp approve` under an `ask: terminal` rule), and its card never offers "Always
+//! allow". Every
 //! other action follows the approval mode and the permissions file. Deleting for good, editing
 //! pictures, shared albums and changing many photos at once are not offered. An upload reads one
 //! file from the exchange folder ([`crate::exchange`]), under its size limit.
@@ -1170,7 +1171,7 @@ pub(crate) fn tool() -> Value {
     let id = json!({"description":"Photo id from photos_list, photos_search or photos_get.","type":"string","minLength":1,"maxLength":crate::photos::MAX_ID_BYTES});
     json!({
         "name": TOOL,
-        "description": "Change the user's Apple iCloud Photos (personal library): upload (local, a photo or video file in the exchange folder the user set up in their terminal), set_favorite (id, favorite), set_title_and_caption (id, title and/or caption; empty text clears), set_rating (id, rating 0 to 5), set_keywords (id, keywords: the whole new list; the words added or taken away are merged into Apple's list as it is at that moment, so a word another device adds at the same time stays; run photos_refresh before the next change to that photo), set_date (id, taken_at such as 2024-05-01T14:30:00+02:00), create_album (name), rename_album (album_id, name) and trash (id; moves the photo to Recently Deleted). Photos and albums are found in the local cache, so run photos_refresh first. A photo or album changed at Apple since the cache read it is refused, never written over; run photos_refresh and ask again. trash always needs the user's approval, in the approval form or with skykeep-mcp approve in their terminal; every change follows the approval mode. Nothing is deleted for good, no picture is edited, and shared albums are not touched. The reply says done with what Apple's answer showed, or sent_not_confirmed when Apple accepted the change but its answer did not show it (run photos_refresh and look), or an error; an unknown outcome means run photos_refresh and look before trying again.",
+        "description": "Change the user's Apple iCloud Photos (personal library): upload (local, a photo or video file in the exchange folder the user set up in their terminal), set_favorite (id, favorite), set_title_and_caption (id, title and/or caption; empty text clears), set_rating (id, rating 0 to 5), set_keywords (id, keywords: the whole new list; the words added or taken away are merged into Apple's list as it is at that moment, so a word another device adds at the same time stays; run photos_refresh before the next change to that photo), set_date (id, taken_at such as 2024-05-01T14:30:00+02:00), create_album (name), rename_album (album_id, name) and trash (id; moves the photo to Recently Deleted). Photos and albums are found in the local cache, so run photos_refresh first. A photo or album changed at Apple since the cache read it is refused, never written over; run photos_refresh and ask again. trash always needs the user's approval on the approval card; every change follows the approval mode. Nothing is deleted for good, no picture is edited, and shared albums are not touched. The reply says done with what Apple's answer showed, or sent_not_confirmed when Apple accepted the change but its answer did not show it (run photos_refresh and look), or an error; an unknown outcome means run photos_refresh and look before trying again.",
         "inputSchema": {
             "type": "object",
             "properties": {

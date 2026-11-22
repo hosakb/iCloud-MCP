@@ -354,11 +354,9 @@ async fn the_tool_is_listed_with_a_strict_schema_and_its_rule_names() {
         );
     }
     // The starter file asks before the one removal, as for every tool's deletions.
-    let starter = skykeep_mcp::permissions::parse(&skykeep_mcp::permissions::starter(
-        Some("writes_only"),
-        Path::new("/srv/sky"),
-    ))
-    .unwrap();
+    let starter =
+        skykeep_mcp::permissions::parse(&skykeep_mcp::permissions::starter(Path::new("/srv/sky")))
+            .unwrap();
     assert!(starter.contains_key("photos_write.trash"));
     assert!(!starter.contains_key("photos_write.set_favorite"));
 }
@@ -717,17 +715,20 @@ async fn a_move_to_recently_deleted_always_asks_and_never_offers_always_allow() 
     );
     assert!(cached(f.dir.path(), "P-1").deleted);
 
-    // Under yolo and without a mode, even with an allow rule, it waits for the terminal.
+    // Under yolo and without a mode, even with an allow rule, it asks on the card too.
     for mode in [Some("yolo"), None] {
         let mut f = fixture(mode).await;
         rules(f.dir.path(), "rules:\n  photos_write: allow\n");
-        let id = proposal_id(&ok(&mut f.server, json!({"action":"trash","id":"P-1"})).await);
+        let form = call(&mut f.server, json!({"action":"trash","id":"P-1"})).await;
+        assert_eq!(form["method"], "elicitation/create", "{mode:?}: {form}");
+        assert_eq!(choices(&form), ["approve", "deny"], "{mode:?}");
         assert!(modified(&f.remote).await.is_empty(), "{mode:?}");
-        let done = f.server.approve_any(&id).await.unwrap();
+        let done = text(&f.server.handle(decide(&form, "approve")).await.unwrap());
         assert_eq!(done["outcome"], "done", "{mode:?}: {done}");
         assert_eq!(modified(&f.remote).await.len(), 1, "{mode:?}");
-        // Used up: it runs once.
-        assert!(f.server.approve_any(&id).await.is_err(), "{mode:?}");
+        // Used up: the same answer again runs nothing.
+        assert!(f.server.handle(decide(&form, "approve")).await.is_none());
+        assert_eq!(modified(&f.remote).await.len(), 1, "{mode:?}");
         assert!(!f
             .dir
             .path()
@@ -813,8 +814,12 @@ async fn deny_rules_refuse_and_a_broken_file_keeps_them() {
     let reply = call(&mut f.server, args.clone()).await;
     let value = text(&reply);
     assert_eq!(value["error"], "denied_by_permissions", "{value}");
-    // A terminal request made earlier is refused once the file says deny.
-    std::fs::remove_file(f.dir.path().join(skykeep_mcp::permissions::FILE_NAME)).unwrap();
+    // A terminal request (the ask: terminal opt-in) made earlier is refused once the file
+    // says deny.
+    rules(
+        f.dir.path(),
+        "rules:\n  photos_write.trash: {ask: terminal}\n",
+    );
     let id = proposal_id(&ok(&mut f.server, json!({"action":"trash","id":"P-1"})).await);
     rules(f.dir.path(), "rules:\n  photos_write.trash: deny\n");
     assert_eq!(
@@ -829,8 +834,9 @@ async fn a_broken_file_with_no_earlier_rules_still_sends_trash_to_a_person() {
     let mut f = fixture(Some("yolo")).await;
     rules(f.dir.path(), "rules:\n  bogus_name: allow\n");
     let reply = call(&mut f.server, json!({"action":"trash","id":"P-1"})).await;
-    assert_ne!(reply["method"], "elicitation/create", "{reply}");
-    proposal_id(&text(&reply));
+    assert_eq!(reply["method"], "elicitation/create", "{reply}");
+    assert_eq!(choices(&reply), ["approve", "deny"]);
+    assert!(!reply.to_string().contains("request_id"), "{reply}");
     assert!(modified(&f.remote).await.is_empty());
 }
 
@@ -844,7 +850,7 @@ async fn permissions_show_says_a_photos_trash_still_asks() {
     let shown =
         skykeep_mcp::permissions::show(&f.dir.path().canonicalize().unwrap(), false).unwrap();
     assert!(
-        shown.contains("photos_write.trash: allow, but asks in your MCP client, because a move to Recently Deleted in Photos always needs a person"),
+        shown.contains("photos_write.trash: allow, but asks in your MCP client, because a deletion always needs a person"),
         "{shown}"
     );
     assert!(
@@ -961,13 +967,14 @@ async fn a_conflict_at_write_time_is_refused_and_nothing_is_sent_again() {
         assert_eq!(sent[0]["record"]["recordChangeTag"], tag, "{args}");
         assert_eq!(cached(f.dir.path(), "P-1"), photo("P-1"), "{args}");
     }
-    // A move to Recently Deleted, approved in the terminal, is refused the same way.
+    // A move to Recently Deleted, approved on the card, is refused the same way.
     let mut f = fixture(Some("yolo")).await;
     conflict_on_write(&f.remote).await;
-    let id = proposal_id(&ok(&mut f.server, json!({"action":"trash","id":"P-1"})).await);
+    let form = call(&mut f.server, json!({"action":"trash","id":"P-1"})).await;
+    let reply = text(&f.server.handle(decide(&form, "approve")).await.unwrap());
     assert_eq!(
-        f.server.approve_any(&id).await,
-        Err("photos_item_changed_run_photos_refresh")
+        reply["error"], "photos_item_changed_run_photos_refresh",
+        "{reply}"
     );
     assert_eq!(modified(&f.remote).await.len(), 1);
     assert!(!cached(f.dir.path(), "P-1").deleted);
@@ -996,6 +1003,11 @@ async fn an_album_renamed_once_can_be_renamed_again_without_a_refresh() {
 #[tokio::test]
 async fn a_terminal_trash_request_shows_plain_lines_and_holds_to_its_preview() {
     let mut f = fixture(Some("yolo")).await;
+    // The terminal is the ask: terminal opt-in only.
+    rules(
+        f.dir.path(),
+        "rules:\n  photos_write.trash: {ask: terminal}\n",
+    );
     // A photo the cache doesn't have is refused at once, with no request made.
     assert_eq!(
         error(&mut f.server, json!({"action":"trash","id":"P-NONE"})).await,
@@ -1399,4 +1411,120 @@ async fn an_error_answer_from_apple_says_the_change_may_not_have_been_made() {
         next.contains("may not have been made") && next.contains("twice"),
         "{next}"
     );
+}
+
+/// The card for `args`; under reads_and_writes the preview card is approved first. `timeout`
+/// is set just before the card that decides.
+async fn card(
+    f: &mut Fixture,
+    mode: Option<&str>,
+    args: &Value,
+    timeout: Option<Duration>,
+) -> Value {
+    if mode == Some("reads_and_writes") {
+        let preview = call(&mut f.server, args.clone()).await;
+        assert_eq!(preview["method"], "elicitation/create", "{preview}");
+        if let Some(t) = timeout {
+            f.server.set_card_timeout(t);
+        }
+        return f.server.handle(decide(&preview, "approve")).await.unwrap();
+    }
+    if let Some(t) = timeout {
+        f.server.set_card_timeout(t);
+    }
+    call(&mut f.server, args.clone()).await
+}
+
+/// Every mode asks for a move to Recently Deleted on the card, never in the terminal, and only
+/// an approval runs it, once.
+#[tokio::test]
+async fn trash_asks_on_the_card_in_every_mode_and_only_an_approval_runs_it() {
+    let trash = json!({"action":"trash","id":"P-1"});
+    for mode in [
+        Some("reads_and_writes"),
+        Some("writes_only"),
+        Some("yolo"),
+        None,
+    ] {
+        // Approved: runs once; the same answer again is ignored.
+        let mut f = fixture(mode).await;
+        let form = card(&mut f, mode, &trash, None).await;
+        assert_eq!(form["method"], "elicitation/create", "{mode:?}: {form}");
+        assert_eq!(choices(&form), ["approve", "deny"], "{mode:?}");
+        assert!(!form.to_string().contains("request_id"), "{mode:?}");
+        assert!(modified(&f.remote).await.is_empty(), "{mode:?}");
+        let done = text(&f.server.handle(decide(&form, "approve")).await.unwrap());
+        assert_eq!(done["outcome"], "done", "{mode:?}: {done}");
+        assert!(f.server.handle(decide(&form, "approve")).await.is_none());
+        assert_eq!(modified(&f.remote).await.len(), 1, "{mode:?}");
+
+        // Denied, declined or closed: nothing runs.
+        for answer in [
+            decide(&form, "deny"),
+            json!({"jsonrpc":"2.0","id":"ID","result":{"action":"decline"}}),
+            json!({"jsonrpc":"2.0","id":"ID","result":{"action":"cancel"}}),
+        ] {
+            let mut f = fixture(mode).await;
+            let form = card(&mut f, mode, &trash, None).await;
+            let mut answer = answer;
+            answer["id"] = form["id"].clone();
+            let reply = text(&f.server.handle(answer).await.unwrap());
+            assert_eq!(reply["error"], "approval_denied", "{mode:?}: {reply}");
+            assert!(reply["message"].as_str().unwrap().contains("nothing ran"));
+            assert!(modified(&f.remote).await.is_empty(), "{mode:?}");
+        }
+
+        // Cancelled by the client before the card is answered.
+        let mut f = fixture(mode).await;
+        let form = card(&mut f, mode, &trash, None).await;
+        let reply = f.server.handle(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}})).await.unwrap();
+        assert_eq!(text(&reply)["error"], "approval_cancelled", "{mode:?}");
+        assert!(f.server.handle(decide(&form, "approve")).await.is_none());
+        assert!(modified(&f.remote).await.is_empty(), "{mode:?}");
+
+        // Nobody answers, as in a scheduled job: the card times out and a late answer is ignored.
+        let mut f = fixture(mode).await;
+        let form = card(&mut f, mode, &trash, Some(Duration::ZERO)).await;
+        assert_eq!(form["method"], "elicitation/create", "{mode:?}");
+        let expired = text(&f.server.expire_consent().unwrap());
+        assert_eq!(expired["error"], "approval_timeout", "{mode:?}");
+        let message = expired["message"].as_str().unwrap();
+        assert!(message.contains("scheduled job"), "{message}");
+        assert!(!message.contains("skykeep-mcp approve"), "{message}");
+        assert!(f.server.handle(decide(&form, "approve")).await.is_none());
+        assert!(modified(&f.remote).await.is_empty(), "{mode:?}");
+
+        // The photo changes in the cache while the card is open: refused, nothing sent.
+        let mut f = fixture(mode).await;
+        let form = card(&mut f, mode, &trash, None).await;
+        {
+            let mut library = quince_core::Library::open(f.dir.path()).unwrap();
+            let mut p = photo("P-1");
+            p.title = Some("Renamed".into());
+            library.put_photos(&[p]).unwrap();
+        }
+        let reply = text(&f.server.handle(decide(&form, "approve")).await.unwrap());
+        assert_eq!(
+            reply["error"], "approval_stale_photos_changed_ask_again",
+            "{mode:?}: {reply}"
+        );
+        assert!(modified(&f.remote).await.is_empty(), "{mode:?}");
+
+        // A client without approval cards: refused with the reason, no terminal request.
+        let f = fixture(mode).await;
+        let mut plain = Server::open(f.dir.path()).unwrap();
+        plain
+            .handle(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}))
+            .await
+            .unwrap();
+        let reply = call(&mut plain, trash.clone()).await;
+        assert!(!reply.to_string().contains("request_id"), "{reply}");
+        let value = text(&reply);
+        assert_eq!(value["error"], "approval_requires_form_client", "{mode:?}");
+        let message = value["message"].as_str().unwrap();
+        assert!(message.contains("nothing ran"), "{message}");
+        assert!(!message.contains("skykeep-mcp approve"), "{message}");
+        assert!(!message.contains("ask: terminal"), "{message}");
+        assert!(modified(&f.remote).await.is_empty(), "{mode:?}");
+    }
 }
