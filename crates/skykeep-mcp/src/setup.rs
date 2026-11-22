@@ -859,6 +859,9 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
     }
     let existing = crate::policy(&library, &held.path);
     let in_file = file_mode(&library, &held.path);
+    // The file's mode, kept with Enter in a folder that has no stored mode yet: it is stored
+    // too, so queued changes are bound to it.
+    let mut keep = None;
     match &existing {
         Ok(_) if in_file.is_some() => {
             let answer = console.ask(&format!(
@@ -867,7 +870,13 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
                 crate::permissions::MODE_KEY
             ))?;
             if answer.trim().is_empty() {
-                return Ok(());
+                if matches!(existing, Ok(Some(_))) {
+                    return Ok(());
+                }
+                keep = MODES
+                    .iter()
+                    .map(|(m, _)| *m)
+                    .find(|m| Some(*m) == in_file.as_deref());
             }
         }
         Ok(Some((policy, _))) => {
@@ -907,16 +916,22 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
     if offer_none {
         menu.push_str(&format!("  4. No approval mode (older behaviour). {} Once you pick 1, 2 or 3, this folder can't go back to 4. Most people should pick 1.\nChoose 1, 2, 3 or 4 (Enter picks 1): ", status::no_mode_choice(&library)));
     } else if in_file.is_some() {
-        console.say(&format!(
-            "permissions.yaml sets {}:, so there is no choice without an approval mode.",
-            crate::permissions::MODE_KEY
-        ))?;
+        if keep.is_none() {
+            console.say(&format!(
+                "permissions.yaml sets {}:, so there is no choice without an approval mode.",
+                crate::permissions::MODE_KEY
+            ))?;
+        }
+        menu.push_str("Choose 1, 2 or 3 (Enter picks 1): ");
     } else {
         console.say("This folder has had an approval mode, so there is no choice without one.")?;
         menu.push_str("Choose 1, 2 or 3 (Enter picks 1): ");
     }
     let count = if offer_none { 4 } else { 3 };
     let mode = loop {
+        if let Some(keep) = keep {
+            break Some(keep);
+        }
         let n = choose(console, &menu, count, Some(1))?;
         if n == 3
             && console

@@ -701,3 +701,40 @@ fn suggested_commands_never_quote_a_tilde() {
         );
     }
 }
+
+/// A folder with no stored approval mode takes the file's mode as its stored one at the next
+/// call, so queued writes carry a grant and a later stricter mode sets them aside.
+#[tokio::test]
+async fn a_mode_in_the_file_binds_queued_writes_in_a_folder_without_a_stored_mode() {
+    let mut f = folder(None).await;
+    let dir = f.path();
+    write_file(&dir, "version: 1\napproval_mode: yolo\n");
+    let create = |title: &str| json!({"action":"create","list_guid":"list","title":title});
+    assert!(!asks(&mut f, 1, "reminders_write", create("Queued under yolo")).await);
+    let library = quince_core::Library::open(&dir).unwrap();
+    let stored: Value =
+        serde_json::from_str(&library.state("mcp.policy").unwrap().unwrap()).unwrap();
+    assert_eq!(stored["mode"], "yolo");
+    let first = library.outbox_all_pending().unwrap().remove(0);
+    assert_eq!(
+        skykeep_mcp::sync::authorized(&library, &dir, &first),
+        Ok(())
+    );
+    write_file(
+        &dir,
+        "version: 1\napproval_mode: reads_and_writes\nrules:\n  reminders_write.create: allow\n",
+    );
+    assert_eq!(
+        skykeep_mcp::sync::authorized(&library, &dir, &first),
+        Err("write_mode_stricter")
+    );
+    assert!(!asks(&mut f, 2, "reminders_write", create("Second")).await);
+    let refused = library.outbox_refused_brief().unwrap();
+    assert!(
+        refused
+            .iter()
+            .any(|r| r.id == first.id && r.reason == "mcp_quarantine:write_mode_stricter"),
+        "{:?}",
+        refused.iter().map(|r| &r.reason).collect::<Vec<_>>()
+    );
+}

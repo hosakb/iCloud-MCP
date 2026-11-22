@@ -885,6 +885,34 @@ pub struct Server {
 #[cfg(test)]
 mod consent_tests {
     use super::*;
+
+    /// A queued write is recorded under the mode the gate decided with, not one read again
+    /// afterwards: a file made stricter in between leaves it marked looser, so it is set
+    /// aside instead of sent.
+    #[test]
+    fn a_queued_write_keeps_the_mode_its_gate_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let mut server = Server::open(&dir).unwrap();
+        let mut library = Library::open(&dir).unwrap();
+        library.set_state(ACCOUNT_KEY, "synthetic").unwrap();
+        server.set_policy("yolo").unwrap();
+        // The file turned stricter after the gate let the write through under yolo.
+        let file = dir.join(permissions::FILE_NAME);
+        std::fs::write(&file, "version: 1\napproval_mode: writes_only\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let args: NoteWrite =
+            serde_json::from_value(json!({"action":"create","body":"synthetic"})).unwrap();
+        authorized_enqueue(&mut library, &dir, Some("yolo"), |l| enqueue_note(l, args)).unwrap();
+        let pending = library.outbox_all_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            sync::authorized(&library, &dir, &pending[0]),
+            Err("write_mode_stricter")
+        );
+    }
     #[tokio::test]
     async fn timeout_and_disconnect_drop_unconsumed_consent() {
         use std::os::unix::fs::PermissionsExt;
@@ -985,6 +1013,10 @@ impl Server {
         let configured = policy(library, &held.path)?;
         let stored = configured.as_ref().map(|(p, _)| p.mode.clone());
         let active = permissions::load(library, &dir, stored.as_deref())?;
+        let configured = match configured {
+            None if adopt_file_mode(library, &dir, &active)? => policy(library, &dir)?,
+            configured => configured,
+        };
         // The file's approval_mode, when it names one, replaces the mode setup stored.
         let mode = active.mode.clone();
         let name = params["name"].as_str().ok_or("invalid_tool")?;
@@ -1176,6 +1208,19 @@ impl Server {
         let held = state::PrivateState::open(&self.dir)?;
         let identity = directory_identity(&held.path)?;
         let library = self.ready(&held)?;
+        store_policy(library, identity, mode, expected)
+    }
+}
+
+/// Stores `mode` as the folder's approval mode with a new revision, setting every waiting
+/// write aside (see [`Server::set_policy_if`]). Caller holds the private folder's lock.
+fn store_policy(
+    library: &mut Library,
+    identity: (u64, u64),
+    mode: &str,
+    expected: Option<&[i64]>,
+) -> Result<Value, &'static str> {
+    {
         let value = json!({"mode":mode,"revision":uuid::Uuid::new_v4().to_string(),"account":library.state(ACCOUNT_KEY).map_err(|_| "policy_unavailable")?,"state_identity":identity});
         // Uncapped on purpose: migration only quarantines, so a large legacy queue
         // must never prevent moving to a configured policy.
@@ -1203,7 +1248,37 @@ impl Server {
             .ok_or("policy_unavailable")?;
         serde_json::from_str(&saved).map_err(|_| "policy_unavailable")
     }
+}
 
+/// A folder without a stored approval mode whose permissions file names one takes that mode
+/// as its stored one, as `skykeep-mcp policy` would: queued writes then carry a grant bound
+/// to it, and a later stricter mode sets them aside. Writes already waiting are set aside, as
+/// for any first mode. Nothing happens before sign-in, where a mode would be bound to no
+/// account. Returns whether a mode was stored.
+fn adopt_file_mode(
+    library: &mut Library,
+    dir: &Path,
+    active: &permissions::Active,
+) -> Result<bool, &'static str> {
+    let Some(mode) = active.mode.as_deref().filter(|_| active.mode_in_file) else {
+        return Ok(false);
+    };
+    if library
+        .state("mcp.policy")
+        .map_err(|_| "policy_unavailable")?
+        .is_some()
+        || library
+            .state(ACCOUNT_KEY)
+            .map_err(|_| "library_unavailable")?
+            .is_none()
+    {
+        return Ok(false);
+    }
+    store_policy(library, directory_identity(dir)?, mode, None)?;
+    Ok(true)
+}
+
+impl Server {
     /// Human CLI only. Refused writes kept for review, without their payloads.
     pub fn quarantined(&mut self) -> Result<Vec<Value>, &'static str> {
         let held = state::PrivateState::open(&self.dir)?;
@@ -1742,6 +1817,10 @@ impl Server {
         let configured = policy(library, &dir)?;
         let stored = configured.as_ref().map(|(p, _)| p.mode.clone());
         let active = permissions::load(library, &dir, stored.as_deref())?;
+        let configured = match configured {
+            None if adopt_file_mode(library, &dir, &active)? => policy(library, &dir)?,
+            configured => configured,
+        };
         // The file's approval_mode, when it names one, replaces the mode setup stored.
         let mode = active.mode.clone();
         let (gate, explicit) = gate_for(library, mode.as_deref(), &active, name, &args)?;
@@ -2179,6 +2258,7 @@ impl Server {
                     authorized_enqueue(
                         library,
                         &dir,
+                        mode.as_deref(),
                         once(&terminal, |l| enqueue_reminder(l, args)),
                     )
                 } else {
@@ -2196,7 +2276,12 @@ impl Server {
                     return Err("login_required");
                 }
                 if configured.is_some() {
-                    authorized_enqueue(library, &dir, once(&terminal, |l| enqueue_note(l, args)))
+                    authorized_enqueue(
+                        library,
+                        &dir,
+                        mode.as_deref(),
+                        once(&terminal, |l| enqueue_note(l, args)),
+                    )
                 } else {
                     in_one(library, once(&terminal, |l| enqueue_note(l, args)))
                 }
@@ -2253,9 +2338,11 @@ fn in_one(
         .map_err(|Refused(error)| error)
 }
 
+/// `mode` is the approval mode the call's gate decided with; each write is recorded under it.
 fn authorized_enqueue(
     library: &mut Library,
     dir: &Path,
+    mode: Option<&str>,
     enqueue: impl FnOnce(&mut Library) -> Result<Value, &'static str>,
 ) -> Result<Value, &'static str> {
     if library
@@ -2323,7 +2410,7 @@ fn authorized_enqueue(
                     || result["guid"] == p.record
                     || (old == Some(p) && current.contains(&p.id))
                 {
-                    sync::record_authorization(library, dir, p).map_err(Refused)?;
+                    sync::record_authorization(library, dir, p, mode).map_err(Refused)?;
                 }
             }
             for p in &before {

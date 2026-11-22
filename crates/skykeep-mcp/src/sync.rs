@@ -195,16 +195,22 @@ fn refused_ids(dir: &Path) -> Result<Vec<i64>, &'static str> {
 
 /// Records the grant a queued write is sent under: the stored policy, the approval mode in
 /// force when it was queued (the file's, else the stored one), the write and its context.
+/// `mode` is the mode the call's gate decided with; it is not read again here, so a file
+/// changed meanwhile can't record a write as made under a stricter mode than it was.
 pub(crate) fn record_authorization(
     library: &mut Library,
     dir: &Path,
     p: &quince_core::outbox::Pending,
+    mode: Option<&str>,
 ) -> Result<(), &'static str> {
     let policy = library
         .state("mcp.policy")
         .map_err(|_| "policy_unavailable")?
         .ok_or("policy_unavailable")?;
-    let mode = crate::mode_in_force(library, dir)?;
+    let mode = match mode {
+        Some(mode) => Some(mode.to_string()),
+        None => crate::mode_in_force(library, dir)?,
+    };
     let grant = json!({"policy":policy,"mode":mode,"pending":pending_value(p),
         "context":send_context(library,p)?});
     library
