@@ -516,7 +516,8 @@ impl Stop {
 fn refused(status: u16) -> Option<Stop> {
     match status {
         200..=299 => None,
-        450 => Some(Stop::Reauth),
+        // Apple's lapsed session, in either of its two answers (#59).
+        421 | 450 => Some(Stop::Reauth),
         429 | 500..=599 => Some(Stop::Busy),
         _ => Some(Stop::Failed),
     }

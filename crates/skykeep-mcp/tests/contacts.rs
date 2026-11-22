@@ -1037,6 +1037,30 @@ async fn failed_refresh_keeps_cache_and_cursor_and_a_retry_recovers() {
     assert_eq!(page["cache"]["last_refresh_failed"], false);
 }
 
+/// Apple's 421 is a lapsed session, as its 450 is (#59).
+#[tokio::test]
+async fn a_421_from_contacts_is_a_lapsed_session() {
+    let remote = apple().await;
+    Mock::given(method("GET"))
+        .and(path("/co/startup"))
+        .respond_with(
+            ResponseTemplate::new(421)
+                .set_body_string(r#"{"reason":"Missing X-APPLE-WEBAUTH-TOKEN cookie","error":1}"#),
+        )
+        .mount(&remote)
+        .await;
+    let (dir, _server, _) = bound_with_unrelated_state(Some("writes_only"));
+    assert_eq!(
+        skykeep_mcp::contacts::refresh_with_client(
+            dir.path(),
+            saved_client(dir.path(), &remote.uri())
+        )
+        .await
+        .unwrap_err(),
+        "login_required"
+    );
+}
+
 #[tokio::test]
 async fn refresh_fails_closed_on_session_account_or_service_problems() {
     // Apple ends the session for Contacts.
