@@ -60,7 +60,7 @@ You need a terminal window that you open yourself. Don't run these commands thro
       | 1. Ask before every read and every change (recommended, `reads_and_writes`) | Asks you in the MCP client | Asks you in the MCP client |
       | 2. Read without asking, ask before every change (`writes_only`) | No question | Asks you in the MCP client |
       | 3. Don't ask before reads or changes (`yolo`, you type `confirm`) | No question | No question, except deletions, moves to Recently Deleted and moves and renames of large Drive folders, which ask in the MCP client |
-      | 4. No approval mode (you type `confirm`) | No question | Routine changes: no question. Deletions, and renames and moves of Drive folders with 20 or more items or an unknown count, ask in the MCP client |
+      | 4. No approval mode, the older behaviour (you type `confirm`) | No question | Like choice 3. You can later run `skykeep-mcp require-approval` to make every change ask. Most people should pick 1 |
 
       Every choice asks on iCloud-MCP's approval card in the MCP client. Hermes supports MCP form elicitation and shows the card. In a client without the card, a request that needs approval is refused with `approval_requires_form_client`, and nothing runs. A session where nobody answers, such as a scheduled job, gets `approval_timeout` after 3 minutes, and nothing runs either. Choice 4 keeps a folder's earlier `require-approval` setting: then every change asks on the card, and setup and status say so. Once a folder has had choice 1, 2 or 3, it can't go back to 4; set up a new folder instead.
    After step 4, setup offers to write a starter permissions file. In it every deletion asks on the card. Press Enter to skip it.
@@ -302,9 +302,13 @@ It needs a folder that setup has prepared. It prints the rules in use, when the 
 
 Setup's choices 1 to 3 are the policy modes `reads_and_writes`, `writes_only` and
 `yolo` (the table is under "Get started"). They control reads, Notes, Reminders and
-Calendar, Drive and Contacts changes, and sync; Drive and Contacts deletions, large folder moves and
-renames, Calendar deletes and Notes and Reminders deletions are always asked, see "Drive changes", "Contacts changes" and "Calendar changes". A folder with no policy (choice 4) keeps the older behaviour in
-"Write approval" above, with its approvals on the card too.
+Calendar, Drive, Contacts and Photos changes, and sync. Every deletion (Notes, Reminders,
+Contacts and Calendar deletes, Drive trash and delete forever, Photos moves to Recently
+Deleted) and every large Drive folder move or rename is always asked; see "Drive changes",
+"Contacts changes", "Calendar changes" and "Photos changes". A folder with no policy
+(choice 4) runs reads and routine changes without asking and asks on the card before every
+deletion and large Drive folder move or rename, like choice 3. The difference is that
+`skykeep-mcp require-approval` can make every change ask there.
 
 The human-only command is `skykeep-mcp policy --state-dir DIR MODE`, where MODE is
 `reads_and_writes`, `writes_only`, or `yolo`. It requires a user-owned terminal,

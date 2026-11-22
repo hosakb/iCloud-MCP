@@ -292,11 +292,12 @@ fn survey(env: &Env, dir: &Path) -> Result<Found, &'static str> {
     })
 }
 
-fn describe(mode: &str) -> &'static str {
+/// The mode in words; "none" says what it does in this folder, from `library`.
+fn describe(mode: &str, library: &quince_core::Library) -> String {
     if mode == "none" {
-        "none"
+        format!("none. {}", status::no_mode_effect(library))
     } else {
-        status::describe_mode(mode)
+        status::describe_mode(mode).to_string()
     }
 }
 
@@ -381,11 +382,17 @@ async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcom
                 "Setup couldn't reach Apple to check the saved sign-in, so it is kept as it is.",
             )?,
         }
+        let mode = {
+            let held = PrivateState::open(&dir)?;
+            describe(
+                found.mode.as_deref().unwrap_or_default(),
+                &crate::setup(&held.path)?,
+            )
+        };
         c.say(&format!(
-            "\nThis folder is already set up. Sign-in kept in the {}, signed in as {}, approval mode: {}",
+            "\nThis folder is already set up. Sign-in kept in the {}, signed in as {}, approval mode: {mode}",
             found.kind.describe(),
             found.account.as_deref().unwrap_or_default(),
-            describe(found.mode.as_deref().unwrap_or_default()),
         ))?;
         match choose(
             c,
@@ -848,7 +855,7 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
         Ok(None) if no_mode_chosen(&library) => {
             let answer = console.ask(&format!(
                 "Current mode: {}\nPress Enter to keep it, or type change: ",
-                describe("none")
+                describe("none", &library)
             ))?;
             if answer.trim().is_empty() {
                 return Ok(());
@@ -870,7 +877,7 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
         MODES[0].1, MODES[1].1, MODES[2].1
     );
     if offer_none {
-        menu.push_str(&format!("  4. No approval mode. {} Once you pick 1, 2 or 3, this folder can't go back to 4.\nChoose 1, 2, 3 or 4 (Enter picks 1): ", status::no_mode_effect(&library)));
+        menu.push_str(&format!("  4. No approval mode (older behaviour). {} Once you pick 1, 2 or 3, this folder can't go back to 4. Most people should pick 1.\nChoose 1, 2, 3 or 4 (Enter picks 1): ", status::no_mode_choice(&library)));
     } else {
         console.say("This folder has had an approval mode, so there is no choice without one.")?;
         menu.push_str("Choose 1, 2 or 3 (Enter picks 1): ");
@@ -880,7 +887,7 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
         let n = choose(console, &menu, count, Some(1))?;
         if n == 3
             && console
-                .ask("The assistant could then read and change your data without asking; deletions still ask on the card. Type confirm to allow that: ")?
+                .ask("The assistant could then read and change your data without asking. Deletions, moves to Recently Deleted and moves or renames of large Drive folders still ask on the card. Type confirm to allow that: ")?
                 .trim()
                 != "confirm"
         {

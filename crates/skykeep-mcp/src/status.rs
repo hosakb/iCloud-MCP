@@ -58,17 +58,29 @@ pub(crate) fn quoted(path: &Path) -> String {
 /// What "no approval mode" means in a folder: the older behaviour, including an earlier
 /// `require-approval`, which setup never loosens.
 pub fn no_mode_effect(library: &quince_core::Library) -> &'static str {
-    if library
+    if require_all(library) {
+        "Every change asks on the approval card in your MCP client, because this folder was set earlier to approve every change (skykeep-mcp require-approval)."
+    } else {
+        "Routine changes run without asking; deletions and renames or moves of large Drive folders ask on the approval card in your MCP client."
+    }
+}
+
+/// Setup's choice 4 in words: how it differs from yolo in this folder.
+pub fn no_mode_choice(library: &quince_core::Library) -> &'static str {
+    if require_all(library) {
+        no_mode_effect(library)
+    } else {
+        "Like 3, but you can later run skykeep-mcp require-approval to make every change ask."
+    }
+}
+
+fn require_all(library: &quince_core::Library) -> bool {
+    library
         .state("mcp.require_write_approval")
         .ok()
         .flatten()
         .as_deref()
         == Some("true")
-    {
-        "Every change asks on the approval card in your MCP client, because this folder was set earlier to approve every change (skykeep-mcp require-approval)."
-    } else {
-        "Routine changes run without asking; deletions and renames or moves of large Drive folders ask on the approval card in your MCP client."
-    }
 }
 
 /// `text` with `--state-dir DIR` added to every `skykeep-mcp` command in it. For the default

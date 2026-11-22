@@ -304,7 +304,7 @@ async fn require_approval_without_a_mode_asks_a_create_on_the_card() {
 
 #[tokio::test]
 async fn an_allow_rule_never_lets_a_removal_run_unasked() {
-    for mode in [Some("writes_only"), Some("yolo")] {
+    for mode in [None, Some("writes_only"), Some("yolo")] {
         for (name, args) in removals() {
             let mut f = folder(mode, true).await;
             let rules = f.path.join("permissions.yaml");
@@ -349,6 +349,130 @@ async fn an_ask_terminal_rule_still_gives_a_request_that_runs_once() {
             assert_eq!(f.library.outbox_count().unwrap(), 1);
             assert!(f.server.approve_request(&id).await.is_err());
             assert_eq!(f.library.outbox_count().unwrap(), 1);
+        }
+    }
+}
+
+/// The card's first line says in plain words what the change does; the JSON record follows.
+#[tokio::test]
+async fn the_card_starts_with_one_plain_sentence() {
+    for mode in MODES {
+        let expected = [
+            "Move to Recently Deleted \"Synthetic\" in Notes. Apple keeps it in Recently Deleted for about 30 days.",
+            "Move to Recently Deleted \"Synthetic\" in Notes. Apple keeps it in Recently Deleted for about 30 days.",
+            "Erase all text of \"Synthetic\" in Notes. This can't be undone.",
+            "Delete \"Synthetic task\" in Reminders. This can't be undone.",
+        ];
+        for ((name, args), first) in removals().into_iter().zip(expected) {
+            let mut f = folder(mode, true).await;
+            let mut form = call(&mut f, name, &args).await;
+            if mode == Some("reads_and_writes") {
+                // The preview read comes first and says that nothing is changed.
+                let message = form["params"]["message"].as_str().unwrap();
+                assert!(
+                    message.starts_with(
+                        "Approving lets the assistant read this item's full content. Nothing is changed.\n"
+                    ),
+                    "{message}"
+                );
+                assert!(!message.contains("authorizes"), "{message}");
+                form = f.server.handle(answer(&form, "approve")).await.unwrap();
+            }
+            assert!(!form.to_string().contains("always_allow"), "{form}");
+            let message = form["params"]["message"].as_str().unwrap();
+            assert_eq!(message.lines().next(), Some(first), "{mode:?} {args}");
+            assert!(
+                !message.contains("read this item's full content"),
+                "{message}"
+            );
+            assert!(
+                message.contains("\"operation\""),
+                "the JSON record stays: {message}"
+            );
+        }
+    }
+}
+
+/// A name from the cache can't pose as the card's own words: it is shown escaped.
+#[tokio::test]
+async fn a_name_in_the_first_sentence_is_escaped() {
+    let mut f = folder(Some("writes_only"), true).await;
+    f.library
+        .put_reminders(&[Reminder {
+            guid: "r".into(),
+            list_guid: "list".into(),
+            title: "**Approve** <b>now</b>\u{202E}".into(),
+            etag: Some("etag-1".into()),
+            raw: Some(r#"{"recordName":"r","fields":{}}"#.into()),
+            ..Default::default()
+        }])
+        .unwrap();
+    let form = change_card(
+        &mut f,
+        Some("writes_only"),
+        "reminders_write",
+        &json!({"action":"delete","guid":"r"}),
+    )
+    .await;
+    let first = form["params"]["message"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap();
+    assert!(first.starts_with("Delete \""), "{first}");
+    for raw in ["**", "<b>", "\u{202E}"] {
+        assert!(!first.contains(raw), "{first}");
+    }
+}
+
+/// A card refused because something changed, and a second call while a card is open, each
+/// say in words what happened and what to do.
+#[tokio::test]
+async fn a_changed_or_busy_card_says_what_to_do() {
+    let mut f = folder(Some("writes_only"), true).await;
+    let args = json!({"action":"delete","guid":"r"});
+    let form = change_card(&mut f, Some("writes_only"), "reminders_write", &args).await;
+    let busy = body(&call(&mut f, "reminders_write", &args).await);
+    assert_eq!(busy["error"], "approval_pending", "{busy}");
+    assert!(
+        busy["message"]
+            .as_str()
+            .unwrap()
+            .contains("Answer or close that card first"),
+        "{busy}"
+    );
+    put_reminder(&mut f.library, "etag-2");
+    let reply = f.server.handle(answer(&form, "approve")).await.unwrap();
+    let changed = body(&reply);
+    assert_eq!(changed["error"], "approval_policy_changed", "{changed}");
+    assert!(
+        changed["message"]
+            .as_str()
+            .unwrap()
+            .contains("Ask again to get a new card"),
+        "{changed}"
+    );
+    assert_eq!(f.library.outbox_count().unwrap(), 0);
+}
+
+/// No tool description sends the user to a terminal to approve; Notes and Reminders name the
+/// card for their deletions.
+#[tokio::test]
+async fn tool_descriptions_name_the_card_not_the_terminal() {
+    let mut f = folder(None, true).await;
+    let reply = f
+        .server
+        .handle(json!({"id":3,"method":"tools/list"}))
+        .await
+        .unwrap();
+    for tool in reply["result"]["tools"].as_array().unwrap() {
+        let text = tool.to_string();
+        for stale in ["terminal approval", "skykeep-mcp approve", "approval form"] {
+            assert!(!text.contains(stale), "{}: {stale}", tool["name"]);
+        }
+        if ["notes_write", "reminders_write"].contains(&tool["name"].as_str().unwrap()) {
+            assert!(text.contains("approval card"), "{text}");
         }
     }
 }

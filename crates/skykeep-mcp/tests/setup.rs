@@ -1121,8 +1121,14 @@ async fn never_asking_needs_a_typed_confirmation() {
     answers.push(Ask(""));
     answers.extend(sign_in_answers());
     answers.extend([Ask("3"), Ask("no"), Ask("3"), Ask("confirm")]);
-    ready(answers, &dir, &server).await;
+    let script = ready(answers, &dir, &server).await;
     assert_eq!(policy(&dir)["mode"], "yolo");
+    // The confirmation names everything that still asks, as the menu line does.
+    assert!(
+        script.screen.contains("Deletions, moves to Recently Deleted and moves or renames of large Drive folders still ask on the card. Type confirm"),
+        "{}",
+        script.screen
+    );
 }
 
 /// No policy at all, chosen on purpose: routine changes run, deletions ask on the card.
@@ -1137,7 +1143,7 @@ async fn no_approval_mode_leaves_the_folder_without_a_policy_and_counts_as_done(
     answers.extend([Ask("4"), Ask("no"), Ask("4"), Ask("confirm")]);
     let script = ready(answers, &dir, &server).await;
     assert!(
-        script.screen.contains("  4. No approval mode. Routine changes run without asking; deletions and renames or moves of large Drive folders ask on the approval card in your MCP client."),
+        script.screen.contains("  4. No approval mode (older behaviour). Like 3, but you can later run skykeep-mcp require-approval to make every change ask. Once you pick 1, 2 or 3, this folder can't go back to 4. Most people should pick 1."),
         "{}",
         script.screen
     );
@@ -1156,7 +1162,14 @@ async fn no_approval_mode_leaves_the_folder_without_a_policy_and_counts_as_done(
     assert!(report.ready(), "{}", report.render());
     assert!(report.render().contains("Approval mode: none"));
     let script = ready(vec![Ask(""), Ask("")], &dir, &server).await;
-    assert!(script.screen.contains("approval mode: none"));
+    // "none" says what it does in this folder.
+    assert!(
+        script
+            .screen
+            .contains("approval mode: none. Routine changes run without asking"),
+        "{}",
+        script.screen
+    );
 }
 
 /// The count the person agreed to is checked again under the lock that sets changes aside.

@@ -1763,3 +1763,29 @@ async fn ask_terminal_stays_an_opt_in_that_still_works() {
         assert_eq!(write_paths(&f.remote).await.len(), 1, "{mode:?}");
     }
 }
+
+/// A folder without an approval mode, set to approve every change: a Calendar create asks on
+/// the card, even where a rule allows it, and runs once when approved.
+#[tokio::test]
+async fn require_approval_without_a_mode_asks_every_calendar_change_on_the_card() {
+    for rule in ["", "rules:\n  calendar_write.create: allow\n"] {
+        let mut f = fixture(None).await;
+        quince_core::Library::open(f.dir.path())
+            .unwrap()
+            .set_state("mcp.require_write_approval", "true")
+            .unwrap();
+        if !rule.is_empty() {
+            rules(f.dir.path(), rule);
+        }
+        let args = json!({"action":"create","calendar_guid":"cal-work","title":"Flight","start":"2026-12-01T07:15:00Z","end":"2026-12-01T09:00:00Z","timezone":"Europe/Lisbon"});
+        let form = call(&mut f.server, args.clone()).await;
+        assert_eq!(form["method"], "elicitation/create", "{rule}: {form}");
+        assert_eq!(choices(&form), ["approve", "deny"], "{rule}");
+        assert!(!form.to_string().contains("request_id"));
+        assert!(writes(&f.remote).await.is_empty());
+        let done = text(&f.server.handle(answer(&form, "approve")).await.unwrap());
+        assert_eq!(done["outcome"], "done", "{rule}: {done}");
+        assert!(f.server.handle(answer(&form, "approve")).await.is_none());
+        assert_eq!(writes(&f.remote).await.len(), 1, "{rule}");
+    }
+}

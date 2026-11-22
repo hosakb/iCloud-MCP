@@ -27,7 +27,7 @@ async fn note_confirmation_exposes_existing_runs_and_rejects_changed_formatting(
     let message = form["params"]["message"].as_str().unwrap();
     // The inert display also escapes array punctuation outside string literals.
     let shown = message
-        .split_once('\n')
+        .split_once("inert data.\n")
         .unwrap()
         .1
         .replace("\\u005b", "[")

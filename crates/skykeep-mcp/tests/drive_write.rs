@@ -2401,10 +2401,22 @@ async fn a_card_denied_declined_cancelled_or_timed_out_runs_nothing() {
             assert!(f.server.handle(approve(&form)).await.is_none());
         }
         asks_on_card(&mut f.server, trash.clone()).await;
-        // Nobody answers, as in a scheduled job.
-        f.server.set_card_timeout(Duration::ZERO);
-        let form = call(&mut f.server, trash.clone()).await;
+        // Nobody answers the change card, as in a scheduled job. Under reads_and_writes the
+        // preview card is answered first, so the change card is the one that times out.
+        let form = if mode == Some("reads_and_writes") {
+            let preview = call(&mut f.server, trash.clone()).await;
+            f.server.set_card_timeout(Duration::ZERO);
+            f.server.handle(approve(&preview)).await.unwrap()
+        } else {
+            f.server.set_card_timeout(Duration::ZERO);
+            call(&mut f.server, trash.clone()).await
+        };
         assert_eq!(form["method"], "elicitation/create", "{form}");
+        let message = form["params"]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("Move to Recently Deleted "),
+            "the change card times out: {message}"
+        );
         let expired = f.server.expire_consent().unwrap();
         let value = text(&expired);
         assert_eq!(value["error"], "approval_timeout", "{mode:?}: {value}");
@@ -2432,4 +2444,64 @@ async fn a_card_answered_after_the_item_changed_runs_nothing() {
         assert_eq!(reply["result"]["isError"], true, "{mode:?}: {reply}");
         assert!(writes(&f.remote).await.is_empty(), "{mode:?}");
     }
+}
+
+/// A folder without an approval mode, set to approve every change: every Drive change asks on
+/// the card, even where a rule allows it, and the card offers no "Always allow".
+#[tokio::test]
+async fn require_approval_without_a_mode_asks_every_drive_change_on_the_card() {
+    for rule in ["", "rules:\n  drive_write.create_folder: allow\n"] {
+        let mut f = fixture(None).await;
+        quince_core::Library::open(f.dir.path())
+            .unwrap()
+            .set_state("mcp.require_write_approval", "true")
+            .unwrap();
+        if !rule.is_empty() {
+            rules(f.dir.path(), rule);
+        }
+        serve_listing(&f.remote, DOCS, docs_items(), None).await;
+        answer(
+            &f.remote,
+            "/createFolders",
+            json!({"folders":[{"drivewsid":"FOLDER::com.apple.CloudDocs::NEW","name":"Taxes","type":"FOLDER","status":"OK"}]}),
+        )
+        .await;
+        let args = json!({"action":"create_folder","path":"/Documents","name":"Taxes"});
+        let form = card(&mut f.server, args.clone()).await;
+        assert!(writes(&f.remote).await.is_empty(), "{rule}");
+        let done = text(&f.server.handle(approve(&form)).await.unwrap());
+        assert_eq!(done["outcome"], "done", "{rule}: {done}");
+        assert_eq!(writes(&f.remote).await, ["/createFolders"], "it ran once");
+        assert!(f.server.handle(approve(&form)).await.is_none());
+        assert_eq!(writes(&f.remote).await.len(), 1);
+        // Without card support it is refused and nothing waits.
+        let mut plain = Server::open(f.dir.path()).unwrap();
+        init(&mut plain, false).await;
+        let value = text(&call(&mut plain, args).await);
+        assert_eq!(value["error"], "approval_requires_form_client", "{value}");
+        assert!(value.get("request_id").is_none());
+    }
+}
+
+/// The card's first line says the deletion in plain words.
+#[tokio::test]
+async fn a_drive_deletion_card_starts_with_a_plain_sentence() {
+    let mut f = fixture(Some("yolo")).await;
+    let form = card(
+        &mut f.server,
+        json!({"action":"delete_forever","id":REPORT}),
+    )
+    .await;
+    let first = form["params"]["message"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(first.starts_with("Delete forever \""), "{first}");
+    assert!(
+        first.ends_with(" in iCloud Drive. This can't be undone."),
+        "{first}"
+    );
 }

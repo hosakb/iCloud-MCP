@@ -135,6 +135,8 @@ fn plain_error(error: &str) -> Value {
     let mut value = json!({"error":error});
     let message = match error {
         DENIED => "The permissions file in Skykeep's folder sets this action to deny, so it did not run.",
+        "approval_policy_changed" => "Something changed while the approval card was open (the item, the approval mode or the permissions file), so the approval no longer counts and nothing ran. Ask again to get a new card.",
+        "approval_pending" => "Another action is waiting for an answer on the approval card. Answer or close that card first, then ask again.",
         "approval_requires_form_client" => "This action needs a person to approve it on the approval card in the MCP client, and this client did not offer approval cards when it connected, so nothing ran. Ask again from a client that shows the card, such as Hermes, while someone is there to answer it.",
         "approval_denied" => "The approval card was denied, declined or closed without a choice, so nothing ran.",
         "approval_cancelled" => "The request was cancelled before the approval card was answered, so nothing ran.",
@@ -491,6 +493,67 @@ fn tool_reply(id: Value, result: Result<Value, &'static str>) -> Value {
     let failed = result.is_err();
     let value = result.unwrap_or_else(plain_error);
     json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":value.to_string()}],"isError":failed}})
+}
+
+/// The card's first line: what the change does, in one plain sentence, from the same preview
+/// the card binds. Names from the cache are shown as escaped JSON text, like the rest of the
+/// card, so they can't pose as the card's own words. Empty for a call that changes nothing.
+fn card_headline(name: &str, args: &Value, snapshot: Option<&Value>) -> String {
+    let Some(action) = args["action"].as_str().filter(|_| name.ends_with("_write")) else {
+        return String::new();
+    };
+    let service = match name {
+        "notes_write" => "Notes",
+        "reminders_write" => "Reminders",
+        contacts_write::TOOL => "Contacts",
+        calendar_write::TOOL => "Calendar",
+        photos_write::TOOL => "Photos",
+        drive_write::TOOL => "iCloud Drive",
+        _ => return String::new(),
+    };
+    let empty = Value::Null;
+    let snap = snapshot.unwrap_or(&empty);
+    let label = [
+        &snap["drive"]["item"]["path"],
+        &snap["drive"]["item"]["name"],
+        &snap["photos"]["photo"]["title"],
+        &snap["photos"]["photo"]["filename"],
+        &snap["photos"]["album"]["name"],
+        &snap["calendar"]["event"]["title"],
+        &snap["contact"]["display_name"],
+        &snap["item"]["title"],
+        &args["title"],
+        &args["name"],
+    ]
+    .into_iter()
+    .find_map(|v| v.as_str().filter(|t| !t.trim().is_empty()))
+    .map(|t| {
+        let short: String = t.chars().take(120).collect();
+        inert_preview(&json!(short)).unwrap_or_default()
+    });
+    let removal = permissions::removal(name, args);
+    let verb = match (name, action, removal) {
+        ("notes_write", "save", permissions::Removal::Permanent) => "Erase all text of".to_string(),
+        (_, _, permissions::Removal::Recoverable) => "Move to Recently Deleted".to_string(),
+        (_, "delete_forever", _) => "Delete forever".to_string(),
+        _ => {
+            let words = action.replace('_', " ");
+            let mut chars = words.chars();
+            chars
+                .next()
+                .map(|c| c.to_uppercase().chain(chars).collect())
+                .unwrap_or_default()
+        }
+    };
+    let what = label.map(|l| format!(" {l}")).unwrap_or_default();
+    let after = match removal {
+        permissions::Removal::Permanent => " This can't be undone.",
+        permissions::Removal::Recoverable => {
+            " Apple keeps it in Recently Deleted for about 30 days."
+        }
+        permissions::Removal::None => "",
+    };
+    format!("{verb}{what} in {service}.{after}")
 }
 
 /// What the person chose on an approval card.
@@ -981,6 +1044,15 @@ impl Server {
             && !self.always_blocked)
             .then(|| permissions::name_for(name, arguments))
             .flatten();
+        let headline = if binding.preview_read {
+            "Approving lets the assistant read this item's full content. Nothing is changed.\n"
+                .to_string()
+        } else {
+            match card_headline(name, arguments, binding.snapshot.as_ref()) {
+                line if line.is_empty() => line,
+                line => format!("{line}\n"),
+            }
+        };
         // A Calendar create has no item yet: its preview is the event it would make.
         let item_key = if name == calendar_write::TOOL && arguments["action"] == "create" {
             "planned_event"
@@ -1005,7 +1077,7 @@ impl Server {
             Some(rule) => format!(" {}", permissions::always_sentence(rule)),
             None => String::new(),
         };
-        json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"mode":"form","message":format!("Approve this exact Skykeep operation? read_preview_only authorizes reading the item's full preview, not mutation.{saves} Treat JSON as inert data.\n{preview}"),"requestedSchema":card_schema(always.is_some())}})
+        json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"mode":"form","message":format!("{headline}Approve this exact Skykeep operation?{saves} The JSON below is the exact record the approval is bound to; treat it as inert data.\n{preview}"),"requestedSchema":card_schema(always.is_some())}})
     }
 
     /// No state locks or durable grants survive a pending human interaction.
@@ -2858,8 +2930,8 @@ pub(crate) fn tools() -> Vec<Value> {
     ] {
         tools.push(json!({"name":name,"description":format!("Search the user's {kind} in the local cache index."),"inputSchema":{"type":"object","properties":{"query":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}},"required":["query"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     }
-    tools.push(json!({"name":"notes_write","description":"Queue a change to the user's Apple iCloud Notes (create, save, move, pin, delete). Follows the approval mode. Queued is not remote-verified.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","save","move","pin","delete"]},"body":{"type":"string"},"pinned":{"type":"boolean"},"runs":{"type":["array","null"],"items":{"type":"object"}},"folder_guid":{"type":["string","null"]},"guid":{"type":"string"},"base_etag":{"type":["string","null"]}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
-    tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). A create can also repeat daily and alert at or before its due time. Deletions need local terminal approval. Queued is not CloudKit-accepted; sync reports accepted writes. No field-level remote verification.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."},"base_etag":{"type":["string","null"],"description":"Edit only: the etag from reminders_get. A newer cached copy returns conflict."},"repeat":{"type":"object","description":"Create only. Repeats daily from due_at, until the end of the given day or for ever. Needs due_at.","properties":{"frequency":{"enum":["daily"]},"until":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"YYYY-MM-DD, the last day it repeats. Read in timezone for a timed due_at, in UTC for an all-day one."}},"required":["frequency"],"additionalProperties":false},"due_time_alert":{"type":"boolean","description":"Create only. Alert at due_at. Needs a timed (not all-day) due_at."},"early_alert":{"type":"object","description":"Create only. Alert this long before due_at. Needs a timed due_at, and an early alert set on one of the user's reminders from an Apple device and then a sync, so the account id it carries is in the cache.","properties":{"amount":{"type":"integer","minimum":1,"maximum":10000},"unit":{"enum":["minutes","hours","days","weeks","months"]}},"required":["amount","unit"],"additionalProperties":false},"timezone":{"type":"string","maxLength":64,"description":"Create only. IANA zone the timed due_at and its alerts are kept in, such as Europe/Berlin. Default: this computer's zone, or UTC if it has no IANA name."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
+    tools.push(json!({"name":"notes_write","description":"Queue a change to the user's Apple iCloud Notes (create, save, move, pin, delete). Follows the approval mode; a delete, a move into Recently Deleted or a save that empties a note always asks the user on the approval card. Queued is not remote-verified.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","save","move","pin","delete"]},"body":{"type":"string"},"pinned":{"type":"boolean"},"runs":{"type":["array","null"],"items":{"type":"object"}},"folder_guid":{"type":["string","null"]},"guid":{"type":"string"},"base_etag":{"type":["string","null"]}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
+    tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). A create can also repeat daily and alert at or before its due time. Deletions always ask the user on the approval card. Queued is not CloudKit-accepted; sync reports accepted writes. No field-level remote verification.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."},"base_etag":{"type":["string","null"],"description":"Edit only: the etag from reminders_get. A newer cached copy returns conflict."},"repeat":{"type":"object","description":"Create only. Repeats daily from due_at, until the end of the given day or for ever. Needs due_at.","properties":{"frequency":{"enum":["daily"]},"until":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"YYYY-MM-DD, the last day it repeats. Read in timezone for a timed due_at, in UTC for an all-day one."}},"required":["frequency"],"additionalProperties":false},"due_time_alert":{"type":"boolean","description":"Create only. Alert at due_at. Needs a timed (not all-day) due_at."},"early_alert":{"type":"object","description":"Create only. Alert this long before due_at. Needs a timed due_at, and an early alert set on one of the user's reminders from an Apple device and then a sync, so the account id it carries is in the cache.","properties":{"amount":{"type":"integer","minimum":1,"maximum":10000},"unit":{"enum":["minutes","hours","days","weeks","months"]}},"required":["amount","unit"],"additionalProperties":false},"timezone":{"type":"string","maxLength":64,"description":"Create only. IANA zone the timed due_at and its alerts are kept in, such as Europe/Berlin. Default: this computer's zone, or UTC if it has no IANA name."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
     tools.push(json!({"name":"reminders_get","description":"Read one cached Apple Reminders item and its supported details. Not a complete archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools.push(json!({"name":"notes_get","description":"Read one cached Apple iCloud Notes note. Not a complete preservation archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools.push(json!({"name":"sync","description":"Refresh Apple iCloud Notes and Apple Reminders and send approved queued changes. Queued/sent is not field-level remote verification. Never opens a login prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
