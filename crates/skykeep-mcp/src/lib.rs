@@ -1,6 +1,7 @@
 //! Local MCP adapter. The library and codecs remain owned by the upstream crates.
 pub mod account;
 pub mod calendar;
+pub mod calendar_write;
 pub mod contacts;
 pub mod drive;
 pub mod drive_write;
@@ -231,8 +232,12 @@ fn gate_for(
 }
 
 /// A Drive change that needs a person whatever the rules say (`drive_write::needs_person`).
+/// A Calendar delete too (`calendar_write::needs_person`).
 /// Arguments that don't validate are left to the tool, which refuses them.
 fn drive_needs_person(library: &Library, name: &str, args: &Value) -> Result<bool, &'static str> {
+    if name == calendar_write::TOOL {
+        return Ok(calendar_write::needs_person(args));
+    }
     if name != drive_write::TOOL {
         return Ok(false);
     }
@@ -411,7 +416,7 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
                     |folder| format!("A folder inside the exchange folder can be changed by other users. Make it yours alone in your own terminal with: chmod 700 {} and try again.", status::quoted(&folder)),
                 ),
         ),
-        _ => None,
+        other => calendar_write::next_step(other),
     }
 }
 
@@ -604,6 +609,8 @@ pub(crate) fn needs_consent(mode: &str, name: &str) -> Result<bool, &'static str
         // Every Drive change is asked in the form, except under yolo. Deletions and large
         // folder moves are then asked in the terminal instead (drive_write::goes_to_terminal).
         "drive_write" => Ok(mode != "yolo"),
+        // The same for Calendar changes; deletes then go to the terminal.
+        "calendar_write" => Ok(mode != "yolo"),
         _ => Err("unknown_tool"),
     }
 }
@@ -612,6 +619,11 @@ fn resolved_snapshot(library: &Library, name: &str, args: &Value) -> Result<Valu
     if name == drive_write::TOOL {
         // Drive has no queue: the preview of what the action reaches is the whole context.
         let snapshot = json!({"drive": drive_write::preview(library, args)?});
+        bounded_value(&snapshot, MAX_ARGUMENT_BYTES)?;
+        return Ok(snapshot);
+    }
+    if name == calendar_write::TOOL {
+        let snapshot = json!({"calendar": calendar_write::preview(library, args)?});
         bounded_value(&snapshot, MAX_ARGUMENT_BYTES)?;
         return Ok(snapshot);
     }
@@ -699,6 +711,7 @@ pub struct Server {
     /// allow rule would not stop it asking (a Drive deletion or large folder move).
     always_blocked: bool,
     drive: drive_write::Seam,
+    calendar: calendar_write::Seam,
 }
 
 #[cfg(test)]
@@ -1043,6 +1056,7 @@ impl Server {
                 always_blocked: false,
                 denied: None,
                 drive: drive_write::Seam::default(),
+                calendar: calendar_write::Seam::default(),
             }),
             Err("state_busy_retry") => Ok(Self {
                 library: None,
@@ -1055,6 +1069,7 @@ impl Server {
                 always_blocked: false,
                 denied: None,
                 drive: drive_write::Seam::default(),
+                calendar: calendar_write::Seam::default(),
             }),
             Err(error) => Err(error),
         }
@@ -1076,6 +1091,12 @@ impl Server {
         self.drive = seam;
     }
 
+    /// Test seam: Calendar changes against synthetic endpoints and limits, as for Drive.
+    #[doc(hidden)]
+    pub fn set_calendar_seam(&mut self, seam: calendar_write::Seam) {
+        self.calendar = seam;
+    }
+
     /// Trusted local CLI only, after `approval_details` was shown: runs one approved
     /// proposal. A Drive change runs now, against Apple; a Notes or Reminders change is queued.
     pub async fn approve_any(&mut self, id: &str) -> Result<Value, &'static str> {
@@ -1090,20 +1111,22 @@ impl Server {
                 .ok_or("approval_not_found")?;
             serde_json::from_str::<Value>(&raw).map_err(|_| "approval_not_found")?["tool"].clone()
         };
-        if tool == drive_write::TOOL {
+        if tool == drive_write::TOOL || tool == calendar_write::TOOL {
             self.approve_drive(id).await
         } else {
             self.approve_request(id).await
         }
     }
 
-    /// A Drive proposal holds to the account, the approval mode (revision included), the
-    /// private directory and the cached preview it was made with: any of them changed, it is
-    /// refused and must be asked again. It is used up before it runs, so it runs once.
+    /// A Drive or Calendar proposal holds to the account, the approval mode (revision
+    /// included), the private directory and the cached preview it was made with: any of them
+    /// changed, it is refused and must be asked again. It is used up before it runs, so it runs
+    /// once.
     async fn approve_drive(&mut self, id: &str) -> Result<Value, &'static str> {
         let held = state::PrivateState::open(&self.dir)?;
         let dir = held.path.clone();
         let seam = self.drive.clone();
+        let calendar_seam = self.calendar.clone();
         let library = self.ready(&held)?;
         let key = format!("mcp.approval.{id}");
         let raw = library
@@ -1112,6 +1135,7 @@ impl Server {
             .filter(|s| !s.is_empty())
             .ok_or("approval_not_found")?;
         let proposal: Value = serde_json::from_str(&raw).map_err(|_| "approval_not_found")?;
+        let tool = proposal["tool"].as_str().unwrap_or_default().to_string();
         if proposal["account"]
             != json!(library
                 .state(ACCOUNT_KEY)
@@ -1132,19 +1156,22 @@ impl Server {
         // request makes it stale, as for other terminal requests.
         let mode = policy(library, &dir)?.map(|(p, _)| p.mode);
         let active = permissions::load(library, &dir, mode.as_deref())?;
-        if gate_for(
-            library,
-            mode.as_deref(),
-            &active,
-            drive_write::TOOL,
-            &proposal["args"],
-        )?
-        .0 == Gate::Deny
-        {
+        if gate_for(library, mode.as_deref(), &active, &tool, &proposal["args"])?.0 == Gate::Deny {
             return Err(DENIED);
         }
         if proposal["rules"] != json!(active.fingerprint) {
             return Err("approval_policy_changed");
+        }
+        if tool == calendar_write::TOOL {
+            if calendar_write::preview(library, &proposal["args"])? != proposal["preview"] {
+                return Err("approval_stale_calendar_changed_ask_again");
+            }
+            let op = calendar_write::validate(&proposal["args"])?;
+            library
+                .set_state(&key, "")
+                .map_err(|_| "library_unavailable")?;
+            let invitations = permissions::invitations_allowed(&active);
+            return calendar_write::run(&dir, &calendar_seam, op, true, invitations).await;
         }
         if drive_write::preview(library, &proposal["args"])? != proposal["preview"] {
             return Err("approval_stale_drive_changed_ask_again");
@@ -1368,6 +1395,8 @@ impl Server {
         let proposal: Value = serde_json::from_str(&raw).map_err(|_| "approval_not_found")?;
         let text = if proposal["tool"] == drive_write::TOOL {
             drive_write::plain_preview(&proposal["preview"])
+        } else if proposal["tool"] == calendar_write::TOOL {
+            calendar_write::plain_preview(&proposal["preview"])
         } else {
             raw
         };
@@ -1463,6 +1492,7 @@ impl Server {
         let grant = self.grant.take();
         let terminal = self.terminal.take();
         let drive_seam = self.drive.clone();
+        let calendar_seam = self.calendar.clone();
         let held = state::PrivateState::open(&self.dir)?;
         let dir = held.path.clone();
         let library = self.ready(&held)?;
@@ -1517,7 +1547,11 @@ impl Server {
                 }
             }
             // A Drive change gets Drive's own request, bound to its preview, below.
-            Gate::Terminal if !terminal_approved && name != drive_write::TOOL => {
+            Gate::Terminal
+                if !terminal_approved
+                    && name != drive_write::TOOL
+                    && name != calendar_write::TOOL =>
+            {
                 return terminal_proposal(
                     library,
                     &dir,
@@ -1655,6 +1689,51 @@ impl Server {
                     && explicit == Some(permissions::Effect::Allow)
                     && !drive_write::needs_person(library, &op)?;
                 drive_write::run(&dir, &drive_seam, op, grant.is_some() || allowed).await
+            }
+            "calendar_write" => {
+                let op = calendar_write::validate(&args)?;
+                let account = library
+                    .state(ACCOUNT_KEY)
+                    .map_err(|_| "library_unavailable")?
+                    .ok_or("login_required")?;
+                let mode = configured.as_ref().map(|(p, _)| p.mode.as_str());
+                // As for Drive: a card the person approved is that person's approval.
+                let terminal = grant.is_none()
+                    && (gate == Gate::Terminal
+                        || calendar_write::goes_to_terminal(mode, &op)
+                        || (configured.is_none()
+                            && library
+                                .state("mcp.require_write_approval")
+                                .map_err(|_| "library_unavailable")?
+                                .as_deref()
+                                == Some("true")));
+                if terminal {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let args = serde_json::to_value(&op).map_err(|_| "invalid_arguments")?;
+                    let proposal = json!({"tool":name,"args":args,"account":account,
+                        "policy":library.state("mcp.policy").map_err(|_| "policy_unavailable")?,
+                        "state_identity":directory_identity(&dir)?,
+                        "rules":active.fingerprint,
+                        "preview":calendar_write::preview(library, &args)?});
+                    library
+                        .set_state(&format!("mcp.approval.{id}"), &proposal.to_string())
+                        .map_err(|_| "library_unavailable")?;
+                    return Ok(json!({"status":"approval_required","request_id":id,
+                        "approve_in_terminal":status::with_dir("skykeep-mcp approve", &dir),
+                        "remote_verified":false}));
+                }
+                let allowed = gate == Gate::Run
+                    && explicit == Some(permissions::Effect::Allow)
+                    && !calendar_write::is_destructive(op.action());
+                let invitations = permissions::invitations_allowed(&active);
+                calendar_write::run(
+                    &dir,
+                    &calendar_seam,
+                    op,
+                    grant.is_some() || allowed,
+                    invitations,
+                )
+                .await
             }
             "sync_status" => {
                 let _: Empty = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -2628,7 +2707,7 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
 
 const SERVER_TITLE: &str =
     "Skykeep: Apple iCloud Notes, Reminders, Contacts, Calendar, Photos & iCloud Drive";
-const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, and reads the user's Apple iCloud Contacts, Apple iCloud Calendar and Apple iCloud Photos metadata (read-only), and reads and changes Apple iCloud Drive: folder listings and file details from the cache, and drive_write to create folders, rename, move, trash, delete for good, upload from and download into the exchange folder the user set up in their terminal. Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode. Notes and Reminders changes are queued until sync sends them; a Drive change runs once it is allowed and its reply says what Apple confirmed. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
+const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, and reads the user's Apple iCloud Contacts and Apple iCloud Photos metadata (read-only), reads Apple iCloud Calendar and changes its events with calendar_write, and reads and changes Apple iCloud Drive: folder listings and file details from the cache, and drive_write to create folders, rename, move, trash, delete for good, upload from and download into the exchange folder the user set up in their terminal. Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode. Notes and Reminders changes are queued until sync sends them; a Drive or Calendar change runs once it is allowed and its reply says what Apple confirmed. calendar_write needs the etag from calendar_get, an offset or IANA zone for every time, and scope for a repeating event. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
 
 pub(crate) fn tools() -> Vec<Value> {
     // (name, description, parent property, parent required)
@@ -2735,6 +2814,7 @@ pub(crate) fn tools() -> Vec<Value> {
     tools.push(json!({"name":"drive_search","description":"Search the names of cached Apple iCloud Drive items in folders drive_refresh has read. At most 1000 matches, most recently changed first. Read-only.","inputSchema":{"type":"object","properties":search,"required":["query"],"additionalProperties":false},"annotations":read}));
     tools.push(json!({"name":"drive_refresh","description":"Read one Apple iCloud Drive folder's item list from Apple into the local cache, with each folder on its path. Give path or a cached folder id; the top folder by default. Reads names, kinds, sizes and dates only: never file contents, and never uploads, renames, moves or deletes. Sends no queued changes. Never opens a login prompt.","inputSchema":{"type":"object","properties":{"path":cloud_path,"id":id},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}));
     tools.push(drive_write::tool());
+    tools.push(calendar_write::tool());
     tools.push(json!({"name":"auth_status","description":"Apple iCloud sign-in status and setup instructions. Never accepts secrets or opens a prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools
 }

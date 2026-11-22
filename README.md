@@ -2,7 +2,7 @@
 
 iCloud-MCP is a local MCP server for Apple Notes, Reminders, Contacts, Calendar, Photos and iCloud Drive, built on the [Skykeep](https://github.com/YashwanthKamireddi/Skykeep) Rust engine. The command is `skykeep-mcp`. It uses newline-delimited JSON-RPC over stdio and has no network listener. Reads use a private local SQLite cache.
 
-Notes and Reminders can be read and changed; their changes enter a durable outbox for sync with iCloud. Contacts, Calendar and Photos are read-only. iCloud Drive can be read and changed, with file contents moving only through one local exchange folder. Mail is not implemented and not planned, because upstream Skykeep has no Mail support.
+Notes and Reminders can be read and changed; their changes enter a durable outbox for sync with iCloud. Contacts and Photos are read-only. Calendar events can be read, and created, changed, moved to another calendar or deleted with `calendar_write`. iCloud Drive can be read and changed, with file contents moving only through one local exchange folder. Mail is not implemented and not planned, because upstream Skykeep has no Mail support.
 
 This fork contains the MCP server and its four engine crates, not the upstream desktop or mobile applications. The source is at [hosakb/iCloud-MCP](https://github.com/hosakb/iCloud-MCP).
 
@@ -28,7 +28,9 @@ It asks for the state folder, where to keep the sign-in, your Apple Account sign
 
 ## Tools and approval
 
-The [MCP reference](crates/skykeep-mcp/README.md#tools) lists every tool, its fields and its errors. A permissions file in the state folder sets each tool or action to `allow`, `ask: client`, `ask: terminal` or `deny`. `ask: client` shows an approval card in the MCP client, `ask: terminal` waits for `skykeep-mcp approve` in your own terminal. Drive deletions always need a person, in every approval mode.
+The [MCP reference](crates/skykeep-mcp/README.md#tools) lists every tool, its fields and its errors. A permissions file in the state folder sets each tool or action to `allow`, `ask: client`, `ask: terminal` or `deny`. `ask: client` shows an approval card in the MCP client, `ask: terminal` waits for `skykeep-mcp approve` in your own terminal. Drive deletions and Calendar deletes always need a person, in every approval mode, and their card has no "Always allow".
+
+`calendar_write` changes an event only in the version `calendar_get` showed (its `etag`), and refuses it when Apple's copy changed since. Times need an offset or an IANA zone name, and a repeating event needs `scope: this_occurrence` or `whole_series`. When other people are invited to an event, a change would send them an update or a cancellation, so it is refused unless the permissions file sets `calendar_write.send_invitations: allow`. That rule takes only `allow` or `deny`, and a broken permissions file refuses such changes. The reply says whether Apple's copy was read back (`remote_verified`).
 
 Approval protects against clients limited to MCP tools, not agents with shell access as the owner of the state directory. Such an agent can edit local state or invoke terminal helpers.
 

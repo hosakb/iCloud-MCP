@@ -128,6 +128,13 @@ fn every_valid_name_takes_every_effect_and_names_come_from_the_tool_list() {
                 assert!(parsed.unwrap_err().contains("can't use ask: terminal"));
                 continue;
             }
+            // Not an action: it lets a change run or refuses it, and asks nobody.
+            if target.name == "calendar_write.send_invitations"
+                && matches!(effect, Effect::AskClient | Effect::AskTerminal)
+            {
+                assert!(parsed.unwrap_err().contains("takes allow or deny only"));
+                continue;
+            }
             let rules = parsed.unwrap();
             assert_eq!(
                 permissions::rule_for(&rules, &target.tool, target.action.as_deref()),
@@ -177,9 +184,9 @@ fn unknown_names_and_bad_values_are_refused_with_a_plain_message() {
         "{error}"
     );
     // An unknown tool is said to be unknown, never another tool's action.
-    let error = permissions::parse("rules:\n  calendar_write.create: allow\n").unwrap_err();
+    let error = permissions::parse("rules:\n  mail_write.create: allow\n").unwrap_err();
     assert!(
-        error.ends_with("there is no tool named calendar_write."),
+        error.ends_with("there is no tool named mail_write."),
         "{error}"
     );
     assert!(!error.contains("reminders_write"), "{error}");

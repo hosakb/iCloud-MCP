@@ -152,7 +152,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 }
 
 /// `YYYY-MM-DD`, exactly, as a day number.
-fn parse_day(text: &str) -> Result<i64, &'static str> {
+pub(crate) fn parse_day(text: &str) -> Result<i64, &'static str> {
     let b = text.as_bytes();
     let digits = |r: std::ops::Range<usize>| -> Option<i64> {
         b.get(r.clone())?
@@ -180,7 +180,7 @@ fn parse_day(text: &str) -> Result<i64, &'static str> {
     Ok(days_from_civil(y, m, d))
 }
 
-fn day_text(days: i64) -> String {
+pub(crate) fn day_text(days: i64) -> String {
     let (y, m, d) = civil_from_days(days);
     format!("{y:04}-{m:02}-{d:02}")
 }
@@ -198,7 +198,7 @@ fn wall_text(wall: i64) -> String {
 }
 
 /// An instant as it reads in `zone`, with its offset: `2026-03-29T09:30:00+02:00`.
-fn zoned_text(at: i64, zone: &Zone) -> String {
+pub(crate) fn zoned_text(at: i64, zone: &Zone) -> String {
     let wall = wall_clock(at, &zone.tz);
     let offset = wall - at;
     let sign = if offset < 0 { '-' } else { '+' };
@@ -218,7 +218,7 @@ pub(crate) fn utc_text(at: i64) -> String {
 /// The zone `name` names: an IANA name, a Windows name, or an id ending in an IANA name.
 /// A name longer than any real zone's is not looked up: the lookup tries every tail of a
 /// slash-separated id, and an event's zone name is whatever Apple sent.
-fn zone(name: &str) -> Option<Zone> {
+pub(crate) fn zone(name: &str) -> Option<Zone> {
     if name.len() > MAX_ZONE_BYTES {
         return None;
     }
@@ -399,6 +399,7 @@ pub(crate) fn validate(name: &str, args: &Value) -> Result<(), &'static str> {
         "calendar_search" => search_args(args).map(|_| ()),
         "calendar_get" => get_args(args).map(|_| ()),
         "calendar_refresh" => refresh_window(args).map(|_| ()),
+        "calendar_write" => crate::calendar_write::validate(args).map(|_| ()),
         _ => Ok(()),
     }
 }
@@ -421,7 +422,7 @@ pub(crate) fn refresh_scope(args: &Value) -> Value {
 }
 
 /// An Apple iCloud calendar: not another account's (CalDAV) and not a subscribed feed.
-fn icloud(guid: &str) -> bool {
+pub(crate) fn icloud(guid: &str) -> bool {
     !guid.starts_with(quince_core::dav::PREFIX)
         && !guid.starts_with(quince_icloud::calendar_feeds::PREFIX)
 }
