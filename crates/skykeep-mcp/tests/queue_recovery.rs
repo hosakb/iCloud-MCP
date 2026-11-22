@@ -327,15 +327,22 @@ async fn family() -> (tempfile::TempDir, skykeep_mcp::Server, quince_core::Libra
         library.mark_full_sync(service).unwrap();
     }
     server.set_policy("yolo").unwrap();
-    server.handle(json!({"id":1,"method":"initialize"})).await;
+    server.handle(json!({"id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}}}})).await;
     (dir, server, library)
 }
 
+/// A call's result; a deletion's card (yolo still asks for those) is approved first.
 async fn write(server: &mut skykeep_mcp::Server, id: i64, tool: &str, args: Value) -> Value {
-    let reply = server
+    let mut reply = server
         .handle(json!({"id":id,"method":"tools/call","params":{"name":tool,"arguments":args}}))
         .await
         .unwrap();
+    if reply["method"] == "elicitation/create" {
+        reply = server
+            .handle(json!({"jsonrpc":"2.0","id":reply["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
+            .await
+            .unwrap();
+    }
     reply["result"].clone()
 }
 

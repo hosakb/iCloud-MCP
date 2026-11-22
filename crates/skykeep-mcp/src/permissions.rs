@@ -12,7 +12,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 pub const FILE_NAME: &str = "permissions.yaml";
-/// Append-only lines for deletions that ran without asking because the file allowed them.
+/// Append-only lines for rules saved from a card (older folders may also hold lines for
+/// deletions that ran because the file allowed them).
 pub const LOG_NAME: &str = "permissions-log.jsonl";
 const MAX_FILE_BYTES: u64 = 65536;
 const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
@@ -546,7 +547,7 @@ pub fn default_effect(
         None if action.is_some_and(|a| is_deletion(tool, a))
             || (action.is_some() && require_all) =>
         {
-            Effect::AskTerminal
+            Effect::AskClient
         }
         None => Effect::Allow,
     }
@@ -736,7 +737,7 @@ fn diff(
         let after = rule(new).unwrap_or(default);
         // Compared as the server really runs them.
         let really = |e: Effect| match action {
-            Some(a) => runs_as(mode, &t.tool, a, e).0,
+            Some(a) => runs_as(&t.tool, a, e).0,
             None => e,
         };
         let (before, after) = (really(before), really(after));
@@ -867,16 +868,6 @@ fn add_looser(pending: &mut Value, event: &Value) {
     let keep = newest.len().saturating_sub(MAX_LOOSER);
     newest.drain(..keep);
     *pending = json!({"count":count,"newest":newest});
-}
-
-/// Records that a deletion ran without asking because the file allowed it: tool, action and
-/// time, never content. Called after the deletion ran; when the log can't be written, the
-/// caller says so in the tool result.
-pub fn log_allowed(dir: &Path, tool: &str, action: &str) -> Result<(), &'static str> {
-    append_log(
-        dir,
-        json!({"at":now(),"tool":tool,"action":action,"rule":"allow"}),
-    )
 }
 
 /// The newest `limit` log lines, oldest first.
@@ -1037,66 +1028,21 @@ pub fn status(library: &Library, dir: &Path, mode: Option<&str>) -> Vec<(String,
     out
 }
 
-/// A rule and what it does, after the minimum the server keeps: without an approval mode,
-/// deletions always wait for the terminal.
-/// What the server really does for `effect` on one action, and why when that differs: without
-/// an approval mode every deletion waits for the terminal, and a Drive deletion allowed by a
-/// rule still asks (the card, or the terminal under yolo). `ask: client` stays the card.
-fn runs_as(
-    mode: Option<&str>,
-    tool: &str,
-    action: &str,
-    effect: Effect,
-) -> (Effect, Option<&'static str>) {
-    if !is_deletion(tool, action) {
-        return (effect, None);
-    }
-    match mode {
-        None if effect < Effect::AskTerminal => (
-            Effect::AskTerminal,
-            Some("a folder without an approval mode always asks before deleting"),
-        ),
-        Some(mode) if tool == crate::drive_write::TOOL && effect == Effect::Allow => (
-            if mode == "yolo" {
-                Effect::AskTerminal
-            } else {
-                Effect::AskClient
-            },
-            Some("a Drive deletion always needs a person"),
-        ),
-        Some(mode) if tool == crate::calendar_write::TOOL && effect == Effect::Allow => (
-            if mode == "yolo" {
-                Effect::AskTerminal
-            } else {
-                Effect::AskClient
-            },
-            Some("a Calendar delete always needs a person"),
-        ),
-        Some(mode) if tool == crate::contacts_write::TOOL && effect == Effect::Allow => (
-            if mode == "yolo" {
-                Effect::AskTerminal
-            } else {
-                Effect::AskClient
-            },
-            Some("a Contacts deletion always needs a person"),
-        ),
-        Some(mode) if tool == crate::photos_write::TOOL && effect == Effect::Allow => (
-            if mode == "yolo" {
-                Effect::AskTerminal
-            } else {
-                Effect::AskClient
-            },
-            Some("a move to Recently Deleted in Photos always needs a person"),
-        ),
-        _ => (effect, None),
+/// What the server really does for `effect` on one action, and why when that differs: a
+/// deletion allowed by a rule still asks on the card, in every mode.
+fn runs_as(tool: &str, action: &str, effect: Effect) -> (Effect, Option<&'static str>) {
+    if is_deletion(tool, action) && effect == Effect::Allow {
+        (Effect::AskClient, Some("a deletion always needs a person"))
+    } else {
+        (effect, None)
     }
 }
 
 /// A rule and what it does, as the server runs it (see [`runs_as`]).
-fn described(name: &str, effect: Effect, mode: Option<&str>) -> String {
+fn described(name: &str, effect: Effect) -> String {
     let all = targets();
     let target = all.iter().find(|t| t.name == name);
-    let own = target.and_then(|t| Some(runs_as(mode, &t.tool, t.action.as_deref()?, effect)));
+    let own = target.and_then(|t| Some(runs_as(&t.tool, t.action.as_deref()?, effect)));
     let drive = target.is_some_and(|t| t.tool == crate::drive_write::TOOL);
     let action = target.and_then(|t| t.action.as_deref());
     let tool_floored = target.is_some_and(|t| {
@@ -1105,7 +1051,7 @@ fn described(name: &str, effect: Effect, mode: Option<&str>) -> String {
                 o.tool == t.tool
                     && o.action
                         .as_deref()
-                        .is_some_and(|a| runs_as(mode, &o.tool, a, effect).1.is_some())
+                        .is_some_and(|a| runs_as(&o.tool, a, effect).1.is_some())
             })
     });
     let plain = format!("{}, {}", effect.as_str(), effect.sentence());
@@ -1190,10 +1136,7 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
         (Some(_), _) => {
             out.push_str("\nLast valid rules, still in use:\n");
             for (name, effect) in &active.rules {
-                out.push_str(&format!(
-                    "  {name}: {}\n",
-                    described(name, *effect, mode.as_deref())
-                ));
+                out.push_str(&format!("  {name}: {}\n", described(name, *effect)));
             }
         }
         (None, "missing") => {
@@ -1215,10 +1158,7 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
                     ),
                     _ => String::new(),
                 };
-                out.push_str(&format!(
-                    "  {name}: {}{from}\n",
-                    described(name, *effect, mode.as_deref())
-                ));
+                out.push_str(&format!("  {name}: {}{from}\n", described(name, *effect)));
             }
         }
     }
@@ -1310,9 +1250,8 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
     Ok(out)
 }
 
-/// A first file for `dir`'s approval mode: deletions ask, the way the mode already asks or
-/// more strictly, and every valid name is listed as a comment.
-pub fn starter(mode: Option<&str>, dir: &Path) -> String {
+/// A first file: every deletion asks on the card, and every valid name is listed as a comment.
+pub fn starter(dir: &Path) -> String {
     // The command names the folder unless it is the default; a folder name with a line break
     // in it would end the comment, so then the person fills it in.
     let show = if dir.to_string_lossy().chars().any(char::is_control) {
@@ -1320,20 +1259,13 @@ pub fn starter(mode: Option<&str>, dir: &Path) -> String {
     } else {
         crate::status::with_dir("skykeep-mcp permissions show", dir)
     };
-    // On the card where the mode already asks there; in the terminal under yolo and without
-    // a mode, where Drive deletions already wait for it.
-    let ask = if mode.is_some_and(|m| m != "yolo") {
-        "client"
-    } else {
-        "terminal"
-    };
     let mut out = String::from(
         "# Skykeep permissions\n\
          #\n\
          # This file decides, for each tool and action, what Skykeep does:\n\
          #   allow           run without asking\n\
-         #   ask: client     ask on a card in your MCP client: approve once, deny or always allow\n\
-         #   ask: terminal   wait until you run skykeep-mcp approve in your own terminal\n\
+         #   ask: client     ask on the approval card in your MCP client\n\
+         #   ask: terminal   opt-in: wait until you run skykeep-mcp approve in your own terminal\n\
          #   deny            always refuse\n\
          #\n\
          # Skykeep reads this file before every tool call, so a change counts at once.\n\
@@ -1342,14 +1274,14 @@ pub fn starter(mode: Option<&str>, dir: &Path) -> String {
          # none, the approval mode decides and every deletion asks.\n\
          # To check it, run: SKYKEEP_SHOW\n\
          #\n\
-         # Write ask on its own indented line, as below, or as {ask: terminal}.\n\
+         # Write ask on its own indented line, as below, or as {ask: client}.\n\
          version: 1\n\
          rules:\n",
     )
     .replace("SKYKEEP_SHOW", &show);
     for t in targets() {
         if t.action.as_deref().is_some_and(|a| is_deletion(&t.tool, a)) {
-            out.push_str(&format!("  {}:\n    ask: {ask}\n", t.name));
+            out.push_str(&format!("  {}:\n    ask: client\n", t.name));
         }
     }
     out.push_str("  # reminders_write.create: allow\n");
@@ -1365,7 +1297,7 @@ pub fn starter(mode: Option<&str>, dir: &Path) -> String {
 }
 
 /// Writes the starter file into `dir`, never over an existing one.
-pub fn write_starter(dir: &Path, mode: Option<&str>) -> Result<(), &'static str> {
+pub fn write_starter(dir: &Path) -> Result<(), &'static str> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
@@ -1375,7 +1307,7 @@ pub fn write_starter(dir: &Path, mode: Option<&str>) -> Result<(), &'static str>
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(dir.join(FILE_NAME))
         .map_err(|_| "permissions_file_unavailable")?;
-    file.write_all(starter(mode, dir).as_bytes())
+    file.write_all(starter(dir).as_bytes())
         .map_err(|_| "permissions_file_unavailable")
 }
 

@@ -251,7 +251,7 @@ async fn nonempty_cached_pages_remain_incomplete_and_require_parent_for_reminder
 }
 
 #[tokio::test]
-async fn configured_note_mutations_require_exact_forms_and_yolo_deletion_does_not() {
+async fn configured_note_mutations_require_exact_forms_and_yolo_deletion_too() {
     let (_dir, mut server, mut library) =
         configured("yolo", json!({"elicitation":{}}), "2025-11-25").await;
     library
@@ -316,8 +316,16 @@ async fn configured_note_mutations_require_exact_forms_and_yolo_deletion_does_no
         ))
         .await
         .unwrap();
+    // Under yolo a deletion still asks on the card, with no "Always allow".
+    assert_eq!(reply["method"], "elicitation/create", "{reply}");
+    assert!(!reply.to_string().contains("always_allow"), "{reply}");
+    let reply = server
+        .handle(
+            json!({"jsonrpc":"2.0","id":reply["id"],"result":{"action":"accept","content":{"decision":"approve"}}}),
+        )
+        .await
+        .unwrap();
     assert_eq!(reply["result"]["isError"], false, "{reply}");
-    assert!(reply.get("method").is_none());
 }
 
 #[tokio::test]

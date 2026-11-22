@@ -15,7 +15,7 @@ pub const MODES: [(&str, &str); 3] = [
     ),
     (
         "yolo",
-        "Don't ask, not even before deleting notes or reminders. Drive and Contacts deletions, moves and renames of large Drive folders, Calendar deletes and Photos moves to Recently Deleted still wait for skykeep-mcp approve.",
+        "Don't ask before reads or changes. Deletions, moves to Recently Deleted and moves and renames of large Drive folders still ask on the approval card.",
     ),
 ];
 
@@ -39,8 +39,8 @@ pub struct Report {
     pub dir: Option<std::path::PathBuf>,
 }
 
-/// Library key: setup chose to leave the folder without an approval mode, for MCP clients that
-/// can't show approval forms. Only setup and status read it; it changes no policy.
+/// Library key: setup chose to leave the folder without an approval mode. Only setup and status
+/// read it; it changes no policy.
 pub const NO_MODE_KEY: &str = "mcp.setup.no_approval_mode";
 
 pub(crate) fn quoted(path: &Path) -> String {
@@ -65,9 +65,9 @@ pub fn no_mode_effect(library: &quince_core::Library) -> &'static str {
         .as_deref()
         == Some("true")
     {
-        "Every change waits until you approve it with skykeep-mcp approve, because this folder was set earlier to approve every change (skykeep-mcp require-approval)."
+        "Every change asks on the approval card in your MCP client, because this folder was set earlier to approve every change (skykeep-mcp require-approval)."
     } else {
-        "Routine changes run without asking; deletions wait until you approve them with skykeep-mcp approve."
+        "Routine changes run without asking; deletions and renames or moves of large Drive folders ask on the approval card in your MCP client."
     }
 }
 
@@ -308,7 +308,7 @@ pub fn check(env: &Env, dir: &Path) -> Report {
                 == Some("1") =>
         {
             report.ok(format!(
-                "Approval mode: none, for MCP clients without approval forms. {}",
+                "Approval mode: none. {}",
                 library.as_ref().map(no_mode_effect).unwrap_or_default()
             ))
         }

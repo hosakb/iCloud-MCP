@@ -16,10 +16,10 @@
 //!
 //! Who approves. [`is_destructive`] names the deletions in one place. They, and a rename or
 //! move of a folder that holds many items (or an unknown number), always need the person's
-//! approval, with a preview of what they affect. The person approves or denies them either
-//! in the MCP client's approval form, under the `reads_and_writes` and `writes_only` modes
-//! (where every Drive change is asked), or with `skykeep-mcp approve` in their own terminal,
-//! under `yolo` or with no approval mode. No mode lets them run without one of the two. Upload and download touch only the exchange folder ([`crate::exchange`]).
+//! approval, with a preview of what they affect, on the MCP client's approval card in every
+//! approval mode (`reads_and_writes` and `writes_only` ask every Drive change there). Only an
+//! `ask: terminal` rule sends them to `skykeep-mcp approve` instead. No mode lets them run
+//! unasked. Upload and download touch only the exchange folder ([`crate::exchange`]).
 use crate::account::{binding, Binding};
 use crate::drive::{self, Stop, Target, PAUSED};
 use crate::exchange::{self, hides_text};
@@ -430,16 +430,6 @@ pub(crate) fn needs_person(library: &Library, op: &DriveWrite) -> Result<bool, &
         }
     }
     Ok(false)
-}
-
-/// Whether the approval is asked in the terminal: when the approval mode has no form for it
-/// (no mode set, or `yolo`). The other modes ask every Drive change in the form.
-pub(crate) fn goes_to_terminal(
-    library: &Library,
-    mode: Option<&str>,
-    op: &DriveWrite,
-) -> Result<bool, &'static str> {
-    Ok(mode.is_none_or(|m| m == "yolo") && needs_person(library, op)?)
 }
 
 /// What the approval shows and is bound to: the action, and what it reaches as cached. The
@@ -1139,7 +1129,7 @@ pub(crate) fn tool() -> Value {
     let id = json!({"description":"move only: id of the folder to move the item into, from drive_list, drive_get or drive_search, instead of destination_path.","type":"string","minLength":1,"maxLength":drive::MAX_ID_BYTES});
     json!({
         "name": TOOL,
-        "description": "Change the user's Apple iCloud Drive: create_folder (path or id of the parent, name), rename (path or id, name), move (path or id, destination_path or destination_id), trash (to Recently Deleted), delete_forever, upload (path or id of the folder, local, optional name) and download (path or id of the file, optional local). Targets are found in the local cache as drive_get finds them, so run drive_refresh on the folder first. local names a file inside the exchange folder the user set up in their terminal: a relative path, never absolute. An existing name is refused, never replaced, in iCloud Drive and locally. Deletions and moves or renames of a folder with many items always need the user's approval, in the approval form or with skykeep-mcp approve in their terminal; every change follows the approval mode. already_has_this_name and already_in_destination mean the change is already done. The reply says done with what was checked, or an error; an unknown outcome means run drive_refresh and look before trying again.",
+        "description": "Change the user's Apple iCloud Drive: create_folder (path or id of the parent, name), rename (path or id, name), move (path or id, destination_path or destination_id), trash (to Recently Deleted), delete_forever, upload (path or id of the folder, local, optional name) and download (path or id of the file, optional local). Targets are found in the local cache as drive_get finds them, so run drive_refresh on the folder first. local names a file inside the exchange folder the user set up in their terminal: a relative path, never absolute. An existing name is refused, never replaced, in iCloud Drive and locally. Deletions and moves or renames of a folder with many items always need the user's approval on the approval card; every change follows the approval mode. already_has_this_name and already_in_destination mean the change is already done. The reply says done with what was checked, or an error; an unknown outcome means run drive_refresh and look before trying again.",
         "inputSchema": {
             "type": "object",
             "properties": {

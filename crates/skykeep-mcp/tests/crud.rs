@@ -18,6 +18,22 @@ async fn call(server: &mut Server, name: &str, args: Value) -> Value {
         .unwrap();
     serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
 }
+/// The call on a client that shows the approval card: the card comes first, nothing runs
+/// before it is approved, and the approved call's result is returned.
+async fn approved_on_card(server: &mut Server, name: &str, args: Value) -> Value {
+    server.handle(json!({"id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}}}})).await;
+    let form = server
+        .handle(json!({"id":2,"method":"tools/call","params":{"name":name,"arguments":args}}))
+        .await
+        .unwrap();
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+    assert!(!form.to_string().contains("request_id"), "{form}");
+    let response = server
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
+        .await
+        .unwrap();
+    serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+}
 #[tokio::test]
 async fn reminder_create_uses_durable_upstream_queue() {
     let (_dir, mut server, mut library) = setup();
@@ -50,18 +66,13 @@ async fn reminder_creation_respects_admin_approval() {
     library
         .set_state("mcp.require_write_approval", "true")
         .unwrap();
-    let result = call(
+    let result = approved_on_card(
         &mut server,
         "reminders_write",
         json!({"action":"create","list_guid":"list","title":"Synthetic"}),
     )
     .await;
-    assert_eq!(result["status"], "approval_required", "{result}");
-    assert_eq!(library.outbox_count().unwrap(), 0);
-    let result = server
-        .approve(result["request_id"].as_str().unwrap())
-        .unwrap();
-    assert_eq!(result["status"], "queued");
+    assert_eq!(result["status"], "queued", "{result}");
     assert_eq!(library.outbox_count().unwrap(), 1);
 }
 #[tokio::test]
@@ -148,7 +159,7 @@ async fn reminder_tick_uses_upstream_completion_semantics() {
     assert_eq!(library.outbox_pending("reminders").unwrap()[0].kind, "done");
 }
 #[tokio::test]
-async fn reminder_delete_is_terminal_gated() {
+async fn reminder_delete_asks_on_the_card() {
     let (_dir, mut server, mut library) = setup();
     library
         .put_reminder_lists(&[quince_core::reminders::ReminderList {
@@ -163,20 +174,13 @@ async fn reminder_delete_is_terminal_gated() {
             ..Default::default()
         })
         .unwrap();
-    let result = call(
+    let result = approved_on_card(
         &mut server,
         "reminders_write",
         json!({"action":"delete","guid":"r"}),
     )
     .await;
-    assert_eq!(result["status"], "approval_required", "{result}");
-    assert!(library.reminder("r").unwrap().is_some());
-    assert_eq!(
-        server
-            .approve(result["request_id"].as_str().unwrap())
-            .unwrap()["status"],
-        "queued"
-    );
+    assert_eq!(result["status"], "queued", "{result}");
     assert!(library.reminder("r").unwrap().is_none());
 }
 #[tokio::test]

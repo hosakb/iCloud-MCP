@@ -58,14 +58,15 @@ More commands (each needs --state-dir FOLDER):
   skykeep-mcp logout      sign out and forget the saved sign-in
   skykeep-mcp policy --state-dir FOLDER MODE
                           set the approval mode: reads_and_writes, writes_only or yolo
-  skykeep-mcp approve     approve one waiting change by its request ID: a Notes or
+  skykeep-mcp approve     only for actions set to ask: terminal in permissions.yaml:
+                          approve one waiting change by its request ID. A Notes or
                           Reminders change is queued, a Drive, Contacts, Photos or
                           Calendar change runs at once and can't be undone from here
   skykeep-mcp require-approval
-                          folders without an approval mode: every change waits for approve
+                          folders without an approval mode: every change asks on the card
   skykeep-mcp allow-routine
                           folders without an approval mode: routine changes run again,
-                          deletions still wait for approve
+                          deletions still ask on the card
   skykeep-mcp quarantine  list and retire writes that were set aside
   skykeep-mcp exchange [--state-dir FOLDER] [--path DIR] [--max-mb N]  (flags in any order)
                           set up the one folder Drive and Photos uploads read from and
@@ -318,7 +319,7 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
         let mut tty = terminal::controlling()?;
         if let Some(mode) = policy_mode {
             use std::io::Write;
-            writeln!(tty, "Set approval mode to {mode} for {}. YOLO runs Notes and Reminders deletions without prompts; Drive and Contacts deletions, moves and renames of large Drive folders, Calendar deletes and Photos moves to Recently Deleted still wait for skykeep-mcp approve. All currently pending writes will be quarantined, including previously approved writes. Old terminal proposals cannot be released under this policy. Type confirm to persist.", dir.display()).map_err(|_| "terminal_unavailable")?;
+            writeln!(tty, "Set approval mode to {mode} for {}. YOLO runs reads and changes without prompts; deletions, moves to Recently Deleted and moves and renames of large Drive folders still ask on the approval card. All currently pending writes will be quarantined, including previously approved writes. Old terminal proposals cannot be released under this policy. Type confirm to persist.", dir.display()).map_err(|_| "terminal_unavailable")?;
             let answer = terminal::hidden(&mut tty, "Confirmation: ", Duration::from_secs(180))?;
             if *answer != "confirm" {
                 return Err("policy_change_cancelled");

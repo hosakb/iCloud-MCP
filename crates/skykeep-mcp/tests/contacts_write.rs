@@ -735,36 +735,30 @@ async fn delete_always_asks_on_a_card_without_always_allow_and_is_verified() {
 async fn delete_of_a_card_changed_elsewhere_is_refused() {
     let mut f = fixture(Some("yolo")).await;
     f.edited_elsewhere(BOB, "Robert");
-    let id = ok(&mut f.server, delete_bob()).await["request_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_eq!(
-        f.server.approve_any(&id).await,
-        Err("contact_changed_conflict")
-    );
+    let form = call(&mut f.server, delete_bob()).await;
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+    let reply = f.server.handle(decide(&form, "approve")).await.unwrap();
+    assert_eq!(text(&reply)["error"], "contact_changed_conflict", "{reply}");
     assert!(f.writes().is_empty());
     assert!(f.card_at_apple(BOB).is_some());
 }
 
 #[tokio::test]
-async fn under_yolo_and_without_a_mode_a_delete_waits_for_the_terminal() {
+async fn under_yolo_and_without_a_mode_a_delete_asks_on_the_card() {
     for policy in [Some("yolo"), None] {
         let mut f = fixture(policy).await;
-        let waiting = ok(&mut f.server, delete_bob()).await;
-        assert_eq!(
-            waiting["status"], "approval_required",
-            "{policy:?}: {waiting}"
-        );
+        let form = call(&mut f.server, delete_bob()).await;
+        assert_eq!(form["method"], "elicitation/create", "{policy:?}: {form}");
+        assert_eq!(choices(&form), ["approve", "deny"]);
+        assert!(!form.to_string().contains("request_id"), "{form}");
         assert!(f.writes().is_empty());
-        let id = waiting["request_id"].as_str().unwrap().to_string();
-        let shown = f.server.approval_text(&id).unwrap();
-        assert!(shown.contains("Bob Builder"), "{shown}");
-        let done = f.server.approve_any(&id).await.unwrap();
+        let reply = f.server.handle(decide(&form, "approve")).await.unwrap();
+        let done = text(&reply);
         assert_eq!(done["outcome"], "done", "{policy:?}: {done}");
         assert!(f.card_at_apple(BOB).is_none());
         // Used once.
-        assert!(f.server.approve_any(&id).await.is_err());
+        assert!(f.server.handle(decide(&form, "approve")).await.is_none());
+        assert_eq!(f.writes().len(), 1);
     }
 }
 
@@ -825,14 +819,18 @@ async fn an_allow_rule_never_lets_a_delete_run_unasked() {
     cancel(&mut f.server, &form).await;
     let shown = skykeep_mcp::permissions::show(f.dir.path(), false).unwrap();
     assert!(
-        shown.contains("a Contacts deletion always needs a person"),
+        shown.contains("because a deletion always needs a person"),
         "{shown}"
     );
-    let mut f = fixture(Some("yolo")).await;
-    rules(f.dir.path(), "rules:\n  contacts_write.delete: allow\n");
-    let waiting = ok(&mut f.server, delete_bob()).await;
-    assert_eq!(waiting["status"], "approval_required", "{waiting}");
-    assert!(f.writes().is_empty());
+    for mode in [Some("yolo"), None] {
+        let mut f = fixture(mode).await;
+        rules(f.dir.path(), "rules:\n  contacts_write.delete: allow\n");
+        let form = call(&mut f.server, delete_bob()).await;
+        assert_eq!(form["method"], "elicitation/create", "{mode:?}: {form}");
+        assert_eq!(choices(&form), ["approve", "deny"]);
+        cancel(&mut f.server, &form).await;
+        assert!(f.writes().is_empty());
+    }
 }
 
 #[tokio::test]
@@ -1135,6 +1133,11 @@ async fn a_refused_field_is_named_with_its_limit() {
 #[tokio::test]
 async fn a_delete_shows_what_it_takes_away() {
     let mut f = fixture(Some("yolo")).await;
+    // The terminal text, for a folder that opted in with ask: terminal.
+    rules(
+        f.dir.path(),
+        "rules:\n  contacts_write.delete: {ask: terminal}\n",
+    );
     let waiting = ok(
         &mut f.server,
         json!({"action":"delete","guid":ADA,"etag":"etag-ada-1"}),
@@ -1232,7 +1235,11 @@ async fn a_slow_read_before_the_write_sent_nothing() {
 
 #[test]
 fn yolo_says_contacts_deletions_still_wait() {
-    assert!(skykeep_mcp::status::describe_mode("yolo").contains("Drive and Contacts deletions"));
+    let yolo = skykeep_mcp::status::describe_mode("yolo");
+    assert!(
+        yolo.contains("Deletions") && yolo.contains("ask on the approval card"),
+        "{yolo}"
+    );
 }
 
 // --- Round three.
@@ -1240,6 +1247,10 @@ fn yolo_says_contacts_deletions_still_wait() {
 #[tokio::test]
 async fn a_stale_terminal_request_says_it_is_out_of_date() {
     let mut f = fixture(Some("yolo")).await;
+    rules(
+        f.dir.path(),
+        "rules:\n  contacts_write.delete: {ask: terminal}\n",
+    );
     let waiting = ok(&mut f.server, delete_bob()).await;
     let id = waiting["request_id"].as_str().unwrap().to_string();
     {
@@ -1290,4 +1301,145 @@ async fn a_create_apple_refuses_for_a_stale_book_says_nothing_was_made() {
     assert!(step.contains("nothing was made"), "{step}");
     assert!(!step.contains("etag"), "{step}");
     assert_eq!(f.cards_at_apple(), 2);
+}
+
+// --- The approval card in every mode (issue 62).
+
+const MODES: [Option<&str>; 4] = [
+    Some("reads_and_writes"),
+    Some("writes_only"),
+    Some("yolo"),
+    None,
+];
+
+/// The card that approves deleting Bob. Under reads_and_writes the preview read is approved
+/// first. `timeout` applies to the change card.
+async fn delete_card(f: &mut Fixture, mode: Option<&str>, timeout: std::time::Duration) -> Value {
+    if mode == Some("reads_and_writes") {
+        let preview = call(&mut f.server, delete_bob()).await;
+        assert_eq!(preview["method"], "elicitation/create", "{preview}");
+        f.server.set_card_timeout(timeout);
+        return f.server.handle(decide(&preview, "approve")).await.unwrap();
+    }
+    f.server.set_card_timeout(timeout);
+    call(&mut f.server, delete_bob()).await
+}
+
+const WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+
+#[tokio::test]
+async fn a_delete_asks_on_the_card_in_every_mode_and_runs_once() {
+    for mode in MODES {
+        let mut f = fixture(mode).await;
+        let form = delete_card(&mut f, mode, WAIT).await;
+        assert_eq!(form["method"], "elicitation/create", "{mode:?}: {form}");
+        assert_eq!(choices(&form), ["approve", "deny"], "{mode:?}");
+        assert!(!form.to_string().contains("request_id"), "{mode:?}");
+        assert!(f.writes().is_empty());
+        let done = text(&f.server.handle(decide(&form, "approve")).await.unwrap());
+        assert_eq!(done["outcome"], "done", "{mode:?}: {done}");
+        assert!(f.card_at_apple(BOB).is_none());
+        // A second use of the same answer is ignored.
+        assert!(f.server.handle(decide(&form, "approve")).await.is_none());
+        assert_eq!(f.writes().len(), 1, "{mode:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_denied_cancelled_or_timed_out_delete_card_sends_nothing() {
+    for mode in MODES {
+        // Deny.
+        let mut f = fixture(mode).await;
+        let form = delete_card(&mut f, mode, WAIT).await;
+        let e = text(&f.server.handle(decide(&form, "deny")).await.unwrap());
+        assert_eq!(e["error"], "approval_denied", "{mode:?}: {e}");
+        assert!(
+            e["message"].as_str().unwrap().contains("nothing ran"),
+            "{e}"
+        );
+        // Cancelled by the client.
+        let form = delete_card(&mut f, mode, WAIT).await;
+        assert_eq!(form["method"], "elicitation/create", "{mode:?}: {form}");
+        let reply = f
+            .server
+            .handle(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}))
+            .await
+            .unwrap();
+        assert_eq!(text(&reply)["error"], "approval_cancelled", "{reply}");
+        assert!(f.server.handle(decide(&form, "approve")).await.is_none());
+        // Nobody answers in time, as in a scheduled job.
+        let form = delete_card(&mut f, mode, std::time::Duration::ZERO).await;
+        assert_eq!(form["method"], "elicitation/create", "{mode:?}: {form}");
+        let expired = text(&f.server.expire_consent().unwrap());
+        assert_eq!(expired["error"], "approval_timeout", "{expired}");
+        assert!(
+            expired["message"]
+                .as_str()
+                .unwrap()
+                .contains("scheduled job"),
+            "{expired}"
+        );
+        assert!(f.server.handle(decide(&form, "approve")).await.is_none());
+        assert!(f.writes().is_empty(), "{mode:?}");
+        assert!(f.card_at_apple(BOB).is_some());
+    }
+}
+
+#[tokio::test]
+async fn a_card_for_a_card_changed_meanwhile_is_refused() {
+    for mode in MODES {
+        let mut f = fixture(mode).await;
+        let form = delete_card(&mut f, mode, WAIT).await;
+        {
+            let mut library = quince_core::Library::open(f.dir.path()).unwrap();
+            let mut card = library.cards_by_guid(&[BOB.to_string()]).unwrap().remove(0);
+            card.contact.last_name = Some("Changed".into());
+            library.put_card(&card).unwrap();
+        }
+        let reply = f.server.handle(decide(&form, "approve")).await.unwrap();
+        assert_eq!(reply["result"]["isError"], true, "{mode:?}: {reply}");
+        assert!(f.writes().is_empty(), "{mode:?}");
+    }
+}
+
+#[tokio::test]
+async fn without_card_support_a_delete_is_refused_and_no_request_is_made() {
+    for mode in MODES {
+        let f = fixture(mode).await;
+        let mut plain = Server::open(f.dir.path()).unwrap();
+        plain.set_contacts_seam(seam(&f.remote.uri()));
+        plain
+            .handle(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}))
+            .await
+            .unwrap();
+        let e = error(&mut plain, delete_bob()).await;
+        assert_eq!(e["error"], "approval_requires_form_client", "{mode:?}: {e}");
+        let message = e["message"].as_str().unwrap();
+        assert!(!message.contains("skykeep-mcp approve"), "{message}");
+        assert!(message.contains("nothing ran"), "{message}");
+        assert!(e.get("request_id").is_none(), "{e}");
+        assert!(f.writes().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn ask_terminal_stays_an_opt_in_that_still_works() {
+    for mode in MODES {
+        let mut f = fixture(mode).await;
+        rules(
+            f.dir.path(),
+            "rules:\n  contacts_write.delete: {ask: terminal}\n",
+        );
+        let waiting = ok(&mut f.server, delete_bob()).await;
+        assert_eq!(
+            waiting["status"], "approval_required",
+            "{mode:?}: {waiting}"
+        );
+        let id = waiting["request_id"].as_str().unwrap().to_string();
+        assert!(f.writes().is_empty());
+        let done = f.server.approve_any(&id).await.unwrap();
+        assert_eq!(done["outcome"], "done", "{mode:?}: {done}");
+        assert!(f.server.approve_any(&id).await.is_err());
+        assert_eq!(f.writes().len(), 1);
+    }
 }

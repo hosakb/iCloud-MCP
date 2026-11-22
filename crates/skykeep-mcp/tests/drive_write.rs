@@ -252,6 +252,53 @@ async fn answer(remote: &MockServer, at: &str, body: Value) {
         .await;
 }
 
+/// Every approval mode, and a folder without one.
+const MODES: [Option<&str>; 4] = [
+    Some("reads_and_writes"),
+    Some("writes_only"),
+    Some("yolo"),
+    None,
+];
+
+/// The approval card for this change: Approve this time and Deny only, never a terminal
+/// request. Under reads_and_writes the card for reading the preview comes first and is
+/// approved here.
+async fn card(server: &mut Server, args: Value) -> Value {
+    let mut form = call(server, args.clone()).await;
+    while form["params"]["message"]
+        .as_str()
+        .is_some_and(|m| m.contains("\"read\\u005fpreview\\u005fonly\": true"))
+    {
+        form = server.handle(approve(&form)).await.unwrap();
+    }
+    assert_eq!(form["method"], "elicitation/create", "{args}: {form}");
+    assert!(!form.to_string().contains("request_id"), "{form}");
+    assert_eq!(choices(&form), ["approve", "deny"], "{args}");
+    form
+}
+
+/// [`card`], then the call is cancelled, so nothing runs.
+async fn asks_on_card(server: &mut Server, args: Value) -> Value {
+    let form = card(server, args).await;
+    let reply = server
+        .handle(
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(text(&reply)["error"], "approval_cancelled", "{reply}");
+    form
+}
+
+/// The permissions file sets these Drive actions to the opt-in ask: terminal.
+fn terminal_rules(dir: &Path, actions: &[&str]) {
+    let mut text = String::from("rules:\n");
+    for action in actions {
+        text.push_str(&format!("  drive_write.{action}: {{ask: terminal}}\n"));
+    }
+    rules(dir, &text);
+}
+
 fn proposal_id(value: &Value) -> String {
     assert_eq!(value["status"], "approval_required", "{value}");
     value["request_id"].as_str().unwrap().to_string()
@@ -551,7 +598,7 @@ async fn a_move_apple_already_shows_done_says_already_in_destination() {
 }
 
 #[tokio::test]
-async fn move_of_a_small_folder_runs_and_a_large_one_waits_with_a_preview() {
+async fn move_of_a_small_folder_runs_and_a_large_one_asks_on_the_card_with_a_preview() {
     let mut f = fixture(None).await;
     // Small and read: one file in it.
     mark_read(
@@ -580,29 +627,26 @@ async fn move_of_a_small_folder_runs_and_a_large_one_waits_with_a_preview() {
     .await;
     assert_eq!(done["outcome"], "done", "{done}");
     assert_eq!(writes(&f.remote).await, ["/moveItems"]);
-    // Large: nothing is sent until the person approves the preview.
-    let waiting = ok(
+    // Large: the card shows the preview, and nothing is sent until the person approves it.
+    let form = asks_on_card(
         &mut f.server,
         json!({"action":"move","id":BIG,"destination_id":DOCS}),
     )
     .await;
-    let id = proposal_id(&waiting);
-    assert_eq!(writes(&f.remote).await, ["/moveItems"]);
-    let details = f.server.approval_details(&id).unwrap();
-    let details: Value = serde_json::from_str(&details).unwrap();
-    assert_eq!(
-        details["preview"]["affects"]["apple_item_count"], 500,
-        "{details}"
+    let message = form["params"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("apple\\u005fitem\\u005fcount\": 500"),
+        "{message}"
     );
-    assert_eq!(details["preview"]["destination"]["id"], DOCS);
-    assert!(!details.to_string().contains("SYNTHETIC-TOKEN"));
-    // Renaming it waits the same way.
-    let waiting = ok(
+    assert!(message.contains(DOCS), "{message}");
+    assert!(!message.contains("SYNTHETIC-TOKEN"));
+    assert_eq!(writes(&f.remote).await, ["/moveItems"]);
+    // Renaming it asks the same way.
+    asks_on_card(
         &mut f.server,
         json!({"action":"rename","id":BIG,"name":"Huge"}),
     )
     .await;
-    proposal_id(&waiting);
     // Moving into itself is refused.
     assert_eq!(
         error(
@@ -622,12 +666,14 @@ async fn move_of_a_small_folder_runs_and_a_large_one_waits_with_a_preview() {
     );
 }
 
-/// Trash and delete forever wait for `skykeep-mcp approve`; approved, trash moves the item
-/// to Recently Deleted only, and delete forever then deletes it from there.
+/// Set to ask: terminal, trash and delete forever wait for `skykeep-mcp approve`; approved,
+/// trash moves the item to Recently Deleted only, and delete forever then deletes it from
+/// there.
 #[tokio::test]
-async fn trash_and_delete_forever_wait_for_the_terminal_and_differ() {
+async fn trash_and_delete_forever_set_to_ask_terminal_wait_for_approve_and_differ() {
     for (action, deleted) in [("trash", false), ("delete_forever", true)] {
         let mut f = fixture(None).await;
+        terminal_rules(f.dir.path(), &[action]);
         let id = proposal_id(&ok(&mut f.server, json!({"action":action,"id":REPORT})).await);
         assert!(writes(&f.remote).await.is_empty(), "{action}");
         // Two reads see it; afterwards it is gone from the top folder.
@@ -657,56 +703,53 @@ async fn trash_and_delete_forever_wait_for_the_terminal_and_differ() {
     }
 }
 
+/// Every mode asks a deletion on the card, with the preview and no "Always allow", and never
+/// makes a terminal request. A client without cards gets a refusal that says what to do.
 #[tokio::test]
-async fn deletions_need_approval_under_every_mode() {
-    // yolo and no mode: the terminal.
-    for mode in [None, Some("yolo")] {
+async fn deletions_ask_on_the_card_under_every_mode() {
+    for mode in MODES {
         let mut f = fixture(mode).await;
         for action in ["trash", "delete_forever"] {
-            let value = ok(&mut f.server, json!({"action":action,"id":REPORT})).await;
-            proposal_id(&value);
-            assert!(value["approve_in_terminal"]
-                .as_str()
-                .unwrap()
-                .contains("skykeep-mcp approve"));
+            let form = asks_on_card(&mut f.server, json!({"action":action,"id":DOCS})).await;
+            let message = form["params"]["message"].as_str().unwrap();
+            // The form's text escapes `_` as \u005f.
+            assert!(
+                message.contains("apple\\u005fitem\\u005fcount"),
+                "{mode:?}: {message}"
+            );
+            assert!(
+                message.contains(action.split('_').next().unwrap()),
+                "{message}"
+            );
         }
-        assert!(writes(&f.remote).await.is_empty());
-    }
-    // The other modes: the approval form, with the preview.
-    for mode in ["writes_only", "reads_and_writes"] {
-        let mut f = fixture(Some(mode)).await;
-        let form = call(&mut f.server, json!({"action":"trash","id":DOCS})).await;
-        assert_eq!(form["method"], "elicitation/create", "{mode}: {form}");
-        let mut message = form["params"]["message"].as_str().unwrap().to_string();
-        if mode == "reads_and_writes" {
-            // First the preview read, then the change.
-            let next = f
-                .server
-                .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
-                .await
-                .unwrap();
-            assert_eq!(next["method"], "elicitation/create", "{next}");
-            message = next["params"]["message"].as_str().unwrap().to_string();
-        }
-        // The form's text escapes `_` as \u005f.
-        assert!(
-            message.contains("apple\\u005fitem\\u005fcount"),
-            "{mode}: {message}"
-        );
-        assert!(message.contains("trash"), "{message}");
-        assert!(writes(&f.remote).await.is_empty());
-        f.server.handle(json!({"jsonrpc":"2.0","id":"x","method":"notifications/cancelled","params":{"requestId":7}})).await;
-        // Without form support there is no way to approve it here.
+        assert!(writes(&f.remote).await.is_empty(), "{mode:?}");
+        // Without card support there is no way to approve it here, and no request is made.
         let mut plain = Server::open(f.dir.path()).unwrap();
+        plain.set_drive_seam(seam(&f.remote.uri(), quick()));
         init(&mut plain, false).await;
-        let reply = call(&mut plain, json!({"action":"trash","id":REPORT})).await;
-        assert_eq!(text(&reply)["error"], "approval_requires_form_client");
+        for args in [
+            json!({"action":"trash","id":REPORT}),
+            json!({"action":"delete_forever","id":REPORT}),
+            json!({"action":"move","id":BIG,"destination_id":DOCS}),
+            json!({"action":"rename","id":BIG,"name":"Huge"}),
+        ] {
+            let reply = call(&mut plain, args.clone()).await;
+            assert_eq!(reply["result"]["isError"], true, "{mode:?} {args}: {reply}");
+            let value = text(&reply);
+            assert_eq!(value["error"], "approval_requires_form_client", "{value}");
+            let message = value["message"].as_str().unwrap();
+            assert!(message.contains("nothing ran"), "{message}");
+            assert!(!message.contains("skykeep-mcp approve"), "{message}");
+            assert!(!reply.to_string().contains("request_id"), "{reply}");
+        }
+        assert!(writes(&f.remote).await.is_empty(), "{mode:?}");
     }
 }
 
 #[tokio::test]
 async fn an_approval_is_stale_after_a_mode_change_or_a_new_cache() {
     let mut f = fixture(None).await;
+    terminal_rules(f.dir.path(), &["trash"]);
     let first = proposal_id(&ok(&mut f.server, json!({"action":"trash","id":REPORT})).await);
     f.server.set_policy("yolo").unwrap();
     assert_eq!(
@@ -750,7 +793,9 @@ async fn a_signed_in_account_other_than_the_folders_changes_nothing() {
         "account_mismatch_use_new_state_directory"
     );
     assert!(writes(&f.remote).await.is_empty());
-    // A terminal request made for one account is refused for another.
+    // A terminal request (asked for with ask: terminal) made for one account is refused for
+    // another.
+    terminal_rules(f.dir.path(), &["trash"]);
     {
         let mut library = quince_core::Library::open(f.dir.path()).unwrap();
         library
@@ -1286,26 +1331,22 @@ fn listed(dir: &Path) -> Value {
 async fn a_folder_not_read_whole_counts_as_many_items() {
     let mut f = fixture(None).await;
     // Small: Apple counts one item, never read.
-    proposal_id(
-        &ok(
-            &mut f.server,
-            json!({"action":"rename","id":SMALL,"name":"Tiny"}),
-        )
-        .await,
-    );
+    asks_on_card(
+        &mut f.server,
+        json!({"action":"rename","id":SMALL,"name":"Tiny"}),
+    )
+    .await;
     // Read, but the folder in it never was.
     mark_read(
         f.dir.path(),
         SMALL,
         vec![cached_folder("FOLDER::com.apple.CloudDocs::SUB", "Sub", 3)],
     );
-    proposal_id(
-        &ok(
-            &mut f.server,
-            json!({"action":"move","id":SMALL,"destination_id":DOCS}),
-        )
-        .await,
-    );
+    asks_on_card(
+        &mut f.server,
+        json!({"action":"move","id":SMALL,"destination_id":DOCS}),
+    )
+    .await;
     // An empty folder is known to hold nothing.
     {
         let mut library = quince_core::Library::open(f.dir.path()).unwrap();
@@ -1325,7 +1366,7 @@ async fn a_folder_not_read_whole_counts_as_many_items() {
         json!({"action":"rename","id":SMALL,"name":"Tiny"}),
     )
     .await;
-    assert_ne!(text(&reply)["status"], "approval_required", "{reply}");
+    assert_ne!(reply["method"], "elicitation/create", "{reply}");
     assert!(writes(&f.remote)
         .await
         .contains(&"/renameItems".to_string()));
@@ -1372,11 +1413,12 @@ async fn trashing_a_folder_forgets_the_folders_read_beneath_it() {
     );
     mark_read(f.dir.path(), SUB, vec![]);
     assert!(listed(f.dir.path()).get(SUB).is_some());
-    let id = proposal_id(&ok(&mut f.server, json!({"action":"trash","id":DOCS})).await);
+    let form = call(&mut f.server, json!({"action":"trash","id":DOCS})).await;
+    assert_eq!(form["method"], "elicitation/create", "{form}");
     serve_listing(&f.remote, ROOT, root_items(), Some(2)).await;
     serve_listing(&f.remote, ROOT, json!([folder(BIG, "Big", 500)]), None).await;
     answer(&f.remote, "/moveItemsToTrash", ok_items(DOCS)).await;
-    let done = f.server.approve_any(&id).await.unwrap();
+    let done = text(&f.server.handle(approve(&form)).await.unwrap());
     assert_eq!(done["outcome"], "done", "{done}");
     let now = listed(f.dir.path());
     assert!(now.get(SUB).is_none(), "{now}");
@@ -1571,6 +1613,7 @@ fn transfers_get_more_time_under_a_larger_limit() {
 /// item as kept says it is in Recently Deleted, with what to do next.
 async fn delete_forever_after_trash(final_answer: ResponseTemplate) -> Result<Value, &'static str> {
     let mut f = fixture(None).await;
+    terminal_rules(f.dir.path(), &["delete_forever"]);
     let id = proposal_id(
         &ok(
             &mut f.server,
@@ -1681,14 +1724,15 @@ async fn a_form_approved_delete_forever_that_stops_half_way_says_what_to_do() {
 
 /// yolo says what it still asks.
 #[test]
-fn the_yolo_description_says_drive_deletions_still_wait() {
+fn the_yolo_description_says_drive_deletions_still_ask_on_the_card() {
     let yolo = skykeep_mcp::status::describe_mode("yolo");
-    assert!(yolo.contains("Drive and Contacts deletions"), "{yolo}");
+    assert!(yolo.contains("Deletions"), "{yolo}");
     assert!(
         yolo.contains("moves and renames of large Drive folders"),
         "{yolo}"
     );
-    assert!(yolo.contains("skykeep-mcp approve"), "{yolo}");
+    assert!(yolo.contains("ask on the approval card"), "{yolo}");
+    assert!(!yolo.contains("skykeep-mcp approve"), "{yolo}");
     assert!(!yolo.contains("Never ask"), "{yolo}");
 }
 
@@ -1767,6 +1811,7 @@ async fn an_upload_apple_files_under_another_name_says_renamed_by_apple() {
 #[tokio::test]
 async fn the_terminal_approval_text_is_plain_and_inert() {
     let mut f = fixture(None).await;
+    terminal_rules(f.dir.path(), &["move", "trash"]);
     let id = proposal_id(
         &ok(
             &mut f.server,
@@ -1941,12 +1986,7 @@ fn a_symbolic_link_above_the_exchange_folder_is_resolved_at_setup() {
 #[tokio::test]
 async fn the_approval_text_names_both_ends_of_a_transfer() {
     let mut f = fixture(None).await;
-    {
-        let mut library = quince_core::Library::open(f.dir.path()).unwrap();
-        library
-            .set_state("mcp.require_write_approval", "true")
-            .unwrap();
-    }
+    terminal_rules(f.dir.path(), &["upload", "download"]);
     let up = proposal_id(
         &ok(
             &mut f.server,
@@ -2058,11 +2098,7 @@ fn drive_write_actions_are_rule_names_and_deletions_are_decided_in_one_place() {
         Removal::Permanent
     );
     assert!(permissions::parse("rules:\n  drive_write.delete_forever: deny\n").is_ok());
-    let starter = permissions::parse(&permissions::starter(
-        Some("writes_only"),
-        Path::new("/srv/sky"),
-    ))
-    .unwrap();
+    let starter = permissions::parse(&permissions::starter(Path::new("/srv/sky"))).unwrap();
     assert!(
         starter.contains_key("drive_write.trash")
             && starter.contains_key("drive_write.delete_forever")
@@ -2090,7 +2126,7 @@ async fn deny_refuses_drive_changes_and_their_waiting_terminal_requests() {
         .await,
         "denied_by_permissions"
     );
-    std::fs::remove_file(f.dir.path().join(skykeep_mcp::permissions::FILE_NAME)).unwrap();
+    terminal_rules(f.dir.path(), &["trash"]);
     let id = proposal_id(&ok(&mut f.server, json!({"action":"trash","id":REPORT})).await);
     rules(f.dir.path(), "rules:\n  drive_write.trash: deny\n");
     assert_eq!(
@@ -2132,20 +2168,18 @@ async fn allow_runs_a_small_drive_change_unasked_but_never_a_deletion_or_large_m
             .await;
     }
     assert_eq!(writes(&f.remote).await, ["/renameItems"]);
-    // Under yolo and without a mode they wait for the terminal.
+    // Under yolo and without a mode they ask on the card too.
     for mode in [Some("yolo"), None] {
         let mut f = fixture(mode).await;
         rules(f.dir.path(), "rules:\n  drive_write: allow\n");
         for action in ["trash", "delete_forever"] {
-            proposal_id(&ok(&mut f.server, json!({"action":action,"id":REPORT})).await);
+            asks_on_card(&mut f.server, json!({"action":action,"id":REPORT})).await;
         }
-        proposal_id(
-            &ok(
-                &mut f.server,
-                json!({"action":"move","id":BIG,"destination_id":DOCS}),
-            )
-            .await,
-        );
+        asks_on_card(
+            &mut f.server,
+            json!({"action":"move","id":BIG,"destination_id":DOCS}),
+        )
+        .await;
         assert!(writes(&f.remote).await.is_empty(), "{mode:?}");
         assert!(!f
             .dir
@@ -2206,7 +2240,7 @@ async fn permissions_show_says_drive_deletions_and_large_moves_still_ask() {
     let shown =
         skykeep_mcp::permissions::show(&f.dir.path().canonicalize().unwrap(), false).unwrap();
     assert!(
-        shown.contains("drive_write.trash: allow, but asks in your MCP client, because a Drive deletion always needs a person"),
+        shown.contains("drive_write.trash: allow, but asks in your MCP client, because a deletion always needs a person"),
         "{shown}"
     );
     assert!(
@@ -2216,13 +2250,11 @@ async fn permissions_show_says_drive_deletions_and_large_moves_still_ask() {
 }
 
 #[tokio::test]
-async fn a_broken_file_under_yolo_still_sends_drive_deletions_to_the_terminal() {
+async fn a_broken_file_under_yolo_still_asks_drive_deletions_on_the_card() {
     let mut f = fixture(Some("yolo")).await;
     rules(f.dir.path(), "rules:\n  bogus_name: allow\n");
     for action in ["trash", "delete_forever"] {
-        let reply = call(&mut f.server, json!({"action":action,"id":REPORT})).await;
-        assert_ne!(reply["method"], "elicitation/create", "{action}: {reply}");
-        proposal_id(&text(&reply));
+        asks_on_card(&mut f.server, json!({"action":action,"id":REPORT})).await;
     }
     assert!(writes(&f.remote).await.is_empty());
 }
@@ -2246,13 +2278,158 @@ async fn permissions_show_and_the_history_match_what_runs_for_drive_deletions_un
         "{shown}"
     );
     assert!(
-        shown.contains("drive_write.delete_forever: allow, but waits for skykeep-mcp approve in your terminal, because a Drive deletion always needs a person"),
+        shown.contains("drive_write.delete_forever: allow, but asks in your MCP client, because a deletion always needs a person"),
         "{shown}"
     );
-    // Under yolo a trash otherwise waits for the terminal, so the card is looser.
-    assert!(shown.contains("looser: drive_write.trash: waits for skykeep-mcp approve in your terminal before, now asks in your MCP client"), "{shown}");
+    // Under yolo a trash asks on the card anyway, so the ask: client rule changes nothing.
+    assert!(!shown.contains("looser: drive_write.trash"), "{shown}");
+    assert!(!shown.contains("skykeep-mcp approve"), "{shown}");
     assert!(
         !shown.contains("drive_write.delete_forever: waits"),
         "{shown}"
     );
+}
+
+/// The answers a delete forever of the report needs: the move to Recently Deleted, then the
+/// delete from there.
+async fn serve_delete_forever(remote: &MockServer) {
+    serve_trash(remote).await;
+    serve_listing(
+        remote,
+        "TRASH_ROOT",
+        json!([file(REPORT, "TRASH_ROOT", "report", "pdf", 11)]),
+        Some(1),
+    )
+    .await;
+    serve_listing(remote, "TRASH_ROOT", json!([]), None).await;
+    answer(remote, "/deleteItems", ok_items(REPORT)).await;
+}
+
+/// The answers a rename of the large folder needs.
+async fn serve_big_rename(remote: &MockServer) {
+    serve_listing(remote, ROOT, root_items(), Some(1)).await;
+    let mut renamed = root_items();
+    renamed[1]["name"] = json!("Huge");
+    renamed[1]["etag"] = json!("f2");
+    serve_listing(remote, ROOT, renamed, None).await;
+    answer(remote, "/renameItems", ok_items(BIG)).await;
+}
+
+/// The cached report gets a new version, as a refresh that saw it change would leave it.
+fn change_cached_report(dir: &Path) {
+    let mut library = quince_core::Library::open(dir).unwrap();
+    let mut item = library.drive_item(REPORT).unwrap().unwrap();
+    item.etag = Some("e9".into());
+    let mut all = library.drive_children(ROOT).unwrap();
+    all.retain(|i| i.drivewsid != REPORT);
+    all.push(item);
+    library.put_drive_children(ROOT, &all).unwrap();
+}
+
+/// In every mode, a deletion and a large folder change ask on the card; approved, they run
+/// once, and the same answer sent again runs nothing.
+#[tokio::test]
+async fn card_approvals_run_once_in_every_mode() {
+    for mode in MODES {
+        for (args, sent) in [
+            (
+                json!({"action":"trash","id":REPORT}),
+                vec!["/moveItemsToTrash"],
+            ),
+            (
+                json!({"action":"delete_forever","id":REPORT}),
+                vec!["/moveItemsToTrash", "/deleteItems"],
+            ),
+            (
+                json!({"action":"rename","id":BIG,"name":"Huge"}),
+                vec!["/renameItems"],
+            ),
+        ] {
+            let mut f = fixture(mode).await;
+            let form = card(&mut f.server, args.clone()).await;
+            assert!(writes(&f.remote).await.is_empty(), "{mode:?} {args}");
+            match args["action"].as_str().unwrap() {
+                "trash" => serve_trash(&f.remote).await,
+                "delete_forever" => serve_delete_forever(&f.remote).await,
+                _ => serve_big_rename(&f.remote).await,
+            }
+            let reply = f.server.handle(approve(&form)).await.unwrap();
+            assert_eq!(
+                reply["result"]["isError"], false,
+                "{mode:?} {args}: {reply}"
+            );
+            assert_eq!(text(&reply)["outcome"], "done", "{mode:?} {args}: {reply}");
+            assert_eq!(writes(&f.remote).await, sent, "{mode:?} {args}");
+            // A second use of the same approval is no approval.
+            assert!(f.server.handle(approve(&form)).await.is_none());
+            assert_eq!(writes(&f.remote).await, sent, "{mode:?} {args}");
+            assert!(!f
+                .dir
+                .path()
+                .join(skykeep_mcp::permissions::LOG_NAME)
+                .exists());
+        }
+    }
+}
+
+/// A card denied, declined, cancelled or left unanswered counts as Deny in every mode: nothing
+/// is sent, and the reply says nothing ran.
+#[tokio::test]
+async fn a_card_denied_declined_cancelled_or_timed_out_runs_nothing() {
+    for mode in MODES {
+        let mut f = fixture(mode).await;
+        serve_trash(&f.remote).await;
+        let trash = json!({"action":"trash","id":REPORT});
+        for answer in [
+            json!({"action":"accept","content":{"decision":"deny"}}),
+            json!({"action":"decline"}),
+            json!({"action":"cancel"}),
+        ] {
+            let form = card(&mut f.server, trash.clone()).await;
+            let reply = f
+                .server
+                .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":answer}))
+                .await
+                .unwrap();
+            let value = text(&reply);
+            assert_eq!(value["error"], "approval_denied", "{mode:?}: {value}");
+            assert!(
+                value["message"].as_str().unwrap().contains("nothing ran"),
+                "{value}"
+            );
+            // A later approval of the same card runs nothing.
+            assert!(f.server.handle(approve(&form)).await.is_none());
+        }
+        asks_on_card(&mut f.server, trash.clone()).await;
+        // Nobody answers, as in a scheduled job.
+        f.server.set_card_timeout(Duration::ZERO);
+        let form = call(&mut f.server, trash.clone()).await;
+        assert_eq!(form["method"], "elicitation/create", "{form}");
+        let expired = f.server.expire_consent().unwrap();
+        let value = text(&expired);
+        assert_eq!(value["error"], "approval_timeout", "{mode:?}: {value}");
+        assert!(
+            value["message"]
+                .as_str()
+                .unwrap()
+                .contains("Nobody answered"),
+            "{value}"
+        );
+        assert!(f.server.handle(approve(&form)).await.is_none());
+        assert!(writes(&f.remote).await.is_empty(), "{mode:?}");
+    }
+}
+
+/// A card approved after the item changed in the cache runs nothing.
+#[tokio::test]
+async fn a_card_answered_after_the_item_changed_runs_nothing() {
+    for mode in MODES {
+        let mut f = fixture(mode).await;
+        serve_trash(&f.remote).await;
+        let form = card(&mut f.server, json!({"action":"trash","id":REPORT})).await;
+        change_cached_report(f.dir.path());
+        let reply = f.server.handle(approve(&form)).await.unwrap();
+        assert_eq!(reply["result"]["isError"], true, "{mode:?}: {reply}");
+        assert!(writes(&f.remote).await.is_empty(), "{mode:?}");
+    }
 }

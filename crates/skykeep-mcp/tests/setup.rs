@@ -453,9 +453,19 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client
     assert!(screen.contains(&format!("Create {}? [Y/n]", dir.display())));
     assert!(screen.contains("1. Ask me before every read and every change. Recommended."));
     assert!(
-        screen.contains("Hermes should show them; if no card appears there, choose 4"),
+        screen.contains("Every choice asks on the approval card in your MCP client."),
         "{screen}"
     );
+    assert!(
+        screen
+            .contains("The client must be able to show Skykeep's approval card; Hermes shows it."),
+        "{screen}"
+    );
+    assert!(screen.contains("such as a scheduled job"), "{screen}");
+    // Nothing sends people to the terminal to approve by default.
+    assert!(!screen.contains("skykeep-mcp approve"), "{screen}");
+    assert!(!screen.contains("ask: terminal"), "{screen}");
+    assert!(!screen.contains("choose 4"), "{screen}");
     assert!(!screen.contains("Hermes can't"), "{screen}");
     assert!(
         screen.contains("Signed in as f***@e***.invalid"),
@@ -471,7 +481,10 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client
         dir.display()
     );
     assert!(screen.contains(&hermes), "{screen}");
-    assert!(screen.contains("choose 4 there"), "{screen}");
+    assert!(
+        screen.contains("Setup is complete. The client must be able to show"),
+        "{screen}"
+    );
     assert_eq!(storage::kind(&dir).unwrap(), Some(Kind::SystemKeyring));
     let saved = policy(&dir);
     assert_eq!(saved["mode"], "reads_and_writes");
@@ -1112,7 +1125,7 @@ async fn never_asking_needs_a_typed_confirmation() {
     assert_eq!(policy(&dir)["mode"], "yolo");
 }
 
-/// For a client without approval forms: no policy at all, the old behaviour, chosen on purpose.
+/// No policy at all, chosen on purpose: routine changes run, deletions ask on the card.
 #[tokio::test]
 async fn no_approval_mode_leaves_the_folder_without_a_policy_and_counts_as_done() {
     let _one = serial().await;
@@ -1123,12 +1136,21 @@ async fn no_approval_mode_leaves_the_folder_without_a_policy_and_counts_as_done(
     answers.extend(sign_in_answers());
     answers.extend([Ask("4"), Ask("no"), Ask("4"), Ask("confirm")]);
     let script = ready(answers, &dir, &server).await;
-    assert!(script
-        .screen
-        .contains("  4. No approval mode, for MCP clients that can't show approval forms."));
-    assert!(script
-        .screen
-        .contains("deletions wait until you approve them with skykeep-mcp approve --state-dir"));
+    assert!(
+        script.screen.contains("  4. No approval mode. Routine changes run without asking; deletions and renames or moves of large Drive folders ask on the approval card in your MCP client."),
+        "{}",
+        script.screen
+    );
+    assert!(
+        !script.screen.contains("skykeep-mcp approve"),
+        "{}",
+        script.screen
+    );
+    assert!(
+        !script.screen.contains("without approval forms"),
+        "{}",
+        script.screen
+    );
     assert!(policy_missing(&dir));
     let report = skykeep_mcp::status::check(storage::env(), &dir);
     assert!(report.ready(), "{}", report.render());
@@ -1242,7 +1264,7 @@ fn the_default_folder_flag_is_left_out_only_for_commands_that_know_the_default()
 }
 
 /// A folder that ran require-approval earlier keeps it under "no approval mode": setup and
-/// status say every change waits for approval, not that routine changes run without asking.
+/// status say every change asks on the card, not that routine changes run without asking.
 #[tokio::test]
 async fn no_approval_mode_tells_the_truth_about_an_earlier_require_approval() {
     let _one = serial().await;
@@ -1264,12 +1286,18 @@ async fn no_approval_mode_tells_the_truth_about_an_earlier_require_approval() {
     );
     assert!(script
         .screen
-        .contains("Every change waits until you approve it"));
+        .contains("Every change asks on the approval card in your MCP client"));
+    assert!(
+        !script.screen.contains("skykeep-mcp approve"),
+        "{}",
+        script.screen
+    );
     let report = skykeep_mcp::status::check(storage::env(), &dir).render();
     assert!(
-        report.contains("Every change waits until you approve it"),
+        report.contains("Every change asks on the approval card in your MCP client"),
         "{report}"
     );
+    assert!(!report.contains("skykeep-mcp approve"), "{report}");
     assert_eq!(
         quince_core::Library::open(&dir)
             .unwrap()
