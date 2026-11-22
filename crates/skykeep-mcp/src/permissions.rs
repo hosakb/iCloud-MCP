@@ -397,9 +397,9 @@ pub fn parse(text: &str) -> Result<Rules, String> {
         let line = lines_of.get(name).copied().unwrap_or(0);
         let Some(target) = valid.iter().find(|t| &t.name == name) else {
             return Err(format!(
-                "line {line}: {} is not a Skykeep tool or action; the closest valid name is {}.",
+                "line {line}: {} is not a Skykeep tool or action; {}",
                 shown(name),
-                closest(name)
+                hint(name)
             ));
         };
         if *effect == Effect::AskTerminal && !changes(&target.tool) {
@@ -412,29 +412,86 @@ pub fn parse(text: &str) -> Result<Rules, String> {
     Ok(rules)
 }
 
-/// The valid name with the fewest single-character edits from `name`.
-fn closest(name: &str) -> String {
-    let distance = |a: &str, b: &str| {
-        let b: Vec<char> = b.chars().collect();
-        let mut row: Vec<usize> = (0..=b.len()).collect();
-        for (i, ca) in a.chars().enumerate() {
-            let mut prev = row[0];
-            row[0] = i + 1;
-            for (j, cb) in b.iter().enumerate() {
-                let next = (row[j + 1] + 1)
-                    .min(row[j] + 1)
-                    .min(prev + usize::from(ca != *cb));
-                prev = row[j + 1];
-                row[j + 1] = next;
-            }
+/// Single-character edits from `a` to `b`.
+fn distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().take(200).enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let next = (row[j + 1] + 1)
+                .min(row[j] + 1)
+                .min(prev + usize::from(ca != *cb));
+            prev = row[j + 1];
+            row[j + 1] = next;
         }
-        row[b.len()]
+    }
+    row[b.len()]
+}
+
+/// What to say about a name that is not valid: the tool's removing actions for a typo of a
+/// deletion, the nearest action of the same tool, or that the tool does not exist.
+fn hint(name: &str) -> String {
+    let all = targets();
+    let (tool, action) = match name.split_once('.') {
+        Some((tool, action)) => (tool, Some(action)),
+        None => (name, None),
     };
-    let name: String = name.chars().take(200).collect();
-    names()
-        .into_iter()
-        .min_by_key(|n| distance(&name, n))
-        .unwrap_or_default()
+    let tools: Vec<&str> = all
+        .iter()
+        .filter(|t| t.action.is_none())
+        .map(|t| t.tool.as_str())
+        .collect();
+    if !tools.contains(&tool) {
+        let near = tools
+            .iter()
+            .copied()
+            .min_by_key(|t| distance(tool, t))
+            .filter(|t| distance(tool, t) <= 2);
+        return match near {
+            Some(near) => format!(
+                "there is no tool named {}; did you mean {near}?",
+                shown(tool)
+            ),
+            None => format!("there is no tool named {}.", shown(tool)),
+        };
+    }
+    let actions: Vec<&str> = all
+        .iter()
+        .filter(|t| t.tool == tool)
+        .filter_map(|t| t.action.as_deref())
+        .collect();
+    let Some(action) = action else {
+        return format!("{tool} is a tool; this name can't be used.");
+    };
+    if actions.is_empty() {
+        return format!("{tool} has no actions, so name it as {tool} alone.");
+    }
+    let removing = ["delete", "remove", "trash", "erase", "purge", "destroy"]
+        .iter()
+        .any(|w| action.to_ascii_lowercase().contains(w));
+    if removing {
+        let removals: Vec<String> = actions
+            .iter()
+            .filter(|a| is_deletion(tool, a))
+            .map(|a| format!("{tool}.{a}"))
+            .collect();
+        return match removals.as_slice() {
+            [] => format!("{tool} has no action that removes something."),
+            [one] => format!("the action of {tool} that removes something is {one}."),
+            many => format!(
+                "the actions of {tool} that remove something are {}.",
+                many.join(" and ")
+            ),
+        };
+    }
+    let near = actions
+        .iter()
+        .min_by_key(|a| distance(action, a))
+        .copied()
+        .unwrap_or_default();
+    format!("the closest valid name is {tool}.{near}.")
 }
 
 /// The rule for one call: `tool.action` first, then the tool's own entry.
@@ -641,12 +698,12 @@ fn diff(
         let default = default_effect(mode, require_all, &t.tool, action);
         let before = rule_for(old, &t.tool, action).unwrap_or(default);
         let after = rule_for(new, &t.tool, action).unwrap_or(default);
-        // Never looser than the server's minimum for the action.
-        let least = |e: Effect| match action.and_then(|a| floor(mode, &t.tool, a)) {
-            Some((least, _)) => e.max(least),
+        // Compared as the server really runs them.
+        let really = |e: Effect| match action {
+            Some(a) => runs_as(mode, &t.tool, a, e).0,
             None => e,
         };
-        let (before, after) = (least(before), least(after));
+        let (before, after) = (really(before), really(after));
         let change = json!({"name":t.name,"from":before.as_str(),"to":after.as_str()});
         if after < before {
             looser.push(change);
@@ -777,7 +834,8 @@ fn add_looser(pending: &mut Value, event: &Value) {
 }
 
 /// Records that a deletion ran without asking because the file allowed it: tool, action and
-/// time, never content. Refuses when the log can't be written, so nothing goes unrecorded.
+/// time, never content. Called after the deletion ran; when the log can't be written, the
+/// caller says so in the tool result.
 pub fn log_allowed(dir: &Path, tool: &str, action: &str) -> Result<(), &'static str> {
     append_log(
         dir,
@@ -925,34 +983,40 @@ pub fn status(library: &Library, dir: &Path, mode: Option<&str>) -> Vec<(String,
 
 /// A rule and what it does, after the minimum the server keeps: without an approval mode,
 /// deletions always wait for the terminal.
-/// The least the server asks for an action whatever a rule says, and why: without an approval
-/// mode every deletion waits for the terminal, and a Drive deletion always needs a person.
-fn floor(mode: Option<&str>, tool: &str, action: &str) -> Option<(Effect, &'static str)> {
+/// What the server really does for `effect` on one action, and why when that differs: without
+/// an approval mode every deletion waits for the terminal, and a Drive deletion allowed by a
+/// rule still asks (the card, or the terminal under yolo). `ask: client` stays the card.
+fn runs_as(
+    mode: Option<&str>,
+    tool: &str,
+    action: &str,
+    effect: Effect,
+) -> (Effect, Option<&'static str>) {
     if !is_deletion(tool, action) {
-        return None;
+        return (effect, None);
     }
     match mode {
-        None => Some((
+        None if effect < Effect::AskTerminal => (
             Effect::AskTerminal,
-            "a folder without an approval mode always asks before deleting",
-        )),
-        Some(mode) if tool == crate::drive_write::TOOL => Some((
+            Some("a folder without an approval mode always asks before deleting"),
+        ),
+        Some(mode) if tool == crate::drive_write::TOOL && effect == Effect::Allow => (
             if mode == "yolo" {
                 Effect::AskTerminal
             } else {
                 Effect::AskClient
             },
-            "a Drive deletion always needs a person",
-        )),
-        Some(_) => None,
+            Some("a Drive deletion always needs a person"),
+        ),
+        _ => (effect, None),
     }
 }
 
-/// A rule and what it does, after the server's minimum (see [`floor`]).
+/// A rule and what it does, as the server runs it (see [`runs_as`]).
 fn described(name: &str, effect: Effect, mode: Option<&str>) -> String {
     let all = targets();
     let target = all.iter().find(|t| t.name == name);
-    let own = target.and_then(|t| floor(mode, &t.tool, t.action.as_deref()?));
+    let own = target.and_then(|t| Some(runs_as(mode, &t.tool, t.action.as_deref()?, effect)));
     let drive = target.is_some_and(|t| t.tool == crate::drive_write::TOOL);
     let action = target.and_then(|t| t.action.as_deref());
     let tool_floored = target.is_some_and(|t| {
@@ -961,17 +1025,16 @@ fn described(name: &str, effect: Effect, mode: Option<&str>) -> String {
                 o.tool == t.tool
                     && o.action
                         .as_deref()
-                        .and_then(|a| floor(mode, &o.tool, a))
-                        .is_some_and(|(least, _)| effect < least)
+                        .is_some_and(|a| runs_as(mode, &o.tool, a, effect).1.is_some())
             })
     });
     let plain = format!("{}, {}", effect.as_str(), effect.sentence());
     match own {
-        Some((least, why)) if effect < least => {
+        Some((really, Some(why))) => {
             format!(
                 "{}, but {}, because {why}",
                 effect.as_str(),
-                least.sentence()
+                really.sentence()
             )
         }
         _ if tool_floored => format!("{plain}, except deletions, which still ask"),
@@ -1160,7 +1223,14 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
 
 /// A first file for `dir`'s approval mode: deletions ask, the way the mode already asks or
 /// more strictly, and every valid name is listed as a comment.
-pub fn starter(mode: Option<&str>) -> String {
+pub fn starter(mode: Option<&str>, dir: &Path) -> String {
+    // The command names the folder unless it is the default; a folder name with a line break
+    // in it would end the comment, so then the person fills it in.
+    let show = if dir.to_string_lossy().chars().any(char::is_control) {
+        "skykeep-mcp permissions show --state-dir FOLDER".to_string()
+    } else {
+        crate::status::with_dir("skykeep-mcp permissions show", dir)
+    };
     // On the card where the mode already asks there; in the terminal under yolo and without
     // a mode, where Drive deletions already wait for it.
     let ask = if mode.is_some_and(|m| m != "yolo") {
@@ -1181,12 +1251,13 @@ pub fn starter(mode: Option<&str>) -> String {
          # Anything not listed follows the folder's approval mode.\n\
          # If the file has a mistake, Skykeep keeps the last valid rules it loaded. If there are\n\
          # none, the approval mode decides and every deletion asks.\n\
-         # To check it, run: skykeep-mcp permissions show\n\
+         # To check it, run: SKYKEEP_SHOW\n\
          #\n\
          # Write ask on its own indented line, as below, or as {ask: terminal}.\n\
          version: 1\n\
          rules:\n",
-    );
+    )
+    .replace("SKYKEEP_SHOW", &show);
     for t in targets() {
         if t.action.as_deref().is_some_and(|a| is_deletion(&t.tool, a)) {
             out.push_str(&format!("  {}:\n    ask: {ask}\n", t.name));
@@ -1210,7 +1281,7 @@ pub fn write_starter(dir: &Path, mode: Option<&str>) -> Result<(), &'static str>
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(dir.join(FILE_NAME))
         .map_err(|_| "permissions_file_unavailable")?;
-    file.write_all(starter(mode).as_bytes())
+    file.write_all(starter(mode, dir).as_bytes())
         .map_err(|_| "permissions_file_unavailable")
 }
 

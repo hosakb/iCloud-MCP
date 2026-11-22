@@ -207,6 +207,17 @@ fn gate_for(
             }
         },
     };
+    // Drive deletions and renames or moves of large folders always need a person: an allow
+    // rule (or yolo) can't let them run unasked. The approval mode decides where it is asked.
+    // This comes before the broken-file step below, so a Drive deletion under yolo still
+    // waits for the terminal then.
+    let gate = match gate {
+        Gate::Run if drive_needs_person(library, name, args)? => match mode {
+            Some(mode) if mode != "yolo" => Gate::Client,
+            _ => Gate::Terminal,
+        },
+        gate => gate,
+    };
     let removes = permissions::removal(name, args) != permissions::Removal::None;
     let gate = match (gate, mode) {
         // Without an approval mode, deletions always wait for skykeep-mcp approve: a rule
@@ -215,15 +226,6 @@ fn gate_for(
         // A broken file with no earlier valid rules: every deletion asks.
         (Gate::Run, Some(_)) if removes && active.strict => Gate::Client,
         (gate, _) => gate,
-    };
-    // Drive deletions and renames or moves of large folders always need a person: an allow
-    // rule (or yolo) can't let them run unasked. The approval mode decides where it is asked.
-    let gate = match gate {
-        Gate::Run if drive_needs_person(library, name, args)? => match mode {
-            Some(mode) if mode != "yolo" => Gate::Client,
-            _ => Gate::Terminal,
-        },
-        gate => gate,
     };
     Ok((gate, explicit))
 }
@@ -388,6 +390,7 @@ fn error_value(error: &'static str, dir: &Path, args: &Value) -> Value {
 /// arguments (`Value::Null` when there are none).
 pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
     match error {
+        "unsafe_state_contents" => state::unsafe_entry_sentence(dir),
         e if e.starts_with("exchange_folder_") => Some(format!(
             "In your own terminal, run: {}",
             status::with_dir("skykeep-mcp exchange", dir)
@@ -412,18 +415,45 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
     }
 }
 
-/// [`tool_reply`] with [`error_value`]'s instructions.
+/// [`tool_reply`] with [`error_value`]'s instructions, and the rule that denied the call.
 fn tool_reply_in(
     id: Value,
     result: Result<Value, &'static str>,
     dir: &Path,
     args: &Value,
+    denied: Option<String>,
 ) -> Value {
     match result {
         Err(error) => {
-            json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":error_value(error, dir, args).to_string()}],"isError":true}})
+            let value = with_rule(error_value(error, dir, args), denied);
+            json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":value.to_string()}],"isError":true}})
         }
         ok => tool_reply(id, ok),
+    }
+}
+
+/// A deny error names the rule in the permissions file that refused the call.
+fn with_rule(mut value: Value, denied: Option<String>) -> Value {
+    if let (Some(rule), true) = (denied, value["error"] == DENIED) {
+        value["message"] = json!(format!(
+            "The rule {rule}: deny in the permissions file refuses this action, so it did not run."
+        ));
+        value["rule"] = json!(rule);
+    }
+    value
+}
+
+/// The entry in the permissions file that denies this call: the action's own, the tool's, or
+/// for a Notes change that deletes, `notes_write.delete`.
+fn deny_rule(rules: &permissions::Rules, name: &str, args: &Value) -> String {
+    use permissions::Effect;
+    let denies = |key: &str| rules.get(key) == Some(&Effect::Deny);
+    let own = args["action"].as_str().map(|a| format!("{name}.{a}"));
+    match own {
+        Some(own) if denies(&own) => own,
+        _ if denies(name) => name.to_string(),
+        _ if name == "notes_write" && denies("notes_write.delete") => "notes_write.delete".into(),
+        _ => name.to_string(),
     }
 }
 
@@ -663,6 +693,8 @@ pub struct Server {
     grant: Option<ApprovalBinding>,
     /// The terminal approval request `skykeep-mcp approve` is running, if any.
     terminal: Option<String>,
+    /// The rule that denied the last call, for its error message.
+    denied: Option<String>,
     /// Set by the last consent check: the card must not offer "Always allow", because an
     /// allow rule would not stop it asking (a Drive deletion or large folder move).
     always_blocked: bool,
@@ -781,6 +813,7 @@ impl Server {
             &params["arguments"],
         )?;
         if gate == Gate::Deny {
+            self.denied = Some(deny_rule(&active.rules, name, &params["arguments"]));
             return Err(DENIED);
         }
         // Malformed Contacts arguments are refused before anyone is asked to approve them.
@@ -1008,6 +1041,7 @@ impl Server {
                 grant: None,
                 terminal: None,
                 always_blocked: false,
+                denied: None,
                 drive: drive_write::Seam::default(),
             }),
             Err("state_busy_retry") => Ok(Self {
@@ -1019,6 +1053,7 @@ impl Server {
                 grant: None,
                 terminal: None,
                 always_blocked: false,
+                denied: None,
                 drive: drive_write::Seam::default(),
             }),
             Err(error) => Err(error),
@@ -1202,6 +1237,7 @@ impl Server {
                 result,
                 &self.dir,
                 &pending.request["params"]["arguments"],
+                self.denied.take(),
             ));
         }
         // Batches and other non-object messages are not supported; say so instead of dropping them.
@@ -1271,7 +1307,16 @@ impl Server {
                         }
                         return Some(self.consent_form(request, binding));
                     }
-                    Err(error) => return Some(tool_reply(id, Err(error))),
+                    Err(error) => {
+                        let denied = self.denied.take();
+                        return Some(tool_reply_in(
+                            id,
+                            Err(error),
+                            &self.dir,
+                            &params["arguments"],
+                            denied,
+                        ));
+                    }
                     Ok(None) => {}
                 }
                 let result = self
@@ -1282,7 +1327,13 @@ impl Server {
                     .await;
                 let (value, failed) = match result {
                     Ok(value) => (value, false),
-                    Err(error) => (error_value(error, &self.dir, &params["arguments"]), true),
+                    Err(error) => (
+                        with_rule(
+                            error_value(error, &self.dir, &params["arguments"]),
+                            self.denied.take(),
+                        ),
+                        true,
+                    ),
                 };
                 Ok(json!({"content":[{"type":"text","text":value.to_string()}],"isError":failed}))
             }
@@ -1420,6 +1471,7 @@ impl Server {
         let active = permissions::load(library, &dir, mode.as_deref())?;
         let (gate, explicit) = gate_for(library, mode.as_deref(), &active, name, &args)?;
         if gate == Gate::Deny {
+            self.denied = Some(deny_rule(&active.rules, name, &args));
             return Err(DENIED);
         }
         let mut current = current_binding(library, configured.as_ref(), &active)?;

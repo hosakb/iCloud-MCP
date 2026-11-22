@@ -205,13 +205,26 @@ pub fn check(env: &Env, dir: &Path) -> Report {
                         quoted(dir)
                     ),
                 ),
-                "unsafe_state_contents" => (
-                    format!("A file in {shown} can be read by others, or is a link."),
-                    format!(
-                        "Run: chmod 600 {}/* and remove any links from the folder.",
-                        quoted(dir)
+                "unsafe_state_contents" => match crate::state::unsafe_entry(dir) {
+                    Some((path, true)) => (
+                        format!("{} is a link inside the folder.", path.display()),
+                        format!("Remove the link: rm {}", quoted(&path)),
                     ),
-                ),
+                    Some((path, false)) => (
+                        format!("Others can read or change {}.", path.display()),
+                        format!(
+                            "Delete it if it is an editor's backup copy, or run: chmod 600 {}",
+                            quoted(&path)
+                        ),
+                    ),
+                    None => (
+                        format!("A file in {shown} can be read by others, or is a link."),
+                        format!(
+                            "Run: chmod 600 {}/* and remove any links from the folder.",
+                            quoted(dir)
+                        ),
+                    ),
+                },
                 "unsafe_state_path" => (
                     format!("The path {shown} goes through a link or '..'."),
                     "Use the folder's real path.".to_string(),

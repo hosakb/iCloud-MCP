@@ -212,7 +212,7 @@ rules:
 | Value | What Skykeep does |
 | --- | --- |
 | `allow` | Runs the action without asking. |
-| `ask: client` | Shows the approval card in your MCP client. This is the normal way in Hermes: the CLI and the desktop app should show the card with its buttons. If no card appears, use `ask: terminal` for that action. Cron jobs and other unattended sessions decline it, so nothing runs there. |
+| `ask: client` | Shows the approval card in your MCP client. This is meant to be the normal way in Hermes: its CLI and desktop app are expected to show the card with its buttons, which was not tested here. If no card appears, use `ask: terminal` for that action. Cron jobs and other unattended sessions are expected to decline it, so nothing runs there; this was not tested with Hermes. |
 | `ask: terminal` | Returns a request ID and waits until you run `skykeep-mcp approve --state-dir FOLDER` in your own terminal, as for deletions today. Use it for clients or sessions without approval forms. Only tools that change something can use it. A request made before the file changed no longer counts, and a later `deny` refuses older requests too. |
 | `deny` | Refuses with `denied_by_permissions` and a sentence saying the file blocks it. |
 
@@ -222,7 +222,15 @@ Anything the file does not list follows the folder's approval mode. A rule can m
 
 **The approval card.** The card offers three choices: "Approve this time", "Deny" and "Always allow this action". A card closed without a choice, declined or cancelled counts as Deny, and nothing runs. "Always allow" runs the action and then writes `allow` for that tool and action into the file. The server writes it only because the person picked it on the card; no MCP tool can do it. Permanent deletions offer only "Approve this time" and "Deny": `delete_forever` and similar actions, a Reminders delete and a Notes save that empties a note. The server changes only that one line, or adds it after the last rule, and keeps every other line and comment as it was. It keeps the previous file as `permissions.yaml.bak` and replaces the file in one step, so a reader never sees half a file. If the file has a mistake or can't be written, the action still runs once and the reply says the rule was not saved and why. If the file changed while the card was open, the card no longer counts and nothing runs.
 
-**Editing the file from Hermes.** Ask the assistant to change the file, or edit it yourself; the next tool call uses it. This means a client or agent that can edit this file can change its own approval level, for example to delete without asking. That is a deliberate choice for ease of use. If you don't want it, don't give the agent file access to the folder. The rules themselves are never visible or changeable through Skykeep's MCP tools.
+**Editing the file from Hermes.** Ask the assistant to change the file, or edit it yourself; the next tool call uses it. To edit it yourself, open it in a terminal:
+
+```sh
+nano ~/.local/share/skykeep-mcp/permissions.yaml
+```
+
+Use your folder if it is another one. nano keeps the file's mode 600, so only you can read or change it. A new file gets your usual mode, often 664 on Ubuntu, and Skykeep then reports it with the `chmod 600` command to run. Some editors leave a backup copy such as `permissions.yaml~` next to it; if others can read that copy, Skykeep refuses the whole folder and names the file to delete or `chmod 600`.
+
+ This means a client or agent that can edit this file can change its own approval level, for example to delete without asking. That is a deliberate choice for ease of use. If you don't want it, don't give the agent file access to the folder. The rules themselves are never visible or changeable through Skykeep's MCP tools.
 
 **When the file is wrong.** Skykeep reads only a regular file in the folder that belongs to you and that no one else can change. It never follows a link and reads at most 64 KiB. The format is a strict part of YAML: `version: 1`, `rules:`, and one rule per line indented with spaces. A broken file never makes anything looser. Skykeep keeps the last valid rules it loaded from the file. If there are none, the approval mode decides and every deletion asks, even under `yolo`. Each tool result says so while the file is unusable, and `status` and `permissions show` say what is wrong. A file that others can change, which is common on Ubuntu with mode 664, is reported with the command that fixes it: `chmod 600 FOLDER/permissions.yaml`.
 

@@ -1394,5 +1394,9 @@ async fn status_quotes_the_folder_in_its_chmod_commands() {
     std::fs::write(&shared, b"x").unwrap();
     std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o644)).unwrap();
     let text = skykeep_mcp::status::check(storage::env(), &dir).render();
-    assert!(text.contains(&format!("chmod 600 {quoted}/*")), "{text}");
+    // The file itself is named, in one piece.
+    assert!(
+        text.contains(&format!("chmod 600 '{}'", shared.display())),
+        "{text}"
+    );
 }

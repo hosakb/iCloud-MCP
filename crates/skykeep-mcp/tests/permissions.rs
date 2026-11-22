@@ -162,9 +162,27 @@ fn unknown_names_and_bad_values_are_refused_with_a_plain_message() {
     assert!(!error.contains("permissions show"), "{error}");
     let error = permissions::parse("rules:\n  reminder_write.creat: allow\n").unwrap_err();
     assert!(
-        error.contains("closest valid name is reminders_write.create"),
+        error.ends_with("there is no tool named reminder_write; did you mean reminders_write?"),
         "{error}"
     );
+    // A typo of a deletion names the actions that really remove something.
+    let error = permissions::parse("rules:\n  drive_write.delete: deny\n").unwrap_err();
+    assert!(
+        error.ends_with("the actions of drive_write that remove something are drive_write.trash and drive_write.delete_forever."),
+        "{error}"
+    );
+    let error = permissions::parse("rules:\n  notes_write.remove: deny\n").unwrap_err();
+    assert!(
+        error.ends_with("the action of notes_write that removes something is notes_write.delete."),
+        "{error}"
+    );
+    // An unknown tool is said to be unknown, never another tool's action.
+    let error = permissions::parse("rules:\n  calendar_write.create: allow\n").unwrap_err();
+    assert!(
+        error.ends_with("there is no tool named calendar_write."),
+        "{error}"
+    );
+    assert!(!error.contains("reminders_write"), "{error}");
     for (text, part) in [
         (
             "rules:\n  notes_write.delete: ask: terminal\n",
@@ -285,7 +303,7 @@ async fn deny_refuses_every_name_with_a_clear_error_and_runs_nothing() {
         assert!(result["message"]
             .as_str()
             .unwrap()
-            .contains("sets this action to deny"));
+            .contains("deny in the permissions file refuses this action"));
     }
     assert_eq!(f.library.outbox_count().unwrap(), 0);
     // A Notes save that empties a note follows the delete rule.
@@ -1108,7 +1126,13 @@ fn the_starter_file_asks_before_deletions_and_lists_every_name() {
         (Some("yolo"), Effect::AskTerminal),
         (None, Effect::AskTerminal),
     ] {
-        let text = permissions::starter(mode);
+        let text = permissions::starter(mode, Path::new("/srv/sky"));
+        assert!(
+            text.contains(
+                "# To check it, run: skykeep-mcp permissions show --state-dir /srv/sky\n"
+            ),
+            "{text}"
+        );
         let rules = permissions::parse(&text).unwrap();
         assert!(
             text.contains("keeps the last valid rules it loaded"),
@@ -1295,4 +1319,79 @@ async fn an_unknown_name_points_to_the_name_list_outside_permissions_show_only()
         "{shown}"
     );
     assert!(shown.contains("Valid names: "), "{shown}");
+}
+
+#[tokio::test]
+async fn a_deny_names_the_rule_that_refused_it() {
+    let mut f = folder(Some("writes_only"), true).await;
+    for (rules, args, rule) in [
+        (
+            "rules:\n  reminders_write: deny\n",
+            create_reminder(),
+            "reminders_write",
+        ),
+        (
+            "rules:\n  reminders_write.create: deny\n",
+            create_reminder(),
+            "reminders_write.create",
+        ),
+        (
+            "rules:\n  notes_write.delete: deny\n",
+            json!({"action":"save","guid":"N","body":""}),
+            "notes_write.delete",
+        ),
+    ] {
+        write_rules(f.path(), rules);
+        let tool = if rule.starts_with("notes") {
+            "notes_write"
+        } else {
+            "reminders_write"
+        };
+        let reply = f.server.handle(call(1, tool, args)).await.unwrap();
+        let result = body(&reply);
+        assert_eq!(result["error"], "denied_by_permissions");
+        assert_eq!(result["rule"], rule, "{result}");
+        assert_eq!(
+            result["message"],
+            format!("The rule {rule}: deny in the permissions file refuses this action, so it did not run.")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_shared_side_file_is_named_with_the_fix_in_the_tool_result_and_status() {
+    let mut f = folder(Some("writes_only"), true).await;
+    let side = f.path().join("permissions.yaml~");
+    std::fs::write(&side, "rules:\n").unwrap();
+    std::fs::set_permissions(&side, std::fs::Permissions::from_mode(0o664)).unwrap();
+    let reply = f
+        .server
+        .handle(call(1, "reminders_lists", json!({})))
+        .await
+        .unwrap();
+    let result = body(&reply);
+    assert_eq!(result["error"], "unsafe_state_contents");
+    let text = result["instructions"].as_str().unwrap();
+    let shown = side.display().to_string();
+    // A name with ~ is quoted for the shell.
+    let quoted = format!("'{shown}'");
+    assert!(
+        text.contains(&format!("others can read or change {quoted}")),
+        "{text}"
+    );
+    assert!(text.contains(&format!("chmod 600 {quoted}")), "{text}");
+    assert!(
+        text.contains("Delete it if it is an editor's backup copy"),
+        "{text}"
+    );
+    let report = skykeep_mcp::status::check(skykeep_mcp::storage::env(), f.path());
+    let rendered = report.render();
+    assert!(
+        rendered.contains(&format!("Others can read or change {shown}.")),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("chmod 600 {quoted}")),
+        "{rendered}"
+    );
 }

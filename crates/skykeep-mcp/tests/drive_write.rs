@@ -2035,12 +2035,20 @@ fn drive_write_actions_are_rule_names_and_deletions_are_decided_in_one_place() {
             names.iter().any(|n| *n == format!("drive_write.{action}")),
             "{action}"
         );
+        // Pinned: only trash and delete_forever remove something.
+        let removes = matches!(action, "trash" | "delete_forever");
         assert_eq!(
             skykeep_mcp::drive_write::is_destructive(action),
+            removes,
+            "{action}"
+        );
+        assert_eq!(
             permissions::is_deletion("drive_write", action),
+            removes,
             "{action}"
         );
     }
+    assert_eq!(skykeep_mcp::drive_write::ACTIONS.len(), 7);
     assert_eq!(
         permissions::removal_of("drive_write", "trash"),
         Removal::Recoverable
@@ -2050,7 +2058,11 @@ fn drive_write_actions_are_rule_names_and_deletions_are_decided_in_one_place() {
         Removal::Permanent
     );
     assert!(permissions::parse("rules:\n  drive_write.delete_forever: deny\n").is_ok());
-    let starter = permissions::parse(&permissions::starter(Some("writes_only"))).unwrap();
+    let starter = permissions::parse(&permissions::starter(
+        Some("writes_only"),
+        Path::new("/srv/sky"),
+    ))
+    .unwrap();
     assert!(
         starter.contains_key("drive_write.trash")
             && starter.contains_key("drive_write.delete_forever")
@@ -2199,6 +2211,48 @@ async fn permissions_show_says_drive_deletions_and_large_moves_still_ask() {
     );
     assert!(
         shown.contains("drive_write.rename: allow, runs without asking, except renaming or moving a large folder, which still asks"),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn a_broken_file_under_yolo_still_sends_drive_deletions_to_the_terminal() {
+    let mut f = fixture(Some("yolo")).await;
+    rules(f.dir.path(), "rules:\n  bogus_name: allow\n");
+    for action in ["trash", "delete_forever"] {
+        let reply = call(&mut f.server, json!({"action":action,"id":REPORT})).await;
+        assert_ne!(reply["method"], "elicitation/create", "{action}: {reply}");
+        proposal_id(&text(&reply));
+    }
+    assert!(writes(&f.remote).await.is_empty());
+}
+
+#[tokio::test]
+async fn permissions_show_and_the_history_match_what_runs_for_drive_deletions_under_yolo() {
+    let mut f = fixture(Some("yolo")).await;
+    let dir = f.dir.path().canonicalize().unwrap();
+    rules(
+        f.dir.path(),
+        "rules:\n  drive_write.trash: {ask: client}\n  drive_write.delete_forever: allow\n",
+    );
+    call(
+        &mut f.server,
+        json!({"action":"create_folder","path":"/x/y"}),
+    )
+    .await;
+    let shown = skykeep_mcp::permissions::show(&dir, false).unwrap();
+    assert!(
+        shown.contains("drive_write.trash: ask: client, asks in your MCP client\n"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("drive_write.delete_forever: allow, but waits for skykeep-mcp approve in your terminal, because a Drive deletion always needs a person"),
+        "{shown}"
+    );
+    // Under yolo a trash otherwise waits for the terminal, so the card is looser.
+    assert!(shown.contains("looser: drive_write.trash: waits for skykeep-mcp approve in your terminal before, now asks in your MCP client"), "{shown}");
+    assert!(
+        !shown.contains("drive_write.delete_forever: waits"),
         "{shown}"
     );
 }
