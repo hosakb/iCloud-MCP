@@ -54,7 +54,7 @@ const GONE: &str = "contact_not_found_at_apple_run_contacts_refresh";
 const PAUSED: &str = "contacts_paused_approve_on_apple_device";
 const BLANK: &str = "contact_needs_a_name_phone_or_email";
 const CUT_SHORT: &str = "contact_shown_cut_short_edit_on_device";
-const NOTHING_SENT: &str = "contacts_read_failed_nothing_sent";
+const NOTHING_SENT: &str = "contacts_write_read_failed_nothing_sent";
 
 /// The Contacts actions that remove something, as the permissions rules decide it for every
 /// tool (`permissions::removal_of`): `delete`, which is permanent.
@@ -223,7 +223,9 @@ impl Fields {
         }
     }
 
-    /// The fields given that `card` does not hold as asked.
+    /// The fields given that `card` does not hold as asked. A list is compared without regard
+    /// to order, as Apple keeps it: entries reordered, or the same entry given twice where the
+    /// card has it twice, are no difference.
     fn differences(&self, card: &Card) -> Vec<&'static str> {
         let mut wanted = card.clone();
         self.apply(&mut wanted);
@@ -251,12 +253,15 @@ impl Fields {
         }
         for (name, kind, _) in self.lists() {
             let of = |card: &Card| -> Vec<(String, Option<String>)> {
-                card.contact
+                let mut entries: Vec<_> = card
+                    .contact
                     .methods
                     .iter()
                     .filter(|m| m.kind == kind)
                     .map(|m| (m.value.clone(), m.label.clone()))
-                    .collect()
+                    .collect();
+                entries.sort();
+                entries
             };
             if of(card) != of(&wanted) {
                 out.push(name);
@@ -343,39 +348,72 @@ fn birthday(text: &str) -> bool {
     (1..=days).contains(&day)
 }
 
-fn check_fields(fields: &Fields) -> Result<(), &'static str> {
+/// Why a call was refused before anything ran: the code, the field it is about (by the
+/// tool's name), and the limit it passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Problem {
+    code: &'static str,
+    field: &'static str,
+    limit: usize,
+}
+
+impl Problem {
+    fn of(code: &'static str) -> Self {
+        Problem {
+            code,
+            field: "",
+            limit: 0,
+        }
+    }
+    fn at(code: &'static str, field: &'static str, limit: usize) -> Self {
+        Problem { code, field, limit }
+    }
+}
+
+/// A field's name in plain words, for the person and the model.
+fn label(field: &str) -> String {
+    match field {
+        "urls" => "web addresses".to_string(),
+        "is_company" => "company card".to_string(),
+        other => other.replace('_', " "),
+    }
+}
+
+fn check_fields(fields: &Fields) -> Result<(), Problem> {
     for (name, value, cap) in fields.texts() {
         let Some(value) = value else { continue };
         if value.chars().count() > cap {
-            return Err("field_too_long");
+            return Err(Problem::at("contact_field_too_long", name, cap));
         }
         if !readable(value, name == "notes") {
-            return Err("invalid_text");
+            return Err(Problem::at("contact_text_not_allowed", name, 0));
         }
         if name == "birthday" && !value.trim().is_empty() && !birthday(value.trim()) {
-            return Err("invalid_birthday");
+            return Err(Problem::at("contact_invalid_birthday", name, 0));
         }
     }
-    for (_, _, list) in fields.lists() {
+    for (name, _, list) in fields.lists() {
         if list.len() > MAX_ENTRIES {
-            return Err("too_many_entries");
+            return Err(Problem::at("contact_too_many_entries", name, MAX_ENTRIES));
         }
         for entry in &list {
-            if entry.value.chars().count() > MAX_VALUE_CHARS
-                || entry
-                    .label
-                    .as_ref()
-                    .is_some_and(|l| l.chars().count() > MAX_LABEL_CHARS)
+            if entry.value.chars().count() > MAX_VALUE_CHARS {
+                return Err(Problem::at("contact_field_too_long", name, MAX_VALUE_CHARS));
+            }
+            if entry
+                .label
+                .as_ref()
+                .is_some_and(|l| l.chars().count() > MAX_LABEL_CHARS)
             {
-                return Err("field_too_long");
+                return Err(Problem::at("contact_label_too_long", name, MAX_LABEL_CHARS));
             }
             if !readable(&entry.value, false)
                 || entry.label.as_ref().is_some_and(|l| !readable(l, false))
             {
-                return Err("invalid_text");
+                return Err(Problem::at("contact_text_not_allowed", name, 0));
             }
             if entry.value.trim().is_empty() {
-                return Err("empty_entry_value");
+                return Err(Problem::at("contact_empty_entry_value", name, 0));
             }
         }
     }
@@ -404,42 +442,106 @@ const FIELD_NAMES: [&str; 18] = [
     "urls",
 ];
 
+/// What is wrong with the values in `fields`, by type: text or null, true or false, or a list
+/// of `{label, value}` entries.
+fn fields_problem(fields: &Value) -> Option<Problem> {
+    let Some(fields) = fields.as_object() else {
+        return Some(Problem::of("contact_fields_must_be_an_object"));
+    };
+    for (key, value) in fields {
+        let Some(&name) = FIELD_NAMES.iter().find(|n| **n == key.as_str()) else {
+            return Some(Problem::of("contact_unknown_field"));
+        };
+        let wrong = match name {
+            "is_company" => !value.is_boolean(),
+            "emails" | "phones" | "urls" => match value {
+                Value::Null => false,
+                Value::Array(entries) => {
+                    if entries.iter().any(|e| {
+                        !e.is_object()
+                            || !e["value"].is_string()
+                            || !(e["label"].is_null() || e["label"].is_string())
+                            || e.as_object()
+                                .is_some_and(|o| o.keys().any(|k| k != "label" && k != "value"))
+                    }) {
+                        return Some(Problem::at(
+                            "contact_entry_must_be_label_and_value",
+                            name,
+                            0,
+                        ));
+                    }
+                    false
+                }
+                _ => true,
+            },
+            _ => !(value.is_string() || value.is_null()),
+        };
+        if wrong {
+            return Some(Problem::at(
+                if name == "is_company" {
+                    "contact_is_company_must_be_true_or_false"
+                } else if matches!(name, "emails" | "phones" | "urls") {
+                    "contact_entry_must_be_label_and_value"
+                } else {
+                    "contact_field_must_be_text_or_null"
+                },
+                name,
+                0,
+            ));
+        }
+    }
+    None
+}
+
 /// Why arguments that don't parse were refused, as a code that says what each action takes.
-fn shape_error(args: &Value) -> &'static str {
+fn shape_error(args: &Value) -> Problem {
     let Some(object) = args.as_object() else {
-        return "invalid_arguments";
+        return Problem::of("invalid_arguments");
     };
     let only = |keys: &[&str]| {
         object.keys().all(|k| keys.contains(&k.as_str()))
             && keys.iter().all(|k| object.contains_key(*k))
     };
-    let fields_error = || match object.get("fields").and_then(Value::as_object) {
-        Some(fields) if fields.keys().any(|k| !FIELD_NAMES.contains(&k.as_str())) => {
-            "unknown_field"
-        }
-        _ => "invalid_arguments",
-    };
-    match object.get("action").and_then(Value::as_str) {
-        Some("create") if !only(&["action", "fields"]) => "create_needs_only_fields",
+    let code = match object.get("action").and_then(Value::as_str) {
+        Some("create") if !only(&["action", "fields"]) => "contact_create_needs_only_fields",
         Some("update") if !only(&["action", "guid", "etag", "fields"]) => {
-            "update_needs_guid_etag_and_fields"
+            "contact_update_needs_guid_etag_and_fields"
         }
-        Some("delete") if !only(&["action", "guid", "etag"]) => "delete_needs_only_guid_and_etag",
-        Some("create" | "update") => fields_error(),
-        Some("delete") => "invalid_arguments",
-        _ => "invalid_action",
-    }
+        Some("delete") if !only(&["action", "guid", "etag"]) => {
+            "contact_delete_needs_only_guid_and_etag"
+        }
+        Some("create" | "update") => {
+            return fields_problem(&object["fields"])
+                .unwrap_or(Problem::of("contact_invalid_guid_or_etag"))
+        }
+        Some("delete") => "contact_invalid_guid_or_etag",
+        _ => "contact_invalid_action",
+    };
+    Problem::of(code)
 }
 
-/// Checks the arguments before any approval prompt, cache or network use.
-pub(crate) fn validate(args: &Value) -> Result<ContactsWrite, &'static str> {
+/// The arguments checked, or what is wrong with them.
+fn checked_args(args: &Value) -> Result<ContactsWrite, Problem> {
+    // `null` would parse as "left out"; a company flag must say true or false.
+    if args["fields"]
+        .get("is_company")
+        .is_some_and(|v| !v.is_boolean())
+    {
+        return Err(Problem::at(
+            "contact_is_company_must_be_true_or_false",
+            "is_company",
+            0,
+        ));
+    }
     let op: ContactsWrite = serde_json::from_value(args.clone()).map_err(|_| shape_error(args))?;
     if let Some((guid, etag)) = op.target() {
-        if guid.is_empty() || guid.len() > contacts::MAX_GUID_BYTES {
-            return Err("invalid_guid_or_etag");
-        }
-        if etag.is_empty() || etag.len() > MAX_ETAG_BYTES || !readable(etag, false) {
-            return Err("invalid_guid_or_etag");
+        if guid.is_empty()
+            || guid.len() > contacts::MAX_GUID_BYTES
+            || etag.is_empty()
+            || etag.len() > MAX_ETAG_BYTES
+            || !readable(etag, false)
+        {
+            return Err(Problem::of("contact_invalid_guid_or_etag"));
         }
     }
     match &op {
@@ -448,18 +550,49 @@ pub(crate) fn validate(args: &Value) -> Result<ContactsWrite, &'static str> {
             let mut card = blank_card();
             fields.apply(&mut card);
             if apple::blank_card(&card.contact) {
-                return Err(BLANK);
+                return Err(Problem::of(BLANK));
             }
         }
         ContactsWrite::Update { fields, .. } => {
             check_fields(fields)?;
             if fields.is_empty() {
-                return Err("nothing_to_change");
+                return Err(Problem::of("contact_nothing_to_change"));
             }
         }
         ContactsWrite::Delete { .. } => {}
     }
     Ok(op)
+}
+
+/// Checks the arguments before any approval prompt, cache or network use.
+pub(crate) fn validate(args: &Value) -> Result<ContactsWrite, &'static str> {
+    checked_args(args).map_err(|p| p.code)
+}
+
+/// The sentence for a refused argument, naming the field and its limit.
+fn argument_step(args: &Value) -> Option<String> {
+    let p = checked_args(args).err()?;
+    let field = label(p.field);
+    Some(match p.code {
+        "contact_field_too_long" => format!("{field}: at most {} characters per value.", p.limit),
+        "contact_label_too_long" => format!("{field}: at most {} characters per label.", p.limit),
+        "contact_too_many_entries" => format!("{field}: at most {} entries.", p.limit),
+        "contact_empty_entry_value" => format!("{field}: every entry needs a value that is not blank."),
+        "contact_text_not_allowed" => format!("{field} holds a control character, or one that hides or reorders text. Only notes may hold line breaks and tabs."),
+        "contact_invalid_birthday" => "birthday is YYYY-MM-DD with a day the month has. If the year is not known, use 1604, as Apple does.".to_string(),
+        "contact_entry_must_be_label_and_value" => format!("{field}: each entry is an object such as {{\"label\":\"HOME\",\"value\":\"ada@example.com\"}}, not a plain string; label may be left out or null."),
+        "contact_is_company_must_be_true_or_false" => "is_company is true or false; leave it out to keep it as it is.".to_string(),
+        "contact_field_must_be_text_or_null" => format!("{field} is text, or null to clear it."),
+        "contact_fields_must_be_an_object" => "fields is an object of field names and values.".to_string(),
+        "contact_nothing_to_change" => "fields names nothing to change. Name at least one field to set or clear.".to_string(),
+        "contact_invalid_action" => "action must be create, update or delete.".to_string(),
+        "contact_create_needs_only_fields" => "create takes action and fields only, such as {\"action\":\"create\",\"fields\":{\"first_name\":\"Ada\"}}. The new card's guid is in the reply.".to_string(),
+        "contact_update_needs_guid_etag_and_fields" => "update takes action, guid, etag and fields. Take guid and etag from contacts_get, and name in fields only what changes.".to_string(),
+        "contact_delete_needs_only_guid_and_etag" => "delete takes action, guid and etag only. Take guid and etag from contacts_get.".to_string(),
+        "contact_invalid_guid_or_etag" => "guid and etag are text as contacts_get shows them: guid at most 512 bytes, etag at most 256.".to_string(),
+        "contact_unknown_field" => format!("fields takes {}. contacts_get's details are given flat in fields; postal addresses, photos and lists can't be changed here.", FIELD_NAMES.join(", ")),
+        _ => return None,
+    })
 }
 
 /// Whether a call needs the person's approval whatever the rules and the approval mode say:
@@ -701,9 +834,47 @@ pub(crate) fn preview(library: &Library, args: &Value) -> Result<Value, &'static
         }
         ContactsWrite::Delete { .. } => {
             value["effect"] = json!("deletes the card from Apple iCloud Contacts on every device; Contacts has no Recently Deleted, so it cannot be undone");
+            if let Some(card) = &card {
+                value["removes"] = removes(library, card)?;
+            }
         }
     }
     Ok(value)
+}
+
+/// What a delete takes away, as the cache holds the card: its name and work, and how many
+/// entries of each kind.
+fn removes(library: &Library, card: &Card) -> Result<Value, &'static str> {
+    let c = &card.contact;
+    let count = |kind: &str| c.methods.iter().filter(|m| m.kind == kind).count();
+    let addresses = library
+        .contact_addresses(&c.guid)
+        .map_err(|_| "library_unavailable")?
+        .len();
+    let others = c
+        .methods
+        .iter()
+        .filter(|m| !["email", "phone", "url", "address"].contains(&m.kind.as_str()))
+        .count();
+    let text = |v: &Option<String>| v.as_deref().map(|t| shown_up_to(t, MAX_TEXT_CHARS));
+    Ok(json!({
+        "name": shown(&c.display_name(), MAX_TEXT_CHARS),
+        "company": text(&c.company),
+        "job_title": text(&card.details.job_title),
+        "birthday": text(&c.birthday),
+        "emails": count("email"),
+        "phones": count("phone"),
+        "web_addresses": count("url"),
+        "postal_addresses": addresses,
+        "other_entries": others,
+        "notes_characters": c.notes.as_deref().map_or(0, |n| n.chars().count()),
+        "photo": c.photo_url.is_some(),
+    }))
+}
+
+/// "1 email", "2 emails".
+fn counted(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 /// A preview in plain lines, for the terminal approval: values without quotes, and each
@@ -715,12 +886,12 @@ pub(crate) fn plain_preview(preview: &Value) -> String {
         other => other.to_string(),
     };
     let mut lines = vec![format!(
-        "Contacts change: {}{}",
-        text(&preview["action"]),
-        if preview["destructive"] == true {
-            ", a deletion"
-        } else {
-            ""
+        "Contacts change: {}",
+        match preview["action"].as_str() {
+            Some("create") => "make a new card",
+            Some("update") => "change this card",
+            Some("delete") => "delete this card for good",
+            _ => "unknown",
         }
     )];
     if preview["effect"].is_string() {
@@ -735,8 +906,43 @@ pub(crate) fn plain_preview(preview: &Value) -> String {
             text(&contact["etag"])
         ));
     }
+    let gone = &preview["removes"];
+    if gone.is_object() {
+        let n = |key: &str| gone[key].as_u64().unwrap_or(0);
+        let mut parts = vec![format!("name {}", text(&gone["name"]))];
+        for (key, what) in [
+            ("company", "company"),
+            ("job_title", "job title"),
+            ("birthday", "birthday"),
+        ] {
+            if gone[key].is_string() {
+                parts.push(format!("{what} {}", text(&gone[key])));
+            }
+        }
+        for (key, one, many) in [
+            ("emails", "email", "emails"),
+            ("phones", "phone", "phones"),
+            ("web_addresses", "web address", "web addresses"),
+            ("postal_addresses", "postal address", "postal addresses"),
+            ("other_entries", "other entry", "other entries"),
+        ] {
+            if n(key) > 0 {
+                parts.push(counted(n(key), one, many));
+            }
+        }
+        if n("notes_characters") > 0 {
+            parts.push(format!(
+                "notes ({})",
+                counted(n("notes_characters"), "character", "characters")
+            ));
+        }
+        if gone["photo"] == true {
+            parts.push("a photo".to_string());
+        }
+        lines.push(format!("It deletes: {}", parts.join(", ")));
+    }
     for change in preview["changes"].as_array().into_iter().flatten() {
-        let field = text(&change["field"]);
+        let field = label(change["field"].as_str().unwrap_or("?"));
         let now = change
             .get("now")
             .map(|n| format!(" (now: {})", text(n)))
@@ -777,23 +983,22 @@ pub(crate) fn approval_text(library: &Library, args: &Value) -> String {
     }
 }
 
-/// What the person can do after `error`, when there is something.
-pub(crate) fn next_step(error: &str) -> Option<String> {
+/// What the person can do after `error`, a code of this tool, when there is something. `args`
+/// are the call's arguments, so a refused field is named with its limit.
+pub(crate) fn next_step(error: &str, args: &Value) -> Option<String> {
+    if error.starts_with("contact_") {
+        if let Some(step) = argument_step(args).filter(|_| validate(args) == Err(error)) {
+            return Some(step);
+        }
+    }
     Some(match error {
         CHANGED => "The card is not at the version given: it changed on another device or since it was read. Nothing was written. Run contacts_refresh, read it again with contacts_get, and ask again with its new etag.",
-        UNKNOWN => "The connection ended before Apple answered, so the change may or may not have been made. Run contacts_refresh and look at the card before trying again.",
+        UNKNOWN => "The connection ended before Apple answered, so the change may or may not have been made. Run contacts_refresh and look at the card before trying again; a create tried again without that can make a second card.",
         NOT_CACHED => "The card is not in the local cache. Run contacts_refresh, then find it with contacts_search or contacts_get.",
         GONE => "Apple no longer has this card; it may have been deleted on another device. Run contacts_refresh.",
         BLANK => "A new card needs a name, a company, a phone number or an email address.",
-        CUT_SHORT => "contacts_get showed this card cut short, so the notes or a list of emails, phones or URLs it would replace were not seen in full, and nothing was changed. contacts_get cannot show the card whole. Change those fields on an Apple device or on icloud.com, or change only other fields here.",
+        CUT_SHORT => "contacts_get showed this card cut short, so the notes or a list of emails, phones or web addresses it would replace were not seen in full, and nothing was changed. contacts_get cannot show the card whole. Change those fields on an Apple device or on icloud.com, or change only other fields here.",
         NOTHING_SENT => "Apple's address book could not be read, so nothing was sent. Try again later; if it keeps failing, run contacts_refresh to see why.",
-        "invalid_action" => "action must be create, update or delete.",
-        "create_needs_only_fields" => "create takes action and fields only, such as {\"action\":\"create\",\"fields\":{\"first_name\":\"Ada\"}}. The new card's guid is in the reply.",
-        "update_needs_guid_etag_and_fields" => "update takes action, guid, etag and fields. Take guid and etag from contacts_get, and name in fields only what changes.",
-        "delete_needs_only_guid_and_etag" => "delete takes action, guid and etag only. Take guid and etag from contacts_get.",
-        "invalid_guid_or_etag" => "guid and etag must be as contacts_get shows them: guid at most 512 bytes, etag at most 256.",
-        "unknown_field" => "fields takes first_name, middle_name, last_name, company, is_company, birthday, notes, prefix, suffix, nickname, phonetic_first_name, phonetic_last_name, phonetic_company, job_title, department, emails, phones and urls. contacts_get's details are given flat in fields; postal addresses, photos and lists can't be changed here.",
-        "invalid_birthday" => "birthday is YYYY-MM-DD with a day the month has. If the year is not known, use 1604, as Apple does.",
         _ => return None,
     }
     .to_string())
@@ -808,7 +1013,9 @@ pub struct Seam {
     pub client: Option<MakeClient>,
     /// Each read of the book, before and after the change.
     pub read: RefreshLimits,
-    /// The change: the read before it and the write.
+    /// The read of the book before the change; past it, nothing was sent.
+    pub read_timeout: Duration,
+    /// The write; past it, the outcome is unknown.
     pub timeout: Duration,
     /// The read back from Apple after the write.
     pub check_timeout: Duration,
@@ -819,6 +1026,7 @@ impl Default for Seam {
         Self {
             client: None,
             read: RefreshLimits::default(),
+            read_timeout: Duration::from_secs(60),
             timeout: Duration::from_secs(120),
             check_timeout: Duration::from_secs(60),
         }
@@ -869,7 +1077,7 @@ fn read_stop(stop: Stop) -> &'static str {
         Stop::TooLarge | Stop::BookTooLarge | Stop::CardTooLarge => {
             "contacts_book_too_large_nothing_sent"
         }
-        Stop::Busy | Stop::Failed => "contacts_read_failed_nothing_sent",
+        Stop::Busy | Stop::Failed => "contacts_write_read_failed_nothing_sent",
     }
 }
 
@@ -970,14 +1178,10 @@ pub(crate) async fn run(dir: &Path, seam: &Seam, op: ContactsWrite) -> Result<Va
         .ok_or("contacts_service_unavailable")?;
     let mut after = Settle::Nothing;
     // Timed apart: once Apple took the write, a slow or failed read back is done, unverified.
-    let sent = tokio::time::timeout(seam.timeout, send(&client, &root, &op, &seam.read)).await;
-    let result = match sent {
-        Err(_) => Err(UNKNOWN),
-        Ok(Err(error)) => Err(error),
-        Ok(Ok(Sent::Unchanged(value))) => Ok(value),
-        Ok(Ok(Sent::Written(guid))) => {
-            Ok(checked(&client, &root, &guid, &op, seam, &mut after).await)
-        }
+    let result = match send(&client, &root, &op, seam).await {
+        Err(error) => Err(error),
+        Ok(Sent::Unchanged(value)) => Ok(value),
+        Ok(Sent::Written(guid)) => Ok(checked(&client, &root, &guid, &op, seam, &mut after).await),
     };
     let cached = settle(dir, &dsid, after);
     result.map(|mut value| {
@@ -998,18 +1202,36 @@ enum Sent {
     Written(String),
 }
 
-/// The read before the change and the write.
+/// The read before the change and the write, each under its own time limit: a read that
+/// fails or runs out of time sent nothing; a write that runs out of time has an unknown
+/// outcome.
 async fn send(
     client: &Client,
     root: &str,
     op: &ContactsWrite,
-    limits: &RefreshLimits,
+    seam: &Seam,
+) -> Result<Sent, &'static str> {
+    // Apple's card as it is now; a create reads the book too, so a book that can't be read
+    // is said to have sent nothing.
+    let (cards, tokens) = tokio::time::timeout(seam.read_timeout, book(client, root, &seam.read))
+        .await
+        .map_err(|_| NOTHING_SENT)?
+        .map_err(read_stop)?;
+    tokio::time::timeout(seam.timeout, write(client, root, op, cards, tokens))
+        .await
+        .map_err(|_| UNKNOWN)?
+}
+
+/// The write itself, against the book just read.
+async fn write(
+    client: &Client,
+    root: &str,
+    op: &ContactsWrite,
+    cards: Vec<Value>,
+    tokens: apple::Tokens,
 ) -> Result<Sent, &'static str> {
     let http = client.http();
     let params = || client.service_params();
-    // Apple's card as it is now; a create reads the book too, so a book that can't be read
-    // is said to have sent nothing.
-    let (cards, tokens) = book(client, root, limits).await.map_err(read_stop)?;
     let existing = match op.target() {
         Some((guid, etag)) => {
             let existing = find(&cards, guid).ok_or(GONE)?;
@@ -1203,7 +1425,7 @@ pub(crate) fn tool() -> Value {
     );
     fields.insert(
         "is_company".into(),
-        json!({"description": "Whether the card is a company's.", "type": "boolean"}),
+        json!({"description": "Whether the card is a company's: true or false. Leave it out to keep it; null is refused.", "type": "boolean"}),
     );
     fields.insert(
         "emails".into(),
@@ -1219,7 +1441,7 @@ pub(crate) fn tool() -> Value {
     );
     json!({
         "name": TOOL,
-        "description": "Change the user's Apple iCloud Contacts, one card per call: create (fields), update (guid, etag, fields) or delete (guid, etag). Take guid and etag from contacts_get; the etag is the card's version. An update or delete of a card that changed since, on another device or in the cache, is refused with contact_changed_conflict and nothing is written: run contacts_refresh, read the card again and ask with its new etag. An update changes only the fields it names; null or an empty string clears a field, and a list of emails, phones or URLs replaces that list. When contacts_get showed the card cut short (card_truncated), an update that replaces its notes or a list of emails, phones or URLs is refused, because part of it was not seen; change those on an Apple device. Postal addresses, photos, contact lists and merging cards are not changed by this tool. Contacts has no Recently Deleted, so a delete is permanent; every delete needs the user's approval, in the approval form or with skykeep-mcp approve in their terminal; every change follows the approval mode and the rules the user set. The reply says done with what was checked, unchanged when Apple already holds the values, or an error; an unknown outcome means run contacts_refresh and look before trying again.",
+        "description": "Change the user's Apple iCloud Contacts, one card per call: create (fields), update (guid, etag, fields) or delete (guid, etag). Take guid and etag from contacts_get; the etag is the card's version. An update or delete of a card that changed since, on another device or in the cache, is refused with contact_changed_conflict and nothing is written: run contacts_refresh, read the card again and ask with its new etag. An update changes only the fields it names; null or an empty string clears a field, and a list of emails, phones or URLs replaces that list (each entry is {label, value}; order is not kept). When contacts_get showed the card cut short (card_truncated), an update that replaces its notes or a list of emails, phones or URLs is refused, because part of it was not seen; change those on an Apple device. Postal addresses, photos, contact lists and merging cards are not changed by this tool. Contacts has no Recently Deleted, so a delete is permanent; every delete needs the user's approval, in the approval form or with skykeep-mcp approve in their terminal; every change follows the approval mode and the rules the user set. The reply says done with what was checked, unchanged when Apple already holds the values, or an error; an unknown outcome means run contacts_refresh and look before trying again; a create tried again without that can make a second card.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1252,11 +1474,11 @@ mod tests {
         assert!(validate(&json!({"action":"delete","guid":"g","etag":"e"})).is_ok());
         assert_eq!(
             validate(&json!({"action":"delete","guid":"g","etag":"e","fields":{}})),
-            Err("delete_needs_only_guid_and_etag")
+            Err("contact_delete_needs_only_guid_and_etag")
         );
         assert_eq!(
             validate(&json!({"action":"create","fields":{"photo":"x"}})),
-            Err("unknown_field")
+            Err("contact_unknown_field")
         );
     }
 

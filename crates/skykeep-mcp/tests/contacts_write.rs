@@ -555,7 +555,7 @@ async fn an_update_apple_already_holds_sends_nothing() {
     assert_eq!(done["outcome"], "unchanged", "{done}");
     assert!(f.writes().is_empty());
     let e = error(&mut f.server, update_ada(json!({}))).await;
-    assert_eq!(e["error"], "nothing_to_change");
+    assert_eq!(e["error"], "contact_nothing_to_change");
 }
 
 // --- Bounds.
@@ -570,76 +570,100 @@ async fn oversized_or_malformed_arguments_are_refused_before_approval_or_network
     for (args, code) in [
         (
             update_ada(json!({"first_name":"x".repeat(257)})),
-            "field_too_long",
+            "contact_field_too_long",
         ),
         (
             update_ada(json!({"notes":"n".repeat(4097)})),
-            "field_too_long",
+            "contact_field_too_long",
         ),
-        (update_ada(json!({"emails":many})), "too_many_entries"),
+        (
+            update_ada(json!({"emails":many})),
+            "contact_too_many_entries",
+        ),
         (
             update_ada(json!({"emails":[{"value":"e".repeat(513)}]})),
-            "field_too_long",
+            "contact_field_too_long",
         ),
         (
             update_ada(json!({"emails":[{"label":"l".repeat(65),"value":"a@b"}]})),
-            "field_too_long",
+            "contact_label_too_long",
         ),
         (
             update_ada(json!({"emails":[{"value":" "}]})),
-            "empty_entry_value",
+            "contact_empty_entry_value",
         ),
         (
             update_ada(json!({"birthday":"14/03/1990"})),
-            "invalid_birthday",
+            "contact_invalid_birthday",
         ),
         (
             update_ada(json!({"first_name":"A\u{202E}da"})),
-            "invalid_text",
+            "contact_text_not_allowed",
         ),
-        (update_ada(json!({"first_name":"A\u{7}da"})), "invalid_text"),
+        (
+            update_ada(json!({"first_name":"A\u{7}da"})),
+            "contact_text_not_allowed",
+        ),
         (
             update_ada(json!({"birthday":"2001-02-31"})),
-            "invalid_birthday",
+            "contact_invalid_birthday",
         ),
-        (update_ada(json!({"photo":"data:"})), "unknown_field"),
-        (update_ada(json!({"first_name":7})), "invalid_arguments"),
+        (
+            update_ada(json!({"photo":"data:"})),
+            "contact_unknown_field",
+        ),
+        (
+            update_ada(json!({"first_name":7})),
+            "contact_field_must_be_text_or_null",
+        ),
+        (
+            update_ada(json!({"emails":["ada@example.com"]})),
+            "contact_entry_must_be_label_and_value",
+        ),
+        (
+            update_ada(json!({"is_company":null})),
+            "contact_is_company_must_be_true_or_false",
+        ),
         (
             json!({"action":"update","guid":ADA,"fields":{"first_name":"X"}}),
-            "update_needs_guid_etag_and_fields",
+            "contact_update_needs_guid_etag_and_fields",
         ),
         (
             json!({"action":"update","guid":ADA,"etag":"etag-ada-1"}),
-            "update_needs_guid_etag_and_fields",
+            "contact_update_needs_guid_etag_and_fields",
         ),
         (
             json!({"action":"delete","guid":BOB}),
-            "delete_needs_only_guid_and_etag",
+            "contact_delete_needs_only_guid_and_etag",
         ),
         (
             json!({"action":"delete","guid":BOB,"etag":"etag-bob-1","fields":{}}),
-            "delete_needs_only_guid_and_etag",
+            "contact_delete_needs_only_guid_and_etag",
         ),
         (
             json!({"action":"delete","guid":"g".repeat(513),"etag":"e"}),
-            "invalid_guid_or_etag",
+            "contact_invalid_guid_or_etag",
         ),
         (
             json!({"action":"create","guid":"C-CHOSEN","fields":{"first_name":"X"}}),
-            "create_needs_only_fields",
+            "contact_create_needs_only_fields",
         ),
-        (json!({"action":"create"}), "create_needs_only_fields"),
-        (json!({"action":"merge"}), "invalid_action"),
-        (json!({"guid":BOB}), "invalid_action"),
+        (
+            json!({"action":"create"}),
+            "contact_create_needs_only_fields",
+        ),
+        (json!({"action":"merge"}), "contact_invalid_action"),
+        (json!({"guid":BOB}), "contact_invalid_action"),
     ] {
         let reply = call(&mut f.server, args.clone()).await;
         assert_ne!(reply["method"], "elicitation/create", "{args}");
         let e = text(&reply);
         assert_eq!(e["error"], code, "{args}");
-        if code.contains("needs") || code == "invalid_action" || code == "unknown_field" {
+        // Every refusal here says what to do instead.
+        {
             assert!(e["instructions"].is_string(), "{args}: {e}");
         }
-        if code.starts_with("update_") || code.starts_with("delete_") {
+        if code.starts_with("contact_update_") || code.starts_with("contact_delete_") {
             assert!(
                 e["instructions"].as_str().unwrap().contains("contacts_get"),
                 "{e}"
@@ -940,7 +964,7 @@ async fn a_failed_read_before_a_create_sends_nothing() {
         json!({"action":"create","fields":{"first_name":"Grace"}}),
     )
     .await;
-    assert_eq!(e["error"], "contacts_read_failed_nothing_sent", "{e}");
+    assert_eq!(e["error"], "contacts_write_read_failed_nothing_sent", "{e}");
     assert!(f.writes().is_empty());
 }
 
@@ -961,7 +985,7 @@ async fn the_terminal_text_shows_each_change_with_its_current_value() {
     let id = waiting["request_id"].as_str().unwrap().to_string();
     let shown = f.server.approval_text(&id).unwrap();
     for line in [
-        "Set first_name to Augusta (now: Ada)",
+        "Set first name to Augusta (now: Ada)",
         "Clear company (now: Analytical Engines)",
         "Replace phones: remove MOBILE +1 555 0100; add WORK +1 555 0199",
     ] {
@@ -1043,4 +1067,138 @@ async fn a_list_or_notes_contacts_get_cut_short_is_not_replaced() {
     assert_eq!(form["method"], "elicitation/create", "{form}");
     cancel(&mut f.server, &form).await;
     assert!(f.writes().is_empty());
+}
+
+// --- Round two: what a refusal and an approval say.
+
+#[tokio::test]
+async fn a_refused_field_is_named_with_its_limit() {
+    let mut f = fixture(Some("yolo")).await;
+    for (fields, words) in [
+        (json!({"first_name":"x".repeat(257)}), ["first name", "256"]),
+        (json!({"notes":"n".repeat(4097)}), ["notes", "4096"]),
+        (
+            json!({"emails":(0..21).map(|i| json!({"value":format!("{i}@x")})).collect::<Vec<_>>()}),
+            ["emails", "20"],
+        ),
+        (json!({"urls":[{"value":" "}]}), ["web addresses", "value"]),
+        (json!({"job_title":"a\u{7}b"}), ["job title", "control"]),
+        (
+            json!({"emails":["ada@example.com"]}),
+            ["emails", "\"label\""],
+        ),
+        (json!({}), ["Name at least one field", "fields"]),
+    ] {
+        let e = error(&mut f.server, update_ada(fields.clone())).await;
+        let step = e["instructions"].as_str().unwrap_or_default();
+        for word in words {
+            assert!(step.contains(word), "{fields}: {word}: {e}");
+        }
+    }
+    // A tool-neutral code from another tool gets no Contacts sentence.
+    assert!(skykeep_mcp::next_step("invalid_action", f.dir.path(), &json!({})).is_none());
+    assert!(skykeep_mcp::next_step("unknown_field", f.dir.path(), &json!({})).is_none());
+}
+
+#[tokio::test]
+async fn a_delete_shows_what_it_takes_away() {
+    let mut f = fixture(Some("yolo")).await;
+    let waiting = ok(
+        &mut f.server,
+        json!({"action":"delete","guid":ADA,"etag":"etag-ada-1"}),
+    )
+    .await;
+    let id = waiting["request_id"].as_str().unwrap().to_string();
+    let shown = f.server.approval_text(&id).unwrap();
+    for part in [
+        "Contacts change: delete this card for good",
+        "It deletes: name Ada Lovelace",
+        "company Analytical Engines",
+        "1 email",
+        "1 phone",
+        "1 postal address",
+        "notes (32 characters)",
+    ] {
+        assert!(shown.contains(part), "{part}\n{shown}");
+    }
+    assert!(!shown.contains("a deletion"), "{shown}");
+    // The card shows the same.
+    let mut f = fixture(Some("writes_only")).await;
+    let form = call(
+        &mut f.server,
+        json!({"action":"delete","guid":ADA,"etag":"etag-ada-1"}),
+    )
+    .await;
+    let message = form["params"]["message"].as_str().unwrap();
+    assert!(message.contains("Analytical Engines"), "{message}");
+    assert!(message.contains("postal"), "{message}");
+    cancel(&mut f.server, &form).await;
+}
+
+#[tokio::test]
+async fn a_terminal_request_that_cannot_run_is_refused_at_once() {
+    for policy in [Some("yolo"), None] {
+        let mut f = fixture(policy).await;
+        for (args, code) in [
+            (
+                json!({"action":"delete","guid":BOB,"etag":"etag-old"}),
+                "contact_changed_conflict",
+            ),
+            (
+                json!({"action":"delete","guid":"C-NOBODY","etag":"e"}),
+                "contact_not_in_cache_run_contacts_refresh",
+            ),
+        ] {
+            let e = error(&mut f.server, args.clone()).await;
+            assert_eq!(e["error"], code, "{policy:?} {args}: {e}");
+        }
+        rules(
+            f.dir.path(),
+            "rules:\n  contacts_write.update: {ask: terminal}\n",
+        );
+        let e = error(
+            &mut f.server,
+            json!({"action":"update","guid":ADA,"etag":"etag-old","fields":{"nickname":"A"}}),
+        )
+        .await;
+        assert_eq!(e["error"], "contact_changed_conflict", "{policy:?}: {e}");
+        assert!(f.writes().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn reordered_or_repeated_entries_are_no_change() {
+    let mut f = fixture(Some("yolo")).await;
+    let done = ok(
+        &mut f.server,
+        update_ada(json!({"emails":[{"label":"HOME","value":"ada@example.com"},{"label":"WORK","value":"ada@work.example"}]})),
+    )
+    .await;
+    assert_eq!(done["remote_verified"], true, "{done}");
+    let etag = done["contact"]["etag"].as_str().unwrap().to_string();
+    let again = ok(
+        &mut f.server,
+        json!({"action":"update","guid":ADA,"etag":etag,"fields":{"emails":[{"label":"WORK","value":"ada@work.example"},{"label":"HOME","value":"ada@example.com"}]}}),
+    )
+    .await;
+    assert_eq!(again["outcome"], "unchanged", "{again}");
+    assert_eq!(f.writes().len(), 1);
+}
+
+#[tokio::test]
+async fn a_slow_read_before_the_write_sent_nothing() {
+    let mut f = fixture(Some("yolo")).await;
+    f.server.set_contacts_seam(Seam {
+        read_timeout: std::time::Duration::from_secs(1),
+        ..seam(&f.remote.uri())
+    });
+    f.slow_reads_after(1);
+    let e = error(&mut f.server, update_ada(json!({"nickname":"A"}))).await;
+    assert_eq!(e["error"], "contacts_write_read_failed_nothing_sent", "{e}");
+    assert!(f.writes().is_empty());
+}
+
+#[test]
+fn yolo_says_contacts_deletions_still_wait() {
+    assert!(skykeep_mcp::status::describe_mode("yolo").contains("Drive and Contacts deletions"));
 }

@@ -401,7 +401,10 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
             "In your own terminal, run: {}",
             status::with_dir("skykeep-mcp exchange", dir)
         )),
-        e if contacts_write::next_step(e).is_some() => contacts_write::next_step(e),
+        // contacts_write's own codes, by their prefix.
+        e if e.starts_with("contact_") || e.starts_with("contacts_write_") => {
+            contacts_write::next_step(e, args)
+        }
         drive_write::UNKNOWN => Some("The connection ended before Apple answered, so the change may or may not have been made. Run drive_refresh on the folder and look at it before trying again.".to_string()),
         drive_write::IN_RECENTLY_DELETED => Some("The item is in Recently Deleted in iCloud Drive but was not deleted for good. Delete it there (iCloud Drive on icloud.com or a Mac), or leave it: Apple deletes it by itself after about 30 days.".to_string()),
         drive_write::IN_RECENTLY_DELETED_LOGIN => Some(format!("The item is in Recently Deleted in iCloud Drive but was not deleted for good, because the sign-in has expired. Sign in again with {} in your own terminal, then delete it from Recently Deleted in iCloud Drive, or leave it: Apple deletes it by itself after about 30 days.", status::with_dir("skykeep-mcp login", dir))),
@@ -1546,6 +1549,11 @@ impl Server {
             }
             // A Drive change gets Drive's own request, bound to its preview, below.
             Gate::Terminal if !terminal_approved && name != drive_write::TOOL => {
+                // A Contacts request that can't run as asked (a version not cached, a card not
+                // cached, a field shown cut short) is refused now, not stored to fail later.
+                if name == contacts_write::TOOL {
+                    contacts_write::preview(library, &args)?;
+                }
                 return terminal_proposal(
                     library,
                     &dir,
@@ -1700,6 +1708,7 @@ impl Server {
                             .as_deref()
                             == Some("true"))
                 {
+                    contacts_write::preview(library, &args)?;
                     return terminal_proposal(
                         library,
                         &dir,
