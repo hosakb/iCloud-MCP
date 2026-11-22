@@ -1000,14 +1000,23 @@ fn runs_as(
             Effect::AskTerminal,
             Some("a folder without an approval mode always asks before deleting"),
         ),
-        Some(mode) if tool == crate::drive_write::TOOL && effect == Effect::Allow => (
-            if mode == "yolo" {
-                Effect::AskTerminal
-            } else {
-                Effect::AskClient
-            },
-            Some("a Drive deletion always needs a person"),
-        ),
+        Some(mode)
+            if (tool == crate::drive_write::TOOL || tool == crate::photos_write::TOOL)
+                && effect == Effect::Allow =>
+        {
+            (
+                if mode == "yolo" {
+                    Effect::AskTerminal
+                } else {
+                    Effect::AskClient
+                },
+                Some(if tool == crate::photos_write::TOOL {
+                    "a move to Recently Deleted in Photos always needs a person"
+                } else {
+                    "a Drive deletion always needs a person"
+                }),
+            )
+        }
         _ => (effect, None),
     }
 }

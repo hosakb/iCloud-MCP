@@ -2,7 +2,7 @@
 
 iCloud-MCP is a local MCP server for Apple Notes, Reminders, Contacts, Calendar, Photos and iCloud Drive, built on the [Skykeep](https://github.com/YashwanthKamireddi/Skykeep) Rust engine. The command is `skykeep-mcp`. It uses newline-delimited JSON-RPC over stdio and has no network listener. Reads use a private local SQLite cache.
 
-Notes and Reminders can be read and changed; their changes enter a durable outbox for sync with iCloud. Contacts, Calendar and Photos are read-only. iCloud Drive can be read and changed, with file contents moving only through one local exchange folder. Mail is not implemented and not planned, because upstream Skykeep has no Mail support.
+Notes and Reminders can be read and changed; their changes enter a durable outbox for sync with iCloud. Contacts and Calendar are read-only. Photos can be read, and the `photos_write` tool changes photo details and albums and uploads files. iCloud Drive can be read and changed. File contents for Drive and Photos move only through one local exchange folder. Mail is not implemented and not planned, because upstream Skykeep has no Mail support.
 
 This fork contains the MCP server and its four engine crates, not the upstream desktop or mobile applications. The source is at [hosakb/iCloud-MCP](https://github.com/hosakb/iCloud-MCP).
 
@@ -29,6 +29,8 @@ It asks for the state folder, where to keep the sign-in, your Apple Account sign
 ## Tools and approval
 
 The [MCP reference](crates/skykeep-mcp/README.md#tools) lists every tool, its fields and its errors. A permissions file in the state folder sets each tool or action to `allow`, `ask: client`, `ask: terminal` or `deny`. `ask: client` shows an approval card in the MCP client, `ask: terminal` waits for `skykeep-mcp approve` in your own terminal. Drive deletions always need a person, in every approval mode.
+
+`photos_write` changes the personal Photos library one action at a time. It can upload a file from the exchange folder, set the favorite mark, title and caption, rating, keywords or date of a photo, create or rename an album, or move a photo to Recently Deleted. A move to Recently Deleted always needs a person, and its card never offers "Always allow". Every other action follows the approval mode and the permissions file, under names such as `photos_write.set_rating`. A photo or album that changed at Apple since the last `photos_refresh` is refused, not written over. A reply says what Apple's answer showed; nothing is read back. The tool can't delete a photo for good, edit pictures or change shared albums.
 
 Approval protects against clients limited to MCP tools, not agents with shell access as the owner of the state directory. Such an agent can edit local state or invoke terminal helpers.
 

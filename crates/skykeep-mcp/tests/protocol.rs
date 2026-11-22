@@ -890,7 +890,7 @@ async fn initialize_and_discover_only_notes_and_reminders_tools() {
         .any(|n| ["secret", "password", "code", "download", "upload"]
             .iter()
             .any(|s| n.contains(s))));
-    // Photos are read-only metadata in this phase.
+    // Photos metadata reads, and one guarded tool for changes.
     let photos: Vec<_> = names.iter().filter(|n| n.contains("photos")).collect();
     assert_eq!(
         photos,
@@ -899,7 +899,8 @@ async fn initialize_and_discover_only_notes_and_reminders_tools() {
             &"photos_list",
             &"photos_search",
             &"photos_get",
-            &"photos_refresh"
+            &"photos_refresh",
+            &"photos_write"
         ]
     );
     // Contacts are read-only in this phase.
