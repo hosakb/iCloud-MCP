@@ -45,7 +45,7 @@
     <p class="subtitle">What runs on main today, and where each request goes</p>
 
     <div class="diagram-container">
-      <svg viewBox="0 0 1260 540">
+      <svg viewBox="0 0 1260 606">
         <defs>
           <marker id="a-sky" markerUnits="userSpaceOnUse" markerWidth="13" markerHeight="11" refX="11" refY="5.5" orient="auto-start-reverse"><polygon points="0 0,13 5.5,0 11" fill="#38bdf8"/></marker>
           <marker id="a-teal" markerUnits="userSpaceOnUse" markerWidth="13" markerHeight="11" refX="11" refY="5.5" orient="auto-start-reverse"><polygon points="0 0,13 5.5,0 11" fill="#2dd4bf"/></marker>
@@ -54,36 +54,38 @@
 
         <!-- ===== MCP client with a usage example ===== -->
         <g>
-          <rect x="20" y="40" width="296" height="300" rx="22" fill="#11293c" stroke="#38bdf8" stroke-width="2.5"/>
+          <rect x="20" y="40" width="296" height="340" rx="22" fill="#11293c" stroke="#38bdf8" stroke-width="2.5"/>
           <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f4ac.svg" x="38" y="56" width="22" height="22"/>
           <text x="68" y="74" fill="white" font-size="16" font-weight="700">Hermes or another MCP client</text>
-          <text x="38" y="94" fill="#bfe3df" font-size="11">starts skykeep-mcp, talks over stdio</text>
+          <text x="38" y="94" fill="#bfe3df" font-size="11">starts the server and talks to it over stdio</text>
 
           <!-- You: prompt bubble -->
           <path d="M44 108 h232 a12 12 0 0 1 12 12 v34 a12 12 0 0 1 -12 12 h-200 l-14 12 l2 -12 h-20 a12 12 0 0 1 -12 -12 v-34 a12 12 0 0 1 12 -12 z" fill="#38bdf8"/>
           <text x="46" y="126" fill="#061a26" font-size="11" font-weight="800">You</text>
-          <text x="46" y="142" fill="#061a26" font-size="12.5" font-weight="700">Add a reminder to call the dentist</text>
+          <text x="46" y="142" fill="#061a26" font-size="12.5" font-weight="700">Remind me to call the dentist</text>
           <text x="46" y="158" fill="#061a26" font-size="12.5" font-weight="700">tomorrow at 9</text>
 
-          <!-- small arrow down -->
           <line x1="168" y1="172" x2="168" y2="194" stroke="#eab308" stroke-width="2.5" stroke-linecap="round" marker-end="url(#a-sand)"/>
 
           <!-- Tool call code block -->
-          <rect x="30" y="200" width="280" height="96" rx="12" fill="#0a1a22" stroke="#eab308" stroke-width="1.5"/>
+          <rect x="30" y="200" width="280" height="132" rx="12" fill="#0a1a22" stroke="#eab308" stroke-width="1.5"/>
           <text x="40" y="220" fill="#fcd34d" font-size="12" font-weight="700" font-family="DejaVu Sans Mono, monospace" xml:space="preserve">reminders_write</text>
           <text x="40" y="237" fill="#e6f4f1" font-size="10.5" font-weight="500" font-family="DejaVu Sans Mono, monospace" xml:space="preserve">{ "action": "create",</text>
           <text x="40" y="254" fill="#e6f4f1" font-size="10.5" font-weight="500" font-family="DejaVu Sans Mono, monospace" xml:space="preserve">  "list_guid": "&lt;from reminders_lists&gt;",</text>
           <text x="40" y="271" fill="#e6f4f1" font-size="10.5" font-weight="500" font-family="DejaVu Sans Mono, monospace" xml:space="preserve">  "title": "Call the dentist",</text>
-          <text x="40" y="288" fill="#e6f4f1" font-size="10.5" font-weight="500" font-family="DejaVu Sans Mono, monospace" xml:space="preserve">  "due_at": 1795420800 }</text>
-          <text x="38" y="318" fill="#bfe3df" font-size="10.5">due_at is tomorrow 09:00 Berlin time in Unix seconds</text>
+          <text x="40" y="288" fill="#e6f4f1" font-size="10.5" font-weight="500" font-family="DejaVu Sans Mono, monospace" xml:space="preserve">  "due_at": 1795420800,</text>
+          <text x="40" y="305" fill="#e6f4f1" font-size="10.5" font-weight="500" font-family="DejaVu Sans Mono, monospace" xml:space="preserve">  "due_time_alert": true,</text>
+          <text x="40" y="322" fill="#e6f4f1" font-size="10.5" font-weight="500" font-family="DejaVu Sans Mono, monospace" xml:space="preserve">  "timezone": "Europe/Berlin" }</text>
+          <text x="38" y="352" fill="#bfe3df" font-size="10.5">due_at is tomorrow 09:00 Berlin time in Unix seconds;</text>
+          <text x="38" y="366" fill="#bfe3df" font-size="10.5">the reminder alerts at that time</text>
         </g>
 
         <!-- Exchange folder -->
         <g>
-          <rect x="20" y="408" width="296" height="60" rx="18" fill="#1d2a26" stroke="#eab308" stroke-width="2"/>
-          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f4c2.svg" x="36" y="427" width="22" height="22"/>
-          <text x="66" y="434" fill="white" font-size="14" font-weight="700">Exchange folder</text>
-          <text x="66" y="452" fill="#bfe3df" font-size="11">the only local files Drive reads or writes</text>
+          <rect x="20" y="446" width="296" height="60" rx="18" fill="#1d2a26" stroke="#eab308" stroke-width="2"/>
+          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f4c2.svg" x="36" y="465" width="22" height="22"/>
+          <text x="66" y="472" fill="white" font-size="14" font-weight="700">Exchange folder</text>
+          <text x="66" y="490" fill="#bfe3df" font-size="11">file contents for Drive and Photos pass only here</text>
         </g>
 
         <!-- ===== Arrows between left column and server ===== -->
@@ -92,97 +94,85 @@
         <text x="368" y="236" fill="#38bdf8" font-size="11" font-weight="700" text-anchor="middle">approval</text>
         <text x="368" y="249" fill="#38bdf8" font-size="11" font-weight="700" text-anchor="middle">card</text>
         <line x1="416" y1="258" x2="320" y2="258" stroke="#38bdf8" stroke-width="3" stroke-linecap="round" marker-end="url(#a-sky)"/>
-        <text x="368" y="426" fill="#eab308" font-size="11" font-weight="700" text-anchor="middle">upload</text>
-        <text x="368" y="462" fill="#eab308" font-size="11" font-weight="700" text-anchor="middle">download</text>
-        <line x1="320" y1="438" x2="416" y2="438" stroke="#eab308" stroke-width="3" stroke-linecap="round" marker-start="url(#a-sand)" marker-end="url(#a-sand)"/>
+        <text x="368" y="464" fill="#eab308" font-size="11" font-weight="700" text-anchor="middle">upload</text>
+        <text x="368" y="500" fill="#eab308" font-size="11" font-weight="700" text-anchor="middle">download</text>
+        <line x1="320" y1="476" x2="416" y2="476" stroke="#eab308" stroke-width="3" stroke-linecap="round" marker-start="url(#a-sand)" marker-end="url(#a-sand)"/>
 
         <g transform="translate(60,0)">
         <!-- ===== Server ===== -->
         <g>
-          <rect x="360" y="20" width="540" height="466" rx="26" fill="#122a38" stroke="#eab308" stroke-width="2.5"/>
-          <text x="630" y="46" fill="#eab308" font-size="16" font-weight="700" text-anchor="middle">iCloud-MCP server (skykeep-mcp)</text>
+          <rect x="360" y="20" width="540" height="540" rx="26" fill="#122a38" stroke="#eab308" stroke-width="2.5"/>
+          <text x="630" y="46" fill="#eab308" font-size="16" font-weight="700" text-anchor="middle">iCloud-MCP server</text>
 
           <!-- Permissions file -->
-          <rect x="380" y="60" width="500" height="66" rx="16" fill="#2a2a1c" stroke="#eab308" stroke-width="2"/>
+          <rect x="380" y="60" width="500" height="84" rx="16" fill="#2a2a1c" stroke="#eab308" stroke-width="2"/>
           <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f512.svg" x="394" y="72" width="18" height="18"/>
           <text x="420" y="86" fill="white" font-size="14" font-weight="700">Permissions file</text>
-          <text x="545" y="86" fill="#fcd34d" font-size="12" font-weight="600">allow · ask: client · ask: terminal · deny</text>
-          <text x="394" y="104" fill="#bfe3df" font-size="11">One rule per tool or action, read at every tool call, so an edit counts at the next call.</text>
-          <text x="394" y="118" fill="#bfe3df" font-size="11">Actions without a rule follow the approval mode chosen in setup.</text>
+          <text x="545" y="86" fill="#fcd34d" font-size="12" font-weight="600">allow · ask · deny, per tool and action</text>
+          <text x="394" y="104" fill="#bfe3df" font-size="11">Read at every tool call, so an edit counts at the next call.</text>
+          <text x="394" y="119" fill="#bfe3df" font-size="11">Actions without a rule follow the approval mode chosen in setup.</text>
+          <text x="394" y="134" fill="#bfe3df" font-size="11">Deletions in Drive, Contacts, Calendar and Photos always need a person.</text>
 
-          <rect x="380" y="140" width="500" height="44" rx="14" fill="#0e4a3a" stroke="#2dd4bf" stroke-width="2"/>
-          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f4dd.svg" x="392" y="152.0" width="20" height="20"/>
-          <text x="420" y="167.0" fill="white" font-size="14" font-weight="700">Notes</text>
-          <text x="505" y="158.5" fill="#d1faf3" font-size="11">list, search, read</text>
-          <text x="505" y="173.5" fill="#d1faf3" font-size="11">create, save, move, pin, delete</text>
-          <rect x="790" y="152.0" width="80" height="20" rx="10" fill="#2dd4bf"/>
-          <text x="830" y="166.0" fill="#06201c" font-size="10" font-weight="800" text-anchor="middle">READ + WRITE</text>
+          <rect x="380" y="156" width="500" height="50" rx="14" fill="#0e4a3a" stroke="#2dd4bf" stroke-width="2"/>
+          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f4dd.svg" x="392" y="171.0" width="20" height="20"/>
+          <text x="420" y="186.0" fill="white" font-size="14" font-weight="700">Notes</text>
+          <text x="505" y="177.0" fill="#d1faf3" font-size="11.5">list, search, read</text>
+          <text x="505" y="193.0" fill="#d1faf3" font-size="11.5">create, save, move, pin, delete</text>
+          <rect x="380" y="214" width="500" height="50" rx="14" fill="#0e4a3a" stroke="#2dd4bf" stroke-width="2"/>
+          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/23f0.svg" x="392" y="229.0" width="20" height="20"/>
+          <text x="420" y="244.0" fill="white" font-size="14" font-weight="700">Reminders</text>
+          <text x="505" y="235.0" fill="#d1faf3" font-size="11.5">list, search, read; create, edit, tick, delete</text>
+          <text x="505" y="251.0" fill="#d1faf3" font-size="11.5">new ones can repeat daily, alert at or before due, keep a time zone</text>
+          <rect x="380" y="272" width="500" height="50" rx="14" fill="#0e4a3a" stroke="#2dd4bf" stroke-width="2"/>
+          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f465.svg" x="392" y="287.0" width="20" height="20"/>
+          <text x="420" y="302.0" fill="white" font-size="14" font-weight="700">Contacts</text>
+          <text x="505" y="293.0" fill="#d1faf3" font-size="11.5">list, search, read; create, update, delete one card</text>
+          <text x="505" y="309.0" fill="#d1faf3" font-size="11.5">an update or delete must name the card's current version</text>
+          <rect x="380" y="330" width="500" height="50" rx="14" fill="#0e4a3a" stroke="#2dd4bf" stroke-width="2"/>
+          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f4c5.svg" x="392" y="345.0" width="20" height="20"/>
+          <text x="420" y="360.0" fill="white" font-size="14" font-weight="700">Calendar</text>
+          <text x="505" y="351.0" fill="#d1faf3" font-size="11.5">read events; create, update, move, delete</text>
+          <text x="505" y="367.0" fill="#d1faf3" font-size="11.5">a whole series or one occurrence; invitations refused by default</text>
+          <rect x="380" y="388" width="500" height="50" rx="14" fill="#0e4a3a" stroke="#2dd4bf" stroke-width="2"/>
+          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f5bc.svg" x="392" y="403.0" width="20" height="20"/>
+          <text x="420" y="418.0" fill="white" font-size="14" font-weight="700">Photos</text>
+          <text x="505" y="409.0" fill="#d1faf3" font-size="11.5">metadata only; upload from the exchange folder</text>
+          <text x="505" y="425.0" fill="#d1faf3" font-size="11.5">favorite, title and caption, rating, keywords, date, albums, trash</text>
+          <rect x="380" y="446" width="500" height="50" rx="14" fill="#0e4a3a" stroke="#2dd4bf" stroke-width="2"/>
+          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f4c1.svg" x="392" y="461.0" width="20" height="20"/>
+          <text x="420" y="476.0" fill="white" font-size="14" font-weight="700">Drive</text>
+          <text x="505" y="467.0" fill="#d1faf3" font-size="11.5">list, search, read; create folder, rename, move, trash,</text>
+          <text x="505" y="483.0" fill="#d1faf3" font-size="11.5">delete for good, upload and download through the exchange folder</text>
 
-          <rect x="380" y="194" width="500" height="44" rx="14" fill="#0e4a3a" stroke="#2dd4bf" stroke-width="2"/>
-          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/23f0.svg" x="392" y="206.0" width="20" height="20"/>
-          <text x="420" y="221.0" fill="white" font-size="14" font-weight="700">Reminders</text>
-          <text x="505" y="212.5" fill="#d1faf3" font-size="11">list, search, read; create, edit, tick, delete</text>
-          <text x="505" y="227.5" fill="#d1faf3" font-size="11">new ones can repeat daily and alert at or before due</text>
-          <rect x="790" y="206.0" width="80" height="20" rx="10" fill="#2dd4bf"/>
-          <text x="830" y="220.0" fill="#06201c" font-size="10" font-weight="800" text-anchor="middle">READ + WRITE</text>
-
-          <rect x="380" y="248" width="500" height="44" rx="14" fill="#0f3550" stroke="#38bdf8" stroke-width="2"/>
-          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f465.svg" x="392" y="260.0" width="20" height="20"/>
-          <text x="420" y="275.0" fill="white" font-size="14" font-weight="700">Contacts</text>
-          <text x="505" y="266.5" fill="#dbeefa" font-size="11">list, search, read one card</text>
-          <text x="505" y="281.5" fill="#dbeefa" font-size="11">never changes contacts at Apple</text>
-          <rect x="790" y="260.0" width="80" height="20" rx="10" fill="#38bdf8"/>
-          <text x="830" y="274.0" fill="#061a26" font-size="10" font-weight="800" text-anchor="middle">READ-ONLY</text>
-
-          <rect x="380" y="302" width="500" height="44" rx="14" fill="#0f3550" stroke="#38bdf8" stroke-width="2"/>
-          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f4c5.svg" x="392" y="314.0" width="20" height="20"/>
-          <text x="420" y="329.0" fill="white" font-size="14" font-weight="700">Calendar</text>
-          <text x="505" y="320.5" fill="#dbeefa" font-size="11">calendars, events by date, search, read</text>
-          <text x="505" y="335.5" fill="#dbeefa" font-size="11">never changes events or answers invitations</text>
-          <rect x="790" y="314.0" width="80" height="20" rx="10" fill="#38bdf8"/>
-          <text x="830" y="328.0" fill="#061a26" font-size="10" font-weight="800" text-anchor="middle">READ-ONLY</text>
-
-          <rect x="380" y="356" width="500" height="44" rx="14" fill="#0f3550" stroke="#38bdf8" stroke-width="2"/>
-          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f5bc.svg" x="392" y="368.0" width="20" height="20"/>
-          <text x="420" y="383.0" fill="white" font-size="14" font-weight="700">Photos</text>
-          <text x="505" y="374.5" fill="#dbeefa" font-size="11">albums, list, search, details</text>
-          <text x="505" y="389.5" fill="#dbeefa" font-size="11">metadata only, no pictures, places or faces</text>
-          <rect x="790" y="368.0" width="80" height="20" rx="10" fill="#38bdf8"/>
-          <text x="830" y="382.0" fill="#061a26" font-size="10" font-weight="800" text-anchor="middle">READ-ONLY</text>
-
-          <rect x="380" y="410" width="500" height="56" rx="14" fill="#0e4a3a" stroke="#2dd4bf" stroke-width="2"/>
-          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f4c1.svg" x="392" y="428.0" width="20" height="20"/>
-          <text x="420" y="443.0" fill="white" font-size="14" font-weight="700">Drive</text>
-          <text x="505" y="427.0" fill="#d1faf3" font-size="11">list, search, read details</text>
-          <text x="505" y="442.0" fill="#d1faf3" font-size="11">create folder, rename, move, trash, delete forever,</text>
-          <text x="505" y="457.0" fill="#d1faf3" font-size="11">upload, download; deletions need your approval</text>
-          <rect x="790" y="428.0" width="80" height="20" rx="10" fill="#2dd4bf"/>
-          <text x="830" y="442.0" fill="#06201c" font-size="10" font-weight="800" text-anchor="middle">READ + WRITE</text>
+          <!-- Commands in your own terminal -->
+          <rect x="380" y="508" width="500" height="40" rx="14" fill="#1d2a26" stroke="#eab308" stroke-width="1.5"/>
+          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f4bb.svg" x="392" y="518" width="20" height="20"/>
+          <text x="420" y="533" fill="white" font-size="13" font-weight="700">setup · status · unlock</text>
+          <text x="585" y="526" fill="#bfe3df" font-size="11">run in your own terminal: sign in, check the folder,</text>
+          <text x="585" y="540" fill="#bfe3df" font-size="11">open the protected sign-in file after a restart</text>
         </g>
 
         <!-- ===== Arrows between server and iCloud ===== -->
-        <line x1="904" y1="162.0" x2="996" y2="162.0" stroke="#2dd4bf" stroke-width="3" stroke-linecap="round" marker-start="url(#a-teal)" marker-end="url(#a-teal)"/>
-        <line x1="904" y1="216.0" x2="996" y2="216.0" stroke="#2dd4bf" stroke-width="3" stroke-linecap="round" marker-start="url(#a-teal)" marker-end="url(#a-teal)"/>
-        <line x1="996" y1="270.0" x2="904" y2="270.0" stroke="#38bdf8" stroke-width="3" stroke-linecap="round" marker-end="url(#a-sky)"/>
-        <line x1="996" y1="324.0" x2="904" y2="324.0" stroke="#38bdf8" stroke-width="3" stroke-linecap="round" marker-end="url(#a-sky)"/>
-        <line x1="996" y1="378.0" x2="904" y2="378.0" stroke="#38bdf8" stroke-width="3" stroke-linecap="round" marker-end="url(#a-sky)"/>
-        <line x1="904" y1="438.0" x2="996" y2="438.0" stroke="#2dd4bf" stroke-width="3" stroke-linecap="round" marker-start="url(#a-teal)" marker-end="url(#a-teal)"/>
+        <line x1="904" y1="181.0" x2="996" y2="181.0" stroke="#2dd4bf" stroke-width="3" stroke-linecap="round" marker-start="url(#a-teal)" marker-end="url(#a-teal)"/>
+        <line x1="904" y1="239.0" x2="996" y2="239.0" stroke="#2dd4bf" stroke-width="3" stroke-linecap="round" marker-start="url(#a-teal)" marker-end="url(#a-teal)"/>
+        <line x1="904" y1="297.0" x2="996" y2="297.0" stroke="#2dd4bf" stroke-width="3" stroke-linecap="round" marker-start="url(#a-teal)" marker-end="url(#a-teal)"/>
+        <line x1="904" y1="355.0" x2="996" y2="355.0" stroke="#2dd4bf" stroke-width="3" stroke-linecap="round" marker-start="url(#a-teal)" marker-end="url(#a-teal)"/>
+        <line x1="904" y1="413.0" x2="996" y2="413.0" stroke="#2dd4bf" stroke-width="3" stroke-linecap="round" marker-start="url(#a-teal)" marker-end="url(#a-teal)"/>
+        <line x1="904" y1="471.0" x2="996" y2="471.0" stroke="#2dd4bf" stroke-width="3" stroke-linecap="round" marker-start="url(#a-teal)" marker-end="url(#a-teal)"/>
 
         <!-- ===== Apple iCloud ===== -->
         <g>
-          <rect x="1000" y="140" width="180" height="326" rx="26" fill="#0f3a36" stroke="#2dd4bf" stroke-width="2.5"/>
-          <circle cx="1090" cy="272" r="26" fill="#2dd4bf"/>
-          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/2601.svg" x="1074" y="256" width="32" height="32"/>
-          <text x="1090" y="322" fill="white" font-size="17" font-weight="700" text-anchor="middle">Apple iCloud</text>
-          <text x="1090" y="342" fill="#bfe3df" font-size="11" text-anchor="middle">your Apple Account</text>
+          <rect x="1000" y="156" width="180" height="340" rx="26" fill="#0f3a36" stroke="#2dd4bf" stroke-width="2.5"/>
+          <circle cx="1090" cy="300.0" r="26" fill="#2dd4bf"/>
+          <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/2601.svg" x="1074" y="284.0" width="32" height="32"/>
+          <text x="1090" y="350.0" fill="white" font-size="17" font-weight="700" text-anchor="middle">Apple iCloud</text>
+          <text x="1090" y="370.0" fill="#bfe3df" font-size="11" text-anchor="middle">your Apple Account</text>
         </g>
 
         <!-- ===== Legend ===== -->
         <g font-size="12" font-weight="600">
-          <line x1="470" y1="516" x2="520" y2="516" stroke="#2dd4bf" stroke-width="3" marker-start="url(#a-teal)" marker-end="url(#a-teal)"/>
-          <text x="532" y="520" fill="#bfe3df">reads and writes</text>
-          <line x1="670" y1="516" x2="720" y2="516" stroke="#38bdf8" stroke-width="3" marker-end="url(#a-sky)"/>
-          <text x="732" y="520" fill="#bfe3df">reads only</text>
+          <line x1="520" y1="584" x2="570" y2="584" stroke="#2dd4bf" stroke-width="3" marker-start="url(#a-teal)" marker-end="url(#a-teal)"/>
+          <text x="582" y="588" fill="#bfe3df">reads and writes: all six services</text>
         </g>
         </g>
       </svg>
