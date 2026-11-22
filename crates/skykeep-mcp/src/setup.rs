@@ -282,6 +282,8 @@ fn survey(env: &Env, dir: &Path) -> Result<Found, &'static str> {
     // The mode in force: the permissions file's approval_mode, else the stored one.
     let mode = match crate::policy(&library, dir) {
         Ok(_) if file_mode(&library, dir).is_some() => file_mode(&library, dir),
+        // Taken over from a file line that is gone: back to no approval mode.
+        Ok(Some(_)) if crate::adopted(&library) => Some("none".into()),
         Ok(Some((p, _))) => Some(p.mode),
         Ok(None) if no_mode_chosen(&library) => Some("none".into()),
         _ => None,
@@ -296,10 +298,7 @@ fn survey(env: &Env, dir: &Path) -> Result<Found, &'static str> {
 
 /// The approval mode `permissions.yaml` sets in `dir` (or its last valid one), if it sets one.
 fn file_mode(library: &quince_core::Library, dir: &Path) -> Option<String> {
-    let stored = crate::policy(library, dir)
-        .ok()
-        .flatten()
-        .map(|(p, _)| p.mode);
+    let stored = crate::stored_mode(library, dir).ok().flatten();
     crate::permissions::peek(library, dir, stored.as_deref())
         .ok()
         .filter(|a| a.mode_in_file)
@@ -879,6 +878,15 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
                     .find(|m| Some(*m) == in_file.as_deref());
             }
         }
+        Ok(Some(_)) if crate::adopted(&library) => {
+            let answer = console.ask(&format!(
+                "Current mode: {}\nPress Enter to keep it, or type change: ",
+                describe("none", &library)
+            ))?;
+            if answer.trim().is_empty() {
+                return Ok(());
+            }
+        }
         Ok(Some((policy, _))) => {
             let answer = console.ask(&format!(
                 "Current mode: {}\nPress Enter to keep it, or type change: ",
@@ -968,7 +976,12 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
     loop {
         let ids: Vec<i64> = {
             let held = PrivateState::open(dir)?;
-            crate::setup(&held.path)?
+            let library = crate::setup(&held.path)?;
+            // Kept from the file: an edit made while setup was asking wins, and nothing is saved.
+            if keep.is_some() && file_mode(&library, &held.path).as_deref() != keep {
+                return Err("permissions.yaml changed while setup was asking, so the approval mode was not saved. Run skykeep-mcp setup again to see the mode the file names now.");
+            }
+            library
                 .outbox_all_pending()
                 .map_err(|_| "library_unavailable")?
                 .iter()
@@ -996,7 +1009,9 @@ fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str
                 ))?;
                 // A line in the file would win over the choice, so it is changed to match.
                 let key = crate::permissions::MODE_KEY;
-                if crate::permissions::setting_in_file(&held.path, key).is_some() {
+                // Kept from the file: the file already holds it and is never rewritten here.
+                if keep.is_none() && crate::permissions::setting_in_file(&held.path, key).is_some()
+                {
                     match crate::permissions::set_setting(&held.path, key, mode) {
                         Ok(()) => console.say(&format!("permissions.yaml now says {key}: {mode}."))?,
                         Err(reason) => console.say(&format!("permissions.yaml could not be changed to match ({reason}); its {key}: line still wins. Change it there."))?,

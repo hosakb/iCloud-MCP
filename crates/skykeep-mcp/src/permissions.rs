@@ -1353,10 +1353,10 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
     let held = crate::state::PrivateState::open(dir)?;
     let dir = held.path.as_path();
     let mut library = crate::setup(dir)?;
-    let (mode, mode_text) = match crate::policy(&library, dir) {
-        Ok(Some((p, _))) => (
-            Some(p.mode.clone()),
-            crate::status::describe_mode(&p.mode).to_string(),
+    let (mode, mode_text) = match crate::stored_mode(&library, dir) {
+        Ok(Some(m)) => (
+            Some(m.clone()),
+            crate::status::describe_mode(&m).to_string(),
         ),
         Ok(None) => (
             None,

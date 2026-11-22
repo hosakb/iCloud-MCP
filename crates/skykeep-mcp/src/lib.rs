@@ -357,10 +357,30 @@ struct Policy {
     state_identity: (u64, u64),
 }
 
+/// Library key: the stored approval mode was taken over from the permissions file, not chosen
+/// by the person. It counts only while the file names a mode.
+const ADOPTED_KEY: &str = "mcp.policy.from_file";
+/// Library key: how many waiting changes taking over the file's mode set aside, said once.
+const SET_ASIDE_KEY: &str = "mcp.policy.set_aside";
+
+/// Whether the stored approval mode was taken over from the permissions file.
+pub(crate) fn adopted(library: &Library) -> bool {
+    library.state(ADOPTED_KEY).ok().flatten().as_deref() == Some("1")
+}
+
+/// The stored approval mode as the fallback when the file names none: the one setup or
+/// `skykeep-mcp policy` stored. One taken over from the file doesn't count then, so the
+/// folder is back to its setup choice (no approval mode).
+pub(crate) fn stored_mode(library: &Library, dir: &Path) -> Result<Option<String>, &'static str> {
+    Ok(policy(library, dir)?
+        .map(|(p, _)| p.mode)
+        .filter(|_| !adopted(library)))
+}
+
 /// The approval mode in force: the permissions file's `approval_mode:`, else the stored one.
 /// Read only; the server records file loads at each tool call.
 pub(crate) fn mode_in_force(library: &Library, dir: &Path) -> Result<Option<String>, &'static str> {
-    let stored = policy(library, dir)?.map(|(p, _)| p.mode);
+    let stored = stored_mode(library, dir)?;
     Ok(permissions::peek(library, dir, stored.as_deref())?.mode)
 }
 
@@ -1011,7 +1031,7 @@ impl Server {
         let dir = held.path.clone();
         let library = self.ready(&held)?;
         let configured = policy(library, &held.path)?;
-        let stored = configured.as_ref().map(|(p, _)| p.mode.clone());
+        let stored = stored_mode(library, &held.path)?;
         let active = permissions::load(library, &dir, stored.as_deref())?;
         let configured = match configured {
             None if adopt_file_mode(library, &dir, &active)? => policy(library, &dir)?,
@@ -1208,17 +1228,19 @@ impl Server {
         let held = state::PrivateState::open(&self.dir)?;
         let identity = directory_identity(&held.path)?;
         let library = self.ready(&held)?;
-        store_policy(library, identity, mode, expected)
+        store_policy(library, identity, mode, expected, false)
     }
 }
 
 /// Stores `mode` as the folder's approval mode with a new revision, setting every waiting
 /// write aside (see [`Server::set_policy_if`]). Caller holds the private folder's lock.
+/// `adopted`: taken over from the permissions file rather than chosen by the person.
 fn store_policy(
     library: &mut Library,
     identity: (u64, u64),
     mode: &str,
     expected: Option<&[i64]>,
+    adopted: bool,
 ) -> Result<Value, &'static str> {
     {
         let value = json!({"mode":mode,"revision":uuid::Uuid::new_v4().to_string(),"account":library.state(ACCOUNT_KEY).map_err(|_| "policy_unavailable")?,"state_identity":identity});
@@ -1239,6 +1261,13 @@ fn store_policy(
                         library.set_state(&sync::reread_key(&p.service), "1")?;
                     }
                 }
+                library.set_state(ADOPTED_KEY, if adopted { "1" } else { "" })?;
+                let set_aside = if adopted && !pending.is_empty() {
+                    pending.len().to_string()
+                } else {
+                    String::new()
+                };
+                library.set_state(SET_ASIDE_KEY, &set_aside)?;
                 library.set_state("mcp.policy", &value.to_string())
             })
             .map_err(|_| "policy_unavailable")?;
@@ -1274,7 +1303,7 @@ fn adopt_file_mode(
     {
         return Ok(false);
     }
-    store_policy(library, directory_identity(dir)?, mode, None)?;
+    store_policy(library, directory_identity(dir)?, mode, None, true)?;
     Ok(true)
 }
 
@@ -1462,7 +1491,7 @@ impl Server {
         }
         // The permissions file as it is now: a later deny refuses, and any edit since the
         // request makes it stale, as for other terminal requests.
-        let stored = policy(library, &dir)?.map(|(p, _)| p.mode);
+        let stored = stored_mode(library, &dir)?;
         let active = permissions::load(library, &dir, stored.as_deref())?;
         let mode = active.mode.clone();
         if gate_for(library, mode.as_deref(), &active, &tool, &proposal["args"])?.0 == Gate::Deny {
@@ -1815,7 +1844,7 @@ impl Server {
         let dir = held.path.clone();
         let library = self.ready(&held)?;
         let configured = policy(library, &dir)?;
-        let stored = configured.as_ref().map(|(p, _)| p.mode.clone());
+        let stored = stored_mode(library, &dir)?;
         let active = permissions::load(library, &dir, stored.as_deref())?;
         let configured = match configured {
             None if adopt_file_mode(library, &dir, &active)? => policy(library, &dir)?,
@@ -2299,6 +2328,22 @@ impl Server {
         if let Some(value) = result.as_mut().ok().filter(|v| v.is_object()) {
             if let Some(text) = active.fallback() {
                 value["permissions_file"] = json!(text);
+            }
+            // Said once: changes set aside when the file's mode was taken over.
+            let set_aside = library
+                .state(SET_ASIDE_KEY)
+                .map_err(|_| "library_unavailable")?
+                .and_then(|n| n.parse::<u64>().ok())
+                .filter(|n| *n > 0);
+            if let Some(n) = set_aside {
+                library
+                    .set_state(SET_ASIDE_KEY, "")
+                    .map_err(|_| "library_unavailable")?;
+                value["set_aside"] = json!(format!(
+                    "{n} waiting change{} set aside when the approval mode from permissions.yaml was first stored; none will be sent. To see them, run {} in your own terminal.",
+                    if n == 1 { " was" } else { "s were" },
+                    status::with_dir("skykeep-mcp quarantine", &dir)
+                ));
             }
         }
         result

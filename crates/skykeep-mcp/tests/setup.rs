@@ -1172,6 +1172,50 @@ async fn no_approval_mode_leaves_the_folder_without_a_policy_and_counts_as_done(
     );
 }
 
+/// Keeping the file's mode with Enter stores it without rewriting the file, and stops when
+/// the file changed while setup was asking.
+#[tokio::test]
+async fn keeping_the_files_mode_never_rewrites_the_file_and_stops_if_it_changed() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    let mut answers = folder_answers(&dir);
+    answers.push(Ask(""));
+    answers.extend(sign_in_answers());
+    answers.extend([Ask("4"), Ask("confirm")]);
+    ready(answers, &dir, &server).await;
+    let file = dir.join(skykeep_mcp::permissions::FILE_NAME);
+    let write = |path: &Path, text: &str| {
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    write(&file, "version: 1\napproval_mode: writes_only\n");
+    let edited = file.clone();
+    let mut answers = vec![Ask(""), Ask("2")];
+    answers.extend(sign_in_answers());
+    answers.push(AskAfter(
+        "",
+        Box::new(move || {
+            std::fs::write(&edited, "version: 1\napproval_mode: reads_and_writes\n").unwrap();
+        }),
+    ));
+    let mut script = Script::new(answers);
+    let error = run(&mut script, &dir, &server).await.unwrap_err();
+    assert!(error.contains("permissions.yaml changed"), "{error}");
+    assert!(policy_missing(&dir));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "version: 1\napproval_mode: reads_and_writes\n"
+    );
+    // Unchanged meanwhile: the mode is stored and the file left exactly as it was.
+    let mut answers = vec![Ask(""), Ask("2")];
+    answers.extend(sign_in_answers());
+    answers.push(Ask(""));
+    ready(answers, &dir, &server).await;
+    assert_eq!(policy(&dir)["mode"], "reads_and_writes");
+    assert!(!dir.join(skykeep_mcp::permissions::BACKUP_NAME).exists());
+}
+
 /// The count the person agreed to is checked again under the lock that sets changes aside.
 #[tokio::test]
 async fn changes_queued_during_the_confirmation_are_asked_about_again() {

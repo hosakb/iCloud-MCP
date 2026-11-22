@@ -207,9 +207,10 @@ pub(crate) fn record_authorization(
         .state("mcp.policy")
         .map_err(|_| "policy_unavailable")?
         .ok_or("policy_unavailable")?;
+    // No approval mode in force (a folder back to its setup choice) is recorded as "none".
     let mode = match mode {
-        Some(mode) => Some(mode.to_string()),
-        None => crate::mode_in_force(library, dir)?,
+        Some(mode) => mode.to_string(),
+        None => crate::mode_in_force(library, dir)?.unwrap_or_else(|| "none".into()),
     };
     let grant = json!({"policy":policy,"mode":mode,"pending":pending_value(p),
         "context":send_context(library,p)?});
@@ -266,10 +267,11 @@ fn authorization_check(
         return Err("write_authorization_stale");
     }
     // Queued under a looser mode than the one in force now: never sent.
-    let queued = grant["mode"].as_str().unwrap_or(&stored.mode);
+    let queued = grant["mode"].as_str().unwrap_or(&stored.mode).to_string();
+    let queued = (queued != "none").then_some(queued);
     let now = crate::mode_in_force(library, dir)?;
     if crate::permissions::mode_rank(now.as_deref(), false)
-        > crate::permissions::mode_rank(Some(queued), false)
+        > crate::permissions::mode_rank(queued.as_deref(), false)
     {
         return Err("write_mode_stricter");
     }

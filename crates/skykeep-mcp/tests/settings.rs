@@ -738,3 +738,58 @@ async fn a_mode_in_the_file_binds_queued_writes_in_a_folder_without_a_stored_mod
         refused.iter().map(|r| &r.reason).collect::<Vec<_>>()
     );
 }
+
+/// A mode taken over from the file counts only while the file names one: once the line is
+/// gone, the folder is back to its setup choice (here no approval mode, with every change
+/// asking), and the change is listed as stricter.
+#[tokio::test]
+async fn a_mode_taken_from_the_file_stops_counting_when_its_line_is_removed() {
+    let mut f = folder(None).await;
+    let dir = f.path();
+    f.library
+        .set_state(skykeep_mcp::status::NO_MODE_KEY, "1")
+        .unwrap();
+    f.library
+        .set_state("mcp.require_write_approval", "true")
+        .unwrap();
+    write_file(&dir, "version: 1\napproval_mode: yolo\n");
+    assert!(!asks(&mut f, 1, "reminders_lists", json!({})).await);
+    let create = json!({"action":"create","list_guid":"list","title":"Synthetic"});
+    assert!(!asks(&mut f, 2, "reminders_write", create.clone()).await);
+    permissions::show(&dir, true).unwrap();
+    write_file(&dir, "version: 1\n");
+    assert!(asks(&mut f, 3, "reminders_write", create).await);
+    let shown = permissions::show(&dir, true).unwrap();
+    assert!(
+        shown.contains("stricter: approval mode: yolo before, now none"),
+        "{shown}"
+    );
+}
+
+/// Changes waiting from before a mode was taken over from the file are set aside, and the
+/// tool result says where to see them.
+#[tokio::test]
+async fn taking_over_the_files_mode_says_where_set_aside_changes_are() {
+    let mut f = folder(None).await;
+    let dir = f.path();
+    let create = json!({"action":"create","list_guid":"list","title":"Waiting"});
+    assert!(!asks(&mut f, 1, "reminders_write", create).await);
+    write_file(&dir, "version: 1\napproval_mode: writes_only\n");
+    let reply = f
+        .server
+        .handle(call(2, "reminders_lists", json!({})))
+        .await
+        .unwrap();
+    let body: Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let notice = body["set_aside"].as_str().unwrap_or_default();
+    assert!(notice.contains("1 waiting change"), "{body}");
+    assert!(notice.contains("skykeep-mcp quarantine"), "{body}");
+    // Said once.
+    let reply = f
+        .server
+        .handle(call(3, "reminders_lists", json!({})))
+        .await
+        .unwrap();
+    assert!(!reply.to_string().contains("set_aside"), "{reply}");
+}

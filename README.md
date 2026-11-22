@@ -303,7 +303,7 @@ rules:
     ask: client
 ```
 
-- `approval_mode:` replaces the mode chosen in setup. The modes are the ones in the table under "Get started". Every deletion, move to Recently Deleted and move or rename of a large Drive folder still asks on the card in every mode. Without the line, the mode from setup applies.
+- `approval_mode:` replaces the mode chosen in setup. The modes are the ones in the table under "Get started". Every deletion, move to Recently Deleted and move or rename of a large Drive folder still asks on the card in every mode. Without the line, the mode from setup applies. In a folder where setup stored no mode, the first tool call after sign-in stores the file's mode so that queued changes are bound to it, and sets aside changes already waiting (`skykeep-mcp quarantine` lists them). That stored mode still counts only while the line is there.
 - `exchange_folder:` names the exchange folder (see "The exchange folder" for the checks). Without the line, the folder set up with `skykeep-mcp exchange` applies, if there is one.
 
 A line in the file wins. `skykeep-mcp policy` and `skykeep-mcp exchange` still work: each changes its line in the file, keeps every other line and comment, keeps the previous file as `permissions.yaml.bak` and writes the new one in one step with mode 600. A file with a mistake is left alone, and the command changes nothing and says what to fix. An edit counts at the next tool call, like a rule. A broken file keeps the last valid settings; if there are none, the mode from setup and the folder from `skykeep-mcp exchange` stay. `status` and `permissions show` say which mode and folder are in use and where each comes from.
