@@ -16,6 +16,6 @@ MCP read tools return local note and reminder content to the client that invoked
 
 Writes first enter the local outbox. The next successful sync can send them to Apple. Under the default policy routine writes need no human approval and have no volume limit. Destructive writes require a trusted-terminal approval. Use `require-approval --state-dir DIR` to require approval for every write.
 
-Approval does not protect local data from software running as the state owner. In particular, an agent with shell access can read the cache or bypass terminal-helper guards. See [SECURITY.md](SECURITY.md) and the [MCP reference](crates/skykeep-mcp/README.md).
+Approval does not protect local data from software running as the state owner. In particular, an agent with shell access can read the cache or bypass terminal-helper guards. See [SECURITY.md](SECURITY.md) and the [README](README.md).
 
 Do not include account identifiers, tokens, note content or personal reminder data in public bug reports, logs or test fixtures.
