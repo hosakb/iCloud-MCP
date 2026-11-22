@@ -724,8 +724,16 @@ fn diff(
         }
         let action = t.action.as_deref();
         let default = default_effect(mode, require_all, &t.tool, action);
-        let before = rule_for(old, &t.tool, action).unwrap_or(default);
-        let after = rule_for(new, &t.tool, action).unwrap_or(default);
+        // The invitations rule counts only under its own name, as the server reads it.
+        let rule = |rules: &Rules| {
+            if is_invitations(&t.tool, action) {
+                rules.get(&t.name).copied()
+            } else {
+                rule_for(rules, &t.tool, action)
+            }
+        };
+        let before = rule(old).unwrap_or(default);
+        let after = rule(new).unwrap_or(default);
         // Compared as the server really runs them.
         let really = |e: Effect| match action {
             Some(a) => runs_as(mode, &t.tool, a, e).0,
@@ -1079,6 +1087,9 @@ fn described(name: &str, effect: Effect, mode: Option<&str>) -> String {
                 really.sentence()
             )
         }
+        _ if tool_floored && target.is_some_and(|t| t.tool == crate::calendar_write::TOOL) => {
+            format!("{plain}, except deletions, which still ask; changes that would notify invited people stay refused unless {} is allow", crate::calendar_write::INVITATIONS_RULE)
+        }
         _ if tool_floored => format!("{plain}, except deletions, which still ask"),
         _ if drive
             && effect == Effect::Allow
@@ -1305,7 +1316,12 @@ pub fn starter(mode: Option<&str>, dir: &Path) -> String {
             out.push_str(&format!("  {}:\n    ask: {ask}\n", t.name));
         }
     }
-    out.push_str("  # reminders_write.create: allow\n#\n# Names you can use:\n");
+    out.push_str("  # reminders_write.create: allow\n");
+    out.push_str(&format!(
+        "#\n# {}: takes allow or deny only; a tool-wide calendar_write: allow does not enable it.\n",
+        crate::calendar_write::INVITATIONS_RULE
+    ));
+    out.push_str("#\n# Names you can use:\n");
     for name in names() {
         out.push_str(&format!("#   {name}\n"));
     }

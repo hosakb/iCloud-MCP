@@ -8,7 +8,9 @@
 //!
 //! Versions. update, move and delete name the event's `etag` as `calendar_get` shows it. The
 //! call is refused when the cache holds another version, and again when Apple's copy is not
-//! that version any more, so a change made on another device is never written over.
+//! that version any more, so a change made on another device is never written over. Between
+//! that last read and the save, the guard is Apple's own check of the etag sent in the save's
+//! body (a 409 or 412 answer); that Apple enforces it there is not confirmed against Apple.
 //!
 //! Repeating events. One occurrence (an id `<series>__<start>`) is changed only with `scope`
 //! said: `this_occurrence` or `whole_series`. There is no default. An event that repeats but
@@ -16,7 +18,8 @@
 //! `whole_series`.
 //!
 //! Times need an explicit zone: an offset (`2026-03-29T09:30:00+02:00`, `...Z`) or a local
-//! time with `timezone` (an IANA name such as Europe/Berlin). A local time the clocks skip
+//! time with `timezone` (an IANA name such as Europe/Berlin). A new event given only offset
+//! times, with no `timezone`, is kept in UTC. A local time the clocks skip
 //! is refused, and so is one they pass twice unless an offset says which. All-day events take
 //! dates, the end being the day after the last.
 //!
@@ -66,6 +69,13 @@ const NOT_CONFIRMED: &str = "calendar_write_not_confirmed_run_calendar_refresh";
 const READ_FAILED: &str = "calendar_read_failed_nothing_sent";
 const GONE: &str = "not_found_at_apple_run_calendar_refresh";
 const SECOND_PASS: &str = "time_in_the_repeated_hour_apple_keeps_only_the_first";
+const TIMEZONE_REQUIRED: &str = "timezone_required";
+const START_REQUIRED: &str = "start_required";
+const MOVE_SCOPE: &str = "move_needs_scope_whole_series";
+const NOT_REPEATING: &str = "not_a_repeating_event_leave_out_scope";
+const EVENT_NOT_FOUND: &str = "event_not_found_run_calendar_refresh";
+/// Characters of the notes a preview shows.
+const NOTES_SHOWN: usize = 200;
 
 const MAX_TITLE_BYTES: usize = 1024;
 const MAX_LOCATION_BYTES: usize = 1024;
@@ -268,7 +278,7 @@ pub(crate) fn validate(args: &Value) -> Result<CalendarWrite, &'static str> {
     match op.action {
         Action::Create => {
             if op.guid.is_some() || op.etag.is_some() || op.scope.is_some() {
-                return Err("invalid_arguments");
+                return Err("create_takes_no_guid_etag_or_scope");
             }
             if op.calendar_guid.is_none() {
                 return Err("calendar_guid_required");
@@ -277,7 +287,7 @@ pub(crate) fn validate(args: &Value) -> Result<CalendarWrite, &'static str> {
                 return Err("title_required");
             }
             if op.start.is_none() {
-                return Err(INVALID_START);
+                return Err(START_REQUIRED);
             }
         }
         Action::Update | Action::Move | Action::Delete => {
@@ -307,13 +317,15 @@ pub(crate) fn validate(args: &Value) -> Result<CalendarWrite, &'static str> {
                     if op.changes_fields() {
                         return Err("invalid_arguments_move_changes_only_the_calendar");
                     }
-                    if op.scope == Some(Repeat::ThisOccurrence) {
-                        return Err("move_of_one_occurrence_not_supported_use_whole_series");
+                    if op.scope == Some(Repeat::ThisOccurrence)
+                        || (is_occurrence(guid) && op.scope.is_none())
+                    {
+                        return Err(MOVE_SCOPE);
                     }
                 }
                 _ => {
                     if op.calendar_guid.is_some() || op.changes_fields() {
-                        return Err("invalid_arguments");
+                        return Err("delete_takes_only_guid_etag_and_scope");
                     }
                 }
             }
@@ -434,7 +446,7 @@ fn times_for(
             }
             (Some(When::Day(s)), None, _) => (s, s + 1),
             (None, Some(When::Day(e)), Some(b)) if b.all_day => (day_of(b.starts_at), e),
-            _ => return Err(INVALID_START),
+            _ => return Err(START_REQUIRED),
         };
         if last <= first {
             return Err("end_must_be_after_start");
@@ -448,9 +460,14 @@ fn times_for(
             None,
         ));
     }
+    // Offsets alone fix the instants: with no zone given or held, the event is kept in UTC.
+    let offsets_only = [start, end]
+        .iter()
+        .all(|w| !matches!(w, Some(When::Local(_))));
     let zone_name = match (&op.timezone, before) {
         (Some(z), _) => Some(z.clone()),
-        (None, Some(b)) if !b.all_day => b.timezone.clone(),
+        (None, Some(b)) if !b.all_day && b.timezone.is_some() => b.timezone.clone(),
+        _ if offsets_only => Some("UTC".to_string()),
         _ => None,
     };
     let zone = match &zone_name {
@@ -460,7 +477,7 @@ fn times_for(
     let instant = |w: When, bad: &'static str| -> Result<i64, &'static str> {
         match w {
             When::Instant(at) => Ok(at),
-            When::Local(wall) => placed(wall, zone.as_ref().ok_or("timezone_required")?)
+            When::Local(wall) => placed(wall, zone.as_ref().ok_or(TIMEZONE_REQUIRED)?)
                 .map_err(|e| if e == INVALID_START { bad } else { e }),
             When::Day(_) => Err(bad),
         }
@@ -477,7 +494,7 @@ fn times_for(
             (s, s + 3600)
         }
         (None, Some(e), Some(b)) => (b.starts_at, instant(e, INVALID_END)?),
-        _ => return Err(INVALID_START),
+        _ => return Err(START_REQUIRED),
     };
     if ends < starts {
         return Err("end_must_be_after_start");
@@ -495,7 +512,7 @@ fn times_for(
         }
     }
     // A timed event is written with its zone: without one Apple would keep it as floating.
-    let name = zone_name.ok_or("timezone_required")?;
+    let name = zone_name.ok_or(TIMEZONE_REQUIRED)?;
     let name = zone.and_then(|z| z.name).unwrap_or(name);
     Ok((starts, ends, Some(name)))
 }
@@ -522,6 +539,18 @@ fn writable(calendars: &[Calendar], guid: &str) -> Result<Calendar, &'static str
         return Err("calendar_read_only");
     }
     Ok(calendar.clone())
+}
+
+/// Whether an update leaves every field it can change as it was.
+fn same_fields(a: &Event, b: &Event) -> bool {
+    a.title == b.title
+        && a.location == b.location
+        && a.notes == b.notes
+        && a.url == b.url
+        && a.starts_at == b.starts_at
+        && a.ends_at == b.ends_at
+        && a.all_day == b.all_day
+        && a.timezone == b.timezone
 }
 
 fn changed_text(new: &Option<String>, old: &Option<String>) -> Option<String> {
@@ -567,9 +596,9 @@ fn plan(library: &Library, op: &CalendarWrite) -> Result<Plan, &'static str> {
     let before = library
         .event(guid)
         .map_err(|_| "library_unavailable")?
-        .ok_or("not_found")?;
+        .ok_or(EVENT_NOT_FOUND)?;
     if !calendars.iter().any(|c| c.guid == before.calendar_guid) {
-        return Err("not_found");
+        return Err(EVENT_NOT_FOUND);
     }
     let calendar = writable(&calendars, &before.calendar_guid)?;
     match before.etag.as_deref() {
@@ -583,12 +612,24 @@ fn plan(library: &Library, op: &CalendarWrite) -> Result<Plan, &'static str> {
         Action::Update => {
             let all_day = op.all_day.unwrap_or(before.all_day);
             if all_day != before.all_day && op.start.is_none() {
-                return Err(INVALID_START);
+                return Err("start_required_to_change_all_day");
             }
-            if op.timezone.is_some() && op.start.is_none() && op.end.is_none() {
+            // A zone the same as the event's, or all_day as it is, changes nothing.
+            let canonical = |z: &str| {
+                calendar::zone(z)
+                    .and_then(|z| z.name)
+                    .unwrap_or_else(|| z.to_string())
+            };
+            let zone_changes = !all_day
+                && op.timezone.as_deref().is_some_and(|z| {
+                    Some(canonical(z)) != before.timezone.as_deref().map(canonical)
+                });
+            if zone_changes && op.start.is_none() && op.end.is_none() {
                 return Err("give_start_to_change_the_timezone");
             }
-            let (starts_at, ends_at, timezone) = if op.changes_time() {
+            let time_changes =
+                op.start.is_some() || op.end.is_some() || all_day != before.all_day || zone_changes;
+            let (starts_at, ends_at, timezone) = if time_changes {
                 times_for(op, all_day, Some(&before))?
             } else {
                 (before.starts_at, before.ends_at, before.timezone.clone())
@@ -606,6 +647,9 @@ fn plan(library: &Library, op: &CalendarWrite) -> Result<Plan, &'static str> {
                 notes: changed_text(&op.notes, &before.notes),
                 etag: before.etag.clone(),
             })
+            .filter(|after| !same_fields(after, &before) || op.alerts.is_some())
+            .map(Some)
+            .ok_or("nothing_to_change")?
         }
         Action::Move => {
             let destination =
@@ -657,10 +701,24 @@ fn when_view(e: &Event) -> Value {
     }
 }
 
+/// Notes as shown: the first `NOTES_SHOWN` characters, with how many more there are, and a
+/// fingerprint of all of them, so an approval is bound to the whole text.
+fn notes_view(notes: &str) -> Value {
+    let count = notes.chars().count();
+    let mut text = shown(notes, NOTES_SHOWN);
+    if count > NOTES_SHOWN {
+        text.push_str(&format!(" ({} more characters)", count - NOTES_SHOWN));
+    }
+    json!({"text":text,"characters":count,
+        "fingerprint":quince_sync::queue::account_tag(&format!("skykeep-calendar-notes:{notes}"))})
+}
+
 fn event_view(e: &Event) -> Value {
     let mut v = json!({
-        "title": shown(&e.title, SHOWN_CHARS),
-        "location": e.location.as_deref().map(|l| shown(l, SHOWN_CHARS)),
+        "title": shown(&e.title, MAX_TITLE_BYTES),
+        "location": e.location.as_deref().map(|l| shown(l, MAX_LOCATION_BYTES)),
+        "notes": e.notes.as_deref().map(notes_view),
+        "url": e.url.as_deref().map(|u| shown(u, MAX_URL_BYTES)),
         "when": when_view(e),
     });
     if !e.guid.is_empty() {
@@ -673,14 +731,38 @@ fn event_view(e: &Event) -> Value {
     v
 }
 
+/// Each field of an update: `unchanged`, `removed`, or the new value.
+fn changes_view(before: &Value, after: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    for field in ["title", "location", "notes", "url", "when"] {
+        let (old, new) = (&before[field], &after[field]);
+        out.insert(
+            field.into(),
+            if old == new {
+                json!("unchanged")
+            } else if new.is_null() {
+                json!("removed")
+            } else {
+                json!({"new": new})
+            },
+        );
+    }
+    Value::Object(out)
+}
+
 fn calendar_view(c: &Calendar) -> Value {
     json!({"guid":c.guid,"title":shown(&c.title, SHOWN_CHARS)})
 }
 
-/// What the approval shows and is bound to: the action and what it reaches as cached. The
-/// same arguments over the same cache give the same preview, so a change in between makes an
-/// approval stale.
-pub(crate) fn preview(library: &Library, args: &Value) -> Result<Value, &'static str> {
+/// What the approval shows and is bound to: the action and what it reaches as cached, and
+/// whether the rules in force let it reach invited people (`invitations`). The same
+/// arguments over the same cache and rules give the same preview, so a change in between
+/// makes an approval stale.
+pub(crate) fn preview(
+    library: &Library,
+    args: &Value,
+    invitations: bool,
+) -> Result<Value, &'static str> {
     let op = validate(args)?;
     let plan = plan(library, &op)?;
     let mut value = json!({
@@ -699,24 +781,36 @@ pub(crate) fn preview(library: &Library, args: &Value) -> Result<Value, &'static
         matches!(op.action, Action::Create | Action::Update),
     ) {
         value["result"] = event_view(after);
+        if plan.before.is_some() {
+            value["changes"] = changes_view(&value["event"], &value["result"]);
+        }
+    }
+    if op.action == Action::Create && op.end.is_none() {
+        value["end_default"] = json!(if op.all_day == Some(true) {
+            "one day: the event ends at the start of the next day"
+        } else {
+            "one hour after the start"
+        });
     }
     if let Some(scope) = op.scope {
         value["scope"] = json!(scope.as_str());
     }
-    value["alerts"] = match &op.alerts {
-        Some(alerts) if alerts.is_empty() => json!("all removed"),
-        Some(alerts) => json!({"minutes_before_start": alerts}),
-        None if op.action == Action::Create => json!("none"),
-        None => json!("kept as Apple has them"),
-    };
+    if matches!(op.action, Action::Create | Action::Update) {
+        value["alerts"] = match &op.alerts {
+            Some(alerts) if alerts.is_empty() => json!("all removed"),
+            Some(alerts) => json!({"minutes_before_start": alerts}),
+            None if op.action == Action::Create => json!("none"),
+            None => json!("kept as Apple has them"),
+        };
+    }
     let what = match op.action {
         Action::Delete => "a cancellation",
-        _ => "an updated invitation",
+        _ => "an update",
     };
-    value["invitations"] = json!(if op.action == Action::Create {
-        "none: calendar_write never adds attendees, so nobody is invited".to_string()
-    } else {
-        format!("Skykeep reads the event's attendees from Apple just before the change. If other people are invited, Apple sends each of them {what}. That is refused before anything is sent unless permissions.yaml sets {INVITATIONS_RULE}: allow.")
+    value["invitations"] = json!(match (op.action, invitations) {
+        (Action::Create, _) => "calendar_write adds no attendees. If the calendar is shared, its members see the new event; the cache does not say whether it is shared.".to_string(),
+        (_, true) => format!("Skykeep reads the event's attendees from Apple just before the change. If other people are invited, Apple emails each of them {what}, because permissions.yaml sets {INVITATIONS_RULE}: allow. Members of a shared calendar see the change too."),
+        (_, false) => format!("Skykeep reads the event's attendees from Apple just before the change. If other people are invited, the change is refused before anything is sent, because permissions.yaml does not set {INVITATIONS_RULE}: allow. Members of a shared calendar see the change."),
     });
     value["effect"] = json!(match (op.action, op.scope) {
         (Action::Create, _) => "adds one new event",
@@ -760,7 +854,27 @@ pub(crate) fn plain_preview(preview: &Value) -> String {
             )
         }
     };
-    let event = |e: &Value| format!("{}, {}", text(&e["title"]), when(&e["when"]));
+    let field = |e: &Value, name: &str| -> String {
+        match name {
+            "when" => when(&e["when"]),
+            "notes" => text(&e["notes"]["text"]),
+            _ => text(&e[name]),
+        }
+    };
+    let event = |lines: &mut Vec<String>, label: &str, e: &Value| {
+        lines.push(format!("{label}:"));
+        for (name, shown) in [
+            ("title", "Title"),
+            ("when", "When"),
+            ("location", "Location"),
+            ("notes", "Notes"),
+            ("url", "URL"),
+        ] {
+            if !e[name].is_null() {
+                lines.push(format!("  {shown}: {}", field(e, name)));
+            }
+        }
+    };
     let mut lines = vec![format!(
         "Calendar change: {}{}",
         text(&preview["action"]),
@@ -772,10 +886,26 @@ pub(crate) fn plain_preview(preview: &Value) -> String {
     )];
     lines.push(format!("What it does: {}", text(&preview["effect"])));
     if preview["event"].is_object() {
-        lines.push(format!("Event now: {}", event(&preview["event"])));
+        event(&mut lines, "Event now", &preview["event"]);
     }
-    if preview["result"].is_object() {
-        lines.push(format!("Event after: {}", event(&preview["result"])));
+    if let Some(changes) = preview["changes"].as_object() {
+        lines.push("Changes:".into());
+        for (name, change) in changes {
+            let shown = match change.as_str() {
+                Some(word) => word.to_string(),
+                None => match name.as_str() {
+                    "when" => when(&change["new"]),
+                    "notes" => text(&change["new"]["text"]),
+                    _ => text(&change["new"]),
+                },
+            };
+            lines.push(format!("  {name}: {shown}"));
+        }
+    } else if preview["result"].is_object() {
+        event(&mut lines, "New event", &preview["result"]);
+    }
+    if preview["end_default"].is_string() {
+        lines.push(format!("End: {}", text(&preview["end_default"])));
     }
     if preview["from_calendar"].is_object() {
         lines.push(format!(
@@ -807,11 +937,21 @@ pub(crate) fn next_step(error: &str) -> Option<String> {
         CHANGED | "etag_not_current_run_calendar_get" | "event_version_unknown_run_calendar_refresh" => "The event is not the version this change was made for. Run calendar_refresh over its days, read it again with calendar_get, and decide again with its current etag.".into(),
         ATTENDEES => format!("Other people are invited to this event, and the change would send them an update or a cancellation. Nothing was sent. To let such changes run, the person sets {INVITATIONS_RULE}: allow in permissions.yaml in their own terminal; otherwise make the change in Apple Calendar."),
         SCOPE_REQUIRED => "This is a repeating event. Ask again with scope: this_occurrence (one occurrence, by its occurrence guid) or scope: whole_series (every occurrence).".into(),
-        INVALID_START | INVALID_END | "timezone_required" => format!("The date or time could not be read. {TIME_FORMAT}"),
+        MOVE_SCOPE => "Only a whole series can move to another calendar. Ask again with scope: whole_series.".into(),
+        NOT_REPEATING => "This event does not repeat. Ask again without scope.".into(),
+        INVALID_START | INVALID_END => format!("The date or time could not be read. {TIME_FORMAT}"),
+        TIMEZONE_REQUIRED => "A local time without an offset needs timezone, an IANA name such as Europe/Berlin, to say where that clock time is. Either add timezone, or give start and end with offsets such as 2026-03-29T09:30:00+02:00; with offsets alone the event is kept in UTC.".into(),
+        START_REQUIRED => format!("Give start as well. {TIME_FORMAT}"),
+        "start_required_to_change_all_day" => "Switching between an all-day and a timed event needs a new start: a date such as 2026-03-29 for all_day: true, or a time with an offset or timezone for all_day: false.".into(),
         "time_does_not_exist_in_timezone_clocks_skip_it" => format!("The clocks skip that local time in that zone (a daylight saving change), so no such time exists there. Pick another time. {TIME_FORMAT}"),
-        "time_is_ambiguous_in_timezone_give_an_offset" => "The clocks pass that local time twice in that zone (a daylight saving change). Give it with its offset, such as 2026-10-25T02:30:00+02:00 in Europe/Berlin for the first one.".into(),
+        "time_is_ambiguous_in_timezone_give_an_offset" => "The clocks pass that local time twice in that zone (a daylight saving change). Only the first pass can be kept: give it with that pass's offset, such as 2026-10-25T02:30:00+02:00 in Europe/Berlin.".into(),
         SECOND_PASS => "Apple keeps an event's time as the clock reads in its zone, and in the hour the clocks pass twice that reading means the first pass. A time in the second pass can't be kept. Pick a time outside that hour, or give the event in another zone such as UTC.".into(),
         "give_start_to_change_the_timezone" => "A new timezone changes when the event happens. Give start (and end, if it changes) in the new zone.".into(),
+        "create_takes_no_guid_etag_or_scope" => "A create makes a new event, so it takes no guid, etag or scope. Leave them out, or use update for an existing event.".into(),
+        "delete_takes_only_guid_etag_and_scope" => "A delete takes only guid, etag and, for a repeating event, scope. Leave the other fields out.".into(),
+        "calendar_not_found" => "No iCloud calendar with that guid is in the cache. Run calendar_calendars to see the guids; if the calendar is new, run calendar_refresh first.".into(),
+        EVENT_NOT_FOUND => "No event with that guid is in the cache. Run calendar_refresh over its days, then find it with calendar_events or calendar_search and read it with calendar_get.".into(),
+        "nothing_to_change" => "The update gives no field that differs from the event as it is. Give the fields to change.".into(),
         _ => return None,
     })
 }
@@ -1023,15 +1163,17 @@ async fn act(
     if now.etag != before.etag {
         return Err(CHANGED);
     }
-    if !is_occurrence(&before.guid)
-        && scope.is_none()
-        && api
+    if !is_occurrence(&before.guid) {
+        let repeats = api
             .repeat_of(before)
             .await
             .map_err(|e| read_error(&e))?
-            .is_some()
-    {
-        return Err(SCOPE_REQUIRED);
+            .is_some();
+        match (repeats, scope.is_some()) {
+            (true, false) => return Err(SCOPE_REQUIRED),
+            (false, true) => return Err(NOT_REPEATING),
+            _ => {}
+        }
     }
     let guests = api.guests(before).await.map_err(|e| read_error(&e))?;
     let others = guests.iter().filter(|g| !g.is_me).count();
@@ -1059,7 +1201,8 @@ async fn act(
             }
             .map_err(|e| write_error(&e))?;
             if series {
-                // The series' own dates moved with it: what the cache holds is out of date.
+                // Every cached occurrence of the series is out of date now.
+                effects.forget_series = Some(series_of(&before.guid).to_string());
                 effects.forget.push(before.guid.clone());
                 json!({
                     "outcome": "done",
@@ -1121,17 +1264,42 @@ async fn act(
     Ok(value)
 }
 
-/// Reads the event back from Apple after a save and says what was checked. The cache gets
-/// Apple's copy, or, when it can't be read, the event without a version, so the next change
-/// asks for a refresh first.
+/// The day Apple is asked about for an event, as the engine asks: in the event's own zone,
+/// or for an all-day or floating one in this computer's.
+fn day_asked(e: &Event) -> String {
+    let zone = match e.timezone.as_deref() {
+        Some(name) if !e.all_day => calendar::zone(name).map_or(jiff::tz::TimeZone::UTC, |z| z.tz),
+        _ => jiff::tz::TimeZone::system(),
+    };
+    calendar::day_text(wall_clock(e.starts_at, &zone).div_euclid(DAY))
+}
+
+/// Reads the event back from Apple after a save and says what was checked. Only an event
+/// Apple returns under the very id asked about counts: for one occurrence Apple may answer
+/// with its series alone, which says nothing about the occurrence. The cache gets Apple's
+/// copy, or, when it can't be confirmed, the event without a version, so the next change asks
+/// for a refresh first.
 async fn read_back(api: &CalendarClient<'_>, asked: &Event, effects: &mut Effects) -> Value {
     let event = json!({"guid": asked.guid, "title": shown(&asked.title, SHOWN_CHARS), "calendar_guid": asked.calendar_guid});
-    match api.current_event(asked).await {
+    let found = api
+        .event_detail_body(asked, &day_asked(asked))
+        .await
+        .map(|body| {
+            body.and_then(|body| {
+                quince_icloud::calendar::parse_snapshot(&body)
+                    .events
+                    .into_iter()
+                    .find(|e| e.guid == asked.guid)
+            })
+        });
+    match found {
         Ok(Some(apple)) if same(&apple, asked) => {
+            let etag = apple.etag.clone();
             effects.put.push(apple);
             json!({
                 "outcome": "done",
                 "event": event,
+                "etag": etag,
                 "checked": "the event was read back from Apple with this title, these times and this calendar",
                 "remote_verified": true,
             })
@@ -1145,7 +1313,7 @@ async fn read_back(api: &CalendarClient<'_>, asked: &Event, effects: &mut Effect
                 "event": event,
                 "checked": match other {
                     Ok(Some(_)) => "Apple accepted the change, but its copy read back differs; run calendar_refresh and look at it",
-                    Ok(None) => "Apple accepted the change, but reading it back did not show the event yet; run calendar_refresh and look at it",
+                    Ok(None) => "Apple accepted the change, but reading it back did not show this event under its own id; run calendar_refresh and look at it",
                     Err(_) => "Apple accepted the change; reading it back failed",
                 },
                 "remote_verified": false,
@@ -1159,7 +1327,7 @@ pub(crate) fn tool() -> Value {
     let time = |what: &str| json!({"description": format!("{what} 2026-03-29T09:30:00+02:00, 2026-03-29T07:30:00Z, or 2026-03-29T09:30:00 with timezone. All-day: a date such as 2026-03-29."), "type":"string","minLength":10,"maxLength":MAX_TIME_BYTES});
     json!({
         "name": TOOL,
-        "description": "Change the user's Apple iCloud Calendar: create (calendar_guid, title, start, optional end, all_day, timezone, location, notes, url, alerts), update (guid and etag from calendar_get, and the fields to change), move (guid, etag, calendar_guid of another calendar) and delete (guid, etag). Times need an offset or timezone (an IANA name); a local time the clocks skip or pass twice is refused. All-day events take dates, end being the day after the last. A repeating event needs scope: this_occurrence or whole_series; there is no default. A change to an event whose version changed since calendar_get is refused. An event with other people invited is refused unless the user has allowed, in their own terminal, changes that send those people an update. Deletes always need the user's approval. The reply says done and whether Apple's copy was read back (remote_verified), or an error; an unknown outcome means run calendar_refresh and look before trying again.",
+        "description": "Change the user's Apple iCloud Calendar: create (calendar_guid, title, start, optional end, all_day, timezone, location, notes, url, alerts), update (guid and etag from calendar_get, and the fields to change), move (guid, etag, calendar_guid of another calendar) and delete (guid, etag). Times need an offset or timezone (an IANA name); a create with offset times and no timezone is kept in UTC. A local time the clocks skip is refused; in the hour they pass twice, only the first pass can be kept, given with its offset. All-day events take dates, end being the day after the last (default one day). calendar_write adds no attendees; members of a shared calendar see changes. A repeating event needs scope: this_occurrence or whole_series; there is no default. A change to an event whose version changed since calendar_get is refused. An event with other people invited is refused unless the user has allowed, in their own terminal, changes that send those people an update. Deletes always need the user's approval. The reply says done and whether Apple's copy was read back (remote_verified), or an error; an unknown outcome means run calendar_refresh and look before trying again.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1167,14 +1335,14 @@ pub(crate) fn tool() -> Value {
                 "guid": {"description": "Event guid from calendar_events, calendar_search or calendar_get. For one occurrence of a repeating event, its occurrence guid.", "type":"string","minLength":1,"maxLength":calendar::MAX_GUID_BYTES},
                 "etag": {"description": "The event's etag from calendar_get: the version this change is for.", "type":"string","minLength":1,"maxLength":MAX_ETAG_BYTES},
                 "calendar_guid": {"description": "create: the calendar to add the event to; move: the calendar to move it into. From calendar_calendars.", "type":"string","minLength":1,"maxLength":calendar::MAX_GUID_BYTES},
-                "title": {"type":"string","minLength":1,"maxLength":MAX_TITLE_BYTES},
+                "title": {"description": "The event's name. Required for create.", "type":"string","minLength":1,"maxLength":MAX_TITLE_BYTES},
                 "location": {"description": "Empty string removes it.", "type":"string","maxLength":MAX_LOCATION_BYTES},
                 "notes": {"description": "Empty string removes them.", "type":"string","maxLength":MAX_NOTES_BYTES},
                 "url": {"description": "Empty string removes it.", "type":"string","maxLength":MAX_URL_BYTES},
                 "start": time("Start, such as"),
-                "end": time("End (default: one hour after start, or the same length as before), such as"),
-                "all_day": {"type":"boolean"},
-                "timezone": {"description": "IANA zone name such as Europe/Berlin: the zone a timed event lives in and local times are read in. update: default the event's own.", "type":"string","minLength":1,"maxLength":calendar::MAX_ZONE_BYTES},
+                "end": time("End (default: one hour after start, one day for all-day, or for update the same length as before), such as"),
+                "all_day": {"description": "true for an all-day event: start and end are dates, and end defaults to the day after start. Default false, or for update the event's own.", "type":"boolean"},
+                "timezone": {"description": "IANA zone name such as Europe/Berlin: the zone a timed event lives in and local times are read in. create: needed for a local time; without it, offset times keep the event in UTC. update: default the event's own.", "type":"string","minLength":1,"maxLength":calendar::MAX_ZONE_BYTES},
                 "alerts": {"description": "Alerts in minutes before the start, 0 at the start. update: replaces all alerts; [] removes them; omit to keep them.", "type":"array","maxItems":MAX_ALERTS,"items":{"type":"integer","minimum":0,"maximum":MAX_ALERT_MINUTES}},
                 "scope": {"description": "For a repeating event: this_occurrence (only with an occurrence guid) or whole_series. Required for a repeating event; no default.", "enum":["this_occurrence","whole_series"]},
             },

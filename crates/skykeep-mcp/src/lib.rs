@@ -615,7 +615,12 @@ pub(crate) fn needs_consent(mode: &str, name: &str) -> Result<bool, &'static str
     }
 }
 
-fn resolved_snapshot(library: &Library, name: &str, args: &Value) -> Result<Value, &'static str> {
+fn resolved_snapshot(
+    library: &Library,
+    name: &str,
+    args: &Value,
+    active: &permissions::Active,
+) -> Result<Value, &'static str> {
     if name == drive_write::TOOL {
         // Drive has no queue: the preview of what the action reaches is the whole context.
         let snapshot = json!({"drive": drive_write::preview(library, args)?});
@@ -623,7 +628,11 @@ fn resolved_snapshot(library: &Library, name: &str, args: &Value) -> Result<Valu
         return Ok(snapshot);
     }
     if name == calendar_write::TOOL {
-        let snapshot = json!({"calendar": calendar_write::preview(library, args)?});
+        let snapshot = json!({"calendar": calendar_write::preview(
+            library,
+            args,
+            permissions::invitations_allowed(active),
+        )?});
         bounded_value(&snapshot, MAX_ARGUMENT_BYTES)?;
         return Ok(snapshot);
     }
@@ -856,7 +865,20 @@ impl Server {
                     return Ok(Some(binding));
                 }
             }
-            binding.snapshot = Some(resolved_snapshot(library, name, &params["arguments"])?);
+            binding.snapshot = Some(resolved_snapshot(
+                library,
+                name,
+                &params["arguments"],
+                &active,
+            )?);
+        } else if name == calendar_write::TOOL {
+            // A new event has no cached item, but its preview says what the card approves.
+            binding.snapshot = Some(resolved_snapshot(
+                library,
+                name,
+                &params["arguments"],
+                &active,
+            )?);
         }
         self.always_blocked = blocked;
         Ok(Some(binding))
@@ -1163,14 +1185,16 @@ impl Server {
             return Err("approval_policy_changed");
         }
         if tool == calendar_write::TOOL {
-            if calendar_write::preview(library, &proposal["args"])? != proposal["preview"] {
+            let invitations = permissions::invitations_allowed(&active);
+            if calendar_write::preview(library, &proposal["args"], invitations)?
+                != proposal["preview"]
+            {
                 return Err("approval_stale_calendar_changed_ask_again");
             }
             let op = calendar_write::validate(&proposal["args"])?;
             library
                 .set_state(&key, "")
                 .map_err(|_| "library_unavailable")?;
-            let invitations = permissions::invitations_allowed(&active);
             return calendar_write::run(&dir, &calendar_seam, op, true, invitations).await;
         }
         if drive_write::preview(library, &proposal["args"])? != proposal["preview"] {
@@ -1514,7 +1538,7 @@ impl Server {
             }
             let mut exact = current.clone();
             if grant.snapshot.is_some() {
-                exact.snapshot = Some(resolved_snapshot(library, name, &args)?);
+                exact.snapshot = Some(resolved_snapshot(library, name, &args, &active)?);
             }
             if grant != &exact {
                 return Err("approval_policy_changed");
@@ -1539,8 +1563,10 @@ impl Server {
         match gate {
             Gate::Client if !terminal_approved => {
                 let mut binding = current.clone();
-                if name.ends_with("_write") && args["action"] != "create" {
-                    binding.snapshot = Some(resolved_snapshot(library, name, &args)?);
+                if name.ends_with("_write")
+                    && (args["action"] != "create" || name == calendar_write::TOOL)
+                {
+                    binding.snapshot = Some(resolved_snapshot(library, name, &args, &active)?);
                 }
                 if grant.as_ref() != Some(&binding) {
                     return Err("approval_required_or_stale");
@@ -1714,7 +1740,7 @@ impl Server {
                         "policy":library.state("mcp.policy").map_err(|_| "policy_unavailable")?,
                         "state_identity":directory_identity(&dir)?,
                         "rules":active.fingerprint,
-                        "preview":calendar_write::preview(library, &args)?});
+                        "preview":calendar_write::preview(library, &args, permissions::invitations_allowed(&active))?});
                     library
                         .set_state(&format!("mcp.approval.{id}"), &proposal.to_string())
                         .map_err(|_| "library_unavailable")?;

@@ -85,6 +85,9 @@ fn apple_events() -> Vec<Value> {
             date(2026, 11, 13, 9, 0),
             date(2026, 11, 13, 17, 0),
         ),
+        // Floating: no zone, 07:00 wherever it is looked at.
+        json!({"guid":"FLOAT","pGuid":"cal-work","title":"Run","etag":"etag-FLOAT",
+            "startDate":date(2026,11,14,7,0),"endDate":date(2026,11,14,8,0)}),
         json!({"guid":"A-1","pGuid":"cal-work","title":"Holiday","allDay":true,"etag":"etag-A-1",
             "startDate":date(2026,10,5,0,0),"endDate":date(2026,10,6,0,0)}),
         weekly,
@@ -101,6 +104,8 @@ struct Fake {
     version: Arc<Mutex<u64>>,
     /// Saves and deletes wait this long before answering.
     delay: Arc<Mutex<Option<Duration>>>,
+    /// `eventdetail` for an occurrence answers with its series alone, as Apple may.
+    master_only: Arc<Mutex<bool>>,
 }
 
 impl Respond for Fake {
@@ -112,6 +117,12 @@ impl Respond for Fake {
             let Some(event) = events.get(guid) else {
                 return ResponseTemplate::new(404);
             };
+            let mut event = event.clone();
+            if *self.master_only.lock().unwrap() {
+                if let Some((series, _)) = guid.split_once("__") {
+                    event["guid"] = json!(series);
+                }
+            }
             let mut body = json!({"Event":[event],"Alarm":[]});
             if let Some(extra) = self.extra.lock().unwrap().get(guid) {
                 for (k, v) in extra.as_object().unwrap() {
@@ -1018,4 +1029,294 @@ async fn permissions_show_says_how_the_calendar_rules_run() {
     let parsed = skykeep_mcp::permissions::parse(&starter).unwrap();
     assert!(parsed.contains_key("calendar_write.delete"));
     assert!(!parsed.contains_key("calendar_write.send_invitations"));
+}
+
+// --- Review fixes.
+
+#[tokio::test]
+async fn offset_times_without_a_timezone_are_kept_in_utc() {
+    let mut f = fixture(Some("yolo")).await;
+    let done = ok(
+        &mut f.server,
+        json!({"action":"create","calendar_guid":"cal-work","title":"Call","start":"2026-12-04T09:00:00+01:00","end":"2026-12-04T10:00:00Z"}),
+    )
+    .await;
+    assert_eq!(done["remote_verified"], true, "{done}");
+    // The read-back version comes back, ready for the next change.
+    assert_eq!(done["etag"], "v1", "{done}");
+    let (_, body) = writes(&f.remote).await.pop().unwrap();
+    assert_eq!(body["Event"]["tz"], "UTC");
+    assert_eq!(body["Event"]["startDate"], date(2026, 12, 4, 8, 0));
+    // A local time still needs a zone, and the text says both ways out.
+    let e = error(
+        &mut f.server,
+        json!({"action":"create","calendar_guid":"cal-work","title":"Call","start":"2026-12-04T09:00"}),
+    )
+    .await;
+    assert_eq!(e["error"], "timezone_required");
+    let said = e["instructions"].as_str().unwrap();
+    assert!(
+        said.contains("add timezone") && said.contains("UTC"),
+        "{said}"
+    );
+    // A floating event: offsets keep it in UTC from now on, a local time needs a zone.
+    assert_eq!(
+        code(
+            &mut f.server,
+            update("FLOAT", json!({"start":"2026-11-14T07:30"}))
+        )
+        .await,
+        "timezone_required"
+    );
+    ok(
+        &mut f.server,
+        update("FLOAT", json!({"start":"2026-11-14T06:30:00Z"})),
+    )
+    .await;
+    let (_, body) = writes(&f.remote).await.pop().unwrap();
+    assert_eq!(body["Event"]["tz"], "UTC");
+}
+
+#[tokio::test]
+async fn the_terminal_text_shows_every_field_and_what_changes() {
+    let mut f = fixture(Some("yolo")).await;
+    let notes = "n".repeat(250);
+    rules(
+        f.dir.path(),
+        "rules:\n  calendar_write.update: {ask: terminal}\n",
+    );
+    let id = proposal_id(
+        &ok(
+            &mut f.server,
+            update(
+                "E-1",
+                json!({"location":"Room 4","notes":notes,"url":"https://example.test/a","title":"Dentist, a long and complete title"}),
+            ),
+        )
+        .await,
+    );
+    let shown = f.server.approval_text(&id).unwrap();
+    for part in [
+        "title: Dentist, a long and complete title",
+        "location: Room 4",
+        "(50 more characters)",
+        "url: https://example.test/a",
+        "when: unchanged",
+    ] {
+        assert!(shown.contains(part), "{part}: {shown}");
+    }
+    // A removed field says so.
+    {
+        let mut library = quince_core::Library::open(f.dir.path()).unwrap();
+        let mut e = library.event("E-1").unwrap().unwrap();
+        e.location = Some("Old room".into());
+        library.put_events(&[e]).unwrap();
+    }
+    let id = proposal_id(&ok(&mut f.server, update("E-1", json!({"location":""}))).await);
+    let shown = f.server.approval_text(&id).unwrap();
+    assert!(shown.contains("location: removed"), "{shown}");
+    assert!(shown.contains("Location: Old room"), "{shown}");
+    // The whole notes text is bound: a change past what is shown makes it stale.
+    let details: Value = serde_json::from_str(&f.server.approval_details(&id).unwrap()).unwrap();
+    assert!(details["preview"]["event"]["notes"].is_null(), "{details}");
+    let id = proposal_id(&ok(&mut f.server, update("E-1", json!({"title":"t2"}))).await);
+    {
+        let mut library = quince_core::Library::open(f.dir.path()).unwrap();
+        let mut e = library.event("E-1").unwrap().unwrap();
+        e.notes = Some(format!("{}x", "n".repeat(300)));
+        library.put_events(&[e]).unwrap();
+    }
+    assert_eq!(
+        f.server.approve_any(&id).await,
+        Err("approval_stale_calendar_changed_ask_again")
+    );
+    // A move card has no alerts line, nor a delete card.
+    for args in [
+        json!({"action":"move","guid":"E-1","etag":"etag-E-1","calendar_guid":"cal-home"}),
+        json!({"action":"delete","guid":"E-1","etag":"etag-E-1"}),
+    ] {
+        rules(f.dir.path(), "rules:\n  calendar_write: {ask: terminal}\n");
+        let id = proposal_id(&ok(&mut f.server, args.clone()).await);
+        assert!(
+            !f.server.approval_text(&id).unwrap().contains("Alerts"),
+            "{args}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_create_card_shows_the_resolved_event_and_the_invitation_rule_in_force() {
+    let mut f = fixture(Some("writes_only")).await;
+    let form = call(
+        &mut f.server,
+        json!({"action":"create","calendar_guid":"cal-home","title":"Lunch","start":"2026-12-05T12:00","timezone":"Europe/Berlin","alerts":[15]}),
+    )
+    .await;
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+    let message = form["params"]["message"].as_str().unwrap();
+    for part in [
+        "Home",
+        "2026-12-05T12:00:00+01:00",
+        "one hour after the start",
+        "15",
+        "members",
+    ] {
+        assert!(message.contains(part), "{part}: {message}");
+    }
+    assert!(!message.contains("nobody is invited"), "{message}");
+    f.server.handle(answer(&form, "deny")).await;
+    // The invitations line says what the rule in force does.
+    let form = call(&mut f.server, update("MEET", json!({"title":"P2"}))).await;
+    let message = form["params"]["message"].as_str().unwrap().to_string();
+    assert!(message.contains("is refused"), "{message}");
+    f.server.handle(answer(&form, "deny")).await;
+    rules(
+        f.dir.path(),
+        "rules:\n  calendar_write.send_invitations: allow\n",
+    );
+    let form = call(&mut f.server, update("MEET", json!({"title":"P2"}))).await;
+    let message = form["params"]["message"].as_str().unwrap();
+    assert!(message.contains("Apple emails each of them"), "{message}");
+    assert!(write_paths(&f.remote).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_tool_wide_allow_is_not_reported_as_allowing_invitations() {
+    let f = fixture(Some("writes_only")).await;
+    rules(f.dir.path(), "rules:\n  calendar_write: allow\n");
+    let shown =
+        skykeep_mcp::permissions::show(&f.dir.path().canonicalize().unwrap(), false).unwrap();
+    assert!(
+        !shown.contains("looser: calendar_write.send_invitations"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("changes that would notify invited people stay refused"),
+        "{shown}"
+    );
+    let starter = skykeep_mcp::permissions::starter(Some("writes_only"), Path::new("/srv/sky"));
+    assert!(
+        starter.contains("calendar_write.send_invitations: takes allow or deny only"),
+        "{starter}"
+    );
+}
+
+#[tokio::test]
+async fn an_occurrence_answered_only_by_its_series_is_not_verified() {
+    let mut f = fixture(Some("yolo")).await;
+    *f.fake.master_only.lock().unwrap() = true;
+    let done = ok(
+        &mut f.server,
+        update(
+            OCCURRENCE,
+            json!({"title":"Standup (once)","scope":"this_occurrence"}),
+        ),
+    )
+    .await;
+    assert_eq!(done["remote_verified"], false, "{done}");
+    assert!(done.get("etag").is_none(), "{done}");
+    assert_eq!(cached(f.dir.path(), OCCURRENCE).unwrap().etag, None);
+}
+
+#[tokio::test]
+async fn a_whole_series_update_forgets_the_cached_occurrences() {
+    let mut f = fixture(Some("yolo")).await;
+    let done = ok(
+        &mut f.server,
+        update(
+            OCCURRENCE,
+            json!({"title":"Standup (all)","scope":"whole_series"}),
+        ),
+    )
+    .await;
+    assert_eq!(done["remote_verified"], false, "{done}");
+    assert_eq!(
+        write_paths(&f.remote).await,
+        [format!("/ca/events/cal-work/{OCCURRENCE}/all")]
+    );
+    assert!(cached(f.dir.path(), OCCURRENCE).is_none());
+}
+
+#[tokio::test]
+async fn unchanged_time_fields_are_not_a_time_change_and_errors_name_the_fix() {
+    let mut f = fixture(Some("yolo")).await;
+    // all_day as it is, and the event's own zone, need no start.
+    ok(
+        &mut f.server,
+        update("A-1", json!({"all_day":true,"title":"Holiday!"})),
+    )
+    .await;
+    ok(
+        &mut f.server,
+        update(
+            "E-1",
+            json!({"timezone":"Europe/Berlin","title":"Dentist!"}),
+        ),
+    )
+    .await;
+    let mut fresh = fixture(Some("yolo")).await;
+    assert_eq!(
+        code(
+            &mut fresh.server,
+            update("E-1", json!({"timezone":"Europe/Berlin"}))
+        )
+        .await,
+        "nothing_to_change"
+    );
+    let e = error(&mut fresh.server, update("E-1", json!({"all_day":true}))).await;
+    assert_eq!(e["error"], "start_required_to_change_all_day");
+    assert!(e["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("all_day: true"));
+    let e = error(
+        &mut fresh.server,
+        json!({"action":"create","calendar_guid":"cal-work","title":"x","end":"2026-12-01T10:00Z"}),
+    )
+    .await;
+    assert_eq!(e["error"], "start_required");
+    assert!(e["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("2026-03-29T09:30:00+02:00"));
+    for (args, why, hint) in [
+        (
+            json!({"action":"create","calendar_guid":"cal-work","title":"x","start":"2026-12-01T10:00Z","guid":"E-1"}),
+            "create_takes_no_guid_etag_or_scope",
+            "update",
+        ),
+        (
+            json!({"action":"delete","guid":"E-1","etag":"etag-E-1","title":"x"}),
+            "delete_takes_only_guid_etag_and_scope",
+            "scope",
+        ),
+        (
+            json!({"action":"create","calendar_guid":"cal-none","title":"x","start":"2026-12-01T10:00Z"}),
+            "calendar_not_found",
+            "calendar_calendars",
+        ),
+        (
+            update("NOPE", json!({"title":"x"})),
+            "event_not_found_run_calendar_refresh",
+            "calendar_get",
+        ),
+        (
+            json!({"action":"move","guid":OCCURRENCE,"etag":format!("etag-{OCCURRENCE}"),"calendar_guid":"cal-home"}),
+            "move_needs_scope_whole_series",
+            "scope: whole_series",
+        ),
+        (
+            update("E-1", json!({"title":"x","scope":"whole_series"})),
+            "not_a_repeating_event_leave_out_scope",
+            "without scope",
+        ),
+    ] {
+        let e = error(&mut fresh.server, args.clone()).await;
+        assert_eq!(e["error"], why, "{args}");
+        assert!(
+            e["instructions"].as_str().unwrap().contains(hint),
+            "{args}: {e}"
+        );
+    }
+    assert!(write_paths(&fresh.remote).await.is_empty());
 }
