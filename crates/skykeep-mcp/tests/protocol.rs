@@ -914,7 +914,7 @@ async fn initialize_and_discover_only_notes_and_reminders_tools() {
             &"contacts_write"
         ]
     );
-    // Calendar is read-only in this phase.
+    // Calendar: five reads and one tool for every change.
     let calendar: Vec<_> = names.iter().filter(|n| n.contains("calendar")).collect();
     assert_eq!(
         calendar,
@@ -923,7 +923,8 @@ async fn initialize_and_discover_only_notes_and_reminders_tools() {
             &"calendar_events",
             &"calendar_search",
             &"calendar_get",
-            &"calendar_refresh"
+            &"calendar_refresh",
+            &"calendar_write"
         ]
     );
     // Drive: four reads and one tool for every change.
