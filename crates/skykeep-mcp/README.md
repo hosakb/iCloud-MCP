@@ -4,7 +4,7 @@ A local MCP server for Apple Notes, Reminders, Contacts, Calendar, Photos and iC
 
 ## Architecture
 
-![Skykeep MCP: Hermes talks to the MCP server over stdio, which syncs with Apple iCloud. Live today: Notes, Reminders and Drive (read and write), Contacts, Calendar and Photos (read-only). Planned with no route built yet: Mail, and repeating reminders with alerts](docs/architecture.webp)
+![Skykeep MCP: Hermes talks to the MCP server over stdio, which syncs with Apple iCloud. Live today: Notes, Reminders and Drive (read and write), Contacts, Calendar and Photos (read-only). Also live: reminders created with a daily repeat and alerts. Planned with no route built yet: Mail](docs/architecture.webp)
 
 Edit `docs/architecture.html` and re-export `docs/architecture.webp` whenever a route moves from planned to live.
 
@@ -46,7 +46,7 @@ You need a terminal window that you open yourself. Don't run these commands thro
       | --- | --- | --- |
       | 1. Ask before every read and every change (recommended, `reads_and_writes`) | Asks you in the MCP client | Asks you in the MCP client |
       | 2. Read without asking, ask before every change (`writes_only`) | No question | Asks you in the MCP client |
-      | 3. Never ask, not even before deleting (`yolo`, you type `confirm`) | No question | No question |
+      | 3. Don't ask, not even before deleting notes or reminders (`yolo`, you type `confirm`) | No question | No question, except Drive deletions and moves of large Drive folders, which wait for `skykeep-mcp approve` in a terminal (see "Drive changes") |
       | 4. No approval mode, for clients without approval forms (you type `confirm`) | No question | Routine changes: no question. Deletions wait until you run `skykeep-mcp approve` in a terminal |
 
       Choices 1 and 2 need an MCP client that can show Skykeep's approval forms. Hermes can't yet: with it, every request that needs approval fails with `approval_requires_form_client`. Use choice 4 for such a client. Choice 4 keeps a folder's earlier `require-approval` setting: then every change waits for `skykeep-mcp approve`, and setup and status say so. Once a folder has had choice 1, 2 or 3, it can't go back to 4; set up a new folder instead.
@@ -138,8 +138,8 @@ Reads come from the local cache and say so (`"source": "local_cache"`). A succes
 
 `drive_write` finds its target in the local cache by cloud path or id, as `drive_get` does, so run `drive_refresh` on the folder first. Drive has no outbox here: an allowed change runs at once and the reply says what happened.
 
-- `"outcome": "done"` comes with `checked`, which says exactly what was confirmed. A rename, move, trash or delete forever is read back from Apple (`remote_verified: true`). An upload is checked against Apple's checksum of the bytes and read back at its size. A new folder is only what Apple's answer described, and a download only counts the bytes; both say `remote_verified: false`.
-- An error means it did not happen, or could not be confirmed. `drive_write_outcome_unknown_run_drive_refresh_before_retrying` means the connection ended before Apple answered: refresh the folder and look before trying again.
+- `"outcome": "done"` comes with `checked`, which says exactly what was confirmed. A rename, move, trash or delete forever is read back from Apple (`remote_verified: true`). An upload is checked against Apple's checksum of the bytes and read back at its size. A new folder is only what Apple's answer described, and a download only counts the bytes; both say `remote_verified: false`. A download asks Apple for the cached version and is refused when Apple has a newer one; `version_checked: false` says when that could not be checked (an empty file, or one cached without a version).
+- An error means it did not happen, or could not be confirmed. `drive_write_outcome_unknown_run_drive_refresh_before_retrying` means the connection ended before Apple answered: refresh the folder and look before trying again. If `delete_forever` moved the item to Recently Deleted but Apple did not delete it from there, the error is `drive_trashed_not_deleted_forever_it_is_in_recently_deleted`: delete it from Recently Deleted in iCloud Drive, or leave it for Apple to delete after about 30 days. Errors that leave you something to do carry an `instructions` line.
 - Before a change, the folder is read from Apple. A new folder or upload whose name is already there is refused (`name_taken`, compared without case). A rename Apple already shows says `already_has_this_name`, and a move already made says `already_in_destination`. Apple's listing can lag a moment behind a file it has just filed: an upload retried in that moment is filed under a free name such as `plan 2.txt`, never over the first, and its reply says `renamed_by_apple: true`. Look at the folder and remove the extra copy if you don't want it. An item that changed at Apple since it was cached is left alone (`drive_item_changed_run_drive_refresh`).
 - Afterwards the folders the change touched read as not yet refreshed, until `drive_refresh` reads them again.
 
@@ -153,9 +153,9 @@ Uploads read from, and downloads write into, one local folder. Set it up in your
 skykeep-mcp exchange --state-dir ~/.local/share/skykeep-mcp
 ```
 
-It creates `~/Skykeep-Exchange` (mode `0700`) if needed and prints the folder and the size limit. Nothing else changes. `--path DIR` picks another folder (its parent must exist) and `--max-mb N` changes the limit, 100 MB by default. No MCP argument can name the folder or change the limit. Until it is set up, `upload` and `download` are refused.
+Like `setup`, `status` and `unlock`, it uses `~/.local/share/skykeep-mcp` when `--state-dir` is left out, and its flags can come in any order. It creates `~/Skykeep-Exchange` (mode `0700`) if needed and prints the folder and the size limit. Nothing else changes. `--path DIR` picks another folder (its parent must exist) and `--max-mb N` changes the limit, 100 MB by default. No MCP argument can name the folder or change the limit. Until it is set up, `upload` and `download` are refused.
 
-The `local` argument names a file inside the folder as a relative path, such as `report.pdf` or `in/report.pdf`. Absolute paths, `..` and symbolic links anywhere on the way are refused; each name is opened with no-follow semantics, and the folder must still be the one you set up. An upload must be a regular file with no other hard link. A download never replaces an existing file: it arrives as a hidden partial file and takes its name only if the name is still free. Without `local`, a download takes the item's name with control and text-direction characters removed, and a name that could leave the folder is refused. The limit is checked while bytes are read or arrive, not afterwards, and a stopped transfer leaves nothing behind; a partial download left by a crash is removed by the next download into that folder once it is ten minutes old. Every folder on the way must be yours and not writable by others. One upload or download may take two minutes plus one second per 256 KB of the limit, about nine minutes at 100 MB; past that it stops and keeps nothing.
+The `local` argument names a file inside the folder as a relative path, such as `report.pdf` or `in/report.pdf`. Absolute paths, `..` and symbolic links anywhere on the way are refused; each name is opened with no-follow semantics, and the folder must still be the one you set up. An upload must be a regular file with no other hard link. A download never replaces an existing file: it arrives as a hidden partial file and takes its name only if the name is still free. Without `local`, a download takes the item's name with control and text-direction characters removed, and a name that could leave the folder is refused. The limit is checked while bytes are read or arrive, not afterwards, and a stopped transfer leaves nothing behind; a partial download left by a crash is removed by the next download into that folder once it is ten minutes old. The exchange folder, and every folder inside it on the way to the file, must be yours and not writable by others; a refusal says the exact `chmod 700` line that fixes it. The folders above the exchange folder are not checked. One upload or download may take two minutes plus one second per 256 KB of the limit, about nine minutes at 100 MB; past that it stops and keeps nothing.
 
 ### Reminders: repeat and alerts on create
 
@@ -176,7 +176,7 @@ The create reply says `queued: true`, `cloudkit_accepted: false` and `remote_ver
 
 ## Write approval
 
-`setup` sets the approval mode for you (step 4 under "Get started"). The commands in this section apply only to a folder with no approval mode: one where you chose 4 in setup, or one set up before approval modes existed. In a folder with mode 1, 2 or 3, approval happens in your MCP client, and `require-approval` and `allow-routine` refuse to run.
+`setup` sets the approval mode for you (step 4 under "Get started"). With mode 1 or 2, approval happens in your MCP client's approval form. In a folder with no approval mode (choice 4, or one set up before approval modes existed), approval happens in your terminal with `skykeep-mcp approve`, as described below. With mode 3 (`yolo`), only Drive deletions and moves of large Drive folders are asked, also with `skykeep-mcp approve` (see "Drive changes"). `require-approval` and `allow-routine` apply only to a folder with no approval mode and refuse to run in the others.
 
 Deletions never run straight from MCP. For Notes and Reminders, a deletion here means `delete`, a `move` into Recently Deleted (that is how iCloud deletes a note), and a `save` that leaves the note body empty. Creating a note in Recently Deleted is refused. For any of these the tool returns `approval_required` with a request ID, and you approve in your own terminal:
 

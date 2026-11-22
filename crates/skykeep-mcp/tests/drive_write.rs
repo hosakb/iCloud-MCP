@@ -308,6 +308,9 @@ async fn the_tool_schema_is_strict_and_names_each_action() {
         .as_str()
         .unwrap()
         .contains("Apple iCloud Drive"));
+    assert!(tool["description"].as_str().unwrap().contains(
+        "already_has_this_name and already_in_destination mean the change is already done"
+    ));
     for action in skykeep_mcp::drive_write::ACTIONS {
         assert_eq!(
             skykeep_mcp::drive_write::is_destructive(action),
@@ -1526,4 +1529,277 @@ fn transfers_get_more_time_under_a_larger_limit() {
     use skykeep_mcp::drive_write::transfer_time;
     assert_eq!(transfer_time(100 * 1024 * 1024), Duration::from_secs(520));
     assert!(transfer_time(10_240 * 1024 * 1024) > transfer_time(100 * 1024 * 1024));
+}
+
+/// delete_forever after the move to Recently Deleted: Apple's answer decides what the error
+/// says. Busy (or a dropped connection) leaves the outcome unknown; a refusal that names the
+/// item as kept says it is in Recently Deleted, with what to do next.
+async fn delete_forever_after_trash(final_answer: ResponseTemplate) -> Result<Value, &'static str> {
+    let mut f = fixture(None).await;
+    let id = proposal_id(
+        &ok(
+            &mut f.server,
+            json!({"action":"delete_forever","id":REPORT}),
+        )
+        .await,
+    );
+    serve_listing(&f.remote, ROOT, root_items(), Some(2)).await;
+    serve_listing(&f.remote, ROOT, json!([folder(DOCS, "Documents", 2)]), None).await;
+    answer(&f.remote, "/moveItemsToTrash", ok_items(REPORT)).await;
+    serve_listing(
+        &f.remote,
+        "TRASH_ROOT",
+        json!([file(REPORT, "TRASH_ROOT", "report", "pdf", 11)]),
+        None,
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/deleteItems"))
+        .respond_with(final_answer)
+        .mount(&f.remote)
+        .await;
+    f.server.approve_any(&id).await
+}
+
+#[tokio::test]
+async fn a_busy_apple_after_the_trash_step_leaves_delete_forever_unknown() {
+    let error = delete_forever_after_trash(
+        ResponseTemplate::new(503).set_body_json(json!({"retryAfter":1})),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "drive_write_outcome_unknown_run_drive_refresh_before_retrying"
+    );
+    let step = skykeep_mcp::next_step(error, Path::new("/state"), &Value::Null).unwrap();
+    assert!(step.contains("Run drive_refresh"), "{step}");
+}
+
+#[tokio::test]
+async fn a_refused_final_delete_says_the_item_is_in_recently_deleted_and_what_to_do() {
+    let error = delete_forever_after_trash(
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"items":[{"drivewsid":REPORT,"status":"FORBIDDEN"}]})),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "drive_trashed_not_deleted_forever_it_is_in_recently_deleted"
+    );
+    let step = skykeep_mcp::next_step(error, Path::new("/state"), &Value::Null).unwrap();
+    assert!(
+        step.contains("Recently Deleted") && step.contains("30 days"),
+        "{step}"
+    );
+    assert!(skykeep_mcp::next_step(
+        "drive_trashed_not_deleted_forever_login_required",
+        Path::new("/state"),
+        &Value::Null
+    )
+    .unwrap()
+    .contains("skykeep-mcp login --state-dir /state"));
+}
+
+/// The approval form path carries the next step in the error result too.
+#[tokio::test]
+async fn a_form_approved_delete_forever_that_stops_half_way_says_what_to_do() {
+    let mut f = fixture(Some("writes_only")).await;
+    let form = call(
+        &mut f.server,
+        json!({"action":"delete_forever","id":REPORT}),
+    )
+    .await;
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+    serve_listing(&f.remote, ROOT, root_items(), Some(2)).await;
+    serve_listing(&f.remote, ROOT, json!([folder(DOCS, "Documents", 2)]), None).await;
+    answer(&f.remote, "/moveItemsToTrash", ok_items(REPORT)).await;
+    serve_listing(
+        &f.remote,
+        "TRASH_ROOT",
+        json!([file(REPORT, "TRASH_ROOT", "report", "pdf", 11)]),
+        None,
+    )
+    .await;
+    answer(
+        &f.remote,
+        "/deleteItems",
+        json!({"items":[{"drivewsid":REPORT,"status":"FORBIDDEN"}]}),
+    )
+    .await;
+    let reply = f
+        .server
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{}}}))
+        .await
+        .unwrap();
+    let value = text(&reply);
+    assert_eq!(
+        value["error"], "drive_trashed_not_deleted_forever_it_is_in_recently_deleted",
+        "{reply}"
+    );
+    assert!(value["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("Recently Deleted"));
+}
+
+/// yolo says what it still asks.
+#[test]
+fn the_yolo_description_says_drive_deletions_still_wait() {
+    let yolo = skykeep_mcp::status::describe_mode("yolo");
+    assert!(yolo.contains("Drive deletions"), "{yolo}");
+    assert!(yolo.contains("skykeep-mcp approve"), "{yolo}");
+    assert!(!yolo.contains("Never ask"), "{yolo}");
+}
+
+/// A download says whether the version was checked: not for an empty file, which is never
+/// fetched, nor for one cached without a version.
+#[tokio::test]
+async fn a_download_says_whether_its_version_was_checked() {
+    let mut f = fixture(None).await;
+    serve_download(&f.remote, b"hello world".to_vec()).await;
+    let checked = ok(&mut f.server, json!({"action":"download","id":REPORT})).await;
+    assert_eq!(checked["version_checked"], true, "{checked}");
+    {
+        let mut library = quince_core::Library::open(f.dir.path()).unwrap();
+        let mut all = library.drive_children(ROOT).unwrap();
+        for item in &mut all {
+            if item.drivewsid == REPORT {
+                item.size = Some(0);
+            }
+        }
+        library.put_drive_children(ROOT, &all).unwrap();
+    }
+    let empty = ok(
+        &mut f.server,
+        json!({"action":"download","id":REPORT,"local":"empty.pdf"}),
+    )
+    .await;
+    assert_eq!(empty["version_checked"], false, "{empty}");
+    assert!(
+        empty["checked"].as_str().unwrap().contains("not checked"),
+        "{empty}"
+    );
+    {
+        let mut library = quince_core::Library::open(f.dir.path()).unwrap();
+        let mut all = library.drive_children(ROOT).unwrap();
+        for item in &mut all {
+            if item.drivewsid == REPORT {
+                item.size = Some(11);
+                item.etag = None;
+            }
+        }
+        library.put_drive_children(ROOT, &all).unwrap();
+    }
+    let unversioned = ok(
+        &mut f.server,
+        json!({"action":"download","id":REPORT,"local":"plain.pdf"}),
+    )
+    .await;
+    assert_eq!(unversioned["version_checked"], false, "{unversioned}");
+}
+
+/// Apple files an upload under a free name when the name was taken after the folder was read:
+/// the reply says so.
+#[tokio::test]
+async fn an_upload_apple_files_under_another_name_says_renamed_by_apple() {
+    let mut f = fixture(None).await;
+    std::fs::write(f.exchange.join("plan.txt"), b"the plan").unwrap();
+    serve_listing(&f.remote, DOCS, docs_items(), None).await;
+    Mock::given(method("POST"))
+        .and(path("/retrieveItemDetails"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items":[{"drivewsid":"FILE::com.apple.CloudDocs::DOC1","parentId":DOCS,"name":"plan 2","extension":"txt","type":"FILE","size":8}]})))
+        .with_priority(1)
+        .mount(&f.remote)
+        .await;
+    serve_upload(&f.remote, b"the plan", None).await;
+    let done = ok(
+        &mut f.server,
+        json!({"action":"upload","path":"/Documents","local":"plan.txt"}),
+    )
+    .await;
+    assert_eq!(done["renamed_by_apple"], true, "{done}");
+    assert_eq!(done["item"]["name"], "plan 2.txt");
+}
+
+/// The terminal approval shows a Drive change in plain lines, and never passes on a
+/// character that reorders or hides text.
+#[tokio::test]
+async fn the_terminal_approval_text_is_plain_and_inert() {
+    let mut f = fixture(None).await;
+    let id = proposal_id(
+        &ok(
+            &mut f.server,
+            json!({"action":"move","id":BIG,"destination_id":DOCS}),
+        )
+        .await,
+    );
+    let text = f.server.approval_text(&id).unwrap();
+    assert!(!text.trim_start().starts_with('{'), "{text}");
+    assert!(text.contains("Drive change: move"), "{text}");
+    assert!(text.contains("Item: Big (/Big)"), "{text}");
+    assert!(text.contains("Move into: Documents (/Documents)"), "{text}");
+    assert!(text.contains("500 items directly"), "{text}");
+    let trash = proposal_id(&ok(&mut f.server, json!({"action":"trash","id":REPORT})).await);
+    let text = f.server.approval_text(&trash).unwrap();
+    assert!(
+        text.contains("a deletion") && text.contains("Recently Deleted"),
+        "{text}"
+    );
+    // A queued Notes change keeps its JSON, with direction characters made visible.
+    let other = "6f1c2a8e-7f55-4c9a-9d1e-0b5a3c2d1e4f";
+    {
+        let mut library = quince_core::Library::open(f.dir.path()).unwrap();
+        library
+            .set_state(
+                &format!("mcp.approval.{other}"),
+                &json!({"tool":"notes_write","args":{"action":"delete","guid":"N\u{202E}1"},"account":"x"}).to_string(),
+            )
+            .unwrap();
+    }
+    let mut reopened = Server::open(f.dir.path()).unwrap();
+    reopened.set_drive_seam(seam(&f.remote.uri(), quick()));
+    let text = reopened.approval_text(other).unwrap();
+    assert!(!text.contains('\u{202E}'), "{text}");
+    assert!(text.contains("N\u{FFFD}1"), "{text}");
+}
+
+/// The refusal for a shared folder inside the exchange folder names the chmod line.
+#[tokio::test]
+async fn a_shared_folder_refusal_names_the_fix() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut f = fixture(None).await;
+    let shared = f.exchange.join("in").join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("a.txt"), b"x").unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let reply = call(
+        &mut f.server,
+        json!({"action":"upload","path":"/","local":"in/shared/a.txt"}),
+    )
+    .await;
+    let value = text(&reply);
+    assert_eq!(value["error"], "local_folder_not_private");
+    let instructions = value["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains(&format!("chmod 700 {}", shared.display())),
+        "{instructions}"
+    );
+}
+
+/// `skykeep-mcp exchange` without --state-dir uses the default folder, as setup does, rather
+/// than stopping at its usage line.
+#[test]
+fn the_exchange_command_defaults_its_state_folder() {
+    let home = private_dir();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_skykeep-mcp"))
+        .args(["exchange", "--max-mb", "5"])
+        .env("HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(!said.contains("usage:"), "{said}");
 }

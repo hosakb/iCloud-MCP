@@ -181,6 +181,27 @@ pub fn explain(code: &str, path: Option<&Path>, dir: &Path) -> String {
     }
 }
 
+/// The first folder on the way to `local` inside the exchange folder that is not this user's
+/// alone, for the instructions that say how to fix it. Looked at without following links.
+pub(crate) fn shared_folder(state_dir: &Path, local: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let library = quince_core::Library::open(state_dir).ok()?;
+    let exchange = configured(&library).ok()??;
+    let names = local_names(local).ok()?;
+    let mut at = exchange.path;
+    for name in names.split_last()?.1 {
+        at.push(name);
+        let meta = std::fs::symlink_metadata(&at).ok()?;
+        if !meta.is_dir() {
+            return None;
+        }
+        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+            return Some(at);
+        }
+    }
+    None
+}
+
 /// The folder, opened and checked to be the one set up.
 fn open_root(exchange: &Exchange) -> Result<OwnedFd, &'static str> {
     let raw = c_name(

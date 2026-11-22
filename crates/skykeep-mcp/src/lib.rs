@@ -167,22 +167,51 @@ fn policy(
 
 /// An error result. One about the Drive exchange folder says the exact command that sets it
 /// up, with this private folder in it, for the person to type in their own terminal.
-fn error_value(error: &'static str, dir: &Path) -> Value {
+/// The same for a few Drive outcomes that leave the person something to do, and for a folder
+/// inside the exchange folder that others can change (`args` are the call's arguments).
+fn error_value(error: &'static str, dir: &Path, args: &Value) -> Value {
     let mut value = json!({"error":error});
-    if error.starts_with("exchange_folder_") {
-        value["instructions"] = json!(format!(
-            "In your own terminal, run: {}",
-            status::with_dir("skykeep-mcp exchange", dir)
-        ));
+    if let Some(instructions) = next_step(error, dir, args) {
+        value["instructions"] = json!(instructions);
     }
     value
 }
 
+/// What the person can do after `error`, when there is something: the sentence an MCP error
+/// result carries as `instructions` and the terminal approval prints. `args` are the call's
+/// arguments (`Value::Null` when there are none).
+pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
+    match error {
+        e if e.starts_with("exchange_folder_") => Some(format!(
+            "In your own terminal, run: {}",
+            status::with_dir("skykeep-mcp exchange", dir)
+        )),
+        drive_write::UNKNOWN => Some("The connection ended before Apple answered, so the change may or may not have been made. Run drive_refresh on the folder and look at it before trying again.".to_string()),
+        drive_write::IN_RECENTLY_DELETED => Some("The item is in Recently Deleted in iCloud Drive but was not deleted for good. Delete it there (iCloud Drive on icloud.com or a Mac), or leave it: Apple deletes it by itself after about 30 days.".to_string()),
+        drive_write::IN_RECENTLY_DELETED_LOGIN => Some(format!("The item is in Recently Deleted in iCloud Drive but was not deleted for good, because the sign-in has expired. Sign in again with {} in your own terminal, then delete it from Recently Deleted in iCloud Drive, or leave it: Apple deletes it by itself after about 30 days.", status::with_dir("skykeep-mcp login", dir))),
+        "local_folder_not_private" => Some(
+            args["local"]
+                .as_str()
+                .and_then(|local| exchange::shared_folder(dir, local))
+                .map_or_else(
+                    || "A folder inside the exchange folder can be changed by other users. Make it yours alone with chmod 700 on that folder, then try again.".to_string(),
+                    |folder| format!("A folder inside the exchange folder can be changed by other users. Make it yours alone in your own terminal with: chmod 700 {} and try again.", status::quoted(&folder)),
+                ),
+        ),
+        _ => None,
+    }
+}
+
 /// [`tool_reply`] with [`error_value`]'s instructions.
-fn tool_reply_in(id: Value, result: Result<Value, &'static str>, dir: &Path) -> Value {
+fn tool_reply_in(
+    id: Value,
+    result: Result<Value, &'static str>,
+    dir: &Path,
+    args: &Value,
+) -> Value {
     match result {
         Err(error) => {
-            json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":error_value(error, dir).to_string()}],"isError":true}})
+            json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":error_value(error, dir, args).to_string()}],"isError":true}})
         }
         ok => tool_reply(id, ok),
     }
@@ -861,6 +890,7 @@ impl Server {
                 pending.request["id"].clone(),
                 result,
                 &self.dir,
+                &pending.request["params"]["arguments"],
             ));
         }
         // Batches and other non-object messages are not supported; say so instead of dropping them.
@@ -941,7 +971,7 @@ impl Server {
                     .await;
                 let (value, failed) = match result {
                     Ok(value) => (value, false),
-                    Err(error) => (error_value(error, &self.dir), true),
+                    Err(error) => (error_value(error, &self.dir, &params["arguments"]), true),
                 };
                 Ok(json!({"content":[{"type":"text","text":value.to_string()}],"isError":failed}))
             }
@@ -965,6 +995,30 @@ impl Server {
             .map_err(|_| "library_unavailable")?
             .filter(|s| !s.is_empty())
             .ok_or("approval_not_found")
+    }
+
+    /// Trusted local CLI only: what `approve` shows before it asks. A Drive change is said in
+    /// plain lines (what it does, the item and its path, what it reaches); a Notes or
+    /// Reminders change as its JSON. Control and text-direction characters are shown as
+    /// U+FFFD, so nothing in the text can reorder or hide what the terminal shows.
+    pub fn approval_text(&self, id: &str) -> Result<String, &'static str> {
+        let raw = self.approval_details(id)?;
+        let proposal: Value = serde_json::from_str(&raw).map_err(|_| "approval_not_found")?;
+        let text = if proposal["tool"] == drive_write::TOOL {
+            drive_write::plain_preview(&proposal["preview"])
+        } else {
+            raw
+        };
+        Ok(text
+            .chars()
+            .map(|c| {
+                if (c.is_control() && c != '\n') || exchange::hides_text(c) {
+                    '\u{FFFD}'
+                } else {
+                    c
+                }
+            })
+            .collect())
     }
 
     pub fn approve(&mut self, id: &str) -> Result<Value, &'static str> {

@@ -60,7 +60,12 @@ const SAMPLE: usize = 20;
 const SAMPLE_CHARS: usize = 64;
 const SHOWN_CHARS: usize = 255;
 
-const UNKNOWN: &str = "drive_write_outcome_unknown_run_drive_refresh_before_retrying";
+pub const UNKNOWN: &str = "drive_write_outcome_unknown_run_drive_refresh_before_retrying";
+/// delete_forever moved the item to Recently Deleted, and Apple is known not to have deleted
+/// it from there.
+pub const IN_RECENTLY_DELETED: &str = "drive_trashed_not_deleted_forever_it_is_in_recently_deleted";
+/// The same, and the deletion from Recently Deleted needs a fresh sign-in.
+pub const IN_RECENTLY_DELETED_LOGIN: &str = "drive_trashed_not_deleted_forever_login_required";
 const NOT_CONFIRMED: &str = "drive_write_not_confirmed_run_drive_refresh";
 const CHANGED: &str = "drive_item_changed_run_drive_refresh";
 const NO_EXCHANGE: &str = "exchange_folder_not_set_up_run_skykeep_mcp_exchange_in_a_terminal";
@@ -488,6 +493,64 @@ pub(crate) fn preview(library: &Library, args: &Value) -> Result<Value, &'static
     Ok(value)
 }
 
+/// A preview in plain lines, for the terminal approval: what the change does, the item and
+/// its path, where it goes, and what it reaches.
+pub(crate) fn plain_preview(preview: &Value) -> String {
+    let text = |v: &Value| v.as_str().unwrap_or("?").to_string();
+    let item = |v: &Value| match v["path"].as_str() {
+        Some(path) => format!("{} ({path})", text(&v["name"])),
+        None => format!("{} (id {})", text(&v["name"]), text(&v["id"])),
+    };
+    let mut lines = vec![format!(
+        "Drive change: {}{}",
+        text(&preview["action"]),
+        if preview["destructive"] == true {
+            ", a deletion"
+        } else {
+            ""
+        }
+    )];
+    if preview["effect"].is_string() {
+        lines.push(format!("What it does: {}", text(&preview["effect"])));
+    }
+    if preview["item"].is_object() {
+        lines.push(format!("Item: {}", item(&preview["item"])));
+    }
+    if preview["new_name"].is_string() {
+        lines.push(format!("New name: {}", text(&preview["new_name"])));
+    }
+    if preview["destination"].is_object() {
+        lines.push(format!("Move into: {}", item(&preview["destination"])));
+    }
+    if preview["into"].is_object() {
+        lines.push(format!("Into: {}", item(&preview["into"])));
+    }
+    if preview["local_file"].is_string() {
+        lines.push(format!(
+            "Local file in the exchange folder: {}",
+            text(&preview["local_file"])
+        ));
+    }
+    let affects = &preview["affects"];
+    if affects.is_object() {
+        let count = affects["apple_item_count"]
+            .as_i64()
+            .map_or("an unknown number of".to_string(), |n| n.to_string());
+        lines.push(format!(
+            "It reaches: {count} items directly, as Apple counts them; {} items cached beneath it{}; {} folders beneath not read yet{}.",
+            affects["cached_items_beneath"].as_u64().unwrap_or(0),
+            if affects["cached_count_capped"] == true { " (counting stopped)" } else { "" },
+            affects["folders_beneath_not_read"].as_u64().unwrap_or(0),
+            if affects["folder_read"] == true { "" } else { "; the folder itself was never read, so what it holds is unknown" },
+        ));
+        if let Some(names) = affects["first_names"].as_array().filter(|n| !n.is_empty()) {
+            let names: Vec<String> = names.iter().map(text).collect();
+            lines.push(format!("First names: {}", names.join(", ")));
+        }
+    }
+    lines.join("\n")
+}
+
 // --- Running an action.
 
 /// Time limits of one action.
@@ -912,10 +975,7 @@ async fn act(
             }
             quince_icloud::drive::delete_forever(http, root, params(), item)
                 .await
-                .map_err(|e| match apple(&e) {
-                    "login_required" => "drive_trashed_not_deleted_forever_login_required",
-                    _ => "drive_trashed_not_deleted_forever_it_is_in_recently_deleted",
-                })?;
+                .map_err(|e| delete_forever_error(&e))?;
             Ok(json!({
                 "outcome": "done",
                 "item": shown_item,
@@ -961,6 +1021,7 @@ async fn act(
                 return Err("invalid_arguments");
             };
             let item = plan.item.as_ref().ok_or("not_found")?;
+            let version_checked = item.size != Some(0) && item.etag.is_some();
             let received = if item.size == Some(0) {
                 0
             } else {
@@ -983,10 +1044,37 @@ async fn act(
                 "local_file": local,
                 "bytes": received,
                 "item": {"id": item.drivewsid, "name": shown(&item.display_name(), SHOWN_CHARS)},
-                "checked": "every byte Apple said it would send arrived; Apple sends no checksum to compare",
+                "checked": if version_checked {
+                    "every byte Apple said it would send arrived, from a link asked for the cached version, which Apple refuses when it has a newer one; Apple sends no checksum to compare"
+                } else if item.size == Some(0) {
+                    "the cache lists an empty file, so nothing was asked of Apple and its version was not checked"
+                } else {
+                    "every byte Apple said it would send arrived; the cache holds no version for the file, so the version was not checked"
+                },
+                "version_checked": version_checked,
                 "remote_verified": false,
             }))
         }
+    }
+}
+
+/// Why the deletion from Recently Deleted failed, once the item is known to be there. Only an
+/// answer that says the item stayed is reported as in Recently Deleted; a dropped connection
+/// or a busy Drive leaves the outcome unknown, and anything else unconfirmed.
+fn delete_forever_error(e: &quince_icloud::Error) -> &'static str {
+    match apple(e) {
+        "login_required" => IN_RECENTLY_DELETED_LOGIN,
+        UNKNOWN => UNKNOWN,
+        _ => match e {
+            quince_icloud::Error::Refused(why)
+                if why.contains("still in Recently Deleted")
+                    || why.contains("did not let that be deleted")
+                    || why.contains("so it was not deleted") =>
+            {
+                IN_RECENTLY_DELETED
+            }
+            _ => NOT_CONFIRMED,
+        },
     }
 }
 
@@ -1038,7 +1126,7 @@ pub(crate) fn tool() -> Value {
     let id = json!({"description":"move only: id of the folder to move the item into, from drive_list, drive_get or drive_search, instead of destination_path.","type":"string","minLength":1,"maxLength":drive::MAX_ID_BYTES});
     json!({
         "name": TOOL,
-        "description": "Change the user's Apple iCloud Drive: create_folder (path or id of the parent, name), rename (path or id, name), move (path or id, destination_path or destination_id), trash (to Recently Deleted), delete_forever, upload (path or id of the folder, local, optional name) and download (path or id of the file, optional local). Targets are found in the local cache as drive_get finds them, so run drive_refresh on the folder first. local names a file inside the exchange folder the user set up in their terminal: a relative path, never absolute. An existing name is refused, never replaced, in iCloud Drive and locally. Deletions and moves or renames of a folder with many items always need the user's approval, in the approval form or with skykeep-mcp approve in their terminal; every change follows the approval mode. The reply says done with what was checked, or an error; an unknown outcome means run drive_refresh and look before trying again.",
+        "description": "Change the user's Apple iCloud Drive: create_folder (path or id of the parent, name), rename (path or id, name), move (path or id, destination_path or destination_id), trash (to Recently Deleted), delete_forever, upload (path or id of the folder, local, optional name) and download (path or id of the file, optional local). Targets are found in the local cache as drive_get finds them, so run drive_refresh on the folder first. local names a file inside the exchange folder the user set up in their terminal: a relative path, never absolute. An existing name is refused, never replaced, in iCloud Drive and locally. Deletions and moves or renames of a folder with many items always need the user's approval, in the approval form or with skykeep-mcp approve in their terminal; every change follows the approval mode. already_has_this_name and already_in_destination mean the change is already done. The reply says done with what was checked, or an error; an unknown outcome means run drive_refresh and look before trying again.",
         "inputSchema": {
             "type": "object",
             "properties": {

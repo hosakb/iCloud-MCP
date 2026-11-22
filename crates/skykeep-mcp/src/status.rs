@@ -13,7 +13,10 @@ pub const MODES: [(&str, &str); 3] = [
         "writes_only",
         "Read without asking, but ask me before every change.",
     ),
-    ("yolo", "Never ask, not even before deleting something."),
+    (
+        "yolo",
+        "Don't ask, not even before deleting notes or reminders. Drive deletions and moves of large Drive folders still wait for skykeep-mcp approve.",
+    ),
 ];
 
 pub fn describe_mode(mode: &str) -> &'static str {
