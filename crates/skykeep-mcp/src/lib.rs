@@ -632,6 +632,7 @@ fn resolved_snapshot(
             library,
             args,
             permissions::invitations_allowed(active),
+            false,
         )?});
         bounded_value(&snapshot, MAX_ARGUMENT_BYTES)?;
         return Ok(snapshot);
@@ -923,7 +924,14 @@ impl Server {
             && !self.always_blocked)
             .then(|| permissions::name_for(name, arguments))
             .flatten();
-        let params = json!({"operation":request["params"],"existing_item":binding.snapshot,"read_preview_only":binding.preview_read,"refresh_scope":refresh});
+        // A Calendar create has no item yet: its preview is the event it would make.
+        let item_key = if name == calendar_write::TOOL && arguments["action"] == "create" {
+            "planned_event"
+        } else {
+            "existing_item"
+        };
+        let mut params = json!({"operation":request["params"],"read_preview_only":binding.preview_read,"refresh_scope":refresh});
+        params[item_key] = json!(binding.snapshot);
         let preview = match inert_preview(&params) {
             Ok(preview) => preview,
             Err(error) => return tool_reply(request["id"].clone(), Err(error)),
@@ -1186,7 +1194,7 @@ impl Server {
         }
         if tool == calendar_write::TOOL {
             let invitations = permissions::invitations_allowed(&active);
-            if calendar_write::preview(library, &proposal["args"], invitations)?
+            if calendar_write::preview(library, &proposal["args"], invitations, true)?
                 != proposal["preview"]
             {
                 return Err("approval_stale_calendar_changed_ask_again");
@@ -1740,12 +1748,13 @@ impl Server {
                         "policy":library.state("mcp.policy").map_err(|_| "policy_unavailable")?,
                         "state_identity":directory_identity(&dir)?,
                         "rules":active.fingerprint,
-                        "preview":calendar_write::preview(library, &args, permissions::invitations_allowed(&active))?});
+                        "preview":calendar_write::preview(library, &args, permissions::invitations_allowed(&active), true)?});
                     library
                         .set_state(&format!("mcp.approval.{id}"), &proposal.to_string())
                         .map_err(|_| "library_unavailable")?;
                     return Ok(json!({"status":"approval_required","request_id":id,
                         "approve_in_terminal":status::with_dir("skykeep-mcp approve", &dir),
+                        "next":status::with_dir("Ask the person to run skykeep-mcp approve in their own terminal and type this request ID there.", &dir),
                         "remote_verified":false}));
                 }
                 let allowed = gate == Gate::Run

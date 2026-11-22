@@ -79,6 +79,9 @@ const EVENT_NOT_FOUND: &str = "event_not_found_run_calendar_refresh";
 /// Characters of the notes a preview shows.
 const NOTES_SHOWN: usize = 200;
 const FLOATING: &str = "floating_event_needs_timezone";
+const CALENDAR_CHANGED: &str = "calendar_changed_run_calendar_refresh_and_try_again";
+const UNKNOWN_ACTION: &str = "calendar_write_unknown_action";
+const NOTES_TOO_LONG: &str = "calendar_notes_too_long_for_the_terminal_change_it_in_apple_calendar";
 const UNKNOWN_FIELD: &str = "calendar_write_unknown_field";
 /// Every field the tool takes.
 const FIELDS: [&str; 14] = [
@@ -210,9 +213,11 @@ impl CalendarWrite {
 
 fn text_ok(text: &str, max: usize, lines: bool) -> bool {
     text.len() <= max
-        && !text
-            .chars()
-            .any(|c| hides_text(c) || (c.is_control() && !(lines && (c == '\n' || c == '\t'))))
+        && !text.chars().any(|c| {
+            hides_text(c)
+                || matches!(c, '\u{2028}' | '\u{2029}')
+                || (c.is_control() && !(lines && (c == '\n' || c == '\t')))
+        })
 }
 
 fn id_ok(text: &str, max: usize) -> bool {
@@ -278,6 +283,12 @@ fn parse_when(text: &str, all_day: bool) -> Option<When> {
 
 /// Checks the arguments before any approval prompt, cache or network use.
 pub(crate) fn validate(args: &Value) -> Result<CalendarWrite, &'static str> {
+    if !args["action"]
+        .as_str()
+        .is_some_and(|a| ACTIONS.contains(&a))
+    {
+        return Err(UNKNOWN_ACTION);
+    }
     if args
         .as_object()
         .is_some_and(|m| m.keys().any(|k| !FIELDS.contains(&k.as_str())))
@@ -730,24 +741,40 @@ fn when_view(e: &Event) -> Value {
     }
 }
 
-/// Notes as shown: the first `NOTES_SHOWN` characters, with how many more there are, and a
-/// fingerprint of all of them, so an approval is bound to the whole text.
-fn notes_view(notes: &str) -> Value {
+/// Text as shown: as [`shown`], and the line and paragraph separators U+2028 and U+2029,
+/// which a terminal may draw as a line break, made visible as U+FFFD too.
+fn seen(text: &str, chars: usize) -> String {
+    shown(text, chars).replace(['\u{2028}', '\u{2029}'], "\u{FFFD}")
+}
+
+/// Notes as shown, with a fingerprint of all of them, so an approval is bound to the whole
+/// text. On the card, the first `NOTES_SHOWN` characters and how many more there are; in the
+/// terminal (`full`), all of them, line breaks kept.
+fn notes_view(notes: &str, full: bool) -> Value {
     let count = notes.chars().count();
-    let mut text = shown(notes, NOTES_SHOWN);
-    if count > NOTES_SHOWN {
-        text.push_str(&format!(" ({} more characters)", count - NOTES_SHOWN));
-    }
+    let text = if full {
+        notes
+            .split('\n')
+            .map(|line| seen(line, usize::MAX))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        let mut text = seen(notes, NOTES_SHOWN);
+        if count > NOTES_SHOWN {
+            text.push_str(&format!(" ({} more characters)", count - NOTES_SHOWN));
+        }
+        text
+    };
     json!({"text":text,"characters":count,
         "fingerprint":quince_sync::queue::account_tag(&format!("skykeep-calendar-notes:{notes}"))})
 }
 
-fn event_view(e: &Event) -> Value {
+fn event_view(e: &Event, full: bool) -> Value {
     let mut v = json!({
-        "title": shown(&e.title, MAX_TITLE_BYTES),
-        "location": e.location.as_deref().map(|l| shown(l, MAX_LOCATION_BYTES)),
-        "notes": e.notes.as_deref().map(notes_view),
-        "url": e.url.as_deref().map(|u| shown(u, MAX_URL_BYTES)),
+        "title": seen(&e.title, MAX_TITLE_BYTES),
+        "location": e.location.as_deref().map(|l| seen(l, MAX_LOCATION_BYTES)),
+        "notes": e.notes.as_deref().map(|n| notes_view(n, full)),
+        "url": e.url.as_deref().map(|u| seen(u, MAX_URL_BYTES)),
         "when": when_view(e),
     });
     if !e.guid.is_empty() {
@@ -780,20 +807,29 @@ fn changes_view(before: &Value, after: &Value) -> Value {
 }
 
 fn calendar_view(c: &Calendar) -> Value {
-    json!({"guid":c.guid,"title":shown(&c.title, SHOWN_CHARS)})
+    json!({"guid":c.guid,"title":seen(&c.title, SHOWN_CHARS)})
 }
 
 /// What the approval shows and is bound to: the action and what it reaches as cached, and
 /// whether the rules in force let it reach invited people (`invitations`). The same
 /// arguments over the same cache and rules give the same preview, so a change in between
-/// makes an approval stale.
+/// makes an approval stale. `full_notes` is for the terminal, which shows notes whole.
 pub(crate) fn preview(
     library: &Library,
     args: &Value,
     invitations: bool,
+    full_notes: bool,
 ) -> Result<Value, &'static str> {
     let op = validate(args)?;
     let plan = plan(library, &op)?;
+    let long = |e: &Option<Event>| {
+        e.as_ref()
+            .and_then(|e| e.notes.as_deref())
+            .is_some_and(|n| n.chars().count() > MAX_NOTES_BYTES)
+    };
+    if full_notes && (long(&plan.before) || long(&plan.after)) {
+        return Err(NOTES_TOO_LONG);
+    }
     let mut value = json!({
         "action": op.action(),
         "destructive": is_destructive(op.action()),
@@ -803,13 +839,13 @@ pub(crate) fn preview(
         value["from_calendar"] = calendar_view(from);
     }
     if let Some(before) = &plan.before {
-        value["event"] = event_view(before);
+        value["event"] = event_view(before, full_notes);
     }
     if let (Some(after), true) = (
         &plan.after,
         matches!(op.action, Action::Create | Action::Update),
     ) {
-        value["result"] = event_view(after);
+        value["result"] = event_view(after, full_notes);
         if plan.before.is_some() {
             value["changes"] = changes_view(&value["event"], &value["result"]);
         }
@@ -886,7 +922,7 @@ pub(crate) fn plain_preview(preview: &Value) -> String {
     let field = |e: &Value, name: &str| -> String {
         match name {
             "when" => when(&e["when"]),
-            "notes" => text(&e["notes"]["text"]),
+            "notes" => text(&e["notes"]["text"]).replace('\n', "\n    "),
             _ => text(&e[name]),
         }
     };
@@ -924,7 +960,7 @@ pub(crate) fn plain_preview(preview: &Value) -> String {
                 Some(word) => word.to_string(),
                 None => match name.as_str() {
                     "when" => when(&change["new"]),
-                    "notes" => text(&change["new"]["text"]),
+                    "notes" => text(&change["new"]["text"]).replace('\n', "\n    "),
                     _ => text(&change["new"]),
                 },
             };
@@ -969,7 +1005,7 @@ pub(crate) fn next_step(error: &str, args: &Value) -> Option<String> {
                     m.keys()
                         .filter(|k| !FIELDS.contains(&k.as_str()))
                         .take(5)
-                        .map(|k| shown(k, 64))
+                        .map(|k| seen(k, 64))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -979,7 +1015,12 @@ pub(crate) fn next_step(error: &str, args: &Value) -> Option<String> {
                 FIELDS.join(", ")
             )
         }
-        FLOATING => "This event has no time zone: it is all-day or floating, shown at the same clock time everywhere. New times would tie it to a zone, so give timezone with them, such as timezone: Europe/Berlin, or timezone: UTC to keep offset times as they are.".into(),
+        FLOATING => "This event has no time zone: a floating event, or an all-day one becoming timed, is shown at the same clock time everywhere. New times would tie it to a zone, so give timezone with them, such as timezone: Europe/Berlin, or timezone: UTC to keep offset times as they are.".into(),
+        UNKNOWN_ACTION => format!("action must be one of {}.", ACTIONS.join(", ")),
+        CALENDAR_CHANGED => "The calendar changed at Apple while the event was being added, and nothing was saved. Run calendar_refresh, then try the create again.".into(),
+        NOTES_TOO_LONG => format!("The event's notes are longer than {MAX_NOTES_BYTES} characters, too long to show whole in the terminal approval. Make this change in Apple Calendar, or approve it on the card in an MCP client."),
+        "event_too_long" => format!("An event may last at most {MAX_EVENT_DAYS} days. Give an earlier end."),
+        "already_in_this_calendar" => "The event is already in that calendar. Run calendar_calendars to pick another calendar_guid, or leave it where it is.".into(),
         "unknown_timezone" => "Use an IANA zone name such as Europe/Berlin, America/New_York or UTC.".into(),
         "invalid_alerts" => "alerts is a list of minutes before the start, 0 at the start. Duplicates, more than 8 alerts, and more than 40320 minutes (four weeks) are refused.".into(),
         "this_occurrence_needs_an_occurrence_guid" => "this_occurrence needs the guid of one occurrence, such as SERIES__20261109T090000Z from calendar_events. For the series itself use scope: whole_series, or leave scope out for an event that does not repeat.".into(),
@@ -1015,14 +1056,17 @@ pub(crate) fn next_step(error: &str, args: &Value) -> Option<String> {
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct WriteLimits {
-    /// The whole action: reads before the change, the change, and the read after it.
+    /// The reads before the change and the change itself.
     pub change_timeout: Duration,
+    /// The read after the change, apart: when it is too slow the change is still done.
+    pub read_back_timeout: Duration,
 }
 
 impl Default for WriteLimits {
     fn default() -> Self {
         Self {
             change_timeout: Duration::from_secs(60),
+            read_back_timeout: Duration::from_secs(20),
         }
     }
 }
@@ -1174,7 +1218,8 @@ pub(crate) async fn run(
     )
     .await;
     let result = match outcome {
-        Ok(result) => result,
+        Ok(Ok(acted)) => finish(&conn, acted, seam.limits.read_back_timeout, &mut effects).await,
+        Ok(Err(e)) => Err(e),
         Err(_) if !sent.load(Ordering::SeqCst) => Err("calendar_timed_out_nothing_sent"),
         Err(_) => Err(UNKNOWN),
     };
@@ -1185,6 +1230,33 @@ pub(crate) async fn run(
     })
 }
 
+/// What is left to check once Apple accepted a change.
+enum Check {
+    /// Read the event back under its own id.
+    ReadBack(Event),
+    /// Read the deleted event: it must be gone.
+    Gone(Event),
+}
+
+/// A change Apple accepted: the reply so far, and what to read back.
+struct Acted {
+    value: Value,
+    check: Option<Check>,
+}
+
+/// The calendar's ctag as Apple holds it now, or the cached one where Apple names none: an
+/// earlier save moved it on, and a stale one may be refused.
+async fn current_ctag(
+    api: &CalendarClient<'_>,
+    c: &Calendar,
+) -> Result<Option<String>, &'static str> {
+    Ok(api
+        .current_ctag(&c.guid)
+        .await
+        .map_err(|e| read_error(&e))?
+        .or_else(|| c.ctag.clone()))
+}
+
 async fn act(
     conn: &Conn,
     op: &CalendarWrite,
@@ -1192,21 +1264,29 @@ async fn act(
     invitations: bool,
     sent: &AtomicBool,
     effects: &mut Effects,
-) -> Result<Value, &'static str> {
+) -> Result<Acted, &'static str> {
     let api = CalendarClient::new(conn.client.http(), &conn.root, conn.client.service_params());
     let scope = op.scope.map(Repeat::scope);
-    let ctag = plan.calendar.ctag.as_deref();
     let alerts = op.alerts.as_deref();
+    let ctag = current_ctag(&api, &plan.calendar).await?;
+    let ctag = ctag.as_deref();
     if op.action == Action::Create {
         let mut event = plan.after.clone().ok_or("invalid_arguments")?;
         event.guid = uuid::Uuid::new_v4().to_string().to_uppercase();
         sent.store(true, Ordering::SeqCst);
         api.put_event_with_alerts(&event, ctag, Some(alerts.unwrap_or(&[])))
             .await
-            .map_err(|e| write_error(&e))?;
-        return Ok(read_back(&api, &event, effects).await);
+            .map_err(|e| match write_error(&e) {
+                // A new event has no version: a conflict here is the calendar's.
+                CHANGED => CALENDAR_CHANGED,
+                other => other,
+            })?;
+        return Ok(Acted {
+            value: json!({}),
+            check: Some(Check::ReadBack(event)),
+        });
     }
-    let before = plan.before.as_ref().ok_or("not_found")?;
+    let before = plan.before.as_ref().ok_or(EVENT_NOT_FOUND)?;
     // Apple's copy now: there, the version cached, and how it repeats.
     let now = api
         .current_event(before)
@@ -1233,9 +1313,13 @@ async fn act(
     if others > 0 && !invitations {
         return Err(ATTENDEES);
     }
+    let from_ctag = match &plan.from {
+        Some(from) => current_ctag(&api, from).await?,
+        None => None,
+    };
     let series = op.scope == Some(Repeat::WholeSeries);
     sent.store(true, Ordering::SeqCst);
-    let mut value = match op.action {
+    let (mut value, check) = match op.action {
         Action::Update | Action::Move => {
             let after = plan.after.as_ref().ok_or("invalid_arguments")?;
             match &plan.from {
@@ -1246,7 +1330,7 @@ async fn act(
                         None,
                         None,
                         scope,
-                        Some((from.guid.as_str(), from.ctag.as_deref())),
+                        Some((from.guid.as_str(), from_ctag.as_deref())),
                     )
                     .await
                 }
@@ -1257,53 +1341,39 @@ async fn act(
                 // Every cached occurrence of the series is out of date now.
                 effects.forget_series = Some(series_of(&before.guid).to_string());
                 effects.forget.push(before.guid.clone());
-                json!({
-                    "outcome": "done",
-                    "event": {"guid": after.guid, "title": shown(&after.title, SHOWN_CHARS), "calendar_guid": after.calendar_guid},
-                    "checked": "Apple accepted the change to the whole series; it was not read back. Run calendar_refresh over the series' days to see it",
-                    "remote_verified": false,
-                })
+                (
+                    json!({
+                        "outcome": "done",
+                        "event": {"guid": after.guid, "title": seen(&after.title, SHOWN_CHARS), "calendar_guid": after.calendar_guid},
+                        "checked": "Apple accepted the change to the whole series; it was not read back. Run calendar_refresh over the series' days to see it",
+                        "remote_verified": false,
+                    }),
+                    None,
+                )
             } else {
-                read_back(&api, after, effects).await
+                (json!({}), Some(Check::ReadBack(after.clone())))
             }
         }
         Action::Delete => {
             api.delete_event_scoped(before, ctag, scope)
                 .await
                 .map_err(|e| write_error(&e))?;
-            let shown_event =
-                json!({"guid": before.guid, "title": shown(&before.title, SHOWN_CHARS)});
             if series {
                 effects.forget_series = Some(series_of(&before.guid).to_string());
             }
             effects.forget.push(before.guid.clone());
             if is_occurrence(&before.guid) {
-                json!({
-                    "outcome": "done",
-                    "event": shown_event,
-                    "checked": "Apple accepted the deletion; Apple answers for an occurrence with its series, so it was not read back",
-                    "remote_verified": false,
-                })
-            } else {
-                match api.current_event(before).await {
-                    Ok(None) => json!({
+                (
+                    json!({
                         "outcome": "done",
-                        "event": shown_event,
-                        "checked": "the event was read back from Apple and is gone",
-                        "remote_verified": true,
-                    }),
-                    Ok(Some(_)) => {
-                        effects.forget.clear();
-                        effects.forget_series = None;
-                        return Err(NOT_CONFIRMED);
-                    }
-                    Err(_) => json!({
-                        "outcome": "done",
-                        "event": shown_event,
-                        "checked": "Apple accepted the deletion; reading it back failed",
+                        "event": {"guid": before.guid, "title": seen(&before.title, SHOWN_CHARS)},
+                        "checked": "Apple accepted the deletion; Apple answers for an occurrence with its series, so it was not read back",
                         "remote_verified": false,
                     }),
-                }
+                    None,
+                )
+            } else {
+                (json!({}), Some(Check::Gone(before.clone())))
             }
         }
         Action::Create => unreachable!("handled above"),
@@ -1313,6 +1383,55 @@ async fn act(
     }
     if let Some(scope) = op.scope {
         value["scope"] = json!(scope.as_str());
+    }
+    Ok(Acted { value, check })
+}
+
+/// Reads back what Apple accepted, under its own time limit: a read that takes too long
+/// leaves the change done but not verified, never unknown.
+async fn finish(
+    conn: &Conn,
+    acted: Acted,
+    limit: Duration,
+    effects: &mut Effects,
+) -> Result<Value, &'static str> {
+    let api = CalendarClient::new(conn.client.http(), &conn.root, conn.client.service_params());
+    let mut value = match acted.check {
+        None => return Ok(acted.value),
+        Some(Check::ReadBack(asked)) => read_back(&api, &asked, effects, limit).await,
+        Some(Check::Gone(before)) => {
+            let event = json!({"guid": before.guid, "title": seen(&before.title, SHOWN_CHARS)});
+            match tokio::time::timeout(limit, api.current_event(&before)).await {
+                Ok(Ok(None)) => json!({
+                    "outcome": "done",
+                    "event": event,
+                    "checked": "the event was read back from Apple and is gone",
+                    "remote_verified": true,
+                }),
+                Ok(Ok(Some(_))) => {
+                    effects.forget.clear();
+                    effects.forget_series = None;
+                    return Err(NOT_CONFIRMED);
+                }
+                Ok(Err(_)) => json!({
+                    "outcome": "done",
+                    "event": event,
+                    "checked": "Apple accepted the deletion; reading it back failed",
+                    "remote_verified": false,
+                }),
+                Err(_) => json!({
+                    "outcome": "done",
+                    "event": event,
+                    "checked": "Apple accepted the deletion; reading it back took too long",
+                    "remote_verified": false,
+                }),
+            }
+        }
+    };
+    if let Some(extra) = acted.value.as_object() {
+        for (k, v) in extra {
+            value[k] = v.clone();
+        }
     }
     Ok(value)
 }
@@ -1332,25 +1451,31 @@ fn day_asked(e: &Event) -> String {
 /// with its series alone, which says nothing about the occurrence. The cache gets Apple's
 /// copy, or, when it can't be confirmed, the event without a version, so the next change asks
 /// for a refresh first.
-async fn read_back(api: &CalendarClient<'_>, asked: &Event, effects: &mut Effects) -> Value {
-    let event = json!({"guid": asked.guid, "title": shown(&asked.title, SHOWN_CHARS), "calendar_guid": asked.calendar_guid});
-    let found = api
-        .event_detail_body(asked, &day_asked(asked))
+async fn read_back(
+    api: &CalendarClient<'_>,
+    asked: &Event,
+    effects: &mut Effects,
+    limit: Duration,
+) -> Value {
+    let event = json!({"guid": asked.guid, "title": seen(&asked.title, SHOWN_CHARS), "calendar_guid": asked.calendar_guid});
+    let found = tokio::time::timeout(limit, api.event_detail_body(asked, &day_asked(asked)))
         .await
-        .map(|body| {
-            body.and_then(|mut body| {
-                // Apple may send one event as an object rather than a list.
-                if body["Event"].is_object() {
-                    body["Event"] = Value::Array(vec![body["Event"].take()]);
-                }
-                quince_icloud::calendar::parse_snapshot(&body)
-                    .events
-                    .into_iter()
-                    .find(|e| e.guid == asked.guid)
+        .map(|read| {
+            read.map(|body| {
+                body.and_then(|mut body| {
+                    // Apple may send one event as an object rather than a list.
+                    if body["Event"].is_object() {
+                        body["Event"] = Value::Array(vec![body["Event"].take()]);
+                    }
+                    quince_icloud::calendar::parse_snapshot(&body)
+                        .events
+                        .into_iter()
+                        .find(|e| e.guid == asked.guid)
+                })
             })
         });
     match found {
-        Ok(Some(apple)) if same(&apple, asked) => {
+        Ok(Ok(Some(apple))) if same(&apple, asked) => {
             let etag = apple.etag.clone();
             effects.put.push(apple);
             json!({
@@ -1369,9 +1494,10 @@ async fn read_back(api: &CalendarClient<'_>, asked: &Event, effects: &mut Effect
                 "outcome": "done",
                 "event": event,
                 "checked": match other {
-                    Ok(Some(_)) => "Apple accepted the change, but its copy read back differs; run calendar_refresh and look at it",
-                    Ok(None) => "Apple accepted the change, but reading it back did not show this event under its own id; run calendar_refresh and look at it",
-                    Err(_) => "Apple accepted the change; reading it back failed",
+                    Ok(Ok(Some(_))) => "Apple accepted the change, but its copy read back differs; run calendar_refresh and look at it",
+                    Ok(Ok(None)) => "Apple accepted the change, but reading it back did not show this event under its own id; run calendar_refresh and look at it",
+                    Ok(Err(_)) => "Apple accepted the change; reading it back failed",
+                    Err(_) => "Apple accepted the change; reading it back took too long. Run calendar_refresh and look at it",
                 },
                 "remote_verified": false,
             })

@@ -106,6 +106,8 @@ struct Fake {
     delay: Arc<Mutex<Option<Duration>>>,
     /// `eventdetail` for an occurrence answers with its series alone, as Apple may.
     master_only: Arc<Mutex<bool>>,
+    /// Once something was saved, `eventdetail` waits this long before answering.
+    slow_reads_after_save: Arc<Mutex<Option<Duration>>>,
 }
 
 impl Respond for Fake {
@@ -129,7 +131,11 @@ impl Respond for Fake {
                     body[k] = v.clone();
                 }
             }
-            return ResponseTemplate::new(200).set_body_json(body);
+            let answer = ResponseTemplate::new(200).set_body_json(body);
+            return match *self.slow_reads_after_save.lock().unwrap() {
+                Some(d) if *self.version.lock().unwrap() > 0 => answer.set_delay(d),
+                _ => answer,
+            };
         }
         let Some(rest) = p.strip_prefix("/ca/events/") else {
             return ResponseTemplate::new(400);
@@ -248,6 +254,7 @@ async fn fixture(policy: Option<&str>) -> Fixture {
         &remote.uri(),
         WriteLimits {
             change_timeout: Duration::from_secs(20),
+            ..WriteLimits::default()
         },
     ));
     init(&mut server, true).await;
@@ -953,6 +960,7 @@ async fn an_answer_lost_after_sending_is_unknown_and_says_to_look_first() {
         &f.remote.uri(),
         WriteLimits {
             change_timeout: Duration::from_secs(1),
+            ..WriteLimits::default()
         },
     ));
     let e = error(
@@ -1105,7 +1113,7 @@ async fn the_terminal_text_shows_every_field_and_what_changes() {
     for part in [
         "title: Dentist, a long and complete title",
         "location: Room 4",
-        "(50 more characters)",
+        "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
         "url: https://example.test/a",
         "when: unchanged",
     ] {
@@ -1422,4 +1430,180 @@ impl Respond for OneObject {
             None => ResponseTemplate::new(404),
         }
     }
+}
+
+// --- Third review.
+
+#[tokio::test]
+async fn the_terminal_shows_whole_notes_and_line_separators_are_refused_or_hidden() {
+    let mut f = fixture(Some("yolo")).await;
+    let notes = format!("first line\n{}\nlast words", "m".repeat(400));
+    rules(
+        f.dir.path(),
+        "rules:\n  calendar_write.update: {ask: terminal}\n",
+    );
+    let id = proposal_id(&ok(&mut f.server, update("E-1", json!({"notes":notes}))).await);
+    let shown = f.server.approval_text(&id).unwrap();
+    assert!(
+        shown.contains("last words") && shown.contains("first line"),
+        "{shown}"
+    );
+    assert!(!shown.contains("more characters"), "{shown}");
+    // U+2028 and U+2029 could break a line where none is shown: refused in what is sent.
+    for title in ["a\u{2028}b", "a\u{2029}b"] {
+        assert_eq!(
+            code(&mut f.server, update("E-1", json!({"title":title}))).await,
+            "invalid_title"
+        );
+    }
+    // And hidden when they come from Apple.
+    {
+        let mut library = quince_core::Library::open(f.dir.path()).unwrap();
+        let mut e = library.event("E-1").unwrap().unwrap();
+        e.title = "Den\u{2028}tist".into();
+        library.put_events(&[e]).unwrap();
+    }
+    let id = proposal_id(&ok(&mut f.server, update("E-1", json!({"location":"x"}))).await);
+    let shown = f.server.approval_text(&id).unwrap();
+    assert!(
+        shown.contains("Den\u{FFFD}tist") && !shown.contains('\u{2028}'),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn a_save_uses_the_calendars_current_ctag_and_a_create_conflict_is_not_an_event_change() {
+    let mut f = fixture(Some("yolo")).await;
+    Mock::given(method("GET"))
+        .and(path("/ca/collectiondetail/cal-work"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"Collection":[{"guid":"cal-work","title":"Work","ctag":"c1-new"}]}),
+        ))
+        .mount(&f.remote)
+        .await;
+    ok(&mut f.server, update("E-1", json!({"title":"Dentist!"}))).await;
+    let (_, body) = writes(&f.remote).await.pop().unwrap();
+    assert_eq!(
+        body["ClientState"]["Collection"][0]["ctag"], "c1-new",
+        "{body}"
+    );
+    Mock::given(method("POST"))
+        .and(path_regex("^/ca/events/cal-work/[0-9A-F-]+$"))
+        .respond_with(ResponseTemplate::new(409))
+        .with_priority(1)
+        .mount(&f.remote)
+        .await;
+    let e = error(
+        &mut f.server,
+        json!({"action":"create","calendar_guid":"cal-work","title":"New","start":"2026-12-06T10:00Z"}),
+    )
+    .await;
+    assert_eq!(
+        e["error"],
+        "calendar_changed_run_calendar_refresh_and_try_again"
+    );
+    assert!(!e["instructions"].as_str().unwrap().contains("etag"), "{e}");
+}
+
+#[tokio::test]
+async fn a_slow_read_back_is_done_but_not_verified() {
+    let mut f = fixture(Some("yolo")).await;
+    *f.fake.slow_reads_after_save.lock().unwrap() = Some(Duration::from_secs(3));
+    f.server.set_calendar_seam(seam(
+        &f.remote.uri(),
+        WriteLimits {
+            change_timeout: Duration::from_secs(20),
+            read_back_timeout: Duration::from_millis(500),
+        },
+    ));
+    let done = ok(
+        &mut f.server,
+        json!({"action":"create","calendar_guid":"cal-work","title":"Slow","start":"2026-12-07T10:00Z"}),
+    )
+    .await;
+    assert_eq!(done["outcome"], "done", "{done}");
+    assert_eq!(done["remote_verified"], false, "{done}");
+    assert!(
+        done["checked"].as_str().unwrap().contains("too long"),
+        "{done}"
+    );
+}
+
+#[tokio::test]
+async fn terminal_requests_say_what_to_do_and_errors_name_the_fix() {
+    let mut f = fixture(Some("yolo")).await;
+    let reply = ok(
+        &mut f.server,
+        json!({"action":"delete","guid":"E-1","etag":"etag-E-1"}),
+    )
+    .await;
+    assert!(
+        reply["next"]
+            .as_str()
+            .unwrap()
+            .contains("type this request ID"),
+        "{reply}"
+    );
+    for (args, why, hint) in [
+        (
+            json!({"action":"create","calendar_guid":"cal-work","title":"x","all_day":true,"start":"2026-01-01","end":"2027-06-01"}),
+            "event_too_long",
+            "366",
+        ),
+        (
+            json!({"action":"move","guid":"E-1","etag":"etag-E-1","calendar_guid":"cal-work"}),
+            "already_in_this_calendar",
+            "calendar_calendars",
+        ),
+        (
+            json!({"action":"remove","guid":"E-1","etag":"etag-E-1"}),
+            "calendar_write_unknown_action",
+            "create, update, move, delete",
+        ),
+    ] {
+        let e = error(&mut f.server, args.clone()).await;
+        assert_eq!(e["error"], why, "{args}");
+        assert!(
+            e["instructions"].as_str().unwrap().contains(hint),
+            "{args}: {e}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_create_card_names_a_planned_event_not_an_existing_one() {
+    let mut f = fixture(Some("writes_only")).await;
+    let form = call(
+        &mut f.server,
+        json!({"action":"create","calendar_guid":"cal-home","title":"Lunch","start":"2026-12-05T12:00Z"}),
+    )
+    .await;
+    let message = form["params"]["message"].as_str().unwrap();
+    assert!(message.contains("planned\\u005fevent"), "{message}");
+    assert!(!message.contains("existing\\u005fitem"), "{message}");
+}
+
+#[tokio::test]
+async fn the_invitations_rule_change_has_its_own_history_sentence() {
+    let f = fixture(Some("writes_only")).await;
+    rules(
+        f.dir.path(),
+        "rules:\n  calendar_write.send_invitations: allow\n",
+    );
+    let shown =
+        skykeep_mcp::permissions::show(&f.dir.path().canonicalize().unwrap(), false).unwrap();
+    assert!(
+        shown.contains("looser: calendar_write.send_invitations: changes that would notify invited people were refused before, now they may run"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn the_approve_help_says_a_calendar_change_runs_at_once() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_skykeep-mcp"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("Calendar change runs at once"), "{text}");
 }

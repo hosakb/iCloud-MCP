@@ -59,7 +59,7 @@ More commands (each needs --state-dir FOLDER):
   skykeep-mcp policy --state-dir FOLDER MODE
                           set the approval mode: reads_and_writes, writes_only or yolo
   skykeep-mcp approve     approve one waiting change by its request ID: a Notes or
-                          Reminders change is queued, a Drive change runs at once
+                          Reminders change is queued, a Drive or Calendar change runs at once
   skykeep-mcp require-approval
                           folders without an approval mode: every change waits for approve
   skykeep-mcp allow-routine
@@ -366,7 +366,7 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
             .map_err(|_| "terminal_unavailable")?;
             let answer = terminal::hidden(
                 &mut tty,
-                "Type approve to allow it (a Notes or Reminders change is queued for the next sync, a Drive change runs now), or Ctrl-C to cancel: ",
+                "Type approve to allow it (a Notes or Reminders change is queued for the next sync, a Drive or Calendar change runs now), or Ctrl-C to cancel: ",
                 Duration::from_secs(180),
             )?;
             if *answer != "approve" {

@@ -951,6 +951,26 @@ pub fn unseen(library: &Library) -> Vec<Value> {
 }
 
 fn change_line(c: &Value) -> String {
+    // Not an action: allow lets changes run, anything else refuses them.
+    if c["name"] == crate::calendar_write::INVITATIONS_RULE {
+        let runs = |key: &str| c[key] == Effect::Allow.as_str();
+        let (was, now) = (
+            if runs("from") {
+                "may run"
+            } else {
+                "were refused"
+            },
+            if runs("to") {
+                "they may run"
+            } else {
+                "they are refused"
+            },
+        );
+        return format!(
+            "{}: changes that would notify invited people {was} before, now {now}",
+            crate::calendar_write::INVITATIONS_RULE
+        );
+    }
     let effect = |key: &str| {
         Effect::from_str(c[key].as_str().unwrap_or_default())
             .map(Effect::sentence)
