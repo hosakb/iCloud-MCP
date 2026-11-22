@@ -432,6 +432,24 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
         "local_file_exists_not_overwritten" => Some("A file with that name is already in the exchange folder, and it was left as it is. Ask again with another local name, or move that file away first.".to_string()),
         "already_has_this_name" => Some("Nothing to do: iCloud Drive already shows the item under that name.".to_string()),
         "already_in_destination" => Some("Nothing to do: the item is already in that folder in iCloud Drive.".to_string()),
+        "policy_state_changed" => Some(format!("This folder was copied or moved, so its approval mode belongs to the old folder. In your own terminal, run {} to choose it again.", status::with_dir("skykeep-mcp setup", dir))),
+        "policy_account_changed" => Some(format!("The approval mode was set before sign-in or for another account. In your own terminal, run {} to choose it again.", status::with_dir("skykeep-mcp setup", dir))),
+        "login_required" => Some(format!("Sign in with {} in a terminal you opened yourself, not one an AI app runs. Never send passwords or codes to MCP or chat.", status::with_dir("skykeep-mcp login", dir))),
+        "conflict" => Some("The item changed since you read it, so nothing was queued. Read it again with notes_get or reminders_get, then ask again with its current base_etag.".to_string()),
+        "mutation_refused" => Some(format!("The change could not be saved to the local queue, so nothing was queued. In your own terminal, run {} to check this folder, then try again.", status::with_dir("skykeep-mcp status", dir))),
+        "drive_read_failed_nothing_sent" => Some("Apple's answer about the item could not be read, so nothing was sent. Try again in a moment; if it keeps failing, run drive_refresh on the folder.".to_string()),
+        "local_file_not_found" => Some("No file with that local name is in the exchange folder. Check the name, or put the file there first.".to_string()),
+        "local_folder_not_found" => Some("A folder on that local path is not in the exchange folder. Check the path, or make the folder first.".to_string()),
+        "local_not_a_folder" => Some("A name on that local path is a file, not a folder. Check the path and ask again.".to_string()),
+        "local_symlink_refused" => Some("That local path goes through a symbolic link, which is refused. Use the real file or folder inside the exchange folder.".to_string()),
+        "path_not_in_cache_run_drive_refresh" => Some("A folder on that path is not in the local copy of iCloud Drive yet. Run drive_refresh with the same path, then try again.".to_string()),
+        "range_too_wide" => Some(format!("The date range is too long. calendar_events and calendar_search take at most {} days, calendar_refresh at most {} days. Ask again with a shorter range.", calendar::MAX_RANGE_DAYS, calendar::MAX_REFRESH_DAYS)),
+        photos::APPLE_FAILED => Some("Apple's Photos server was busy, had asked to wait, or sent a reply that could not be used. The local copy was kept as it was. Run photos_refresh again in a few minutes.".to_string()),
+        photos::STORE_FAILED => Some(format!("Apple's Photos reply arrived, but it could not be saved to the local copy, which was kept as it was. In your own terminal, run {} to check this folder, then run photos_refresh again.", status::with_dir("skykeep-mcp status", dir))),
+        "calendar_service_unavailable" => service_off("Apple Calendar", dir),
+        "contacts_service_unavailable" => service_off("Apple Contacts", dir),
+        "drive_service_unavailable" => service_off("iCloud Drive", dir),
+        "photos_service_unavailable" => service_off("iCloud Photos", dir),
         "local_folder_not_private" => Some(
             args["local"]
                 .as_str()
@@ -443,6 +461,11 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
         ),
         other => calendar_write::next_step(other, args),
     }
+}
+
+/// The next step when the sign-in does not offer `service`.
+fn service_off(service: &str, dir: &Path) -> Option<String> {
+    Some(format!("This iCloud sign-in does not offer {service}. Check that {service} is turned on for this Apple Account in iCloud settings, then in your own terminal run {} to sign in again.", status::with_dir("skykeep-mcp setup", dir)))
 }
 
 /// [`tool_reply`] with [`error_value`]'s instructions, and the rule that denied the call.
@@ -2242,11 +2265,17 @@ fn authorized_enqueue(
             present.push(p.id);
         }
     }
+    // A refusal from the write keeps its own code; a library failure is `mutation_refused`.
+    struct Refused(&'static str);
+    impl From<quince_core::Error> for Refused {
+        fn from(_: quince_core::Error) -> Self {
+            Refused("mutation_refused")
+        }
+    }
     library
-        .atomically(|library| -> quince_core::Result<Value> {
-            let convert = |error| quince_core::Error::Io(std::io::Error::other(error));
-            let result = enqueue(library).map_err(convert)?;
-            let after = sync::pending_operations(library).map_err(convert)?;
+        .atomically(|library| -> Result<Value, Refused> {
+            let result = enqueue(library).map_err(Refused)?;
+            let after = sync::pending_operations(library).map_err(Refused)?;
             for p in &after {
                 let old = before.iter().find(|old| old.id == p.id);
                 if old.is_some()
@@ -2269,7 +2298,7 @@ fn authorized_enqueue(
                     || result["guid"] == p.record
                     || (old == Some(p) && current.contains(&p.id))
                 {
-                    sync::record_authorization(library, p).map_err(convert)?;
+                    sync::record_authorization(library, p).map_err(Refused)?;
                 }
             }
             for p in &before {
@@ -2279,7 +2308,7 @@ fn authorized_enqueue(
             }
             Ok(result)
         })
-        .map_err(|_| "mutation_refused")
+        .map_err(|Refused(error)| error)
 }
 
 /// One-time setup under the directory lock: persistent document writer and private modes.
@@ -2961,7 +2990,7 @@ pub(crate) fn tools() -> Vec<Value> {
     ] {
         tools.push(json!({"name":name,"description":format!("Search the user's {kind} in the local cache index."),"inputSchema":{"type":"object","properties":{"query":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}},"required":["query"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     }
-    tools.push(json!({"name":"notes_write","description":"Queue a change to the user's Apple iCloud Notes (create, save, move, pin, delete). Follows the approval mode. Queued is not remote-verified.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","save","move","pin","delete"]},"body":{"type":"string"},"pinned":{"type":"boolean"},"runs":{"type":["array","null"],"items":{"type":"object"}},"folder_guid":{"type":["string","null"]},"guid":{"type":"string"},"base_etag":{"type":["string","null"]}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
+    tools.push(json!({"name":"notes_write","description":"Queue a change to the user's Apple iCloud Notes (create, save, move, pin, delete). Follows the approval mode. Queued is not remote-verified.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","save","move","pin","delete"]},"body":{"type":"string"},"pinned":{"type":"boolean"},"runs":{"type":["array","null"],"items":{"type":"object"}},"folder_guid":{"type":["string","null"]},"guid":{"type":"string"},"base_etag":{"type":["string","null"],"description":"Needed for move, save, pin and delete: the etag from notes_get. A missing or older etag returns conflict."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
     tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). A create can also repeat daily and alert at or before its due time. Deletions need local terminal approval. Queued is not CloudKit-accepted; sync reports accepted writes. No field-level remote verification.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."},"base_etag":{"type":["string","null"],"description":"Edit only: the etag from reminders_get. A newer cached copy returns conflict."},"repeat":{"type":"object","description":"Create only. Repeats daily from due_at, until the end of the given day or for ever. Needs due_at.","properties":{"frequency":{"enum":["daily"]},"until":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"YYYY-MM-DD, the last day it repeats. Read in timezone for a timed due_at, in UTC for an all-day one."}},"required":["frequency"],"additionalProperties":false},"due_time_alert":{"type":"boolean","description":"Create only. Alert at due_at. Needs a timed (not all-day) due_at."},"early_alert":{"type":"object","description":"Create only. Alert this long before due_at. Needs a timed due_at, and an early alert set on one of the user's reminders from an Apple device and then a sync, so the account id it carries is in the cache.","properties":{"amount":{"type":"integer","minimum":1,"maximum":10000},"unit":{"enum":["minutes","hours","days","weeks","months"]}},"required":["amount","unit"],"additionalProperties":false},"timezone":{"type":"string","maxLength":64,"description":"Create only. IANA zone the timed due_at and its alerts are kept in, such as Europe/Berlin. Default: this computer's zone, or UTC if it has no IANA name."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
     tools.push(json!({"name":"reminders_get","description":"Read one cached Apple Reminders item and its supported details. Not a complete archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools.push(json!({"name":"notes_get","description":"Read one cached Apple iCloud Notes note. Not a complete preservation archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
