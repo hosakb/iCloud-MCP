@@ -1105,6 +1105,7 @@ async fn no_mcp_tool_reads_or_changes_the_rules() {
 fn the_starter_file_asks_before_deletions_and_lists_every_name() {
     for (mode, ask) in [
         (Some("writes_only"), Effect::AskClient),
+        (Some("yolo"), Effect::AskTerminal),
         (None, Effect::AskTerminal),
     ] {
         let text = permissions::starter(mode);
@@ -1120,7 +1121,15 @@ fn the_starter_file_asks_before_deletions_and_lists_every_name() {
         assert!(!text.contains("ignores all of it"), "{text}");
         assert_eq!(rules["notes_write.delete"], ask);
         assert_eq!(rules["reminders_write.delete"], ask);
-        assert!(rules.keys().all(|k| k.ends_with("delete")), "{rules:?}");
+        assert!(
+            rules.keys().all(|k| {
+                let (tool, action) = k.split_once('.').unwrap();
+                permissions::is_deletion(tool, action)
+            }),
+            "{rules:?}"
+        );
+        assert_eq!(rules["drive_write.trash"], ask);
+        assert_eq!(rules["drive_write.delete_forever"], ask);
         for name in permissions::names() {
             assert!(text.contains(&format!("#   {name}\n")), "{name}");
         }
@@ -1178,7 +1187,11 @@ async fn permissions_show_describes_deletions_as_the_server_runs_them() {
     f.server.handle(call(1, "reminders_lists", json!({}))).await;
     let shown = permissions::show(&f.path().canonicalize().unwrap(), false).unwrap();
     assert!(shown.contains("reminders_write.delete: allow, but waits for skykeep-mcp approve in your terminal, because a folder without an approval mode always asks before deleting"), "{shown}");
-    assert!(shown.contains("notes_write: allow, runs without asking, except deletions, which wait for skykeep-mcp approve in your terminal"), "{shown}");
+    assert!(
+        shown
+            .contains("notes_write: allow, runs without asking, except deletions, which still ask"),
+        "{shown}"
+    );
     assert!(
         shown.contains("reminders_write.create: allow, runs without asking\n"),
         "{shown}"

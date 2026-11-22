@@ -960,7 +960,7 @@ fn offer_permissions(console: &mut dyn Console, dir: &Path) -> Result<(), &'stat
         .ok()
         .flatten()
         .map(|(p, _)| p.mode);
-    let ask = if mode.is_some() {
+    let ask = if mode.as_deref().is_some_and(|m| m != "yolo") {
         "on a card in your MCP client"
     } else {
         "in your terminal, with skykeep-mcp approve"

@@ -171,6 +171,9 @@ async fn authenticated_sync_refreshes_only_notes_and_reminders() {
         .unwrap();
     assert_eq!(result["services"].as_array().unwrap().len(), 2);
     assert_eq!(result["remote_verified"], false);
+    // Nothing left the queue, so there is nothing for the accepted note to explain.
+    assert_eq!(result["left_queue_this_sync"], serde_json::json!([]));
+    assert!(result.get("left_queue_note").is_none(), "{result}");
     let requests = server.received_requests().await.unwrap();
     assert!(requests
         .iter()

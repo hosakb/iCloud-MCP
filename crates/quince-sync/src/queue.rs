@@ -134,6 +134,7 @@ where
             }
         };
         let (id, tries, record) = (p.id, p.tries, p.record.clone());
+        let left = p.clone();
         // A panic while sending one change is that change refused, said with the rest — never
         // the whole queue stopped behind it, retried for ever, its edit laid back over the
         // screen each time (an empty note's formatting once did this).
@@ -149,7 +150,14 @@ where
         };
         match sent {
             Ok(()) => {
-                let _ = library.lock().await.outbox_done(id);
+                let mut l = library.lock().await;
+                if l.outbox_done(id).is_ok() {
+                    // Left behind, the note says every step was taken: a stale key, never a
+                    // reason to write again, so it is logged rather than failing the pass.
+                    if let Err(e) = crate::reminders::settle(&mut l, &left) {
+                        crate::quiet!("outbox: a sent change's step note stayed: {e}");
+                    }
+                }
                 report.sent = true;
             }
             Err(e) if transient(&e, tries) => {
@@ -158,6 +166,8 @@ where
                 return report;
             }
             Err(e) => {
+                // A refused change keeps its step note: sent again from the refused list, it
+                // takes only the steps still to do. Discarding it takes the note away.
                 let _ = library.lock().await.outbox_refuse(id, &e.to_string());
                 report.refused.push((record, e.to_string()));
             }

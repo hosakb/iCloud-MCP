@@ -925,7 +925,7 @@ async fn initialize_and_discover_only_notes_and_reminders_tools() {
             &"calendar_refresh"
         ]
     );
-    // Drive is read-only metadata in this phase.
+    // Drive: four reads and one tool for every change.
     let drive: Vec<_> = names.iter().filter(|n| n.contains("drive")).collect();
     assert_eq!(
         drive,
@@ -933,7 +933,8 @@ async fn initialize_and_discover_only_notes_and_reminders_tools() {
             &"drive_list",
             &"drive_get",
             &"drive_search",
-            &"drive_refresh"
+            &"drive_refresh",
+            &"drive_write"
         ]
     );
     assert!(server

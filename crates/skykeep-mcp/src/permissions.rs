@@ -641,12 +641,12 @@ fn diff(
         let default = default_effect(mode, require_all, &t.tool, action);
         let before = rule_for(old, &t.tool, action).unwrap_or(default);
         let after = rule_for(new, &t.tool, action).unwrap_or(default);
-        // Without an approval mode a deletion never gets looser than the terminal.
-        let floor = |e: Effect| match (mode, action) {
-            (None, Some(a)) if is_deletion(&t.tool, a) => e.max(Effect::AskTerminal),
-            _ => e,
+        // Never looser than the server's minimum for the action.
+        let least = |e: Effect| match action.and_then(|a| floor(mode, &t.tool, a)) {
+            Some((least, _)) => e.max(least),
+            None => e,
         };
-        let (before, after) = (floor(before), floor(after));
+        let (before, after) = (least(before), least(after));
         let change = json!({"name":t.name,"from":before.as_str(),"to":after.as_str()});
         if after < before {
             looser.push(change);
@@ -925,31 +925,63 @@ pub fn status(library: &Library, dir: &Path, mode: Option<&str>) -> Vec<(String,
 
 /// A rule and what it does, after the minimum the server keeps: without an approval mode,
 /// deletions always wait for the terminal.
+/// The least the server asks for an action whatever a rule says, and why: without an approval
+/// mode every deletion waits for the terminal, and a Drive deletion always needs a person.
+fn floor(mode: Option<&str>, tool: &str, action: &str) -> Option<(Effect, &'static str)> {
+    if !is_deletion(tool, action) {
+        return None;
+    }
+    match mode {
+        None => Some((
+            Effect::AskTerminal,
+            "a folder without an approval mode always asks before deleting",
+        )),
+        Some(mode) if tool == crate::drive_write::TOOL => Some((
+            if mode == "yolo" {
+                Effect::AskTerminal
+            } else {
+                Effect::AskClient
+            },
+            "a Drive deletion always needs a person",
+        )),
+        Some(_) => None,
+    }
+}
+
+/// A rule and what it does, after the server's minimum (see [`floor`]).
 fn described(name: &str, effect: Effect, mode: Option<&str>) -> String {
     let all = targets();
     let target = all.iter().find(|t| t.name == name);
-    let deletes = |tool: &str, action: &str| mode.is_none() && is_deletion(tool, action);
-    let floor = target.and_then(|t| t.action.as_deref().map(|a| deletes(&t.tool, a)));
-    let tool_deletes = target.is_some_and(|t| {
+    let own = target.and_then(|t| floor(mode, &t.tool, t.action.as_deref()?));
+    let drive = target.is_some_and(|t| t.tool == crate::drive_write::TOOL);
+    let action = target.and_then(|t| t.action.as_deref());
+    let tool_floored = target.is_some_and(|t| {
         t.action.is_none()
             && all.iter().any(|o| {
-                o.tool == t.tool && o.action.as_deref().is_some_and(|a| deletes(&o.tool, a))
+                o.tool == t.tool
+                    && o.action
+                        .as_deref()
+                        .and_then(|a| floor(mode, &o.tool, a))
+                        .is_some_and(|(least, _)| effect < least)
             })
     });
-    if floor == Some(true) && effect < Effect::AskTerminal {
-        format!(
-            "{}, but {}, because a folder without an approval mode always asks before deleting",
-            effect.as_str(),
-            Effect::AskTerminal.sentence()
-        )
-    } else if tool_deletes && effect < Effect::AskTerminal {
-        format!(
-            "{}, {}, except deletions, which wait for skykeep-mcp approve in your terminal",
-            effect.as_str(),
-            effect.sentence()
-        )
-    } else {
-        format!("{}, {}", effect.as_str(), effect.sentence())
+    let plain = format!("{}, {}", effect.as_str(), effect.sentence());
+    match own {
+        Some((least, why)) if effect < least => {
+            format!(
+                "{}, but {}, because {why}",
+                effect.as_str(),
+                least.sentence()
+            )
+        }
+        _ if tool_floored => format!("{plain}, except deletions, which still ask"),
+        _ if drive
+            && effect == Effect::Allow
+            && (action.is_none() || matches!(action, Some("rename" | "move"))) =>
+        {
+            format!("{plain}, except renaming or moving a large folder, which still asks")
+        }
+        _ => plain,
     }
 }
 
@@ -1129,7 +1161,13 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
 /// A first file for `dir`'s approval mode: deletions ask, the way the mode already asks or
 /// more strictly, and every valid name is listed as a comment.
 pub fn starter(mode: Option<&str>) -> String {
-    let ask = if mode.is_some() { "client" } else { "terminal" };
+    // On the card where the mode already asks there; in the terminal under yolo and without
+    // a mode, where Drive deletions already wait for it.
+    let ask = if mode.is_some_and(|m| m != "yolo") {
+        "client"
+    } else {
+        "terminal"
+    };
     let mut out = String::from(
         "# Skykeep permissions\n\
          #\n\

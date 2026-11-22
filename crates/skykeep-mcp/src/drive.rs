@@ -1,7 +1,7 @@
 //! Apple iCloud Drive, read-only metadata: a cached folder listing, one item's details, a name
 //! search, and an explicit refresh that reads one folder's item list (and that of each folder
 //! on its path) into the local cache. Nothing here reads file contents, writes to Apple, sends
-//! a queued change or touches a local file path. The engine crates own the parsing and the
+//! a queued change or touches a local file path; changes are `drive_write`'s. The engine crates own the parsing and the
 //! cache; the refresh's requests are made here so every response is read under a byte limit,
 //! and the engine's own reader (`parse_folder`) does the rest.
 //!
@@ -40,7 +40,7 @@ const SEARCH_KEEPS: usize = 1000;
 /// listed again.
 const MAX_LISTED: usize = 10_000;
 /// Where the folders read by `drive_refresh` are kept: a JSON object, id to unix seconds.
-const LISTED_KEY: &str = "mcp.drive.listed";
+pub(crate) const LISTED_KEY: &str = "mcp.drive.listed";
 
 /// Caps on a tool result's text as encoded in the JSON-RPC frame, as for Contacts.
 const MAX_PAGE_BYTES: usize = 262_144;
@@ -56,7 +56,7 @@ const DATES: std::ops::RangeInclusive<i64> = 0..=7_258_118_400;
 
 /// What a cached item does not hold.
 const NOT_INCLUDED: [&str; 6] = [
-    "file contents; this server never downloads, uploads, renames, moves or deletes Drive items",
+    "file contents; drive_write downloads a file into the exchange folder",
     "items in Recently Deleted",
     "folders not yet read with drive_refresh",
     "sharing, collaboration and version history",
@@ -92,7 +92,7 @@ struct Search {
 
 /// Where an argument points: the root, a cloud path's names, or an id.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Target {
+pub(crate) enum Target {
     Path(Vec<String>),
     Id(String),
 }
@@ -110,7 +110,7 @@ fn page_limit(limit: Option<usize>) -> Result<usize, &'static str> {
 }
 
 /// The names of a cloud path. `/` is the root and has none.
-fn path_names(path: &str) -> Result<Vec<String>, &'static str> {
+pub(crate) fn path_names(path: &str) -> Result<Vec<String>, &'static str> {
     if path.len() > MAX_PATH_BYTES {
         return Err("path_too_long");
     }
@@ -131,7 +131,7 @@ fn path_names(path: &str) -> Result<Vec<String>, &'static str> {
 }
 
 /// Whether `name` can be one name of a cloud path.
-fn addressable(name: &str) -> bool {
+pub(crate) fn addressable(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME_BYTES
         && name != "."
@@ -140,7 +140,7 @@ fn addressable(name: &str) -> bool {
         && !name.chars().any(char::is_control)
 }
 
-fn checked_id(id: &str) -> Result<(), &'static str> {
+pub(crate) fn checked_id(id: &str) -> Result<(), &'static str> {
     if id.is_empty() || id.len() > MAX_ID_BYTES || id.chars().any(char::is_control) {
         return Err("invalid_id");
     }
@@ -149,7 +149,7 @@ fn checked_id(id: &str) -> Result<(), &'static str> {
 
 /// A folder argument: the root when neither is given. Recently Deleted and file ids are
 /// refused by their form, before the cache is read.
-fn folder_target(path: Option<&str>, id: Option<&str>) -> Result<Target, &'static str> {
+pub(crate) fn folder_target(path: Option<&str>, id: Option<&str>) -> Result<Target, &'static str> {
     match (path, id) {
         (Some(_), Some(_)) => Err("invalid_arguments"),
         (Some(path), None) => Ok(Target::Path(path_names(path)?)),
@@ -213,6 +213,7 @@ pub(crate) fn validate(name: &str, args: &Value) -> Result<(), &'static str> {
         "drive_get" => item_target(&parse(args)?).map(|_| ()),
         "drive_search" => search_args(args).map(|_| ()),
         "drive_refresh" => refresh_target(args).map(|_| ()),
+        "drive_write" => crate::drive_write::validate(args).map(|_| ()),
         _ => Ok(()),
     }
 }
@@ -229,12 +230,12 @@ pub(crate) fn refresh_scope() -> Value {
 
 // --- The cache.
 
-fn is_trash(item: &DriveItem) -> bool {
+pub(crate) fn is_trash(item: &DriveItem) -> bool {
     item.drivewsid.contains(TRASH) || item.parent_id.as_deref().is_some_and(|p| p.contains(TRASH))
 }
 
 /// What `drive_refresh` has read: folder id to unix seconds.
-fn listed_map(library: &Library) -> serde_json::Map<String, Value> {
+pub(crate) fn listed_map(library: &Library) -> serde_json::Map<String, Value> {
     library
         .state(LISTED_KEY)
         .ok()
@@ -251,7 +252,7 @@ fn listed_at(library: &Library, id: &str) -> Option<i64> {
     listed_map(library).get(id).and_then(Value::as_i64)
 }
 
-fn children(library: &Library, id: &str) -> Result<Vec<DriveItem>, &'static str> {
+pub(crate) fn children(library: &Library, id: &str) -> Result<Vec<DriveItem>, &'static str> {
     let mut items = library
         .drive_children(id)
         .map_err(|_| "library_unavailable")?;
@@ -266,13 +267,16 @@ fn children(library: &Library, id: &str) -> Result<Vec<DriveItem>, &'static str>
     Ok(items)
 }
 
-fn same_name(item: &DriveItem, name: &str) -> bool {
+pub(crate) fn same_name(item: &DriveItem, name: &str) -> bool {
     quince_core::fold::composed(&item.display_name()) == quince_core::fold::composed(name)
 }
 
 /// The cached item a path names, `None` for the root. Each folder on the way must have been
 /// listed, or the cache cannot say what is in it.
-fn resolve_cached(library: &Library, names: &[String]) -> Result<Option<DriveItem>, &'static str> {
+pub(crate) fn resolve_cached(
+    library: &Library,
+    names: &[String],
+) -> Result<Option<DriveItem>, &'static str> {
     let listed = listed_map(library);
     let mut at: Option<DriveItem> = None;
     for name in names {
@@ -295,7 +299,7 @@ fn resolve_cached(library: &Library, names: &[String]) -> Result<Option<DriveIte
     Ok(at)
 }
 
-fn cached_item(library: &Library, id: &str) -> Result<Option<DriveItem>, &'static str> {
+pub(crate) fn cached_item(library: &Library, id: &str) -> Result<Option<DriveItem>, &'static str> {
     Ok(library
         .drive_item(id)
         .map_err(|_| "library_unavailable")?
@@ -304,7 +308,7 @@ fn cached_item(library: &Library, id: &str) -> Result<Option<DriveItem>, &'stati
 
 /// The cloud path of a cached item, by its parents up to the root. `None` when the chain is
 /// not cached whole or a name cannot be written in a path.
-fn cloud_path(library: &Library, item: &DriveItem) -> Option<String> {
+pub(crate) fn cloud_path(library: &Library, item: &DriveItem) -> Option<String> {
     let mut names = vec![item.display_name()];
     let mut parent = item.parent_id.clone();
     loop {
@@ -345,7 +349,7 @@ fn date(at: Option<i64>) -> Value {
         .map_or(Value::Null, |at| Value::String(utc_text(at)))
 }
 
-fn kind(item: &DriveItem) -> &'static str {
+pub(crate) fn kind(item: &DriveItem) -> &'static str {
     match item.kind.as_str() {
         "FOLDER" => "folder",
         "APP_LIBRARY" => "app_library",
@@ -452,7 +456,7 @@ fn paged(
 }
 
 /// The folder a list or refresh argument names, from the cache: its id and cloud path.
-fn cached_folder(
+pub(crate) fn cached_folder(
     library: &Library,
     target: &Target,
 ) -> Result<(String, Option<String>), &'static str> {
@@ -702,7 +706,7 @@ const MAX_REFUSAL_BYTES: usize = 4096;
 
 /// Why a refresh read stopped. Apple's own error bodies are never stored or shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stop {
+pub(crate) enum Stop {
     Reauth,
     Busy,
     Failed,
@@ -745,7 +749,7 @@ impl Stop {
     }
 }
 
-const PAUSED: &str = "drive_paused_approve_on_apple_device";
+pub(crate) const PAUSED: &str = "drive_paused_approve_on_apple_device";
 
 fn refused(status: u16) -> Option<Stop> {
     match status {
@@ -759,7 +763,7 @@ fn refused(status: u16) -> Option<Stop> {
 /// One folder's item list from `retrieveItemDetailsInFolders`, as the engine's
 /// `fetch_folder` asks for it, its body read under the limits, checked, and parsed by the
 /// engine's reader. Recently Deleted items are left out.
-async fn folder_read(
+pub(crate) async fn folder_read(
     client: &Client,
     root: &str,
     id: &str,
