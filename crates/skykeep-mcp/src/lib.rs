@@ -402,6 +402,9 @@ fn error_value(error: &'static str, dir: &Path, args: &Value) -> Value {
 /// result carries as `instructions` and the terminal approval prints. `args` are the call's
 /// arguments (`Value::Null` when there are none).
 pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
+    if let Some(text) = photos_write::next_step(error, dir, args) {
+        return Some(text);
+    }
     match error {
         "unsafe_state_contents" => state::unsafe_entry_sentence(dir),
         e if e.starts_with("exchange_folder_") => Some(format!(
@@ -411,13 +414,6 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
         drive_write::UNKNOWN => Some("The connection ended before Apple answered, so the change may or may not have been made. Run drive_refresh on the folder and look at it before trying again.".to_string()),
         drive_write::IN_RECENTLY_DELETED => Some("The item is in Recently Deleted in iCloud Drive but was not deleted for good. Delete it there (iCloud Drive on icloud.com or a Mac), or leave it: Apple deletes it by itself after about 30 days.".to_string()),
         drive_write::IN_RECENTLY_DELETED_LOGIN => Some(format!("The item is in Recently Deleted in iCloud Drive but was not deleted for good, because the sign-in has expired. Sign in again with {} in your own terminal, then delete it from Recently Deleted in iCloud Drive, or leave it: Apple deletes it by itself after about 30 days.", status::with_dir("skykeep-mcp login", dir))),
-        photos_write::UNKNOWN => Some("The connection ended before Apple answered, so the Photos change may or may not have been made. Run photos_refresh and look at the photo or album before trying again; an upload or a new album asked again could be made twice.".to_string()),
-        photos_write::CHANGED => Some("The photo or album changed in iCloud Photos since the local cache read it, so it was left as it is. Run photos_refresh, look at it again, then ask again.".to_string()),
-        "album_name_taken" => Some("Another album in iCloud Photos already has that name, as the local cache shows, so nothing was changed. Ask again with another name, or rename the other album first.".to_string()),
-        "album_already_has_this_name" => Some("Nothing to do: the album already has that name in the local cache.".to_string()),
-        "photos_file_too_small" => Some(format!("iCloud Photos takes files of at least {} bytes, so nothing was uploaded. Pick a whole photo or video file.", quince_icloud::photos_upload::MIN_BYTES)),
-        "photos_file_type_not_supported" => Some(format!("iCloud Photos takes these file types: {}. Nothing was uploaded; convert the file to one of them first.", photos_write::UPLOAD_TYPES)),
-        "approval_stale_photos_changed_ask_again" => Some("The photo or album changed in the local cache after this request was made, so it did not run. Ask again to get a new request that shows it as it is now.".to_string()),
         "name_taken" => Some("Something with that name is already in that iCloud Drive folder, and it was left as it is. Ask again with another name, or rename or remove the one that is there first.".to_string()),
         "local_file_exists_not_overwritten" => Some("A file with that name is already in the exchange folder, and it was left as it is. Ask again with another local name, or move that file away first.".to_string()),
         "already_has_this_name" => Some("Nothing to do: iCloud Drive already shows the item under that name.".to_string()),

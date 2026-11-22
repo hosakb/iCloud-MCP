@@ -476,7 +476,10 @@ async fn a_photo_or_album_changed_at_apple_is_refused_not_written_over() {
 #[tokio::test]
 async fn hidden_unknown_and_unversioned_photos_are_refused_before_apple_is_asked() {
     let mut f = fixture(Some("yolo")).await;
-    for (id, code) in [("P-HIDDEN", "not_found"), ("P-NONE", "not_found")] {
+    for (id, code) in [
+        ("P-HIDDEN", "photo_not_found"),
+        ("P-NONE", "photo_not_found"),
+    ] {
         assert_eq!(
             error(
                 &mut f.server,
@@ -988,7 +991,7 @@ async fn a_terminal_trash_request_shows_plain_lines_and_holds_to_its_preview() {
     // A photo the cache doesn't have is refused at once, with no request made.
     assert_eq!(
         error(&mut f.server, json!({"action":"trash","id":"P-NONE"})).await,
-        "not_found"
+        "photo_not_found"
     );
     let reply = ok(&mut f.server, json!({"action":"trash","id":"P-1"})).await;
     let id = proposal_id(&reply);
@@ -1055,6 +1058,253 @@ async fn album_and_file_refusals_say_what_to_do() {
         ),
     ] {
         let value = text(&call(&mut f.server, args.clone()).await);
+        assert!(
+            value["instructions"].as_str().unwrap().contains(words),
+            "{args}: {value}"
+        );
+    }
+}
+
+/// A binary property list of an array of short ASCII strings, as Photos keeps keywords
+/// (`keywordsEnc`), base64'd.
+fn keywords_enc(words: &[&str]) -> String {
+    let mut out = b"bplist00".to_vec();
+    let mut offsets = vec![out.len()];
+    out.push(0xA0 | words.len() as u8);
+    out.extend((1..=words.len()).map(|i| i as u8));
+    for word in words {
+        offsets.push(out.len());
+        out.push(0x50 | word.len() as u8);
+        out.extend(word.as_bytes());
+    }
+    let table = out.len();
+    out.extend(offsets.iter().map(|o| *o as u8));
+    out.extend([0u8; 6]);
+    out.extend([1u8, 1u8]);
+    out.extend((offsets.len() as u64).to_be_bytes());
+    out.extend(0u64.to_be_bytes());
+    out.extend((table as u64).to_be_bytes());
+    b64_bytes(&out)
+}
+
+fn b64_bytes(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[tokio::test]
+async fn a_keyword_change_keeps_a_word_added_elsewhere_and_then_asks_for_a_refresh() {
+    let mut f = fixture(Some("yolo")).await;
+    // Apple holds a word the cache has not seen.
+    Mock::given(method("POST"))
+        .and(path(format!("{DB}/records/lookup")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"records":[{
+            "recordName":"P-1","recordType":"CPLAsset","recordChangeTag":TAG,
+            "fields":{"keywordsEnc":{"value":keywords_enc(&["Beach", "Extra"])}}}]})))
+        // The version check, then the engine's own read; afterwards Apple shows the new tag.
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&f.remote)
+        .await;
+    let done = ok(
+        &mut f.server,
+        json!({"action":"set_keywords","id":"P-1","keywords":["Beach","Sea"]}),
+    )
+    .await;
+    // The answer, decoded, holds exactly the merged list.
+    assert_eq!(done["outcome"], "done", "{done}");
+    assert_eq!(done["keywords"], json!(["Beach", "Extra", "Sea"]));
+    assert!(done["next"].as_str().unwrap().contains("photos_refresh"));
+    let after = cached(f.dir.path(), "P-1");
+    assert_eq!(after.keywords, ["Beach", "Extra", "Sea"]);
+    // The cached version stays, so the next change is refused until a refresh.
+    assert_eq!(after.change_tag.as_deref(), Some(TAG));
+    let sent = modified(&f.remote).await;
+    assert_eq!(
+        sent[0]["record"]["fields"]["keywordsEnc"]["value"],
+        keywords_enc(&["Beach", "Extra", "Sea"])
+    );
+    assert_eq!(
+        error(
+            &mut f.server,
+            json!({"action":"set_rating","id":"P-1","rating":2})
+        )
+        .await,
+        "photos_item_changed_run_photos_refresh"
+    );
+}
+
+#[tokio::test]
+async fn a_keyword_change_on_a_photo_gone_meanwhile_sends_nothing() {
+    let mut f = fixture(Some("yolo")).await;
+    // The version check finds the photo, the engine's own read a moment later doesn't.
+    Mock::given(method("POST"))
+        .and(path(format!("{DB}/records/lookup")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"records":[{
+            "recordName":"P-1","recordType":"CPLAsset","recordChangeTag":TAG,"fields":{}}]})))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&f.remote)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{DB}/records/lookup")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"records":[]})))
+        .with_priority(2)
+        .mount(&f.remote)
+        .await;
+    let reply = call(
+        &mut f.server,
+        json!({"action":"set_keywords","id":"P-1","keywords":["Sea"]}),
+    )
+    .await;
+    let value = text(&reply);
+    assert_eq!(
+        value["error"], "photos_item_not_found_at_apple_run_photos_refresh",
+        "{value}"
+    );
+    assert!(value["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("nothing was sent"));
+    assert!(modified(&f.remote).await.is_empty());
+}
+
+#[tokio::test]
+async fn an_answer_that_does_not_show_the_change_is_sent_not_confirmed() {
+    let mut f = fixture(Some("yolo")).await;
+    Mock::given(method("POST"))
+        .and(path(format!("{DB}/records/modify")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"records":[{
+            "recordName":"P-1","recordType":"CPLAsset","recordChangeTag":"tag-9",
+            "fields":{"rating":{"value":1}}}]})))
+        .with_priority(1)
+        .mount(&f.remote)
+        .await;
+    let done = ok(
+        &mut f.server,
+        json!({"action":"set_rating","id":"P-1","rating":4}),
+    )
+    .await;
+    assert_eq!(done["outcome"], "sent_not_confirmed", "{done}");
+    assert!(done["checked"].as_str().unwrap().contains("photos_refresh"));
+    // A keyword answer that drops the field is not confirmed either.
+    f.remote.reset().await;
+    let mut g = fixture(Some("yolo")).await;
+    Mock::given(method("POST"))
+        .and(path(format!("{DB}/records/modify")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"records":[{
+            "recordName":"P-2","recordType":"CPLAsset","recordChangeTag":"tag-9","fields":{}}]})))
+        .with_priority(1)
+        .mount(&g.remote)
+        .await;
+    let done = ok(
+        &mut g.server,
+        json!({"action":"set_keywords","id":"P-2","keywords":["Sea"]}),
+    )
+    .await;
+    assert_eq!(done["outcome"], "sent_not_confirmed", "{done}");
+}
+
+#[tokio::test]
+async fn the_terminal_shows_the_value_now_and_what_a_keyword_change_removes() {
+    let mut f = fixture(Some("yolo")).await;
+    rules(f.dir.path(), "rules:\n  photos_write: {ask: terminal}\n");
+    let id = proposal_id(
+        &ok(
+            &mut f.server,
+            json!({"action":"set_keywords","id":"P-1","keywords":[]}),
+        )
+        .await,
+    );
+    let shown = f.server.approval_text(&id).unwrap();
+    for line in [
+        "Keywords now: Beach",
+        "New keywords: (none, removes all)",
+        "Keywords added: (none)",
+        "Keywords removed: Beach",
+    ] {
+        assert!(shown.lines().any(|l| l == line), "{line}: {shown}");
+    }
+    let id = proposal_id(
+        &ok(
+            &mut f.server,
+            json!({"action":"set_title_and_caption","id":"P-1","title":"","caption":"one\nPhoto: forged\nWhat it does: nothing"}),
+        )
+        .await,
+    );
+    let shown = f.server.approval_text(&id).unwrap();
+    assert!(
+        shown.lines().any(|l| l == "New title: (cleared)"),
+        "{shown}"
+    );
+    assert!(shown.lines().any(|l| l == "Caption now: none"), "{shown}");
+    assert_eq!(
+        shown.lines().filter(|l| l.starts_with("Photo:")).count(),
+        1,
+        "{shown}"
+    );
+    assert!(
+        !shown
+            .lines()
+            .any(|l| l.starts_with("What it does: nothing")),
+        "{shown}"
+    );
+    assert!(shown.contains("one \u{21B5} Photo: forged"), "{shown}");
+    let id = proposal_id(
+        &ok(
+            &mut f.server,
+            json!({"action":"set_rating","id":"P-1","rating":4}),
+        )
+        .await,
+    );
+    let shown = f.server.approval_text(&id).unwrap();
+    assert!(shown.lines().any(|l| l == "Rating now: 0"), "{shown}");
+    assert!(shown.lines().any(|l| l == "New rating: 4"), "{shown}");
+}
+
+#[tokio::test]
+async fn refusals_of_arguments_say_what_the_action_takes() {
+    let mut f = fixture(Some("yolo")).await;
+    jpeg(&f.exchange.join("big.jpg"), 1024 * 1024 + 1);
+    for (args, code, words) in [
+        (
+            json!({"action":"set_rating","id":"P-1","stars":4}),
+            "invalid_photos_write_arguments",
+            "id and rating",
+        ),
+        (
+            json!({"action":"set_favorite","id":"P-NONE","favorite":true}),
+            "photo_not_found",
+            "Hidden photos",
+        ),
+        (
+            json!({"action":"rename_album","album_id":"AL-9","name":"X"}),
+            "album_not_found",
+            "photos_albums",
+        ),
+        (
+            json!({"action":"set_title_and_caption","id":"P-1","title":"a\u{202E}b"}),
+            "invalid_title",
+            "at most 255 characters",
+        ),
+        (
+            json!({"action":"set_keywords","id":"P-1","keywords":["a","A"]}),
+            "duplicate_keyword",
+            "twice",
+        ),
+        (
+            json!({"action":"set_date","id":"P-1","taken_at":"tomorrow"}),
+            "invalid_taken_at",
+            "+02:00",
+        ),
+        (
+            json!({"action":"upload","local":"big.jpg"}),
+            "local_file_over_exchange_limit",
+            "--max-mb N",
+        ),
+    ] {
+        let value = text(&call(&mut f.server, args.clone()).await);
+        assert_eq!(value["error"], code, "{args}");
         assert!(
             value["instructions"].as_str().unwrap().contains(words),
             "{args}: {value}"
