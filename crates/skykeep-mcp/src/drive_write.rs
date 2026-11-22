@@ -570,7 +570,8 @@ pub(crate) fn plain_preview(preview: &Value) -> String {
 pub struct WriteLimits {
     /// create_folder, rename, move, trash and delete_forever.
     pub change_timeout: Duration,
-    /// upload and download; `None` scales with the size limit ([`transfer_time`]).
+    /// upload and download; `None` scales with the size limit ([`upload_time`],
+    /// [`transfer_time`]).
     pub transfer_timeout: Option<Duration>,
     /// The folder reads made before a change.
     pub read: drive::RefreshLimits,
@@ -590,6 +591,13 @@ impl Default for WriteLimits {
 /// and one second more per 256 KB of the limit (about nine minutes at 100 MB).
 pub fn transfer_time(max_bytes: u64) -> Duration {
     Duration::from_secs(120 + max_bytes / (256 * 1024))
+}
+
+/// How long one upload may take: [`transfer_time`], plus the time Apple may take to answer
+/// once it has every byte ([`quince_icloud::upload::ANSWER`], five minutes), as a Photos
+/// upload has.
+pub fn upload_time(max_bytes: u64) -> Duration {
+    transfer_time(max_bytes) + quince_icloud::upload::ANSWER
 }
 
 /// Makes the session's client for a private directory.
@@ -662,7 +670,7 @@ fn apple(e: &quince_icloud::Error) -> &'static str {
     match e {
         E::ReauthRequired => "login_required",
         E::NeedsDeviceApproval => PAUSED,
-        E::Network(_) | E::Busy(_) => UNKNOWN,
+        E::Network(_) | E::Stalled | E::Busy(_) => UNKNOWN,
         E::Refused(_) if quince_icloud::drive::transient(e) => UNKNOWN,
         E::Conflict => CHANGED,
         _ => NOT_CONFIRMED,
@@ -827,7 +835,8 @@ pub(crate) async fn run(
     let limits = seam.limits;
     let timeout = match &local {
         Local::None => limits.change_timeout,
-        Local::Upload(_, _, max) | Local::Download(_, _, max) => limits
+        Local::Upload(_, _, max) => limits.transfer_timeout.unwrap_or_else(|| upload_time(*max)),
+        Local::Download(_, _, max) => limits
             .transfer_timeout
             .unwrap_or_else(|| transfer_time(*max)),
     };
@@ -1006,8 +1015,11 @@ async fn act(
             }
             effects.unlist.push(folder.clone());
             let progress: quince_icloud::drive::Progress = Arc::new(|_, _| {});
+            // The file's bytes go through the session's uploads client, watched while they
+            // go; the read timeout of the plain client cut off uploads longer than a minute.
             let filed = quince_icloud::drive::upload(
                 http,
+                conn.client.uploads(),
                 docws,
                 root,
                 params(),
@@ -1161,6 +1173,14 @@ pub(crate) fn tool() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An upload that stopped part way, or got no answer once every byte was in, can not
+    /// tell whether Apple filed it. Before the watched upload such a stop came back as a
+    /// network timeout, and it still reads the same way.
+    #[test]
+    fn a_stalled_upload_is_an_unknown_outcome_like_a_dropped_connection() {
+        assert_eq!(apple(&quince_icloud::Error::Stalled), UNKNOWN);
+    }
 
     #[test]
     fn every_action_parses_and_only_deletions_are_destructive() {
