@@ -17,7 +17,7 @@ Terminal approval protects against MCP-only clients, not processes running as yo
 
 Deletes, moves into Recently Deleted and saves that empty a note require a terminal approval. Creating a note in Recently Deleted is refused. `require-approval --state-dir DIR` extends approval to every write; `allow-routine --state-dir DIR` restores the default. Neither policy change is available as an MCP tool.
 
-There is no volume limit on routine writes. A successful tool response means queued locally. Even after delivery the server does not verify every remote field, and `remote_verified` remains `false`. Unsupported note structures, locked notes and read-only notes are refused rather than silently rewritten. See the [MCP reference](crates/skykeep-mcp/README.md) for operation semantics and inherited limitations.
+There is no volume limit on routine writes. A successful tool response means queued locally. Even after delivery the server does not verify every remote field, and `remote_verified` remains `false`. Unsupported note structures, locked notes and read-only notes are refused rather than silently rewritten. See the [README](README.md) for operation semantics and inherited limitations.
 
 ## Development and reporting
 

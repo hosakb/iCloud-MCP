@@ -1,6 +1,6 @@
 # Getting help
 
-Use this fork's issues for MCP bugs, questions and feature requests. Include the commit or version, Linux distribution, MCP client, tool or terminal-helper command and steps to reproduce. The [README](../README.md) covers setup; the [MCP reference](../crates/skykeep-mcp/README.md) covers tools, approval and limitations.
+Use this fork's issues for MCP bugs, questions and feature requests. Include the commit or version, Linux distribution, MCP client, tool or terminal-helper command and steps to reproduce. The [README](../README.md) covers setup, tools, approval and limitations.
 
 Use synthetic examples. Do not post account identifiers, session tokens, passwords, verification codes or personal note and reminder content. Review logs before sharing them.
 
