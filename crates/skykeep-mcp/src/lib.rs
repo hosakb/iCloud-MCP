@@ -3,6 +3,8 @@ pub mod account;
 pub mod calendar;
 pub mod contacts;
 pub mod drive;
+pub mod drive_write;
+pub mod exchange;
 pub mod keyhold;
 pub mod login;
 pub mod photos;
@@ -163,6 +165,62 @@ fn policy(
     )))
 }
 
+/// An error result. One about the Drive exchange folder says the exact command that sets it
+/// up, with this private folder in it, for the person to type in their own terminal.
+/// The same for a few Drive outcomes that leave the person something to do, and for a folder
+/// inside the exchange folder that others can change (`args` are the call's arguments).
+fn error_value(error: &'static str, dir: &Path, args: &Value) -> Value {
+    let mut value = json!({"error":error});
+    if let Some(instructions) = next_step(error, dir, args) {
+        value["instructions"] = json!(instructions);
+    }
+    value
+}
+
+/// What the person can do after `error`, when there is something: the sentence an MCP error
+/// result carries as `instructions` and the terminal approval prints. `args` are the call's
+/// arguments (`Value::Null` when there are none).
+pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
+    match error {
+        e if e.starts_with("exchange_folder_") => Some(format!(
+            "In your own terminal, run: {}",
+            status::with_dir("skykeep-mcp exchange", dir)
+        )),
+        drive_write::UNKNOWN => Some("The connection ended before Apple answered, so the change may or may not have been made. Run drive_refresh on the folder and look at it before trying again.".to_string()),
+        drive_write::IN_RECENTLY_DELETED => Some("The item is in Recently Deleted in iCloud Drive but was not deleted for good. Delete it there (iCloud Drive on icloud.com or a Mac), or leave it: Apple deletes it by itself after about 30 days.".to_string()),
+        drive_write::IN_RECENTLY_DELETED_LOGIN => Some(format!("The item is in Recently Deleted in iCloud Drive but was not deleted for good, because the sign-in has expired. Sign in again with {} in your own terminal, then delete it from Recently Deleted in iCloud Drive, or leave it: Apple deletes it by itself after about 30 days.", status::with_dir("skykeep-mcp login", dir))),
+        "name_taken" => Some("Something with that name is already in that iCloud Drive folder, and it was left as it is. Ask again with another name, or rename or remove the one that is there first.".to_string()),
+        "local_file_exists_not_overwritten" => Some("A file with that name is already in the exchange folder, and it was left as it is. Ask again with another local name, or move that file away first.".to_string()),
+        "already_has_this_name" => Some("Nothing to do: iCloud Drive already shows the item under that name.".to_string()),
+        "already_in_destination" => Some("Nothing to do: the item is already in that folder in iCloud Drive.".to_string()),
+        "local_folder_not_private" => Some(
+            args["local"]
+                .as_str()
+                .and_then(|local| exchange::shared_folder(dir, local))
+                .map_or_else(
+                    || "A folder inside the exchange folder can be changed by other users. Make it yours alone with chmod 700 on that folder, then try again.".to_string(),
+                    |folder| format!("A folder inside the exchange folder can be changed by other users. Make it yours alone in your own terminal with: chmod 700 {} and try again.", status::quoted(&folder)),
+                ),
+        ),
+        _ => None,
+    }
+}
+
+/// [`tool_reply`] with [`error_value`]'s instructions.
+fn tool_reply_in(
+    id: Value,
+    result: Result<Value, &'static str>,
+    dir: &Path,
+    args: &Value,
+) -> Value {
+    match result {
+        Err(error) => {
+            json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":error_value(error, dir, args).to_string()}],"isError":true}})
+        }
+        ok => tool_reply(id, ok),
+    }
+}
+
 fn tool_reply(id: Value, result: Result<Value, &'static str>) -> Value {
     let failed = result.is_err();
     let value = result.unwrap_or_else(|error| json!({"error":error}));
@@ -286,11 +344,20 @@ fn needs_consent(mode: &str, name: &str) -> Result<bool, &'static str> {
         "drive_list" | "drive_get" | "drive_search" | "drive_refresh" => {
             Ok(mode == "reads_and_writes")
         }
+        // Every Drive change is asked in the form, except under yolo. Deletions and large
+        // folder moves are then asked in the terminal instead (drive_write::goes_to_terminal).
+        "drive_write" => Ok(mode != "yolo"),
         _ => Err("unknown_tool"),
     }
 }
 
 fn resolved_snapshot(library: &Library, name: &str, args: &Value) -> Result<Value, &'static str> {
+    if name == drive_write::TOOL {
+        // Drive has no queue: the preview of what the action reaches is the whole context.
+        let snapshot = json!({"drive": drive_write::preview(library, args)?});
+        bounded_value(&snapshot, MAX_ARGUMENT_BYTES)?;
+        return Ok(snapshot);
+    }
     let guid = args["guid"].as_str().ok_or("guid_required")?;
     if name == "notes_write" {
         let _: NoteWrite = serde_json::from_value(args.clone()).map_err(|_| "invalid_arguments")?;
@@ -367,6 +434,7 @@ pub struct Server {
     forms: bool,
     pending: Option<PendingConsent>,
     grant: Option<ApprovalBinding>,
+    drive: drive_write::Seam,
 }
 
 #[cfg(test)]
@@ -672,6 +740,7 @@ impl Server {
                 forms: false,
                 pending: None,
                 grant: None,
+                drive: drive_write::Seam::default(),
             }),
             Err("state_busy_retry") => Ok(Self {
                 library: None,
@@ -680,6 +749,7 @@ impl Server {
                 forms: false,
                 pending: None,
                 grant: None,
+                drive: drive_write::Seam::default(),
             }),
             Err(error) => Err(error),
         }
@@ -692,6 +762,75 @@ impl Server {
             self.dir = held.path.clone();
         }
         self.library.as_mut().ok_or("state_unavailable")
+    }
+
+    /// Test seam: Drive changes against synthetic endpoints and limits. Never set in
+    /// production, and no MCP method reaches it.
+    #[doc(hidden)]
+    pub fn set_drive_seam(&mut self, seam: drive_write::Seam) {
+        self.drive = seam;
+    }
+
+    /// Trusted local CLI only, after `approval_details` was shown: runs one approved
+    /// proposal. A Drive change runs now, against Apple; a Notes or Reminders change is queued.
+    pub async fn approve_any(&mut self, id: &str) -> Result<Value, &'static str> {
+        uuid::Uuid::parse_str(id).map_err(|_| "invalid_request_id")?;
+        let tool = {
+            let held = state::PrivateState::open(&self.dir)?;
+            let library = self.ready(&held)?;
+            let raw = library
+                .state(&format!("mcp.approval.{id}"))
+                .map_err(|_| "library_unavailable")?
+                .filter(|s| !s.is_empty())
+                .ok_or("approval_not_found")?;
+            serde_json::from_str::<Value>(&raw).map_err(|_| "approval_not_found")?["tool"].clone()
+        };
+        if tool == drive_write::TOOL {
+            self.approve_drive(id).await
+        } else {
+            self.approve(id)
+        }
+    }
+
+    /// A Drive proposal holds to the account, the approval mode (revision included), the
+    /// private directory and the cached preview it was made with: any of them changed, it is
+    /// refused and must be asked again. It is used up before it runs, so it runs once.
+    async fn approve_drive(&mut self, id: &str) -> Result<Value, &'static str> {
+        let held = state::PrivateState::open(&self.dir)?;
+        let dir = held.path.clone();
+        let seam = self.drive.clone();
+        let library = self.ready(&held)?;
+        let key = format!("mcp.approval.{id}");
+        let raw = library
+            .state(&key)
+            .map_err(|_| "library_unavailable")?
+            .filter(|s| !s.is_empty())
+            .ok_or("approval_not_found")?;
+        let proposal: Value = serde_json::from_str(&raw).map_err(|_| "approval_not_found")?;
+        if proposal["account"]
+            != json!(library
+                .state(ACCOUNT_KEY)
+                .map_err(|_| "library_unavailable")?)
+        {
+            return Err("account_mismatch");
+        }
+        policy(library, &dir)?;
+        if proposal["policy"]
+            != json!(library
+                .state("mcp.policy")
+                .map_err(|_| "policy_unavailable")?)
+            || proposal["state_identity"] != json!(directory_identity(&dir)?)
+        {
+            return Err("approval_policy_changed");
+        }
+        if drive_write::preview(library, &proposal["args"])? != proposal["preview"] {
+            return Err("approval_stale_drive_changed_ask_again");
+        }
+        let op = drive_write::validate(&proposal["args"])?;
+        library
+            .set_state(&key, "")
+            .map_err(|_| "library_unavailable")?;
+        drive_write::run(&dir, &seam, op, true).await
     }
 
     pub async fn refresh(&mut self) -> Result<Value, &'static str> {
@@ -751,7 +890,12 @@ impl Server {
                 )
                 .await;
             self.grant = None;
-            return Some(tool_reply(pending.request["id"].clone(), result));
+            return Some(tool_reply_in(
+                pending.request["id"].clone(),
+                result,
+                &self.dir,
+                &pending.request["params"]["arguments"],
+            ));
         }
         // Batches and other non-object messages are not supported; say so instead of dropping them.
         if !request.is_object() {
@@ -831,7 +975,7 @@ impl Server {
                     .await;
                 let (value, failed) = match result {
                     Ok(value) => (value, false),
-                    Err(error) => (json!({"error":error}), true),
+                    Err(error) => (error_value(error, &self.dir, &params["arguments"]), true),
                 };
                 Ok(json!({"content":[{"type":"text","text":value.to_string()}],"isError":failed}))
             }
@@ -855,6 +999,30 @@ impl Server {
             .map_err(|_| "library_unavailable")?
             .filter(|s| !s.is_empty())
             .ok_or("approval_not_found")
+    }
+
+    /// Trusted local CLI only: what `approve` shows before it asks. A Drive change is said in
+    /// plain lines (what it does, the item and its path, what it reaches); a Notes or
+    /// Reminders change as its JSON. Control and text-direction characters are shown as
+    /// U+FFFD, so nothing in the text can reorder or hide what the terminal shows.
+    pub fn approval_text(&self, id: &str) -> Result<String, &'static str> {
+        let raw = self.approval_details(id)?;
+        let proposal: Value = serde_json::from_str(&raw).map_err(|_| "approval_not_found")?;
+        let text = if proposal["tool"] == drive_write::TOOL {
+            drive_write::plain_preview(&proposal["preview"])
+        } else {
+            raw
+        };
+        Ok(text
+            .chars()
+            .map(|c| {
+                if (c.is_control() && c != '\n') || exchange::hides_text(c) {
+                    '\u{FFFD}'
+                } else {
+                    c
+                }
+            })
+            .collect())
     }
 
     pub fn approve(&mut self, id: &str) -> Result<Value, &'static str> {
@@ -895,6 +1063,7 @@ impl Server {
 
     async fn call(&mut self, name: &str, args: Value) -> Result<Value, &'static str> {
         let grant = self.grant.take();
+        let drive_seam = self.drive.clone();
         let held = state::PrivateState::open(&self.dir)?;
         let dir = held.path.clone();
         let library = self.ready(&held)?;
@@ -1000,6 +1169,36 @@ impl Server {
                     return Err("login_required");
                 }
                 drive::refresh(&dir, grant.is_some(), args).await
+            }
+            "drive_write" => {
+                let op = drive_write::validate(&args)?;
+                let account = library
+                    .state(ACCOUNT_KEY)
+                    .map_err(|_| "library_unavailable")?
+                    .ok_or("login_required")?;
+                let mode = configured.as_ref().map(|(p, _)| p.mode.as_str());
+                let terminal = drive_write::goes_to_terminal(library, mode, &op)?
+                    || (configured.is_none()
+                        && library
+                            .state("mcp.require_write_approval")
+                            .map_err(|_| "library_unavailable")?
+                            .as_deref()
+                            == Some("true"));
+                if terminal {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let args = serde_json::to_value(&op).map_err(|_| "invalid_arguments")?;
+                    let proposal = json!({"tool":name,"args":args,"account":account,
+                        "policy":library.state("mcp.policy").map_err(|_| "policy_unavailable")?,
+                        "state_identity":directory_identity(&dir)?,
+                        "preview":drive_write::preview(library, &args)?});
+                    library
+                        .set_state(&format!("mcp.approval.{id}"), &proposal.to_string())
+                        .map_err(|_| "library_unavailable")?;
+                    return Ok(json!({"status":"approval_required","request_id":id,
+                        "approve_in_terminal":status::with_dir("skykeep-mcp approve", &dir),
+                        "remote_verified":false}));
+                }
+                drive_write::run(&dir, &drive_seam, op, grant.is_some()).await
             }
             "sync_status" => {
                 let _: Empty = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -1914,7 +2113,7 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
 
 const SERVER_TITLE: &str =
     "Skykeep: Apple iCloud Notes, Reminders, Contacts, Calendar, Photos & iCloud Drive";
-const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, and reads the user's Apple iCloud Contacts, Apple iCloud Calendar and Apple iCloud Photos metadata (read-only), and Apple iCloud Drive folder listings and file details (read-only; no file contents). Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode and are queued until sync sends them. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
+const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, and reads the user's Apple iCloud Contacts, Apple iCloud Calendar and Apple iCloud Photos metadata (read-only), and reads and changes Apple iCloud Drive: folder listings and file details from the cache, and drive_write to create folders, rename, move, trash, delete for good, upload from and download into the exchange folder the user set up in their terminal. Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode. Notes and Reminders changes are queued until sync sends them; a Drive change runs once it is allowed and its reply says what Apple confirmed. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
 
 fn tools() -> Vec<Value> {
     // (name, description, parent property, parent required)
@@ -2020,6 +2219,7 @@ fn tools() -> Vec<Value> {
     search["query"] = json!({"type":"string","minLength":1,"maxLength":drive::MAX_QUERY_BYTES,"description":"Words matched against item names, ignoring case and accents. At most 256 UTF-8 bytes."});
     tools.push(json!({"name":"drive_search","description":"Search the names of cached Apple iCloud Drive items in folders drive_refresh has read. At most 1000 matches, most recently changed first. Read-only.","inputSchema":{"type":"object","properties":search,"required":["query"],"additionalProperties":false},"annotations":read}));
     tools.push(json!({"name":"drive_refresh","description":"Read one Apple iCloud Drive folder's item list from Apple into the local cache, with each folder on its path. Give path or a cached folder id; the top folder by default. Reads names, kinds, sizes and dates only: never file contents, and never uploads, renames, moves or deletes. Sends no queued changes. Never opens a login prompt.","inputSchema":{"type":"object","properties":{"path":cloud_path,"id":id},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}));
+    tools.push(drive_write::tool());
     tools.push(json!({"name":"auth_status","description":"Apple iCloud sign-in status and setup instructions. Never accepts secrets or opens a prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools
 }
