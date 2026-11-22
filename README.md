@@ -6,6 +6,8 @@ Notes and Reminders can be read and changed; their changes enter a durable outbo
 
 This fork contains the MCP server and its four engine crates, not the upstream desktop or mobile applications. The source is at [hosakb/iCloud-MCP](https://github.com/hosakb/iCloud-MCP).
 
+![iCloud-MCP architecture diagram](crates/skykeep-mcp/docs/architecture.webp)
+
 ## Build
 
 Install the Rust version pinned in [rust-toolchain.toml](rust-toolchain.toml). On Debian or Ubuntu, install a C build toolchain, `pkg-config` and `libdbus-1-dev`.
