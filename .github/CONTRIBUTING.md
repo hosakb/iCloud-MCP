@@ -1,6 +1,6 @@
 # Contributing
 
-This fork develops the local Notes and Reminders MCP server, not the upstream desktop or mobile apps. Read the [architecture](../ARCHITECTURE.md) and [MCP reference](../crates/skykeep-mcp/README.md) before changing behavior.
+This fork develops the local Notes and Reminders MCP server, not the upstream desktop or mobile apps. Read the [architecture](../ARCHITECTURE.md) and [README](../README.md) before changing behavior.
 
 Contributions use the [GPL-3.0-only license](../LICENSE). The [code of conduct](CODE_OF_CONDUCT.md) applies.
 

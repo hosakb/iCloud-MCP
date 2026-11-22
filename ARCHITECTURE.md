@@ -28,7 +28,7 @@ Login, logout, approval and policy changes are terminal helpers, not MCP tools. 
 
 The server does not import a desktop session. It uses the `skykeep-mcp` keyring service, with an entry per state directory. The file `src-tauri/tauri.conf.json` remains only as an identifier record: unchanged `quince-auth` source embeds it at compile time for its inherited default service. Its identifier is unchanged; it contains no desktop build or packaging configuration.
 
-Destructive writes require a terminal approval tied to the requested operation. Optional require-all policy extends that to routine writes. This boundary assumes the client can use MCP tools only. An agent with shell access as the state owner can bypass it. See the [MCP reference](crates/skykeep-mcp/README.md#write-approval) and [security policy](SECURITY.md).
+Destructive writes require a terminal approval tied to the requested operation. Optional require-all policy extends that to routine writes. This boundary assumes the client can use MCP tools only. An agent with shell access as the state owner can bypass it. See the [README](README.md#write-approval) and [security policy](SECURITY.md).
 
 ## Upstream maintenance
 
