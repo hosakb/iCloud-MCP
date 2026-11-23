@@ -1035,7 +1035,24 @@ async fn a_copied_folder_replaced_at_the_same_path_is_refused() {
     );
     // Set up again in the terminal, the new folder is the one held to.
     skykeep_mcp::exchange::set_up(&mut library, Some(older_path.clone()), None).unwrap();
-    assert_eq!(in_force(&library), Ok(Some(older_path)));
+    assert_eq!(in_force(&library), Ok(Some(older_path.clone())));
+    // Review round 3: a stored setting that can't be read can't be checked: refused, with
+    // the command that sets it up again.
+    library
+        .set_state("mcp.drive.exchange", "not a setting")
+        .unwrap();
+    assert_eq!(
+        in_force(&library),
+        Err("exchange_folder_unchecked_run_skykeep_mcp_exchange")
+    );
+    let step = skykeep_mcp::next_step(
+        "exchange_folder_unchecked_run_skykeep_mcp_exchange",
+        &dir,
+        &Value::Null,
+    )
+    .unwrap();
+    assert!(step.contains("skykeep-mcp exchange"), "{step}");
+    assert!(step.contains("can't be checked"), "{step}");
 }
 
 /// Review round 2: when the file's mistake can't be named (no library to read it from), the

@@ -417,11 +417,18 @@ from the cache. If that pass fails, the next sync that reaches the drain tries
 again. Until it succeeds, reads can still show the unsent change.
 A note or reminder that changed or was deleted on iCloud after a change to it was
 queued is set aside as `mcp_quarantine:item_changed_on_icloud_since_queued`, with an
-`instructions` field that says what to do next. A new etag or modified time alone,
-which Apple gives an item when it next reads it back, no longer sets a change aside.
+`instructions` field that says what to do next. It stays in the list, and counts
+toward the 1024 kept, until you retire it with `skykeep-mcp quarantine`. A new etag or
+modified time alone, which Apple gives an item when it next reads it back, no longer sets
+a change aside.
 Native sends recheck exact payload, account, policy, directory and the bound cached
 rows after refresh, before entering the writer, and refuse that write if they
-changed. A sync has a 60-second async deadline. At most 128 waiting writes are
+changed. A sync lays a waiting note save over the copy it reads from Apple, so the
+cache can't show a change made on iCloud to that note. Just before a note save is sent,
+iCloud-MCP reads Apple's copy again and compares it with the text the save was typed
+over; a save that sets its own formatting is also compared with the formatting it was
+typed over. If either changed, or the note is gone, the save is set aside. A text-only
+save keeps Apple's formatting, so its formatting is not compared. A sync has a 60-second async deadline. At most 128 waiting writes are
 admitted. Timeout after a send begins means delivery may be uncertain; the
 original durable record remains for retry. These safeguards can refuse delivery
 after a concurrent remote edit of the same item. Apple-side conflict/merge

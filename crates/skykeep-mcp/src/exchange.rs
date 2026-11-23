@@ -167,6 +167,9 @@ pub fn checked(written: &str, state_dir: &Path, max_bytes: u64) -> Result<Exchan
 
 /// `permissions.yaml` can't be used, so no exchange folder is in use.
 pub const FILE_UNUSABLE: &str = "exchange_folder_file_unusable";
+/// The folder set up with `skykeep-mcp exchange` can't be read, so the file's folder can't be
+/// checked against it.
+pub const UNCHECKED: &str = "exchange_folder_unchecked_run_skykeep_mcp_exchange";
 /// `permissions.yaml` has no `exchange_folder:` line, but a folder was set up earlier with
 /// `skykeep-mcp exchange`; once the file exists only its line counts, so none is in use.
 pub const NOT_IN_FILE: &str = "exchange_folder_not_in_permissions_file";
@@ -195,10 +198,15 @@ pub fn in_force(
         exchange.from_file = true;
         // The folder set up in the terminal, named in the file (as the copy into the first
         // file does), is still held to the device and inode it was set up with.
-        if let Ok(Some(stored)) = &stored {
-            if stored.path == exchange.path && stored.identity != exchange.identity {
+        // A stored setting that can't be read can't be compared: refused, never skipped.
+        match &stored {
+            Ok(Some(stored))
+                if stored.path == exchange.path && stored.identity != exchange.identity =>
+            {
                 return Err("exchange_folder_changed_run_skykeep_mcp_exchange");
             }
+            Ok(_) => {}
+            Err(_) => return Err(UNCHECKED),
         }
         return Ok(Some(exchange));
     }
@@ -248,6 +256,7 @@ pub fn problem(code: &str) -> &'static str {
         "exchange_folder_changed" => "changed while it was in use; try again",
         FILE_UNUSABLE => "is not used while permissions.yaml can't be used",
         NOT_IN_FILE => "is not named in permissions.yaml",
+        UNCHECKED => "can't be checked, because the folder set up with skykeep-mcp exchange can't be read",
         _ => "can't be opened",
     }
 }
@@ -275,6 +284,10 @@ pub fn fix(code: &str, dir: &Path, written: Option<&str>) -> String {
         "exchange_folder_writable_by_others" => {
             format!("Make it yours alone with: chmod 700 {folder} or {change}.")
         }
+        UNCHECKED => format!(
+            "In your own terminal, run {} to set the folder up again.",
+            crate::status::with_dir("skykeep-mcp exchange", dir)
+        ),
         _ => {
             let mut text = change;
             text[..1].make_ascii_uppercase();
