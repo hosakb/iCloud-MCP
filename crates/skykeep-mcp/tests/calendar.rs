@@ -811,6 +811,8 @@ async fn reads_and_writes_binds_each_calendar_read_to_one_approval() {
     assert_eq!(form["method"], "elicitation/create", "{form}");
     let message = form["params"]["message"].as_str().unwrap();
     assert!(message.contains("calendar_get"), "{message}");
+    // An underscore inside a word is no longer escaped on the card.
+    assert!(!message.contains("calendar\\u005fget"), "{message}");
     assert!(!message.contains("Gym"), "no content before approval");
     assert_eq!(
         text(&call(&mut server, 4, "calendar_calendars", json!({})).await)["error"],

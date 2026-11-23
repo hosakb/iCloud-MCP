@@ -526,7 +526,9 @@ async fn reads_and_writes_binds_each_contacts_read_to_one_approval() {
     let message = form["params"]["message"].as_str().unwrap();
     // The preview escapes markup characters such as `_` as inert JSON text.
     assert!(
-        message.contains("contacts_get") && message.contains("C-ADA"),
+        message.contains("contacts_get")
+            && !message.contains("contacts\\u005fget")
+            && message.contains("C-ADA"),
         "{message}"
     );
     assert!(!message.contains("Lovelace"), "no content before approval");

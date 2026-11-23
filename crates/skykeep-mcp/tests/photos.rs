@@ -726,6 +726,8 @@ async fn reads_and_writes_binds_each_photos_read_to_one_approval() {
     assert_eq!(form["method"], "elicitation/create", "{form}");
     let message = form["params"]["message"].as_str().unwrap();
     assert!(message.contains("photos_get"), "{message}");
+    // An underscore inside a word is no longer escaped on the card.
+    assert!(!message.contains("photos\\u005fget"), "{message}");
     assert!(!message.contains("Beach day"), "no content before approval");
     assert_eq!(
         text(&call(&mut server, 4, "photos_list", json!({})).await)["error"],

@@ -458,7 +458,7 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client
     );
     assert!(
         screen
-            .contains("The client must be able to show Skykeep's approval card; Hermes shows it."),
+            .contains("The client must be able to show iCloud-MCP's approval card; Hermes, Claude Code and Codex show it in their interactive apps."),
         "{screen}"
     );
     assert!(screen.contains("such as a scheduled job"), "{screen}");
@@ -481,6 +481,14 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client
         dir.display()
     );
     assert!(screen.contains(&hermes), "{screen}");
+    // Claude Code and Codex each get the one command the README shows.
+    for client in ["claude mcp add --scope user", "codex mcp add"] {
+        let command = format!(
+            "{client} icloud -- /opt/skykeep/skykeep-mcp --state-dir {}",
+            dir.display()
+        );
+        assert!(screen.contains(&command), "{screen}");
+    }
     assert!(
         screen.contains("Setup is complete. The client must be able to show"),
         "{screen}"

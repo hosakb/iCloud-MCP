@@ -1066,7 +1066,10 @@ async fn cards_turn_on_from_protocol_2025_06_18_and_the_answer_names_the_asked_v
             let message = error["message"].as_str().unwrap();
             assert!(message.contains("nothing ran"), "{message}");
             assert!(message.contains("2025-06-18"), "{message}");
-            assert!(!message.contains("Hermes"), "{message}");
+            assert!(
+                message.contains("Update your MCP client, or use Hermes, Claude Code or Codex in their interactive apps."),
+                "{message}"
+            );
             assert_eq!(library.outbox_count().unwrap(), count, "{asked}");
             continue;
         }
@@ -1155,7 +1158,10 @@ async fn a_client_without_cards_is_told_so_without_naming_a_product() {
         assert_eq!(error["error"], "approval_requires_form_client", "{version}");
         let message = error["message"].as_str().unwrap();
         assert!(message.contains("nothing ran"), "{message}");
-        assert!(!message.contains("Hermes"), "{message}");
+        assert!(
+            message.contains("Hermes, Claude Code or Codex in their interactive apps"),
+            "{message}"
+        );
         assert_eq!(library.outbox_count().unwrap(), 0);
     }
 }
@@ -1168,7 +1174,7 @@ async fn the_card_leaves_out_client_meta_and_escapes_only_what_could_render() {
         let mut request = operation(
             2,
             "notes_write",
-            json!({"action":"create","body":"snake_case and _stress_ <b>x</b>"}),
+            json!({"action":"create","body":"Title\u{7f}bell\nsnake_case and _stress_ <b>x</b>"}),
         );
         request["params"]["_meta"] = json!({
             "progressToken": "tok-77",
@@ -1197,8 +1203,17 @@ async fn the_card_leaves_out_client_meta_and_escapes_only_what_could_render() {
             // An underscore at a word edge could start emphasis, so it stays escaped.
             "\\u005fstress\\u005f",
             "\\u003cb\\u003e",
+            // DEL is a control character and is escaped like the others.
+            "Title\\u007fbell",
+            // The text says what the JSON is: the tool and its arguments.
+            "shows the tool and its arguments",
         ] {
             assert!(message.contains(present), "{present}: {message}");
         }
+        assert!(!message.contains('\u{7f}'), "{message}");
+        assert!(
+            !message.contains("exact record the approval is bound to"),
+            "{message}"
+        );
     }
 }

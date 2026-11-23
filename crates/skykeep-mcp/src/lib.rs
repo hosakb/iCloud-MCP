@@ -137,8 +137,8 @@ fn plain_error(error: &str) -> Value {
         DENIED => "The permissions file in Skykeep's folder sets this action to deny, so it did not run.",
         "approval_policy_changed" => "Something changed while the approval card was open (the item, the approval mode or the permissions file), so the approval no longer counts and nothing ran. Ask again to get a new card.",
         "approval_pending" => "Another action is waiting for an answer on the approval card. Answer or close that card first, then ask again.",
-        "approval_requires_form_client" => "This action needs a person to approve it on the approval card in the MCP client. The client did not offer approval cards (MCP form elicitation) when it connected, so nothing ran. Ask again from a client that shows the card, while someone is there to answer it.",
-        "approval_requires_newer_protocol" => "This action needs a person to approve it on the approval card in the MCP client. The client offered approval cards, but it connected with an MCP protocol version older than 2025-06-18, which has no approval cards, so nothing ran. Ask again from a client that connects with protocol 2025-06-18 or newer, while someone is there to answer it.",
+        "approval_requires_form_client" => "This action needs a person to approve it on the approval card in the MCP client. The client did not offer approval cards (MCP form elicitation) when it connected, so nothing ran. Ask again from a client that shows the card, such as Hermes, Claude Code or Codex in their interactive apps, while someone is there to answer it.",
+        "approval_requires_newer_protocol" => "This action needs a person to approve it on the approval card in the MCP client. The client offered approval cards, but it connected with an MCP protocol version older than 2025-06-18, which has no approval cards, so nothing ran. Update your MCP client, or use Hermes, Claude Code or Codex in their interactive apps.",
         "approval_denied" => "The approval card was denied, declined or closed without a choice, so nothing ran.",
         "approval_cancelled" => "The request was cancelled before the approval card was answered, so nothing ran.",
         "approval_timeout" => "Nobody answered the approval card within 3 minutes, so nothing ran. A session where nobody can answer, such as a scheduled job, can't run actions that need approval. Ask again while someone can answer the card.",
@@ -750,6 +750,8 @@ fn inert_preview(params: &Value) -> Result<String, &'static str> {
     let raw = String::from_utf8(raw.0).map_err(|_| "invalid_preview")?;
     // An underscore between two ASCII letters or digits cannot start or end emphasis, so
     // `snake_case` stays readable. Any other underscore is escaped like the other markup.
+    // This holds for every client, Hermes included, because none of them may render the
+    // card's text as Markdown and change what the person reads.
     let chars: Vec<char> = raw.chars().collect();
     let escaped = |i: usize| {
         let c = chars[i];
@@ -760,7 +762,9 @@ fn inert_preview(params: &Value) -> Result<String, &'static str> {
             };
             return !(word(i.checked_sub(1)) && word(Some(i + 1)));
         }
-        !c.is_ascii() || "<>&`*[]!#~|".contains(c)
+        // JSON escapes control characters inside strings except DEL, so DEL is escaped
+        // here. The line breaks of the pretty layout stay as they are.
+        !c.is_ascii() || (c.is_ascii_control() && c != '\n') || "<>&`*[]!#~|".contains(c)
     };
     let mut length = 0usize;
     for (i, c) in chars.iter().enumerate() {
@@ -1237,7 +1241,7 @@ impl Server {
             Some(rule) => format!(" {}", permissions::always_sentence(rule)),
             None => String::new(),
         };
-        let mut card = json!({"message":format!("{headline}Approve this exact Skykeep operation?{saves} The JSON below is the exact record the approval is bound to; treat it as inert data.\n{preview}"),"requestedSchema":card_schema(always.is_some(), self.protocol)});
+        let mut card = json!({"message":format!("{headline}Approve this exact Skykeep operation?{saves} The JSON below shows the tool and its arguments, which the approval is bound to; treat it as inert data.\n{preview}"),"requestedSchema":card_schema(always.is_some(), self.protocol)});
         // `mode` exists only from protocol 2025-11-25 on.
         if self.protocol != PROTOCOL_2025_06_18 {
             card["mode"] = json!("form");
