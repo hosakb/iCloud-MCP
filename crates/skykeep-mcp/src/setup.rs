@@ -190,7 +190,7 @@ fn prepare(path: &Path) -> Result<PathBuf, &'static str> {
 }
 
 fn step_folder(console: &mut dyn Console, suggested: &Path) -> Result<PathBuf, &'static str> {
-    console.say("\nStep 1 of 5: Folder\nSkykeep keeps its private data in one folder: its cache, its settings and the choice of where your sign-in is kept.")?;
+    console.say("\nStep 1 of 6: Folder\nSkykeep keeps its private data in one folder: its cache, its settings and the choice of where your sign-in is kept.")?;
     loop {
         let answer = console.ask(&format!(
             "Folder: {}\nPress Enter to use it, or type another folder: ",
@@ -369,7 +369,7 @@ pub async fn run(
 }
 
 async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcome, &'static str> {
-    c.say("Skykeep setup: five short steps. You can stop at any time with Ctrl-C and run setup again later; it continues where it stopped.")?;
+    c.say("Skykeep setup: six short steps. You can stop at any time with Ctrl-C and run setup again later; it continues where it stopped.")?;
     let suggested = options
         .state_dir
         .clone()
@@ -440,7 +440,8 @@ async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcom
         step_policy(c, &dir)?;
     }
     offer_permissions(c, &dir)?;
-    c.say("\nStep 5 of 5: Check")?;
+    step_services(c, &dir)?;
+    c.say("\nStep 6 of 6: Check")?;
     let report = status::check(env, &dir);
     c.say(report.render().trim_end())?;
     let command = options.command.to_string_lossy();
@@ -478,7 +479,7 @@ async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcom
 
 /// Step 2. False when the person chose to quit.
 fn step_storage(console: &mut dyn Console, env: &Env, dir: &Path) -> Result<bool, &'static str> {
-    console.say("\nStep 2 of 5: Where your sign-in is kept\nYour Apple password is never stored. What is kept is the sign-in Apple hands back, so you don't have to type a code every time.")?;
+    console.say("\nStep 2 of 6: Where your sign-in is kept\nYour Apple password is never stored. What is kept is the sign-in Apple hands back, so you don't have to type a code every time.")?;
     let held = PrivateState::open(dir)?;
     let dir = held.path.as_path();
     let chosen = storage::kind(dir)?;
@@ -788,7 +789,7 @@ async fn step_sign_in(
     endpoints: &Endpoints,
     again: bool,
 ) -> Result<(), &'static str> {
-    console.say("\nStep 3 of 5: Apple sign-in")?;
+    console.say("\nStep 3 of 6: Apple sign-in")?;
     let held = PrivateState::open(dir)?;
     let dir = held.path.as_path();
     let store = storage::open_store_in(env, dir)?;
@@ -846,7 +847,7 @@ const CARD_NOTE: &str = "The client must be able to show Skykeep's approval card
 
 /// Step 4. Runs after the sign-in: a policy saved before sign-in is bound to no account.
 fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str> {
-    console.say(&format!("\nStep 4 of 5: Approval mode\nThis decides when the assistant has to ask you before it acts. Every choice asks on the approval card in your MCP client. {CARD_NOTE} You can change it later with an {}: line in permissions.yaml in this folder; a line there wins over what you choose here, and setup keeps it in step.", crate::permissions::MODE_KEY))?;
+    console.say(&format!("\nStep 4 of 6: Approval mode\nThis decides when the assistant has to ask you before it acts. Every choice asks on the approval card in your MCP client. {CARD_NOTE} You can change it later with an {}: line in permissions.yaml in this folder; a line there wins over what you choose here, and setup keeps it in step.", crate::permissions::MODE_KEY))?;
     let held = PrivateState::open(dir)?;
     let library = crate::setup(&held.path)?;
     if library
@@ -1052,4 +1053,81 @@ fn offer_permissions(console: &mut dyn Console, dir: &Path) -> Result<(), &'stat
         console.say("Starter permissions file written. To see the rules in use, run skykeep-mcp permissions show.")?;
     }
     Ok(())
+}
+
+/// The services prompt setup shows; tests answer it by this text.
+pub const SERVICES_CHOICE: &str = "Type the numbers of the services to keep on, such as 1 4, or none (Enter keeps them as they are): ";
+
+/// Step 5. Which services the server may use, kept as the `services:` line in
+/// permissions.yaml. Nothing is written while the answer leaves things as they are.
+fn step_services(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str> {
+    use crate::permissions::{self, SERVICES, SERVICES_KEY};
+    let active = {
+        let held = PrivateState::open(dir)?;
+        let library = crate::setup(&held.path)?;
+        let stored = crate::stored_mode(&library, &held.path).ok().flatten();
+        permissions::peek(&library, &held.path, stored.as_deref())?
+    };
+    let mut menu = String::new();
+    for (n, (key, name)) in SERVICES.iter().enumerate() {
+        let state = if active.service_on(key) { "on" } else { "off" };
+        menu.push_str(&format!("\n  {}. {name} ({state})", n + 1));
+    }
+    console.say(&format!("\nStep 5 of 6: Services\nChoose which iCloud services the assistant may use. A service you switch off has no tools in your MCP client, and nothing from it is read, cached or synced; data cached before stays in this folder, unread, until you set up a fresh folder and delete this one. Apple signs in the whole account, so this is a limit inside this server, not at Apple: someone with the sign-in could still reach every service. You can change it later with the {SERVICES_KEY}: line in permissions.yaml in this folder.{menu}"))?;
+    let chosen: Vec<&str> = loop {
+        let answer = console.ask(SERVICES_CHOICE)?;
+        let answer = answer.trim();
+        if answer.is_empty() {
+            return Ok(());
+        }
+        if answer.eq_ignore_ascii_case("none") {
+            break Vec::new();
+        }
+        let numbers: Option<Vec<usize>> = answer
+            .split([' ', ','])
+            .filter(|w| !w.is_empty())
+            .map(|w| w.parse().ok().filter(|n| (1..=SERVICES.len()).contains(n)))
+            .collect();
+        match numbers {
+            Some(numbers) => {
+                break SERVICES
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| numbers.contains(&(i + 1)))
+                    .map(|(_, (key, _))| *key)
+                    .collect()
+            }
+            None => console.say("Please type numbers from 1 to 6, such as 1 4, or none.")?,
+        }
+    };
+    // The same as now (every service on and no line, too): nothing is written.
+    if chosen == active.services {
+        return console.say(&format!(
+            "Services unchanged. {}",
+            active.services_sentence()
+        ));
+    }
+    let value = format!("[{}]", chosen.join(", "));
+    let held = PrivateState::open(dir)?;
+    // Whatever the file says before setup writes is loaded as usual first, so a looser edit
+    // made by someone else is still reported, and only setup's own line counts as chosen here.
+    {
+        let mut library = crate::setup(&held.path)?;
+        let stored = crate::stored_mode(&library, &held.path).ok().flatten();
+        permissions::load(&mut library, &held.path, stored.as_deref())?;
+    }
+    match permissions::set_setting_print(&held.path, SERVICES_KEY, &value) {
+        Ok(print) => {
+            // Recorded now as the person's own choice, so the check below raises no notice.
+            let mut library = crate::setup(&held.path)?;
+            let stored = crate::stored_mode(&library, &held.path).ok().flatten();
+            permissions::load_own(&mut library, &held.path, stored.as_deref(), &print)?;
+            console.say(&format!(
+            "permissions.yaml now says {SERVICES_KEY}: {value}. Restart your MCP client so it offers the tools of the services that are on."
+            ))
+        }
+        Err(reason) => console.say(&format!(
+            "permissions.yaml could not be changed ({reason}), so the services stay as they were. Fix the file, then run skykeep-mcp setup again."
+        )),
+    }
 }

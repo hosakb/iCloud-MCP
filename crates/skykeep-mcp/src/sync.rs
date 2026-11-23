@@ -301,6 +301,15 @@ pub(crate) fn quarantine_looser(library: &mut Library, dir: &Path) -> Result<(),
     Ok(())
 }
 
+/// Notes and Reminders, as far as the permissions file's `services:` line leaves them on.
+fn services_on(library: &Library, dir: &Path) -> Vec<&'static str> {
+    let on = crate::permissions::peek(library, dir, None).map(|a| a.services);
+    ["notes", "reminders"]
+        .into_iter()
+        .filter(|s| on.as_ref().is_ok_and(|on| on.contains(s)))
+        .collect()
+}
+
 pub async fn run(dir: &Path) -> Result<Value, &'static str> {
     run_authorized(dir, false).await
 }
@@ -308,6 +317,9 @@ pub async fn run(dir: &Path) -> Result<Value, &'static str> {
 fn refresh_gate(dir: &Path, approved: bool) -> Result<bool, &'static str> {
     let mut library = Library::open(dir).map_err(|_| "library_unavailable")?;
     let configured = crate::policy(&library, dir)?;
+    if services_on(&library, dir).is_empty() {
+        return Err("sync_switched_off");
+    }
     if crate::mode_in_force(&library, dir)?.as_deref() == Some("reads_and_writes") && !approved {
         return Err("read_approval_required");
     }
@@ -378,6 +390,7 @@ async fn sync_pass(
     let dsid = client.session().dsid.as_deref().ok_or("login_required")?;
     let tag = queue::account_tag(dsid);
     let library = Library::open(dir).map_err(|_| "library_unavailable")?;
+    let on = services_on(&library, dir);
     if crate::account::binding(&library, dsid)? != crate::account::Binding::Same {
         return Err("account_mismatch_use_new_state_directory");
     }
@@ -398,6 +411,11 @@ async fn sync_pass(
     // back.
     let mut waiting_before = Vec::new();
     for service in ["notes", "reminders"] {
+        // Switched off in permissions.yaml: nothing is read, and its queued changes wait.
+        if !on.contains(&service) {
+            services.push(json!({"service":service,"outcome":"switched_off","sent":false}));
+            continue;
+        }
         let lock = Mutex::new(());
         let before = pass::run(service, &ctx, &data, &lock).await;
         waiting_before.extend(

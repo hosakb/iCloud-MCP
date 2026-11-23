@@ -168,8 +168,10 @@ enum Answer {
     AskAfter(&'static str, Box<dyn FnOnce() + Send>),
     /// The answer to the optional starter permissions file. Without one, the script skips it.
     Starter(&'static str),
+    /// The answer to the services step. Without one, the script keeps them as they are.
+    Services(&'static str),
 }
-use Answer::{Ask, AskAfter, Cancel, Secret, Starter};
+use Answer::{Ask, AskAfter, Cancel, Secret, Services, Starter};
 
 fn leak(text: String) -> &'static str {
     Box::leak(text.into_boxed_str())
@@ -215,6 +217,19 @@ impl Console for Script {
     }
     fn ask(&mut self, label: &str) -> Result<String, &'static str> {
         self.screen.push_str(label);
+        if label.ends_with(setup::SERVICES_CHOICE) {
+            let answer = match self.answers.front() {
+                Some(Services(a)) => {
+                    let a = *a;
+                    self.answers.pop_front();
+                    a
+                }
+                _ => "",
+            };
+            self.screen.push_str(answer);
+            self.screen.push('\n');
+            return Ok(answer.into());
+        }
         if label.ends_with(setup::STARTER_CHOICE) {
             let answer = match self.answers.front() {
                 Some(Starter(a)) => {
@@ -231,6 +246,7 @@ impl Console for Script {
         let answer = match self.answers.pop_front() {
             Some(Ask(a)) => a,
             Some(Starter(_)) => panic!("expected the starter offer at {label:?}\n{}", self.screen),
+            Some(Services(_)) => panic!("expected the services step at {label:?}\n{}", self.screen),
             Some(AskAfter(a, meanwhile)) => {
                 meanwhile();
                 a
@@ -249,7 +265,7 @@ impl Console for Script {
         match self.answers.pop_front() {
             Some(Secret(a)) => Ok(Zeroizing::new(a.into())),
             Some(Cancel) => Err("input_cancelled"),
-            Some(Ask(_)) | Some(AskAfter(..)) | Some(Starter(_)) => {
+            Some(Ask(_)) | Some(AskAfter(..)) | Some(Starter(_)) | Some(Services(_)) => {
                 panic!("expected a shown prompt at {label:?}\n{}", self.screen)
             }
             None => panic!("unexpected prompt {label:?}\n{}", self.screen),
@@ -447,8 +463,8 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client
     let script = first_run_with_keyring(&dir, &server).await;
     script.assert_no_secrets();
     let screen = &script.screen;
-    for step in 1..=5 {
-        assert!(screen.contains(&format!("Step {step} of 5")), "{screen}");
+    for step in 1..=6 {
+        assert!(screen.contains(&format!("Step {step} of 6")), "{screen}");
     }
     assert!(screen.contains(&format!("Create {}? [Y/n]", dir.display())));
     assert!(screen.contains("1. Ask me before every read and every change. Recommended."));
@@ -508,7 +524,7 @@ async fn a_rerun_checks_the_sign_in_and_asks_keep_sign_in_again_switch_or_quit()
         .screen
         .contains("Checking the saved sign-in with Apple"));
     assert!(script.screen.contains("1. Keep this setup\n  2. Sign in again in this folder (same Apple Account)\n  3. Switch to another Apple Account\n  4. Quit"));
-    assert!(!script.screen.contains("Step 3 of 5"), "no new sign-in");
+    assert!(!script.screen.contains("Step 3 of 6"), "no new sign-in");
     assert_eq!(
         policy(&dir)["revision"],
         revision,
@@ -1483,5 +1499,97 @@ async fn status_quotes_the_folder_in_its_chmod_commands() {
     assert!(
         text.contains(&format!("chmod 600 '{}'", shared.display())),
         "{text}"
+    );
+}
+
+#[tokio::test]
+async fn the_services_step_writes_the_services_line_only_when_something_changes() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    let script = first_run_with_keyring(&dir, &server).await;
+    let screen = &script.screen;
+    assert!(screen.contains("Step 5 of 6: Services"), "{screen}");
+    assert!(screen.contains("  5. Photos (on)"), "{screen}");
+    assert!(
+        screen.contains("a limit inside this server, not at Apple"),
+        "{screen}"
+    );
+    assert!(
+        !dir.join(skykeep_mcp::permissions::FILE_NAME).exists(),
+        "Enter keeps every service on and writes no file"
+    );
+    // A rerun that keeps the setup still offers the step; Calendar only, then.
+    let mut script = Script::new(vec![Ask(""), Ask(""), Services("x"), Services("4")]);
+    run(&mut script, &dir, &server).await.unwrap();
+    assert!(
+        script.screen.contains("Please type numbers from 1 to 6"),
+        "{}",
+        script.screen
+    );
+    let file = dir.join(skykeep_mcp::permissions::FILE_NAME);
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("services: [calendar]"), "{text}");
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
+    assert!(
+        script
+            .screen
+            .contains("permissions.yaml now says services: [calendar]."),
+        "{}",
+        script.screen
+    );
+    // The server refuses the rest at once.
+    let reply = tool(&dir, "notes_folders").await;
+    assert_eq!(reply["error"], "notes_switched_off", "{reply}");
+    // The next run shows the choice and changes nothing on Enter.
+    let mut script = Script::new(vec![Ask(""), Ask("")]);
+    run(&mut script, &dir, &server).await.unwrap();
+    assert!(
+        script.screen.contains("  1. Notes (off)"),
+        "{}",
+        script.screen
+    );
+    assert!(
+        script.screen.contains("  4. Calendar (on)"),
+        "{}",
+        script.screen
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+    // Every service on again: the line stays, listing all six.
+    let mut script = Script::new(vec![Ask(""), Ask(""), Services("1 2 3 4 5 6")]);
+    let r = run(&mut script, &dir, &server).await;
+    assert!(r.is_ok(), "{}", script.screen);
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        text.contains("services: [notes, reminders, contacts, calendar, photos, drive]"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn a_looser_edit_made_before_the_services_step_is_still_reported() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    first_run_with_keyring(&dir, &server).await;
+    tool(&dir, "sync_status").await;
+    // Someone else allows a change in the file; no tool call has loaded it yet.
+    let file = dir.join(skykeep_mcp::permissions::FILE_NAME);
+    std::fs::write(&file, "version: 1\nrules:\n  notes_write.create: allow\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut script = Script::new(vec![Ask(""), Ask(""), Services("2")]);
+    let outcome = run(&mut script, &dir, &server).await;
+    assert!(
+        outcome.is_err(),
+        "the check asks to look: {}",
+        script.screen
+    );
+    assert!(
+        script
+            .screen
+            .contains("became looser, most recently notes_write.create"),
+        "{}",
+        script.screen
     );
 }

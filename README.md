@@ -7,6 +7,7 @@ iCloud-MCP is a local MCP server for Apple Notes, Reminders, Contacts, Calendar,
 - Calendar events can be read, and created, changed, moved to another calendar or deleted with `calendar_write`. Deletes always need your approval.
 - Photos reads give metadata only, never the pictures. `photos_write` changes photo details and albums, uploads a file from the exchange folder, and moves a photo to Recently Deleted only with your approval.
 - iCloud Drive can be read and changed with `drive_write`. File contents move only through one local exchange folder you name, and deletions always need your approval.
+- Setup asks which of the six services the server may use; all are on by default. A switched-off service has no tools in the MCP client, a call to one is refused with the next step, and nothing from it is read, cached or synced.
 - `setup` guides you through sign-in in your own terminal. `status` checks the setup and `unlock` opens the protected sign-in file after a restart.
 - Every approval happens on a card in your MCP client, in every approval mode. Hermes shows it. A client without the card, or a session where nobody answers it, can't run actions that need approval; they are refused and nothing runs.
 - A permissions file sets each tool or action to `allow`, `ask` or `deny`. With `ask: client` your MCP client shows a card with "Approve this time", "Deny" and, where an allow rule would stop the asking, "Always allow this action". The server reads the file at every tool call, so an edit counts from the next call.
@@ -48,7 +49,7 @@ You need a terminal window that you open yourself. Don't run these commands thro
    skykeep-mcp setup
    ```
 
-   It walks you through five steps and tells you what each one does:
+   It walks you through six steps and tells you what each one does:
 
    1. **Folder.** Where iCloud-MCP keeps its private data. Press Enter to use the suggested folder, `~/.local/share/skykeep-mcp`, or type another one as a full path starting with `/` or `~`. Setup asks before it creates a folder. With another folder, add `--state-dir FOLDER` to every command; setup and status print each command with it already filled in.
    2. **Where your sign-in is kept.** Your computer's password store when it has one, otherwise a protected file (see below).
@@ -64,7 +65,8 @@ You need a terminal window that you open yourself. Don't run these commands thro
 
       Every choice asks on iCloud-MCP's approval card in the MCP client. Hermes supports MCP form elicitation and shows the card. In a client without the card, a request that needs approval is refused with `approval_requires_form_client`, and nothing runs. A session where nobody answers, such as a scheduled job, gets `approval_timeout` after 3 minutes, and nothing runs either. Choice 4 keeps a folder's earlier `require-approval` setting: then every change asks on the card, and setup and status say so. Once a folder has had choice 1, 2 or 3, it can't go back to 4; set up a new folder instead. You can change the mode later with an `approval_mode:` line in `permissions.yaml` (see "Settings in the permissions file"). A line there wins over the choice made here, and setup changes that line to match when you choose again.
    After step 4, setup offers to write a starter permissions file. In it every deletion asks on the card. Press Enter to skip it.
-   5. **Check.** Setup checks everything it set up and prints what to paste into your MCP client's settings: a JSON line for most clients, and a `config.yaml` block for Hermes.
+   5. **Services.** Which of Notes, Reminders, Contacts, Calendar, Photos and Drive the assistant may use. Setup lists them with numbers and whether each is on; type the numbers to keep on (such as `1 4`), `none`, or press Enter to keep them as they are. The choice is stored as the `services:` line in `permissions.yaml` (see "Settings in the permissions file"); with every service on and no line, nothing is written. Apple gives one sign-in for the whole account, so this is a limit inside iCloud-MCP, not at Apple: someone with the sign-in file could still reach the other services outside this server.
+   6. **Check.** Setup checks everything it set up and prints what to paste into your MCP client's settings: a JSON line for most clients, and a `config.yaml` block for Hermes.
 
    You can run `setup` again at any time. It checks the saved sign-in with Apple, then asks whether to keep the setup, sign in again in the same folder (same Apple Account), switch to another Apple Account, or quit. If Apple no longer accepts the saved sign-in, setup says so and goes straight to signing in again. A folder belongs to one Apple Account, so switching sets up a new folder for the other account and leaves the first one as it is. If setup stopped part way, the next run continues with the first step that is not done.
 
@@ -121,7 +123,7 @@ The folder must be owned by you, mode `0700`, and contain no symlinks or files r
 skykeep-mcp --state-dir ~/.local/share/skykeep-mcp
 ```
 
-Configure your MCP client to start that command. Stdout carries protocol messages only. JSON-RPC batches are not supported and get an `Invalid Request` error. Several clients can share one directory: operations take turns on the lock, and a server that starts while another holds it still answers `initialize`, then returns `state_busy_retry` from each tool call until the lock is free. Setup prints the exact line to paste. The server never opens a keyring unlock dialog or a sign-in prompt; if the keyring is locked or the session has expired, tools return `login_required` with instructions, and with a protected file that is not unlocked they return `locked: run skykeep-mcp unlock in a terminal`. `auth_status` names the folder in that command, and says which other problem a protected file has, such as a damaged file or a blocked kernel key storage. While running it refreshes Notes and Reminders every five minutes; a failed pass waits for the next interval rather than retrying.
+Configure your MCP client to start that command. Stdout carries protocol messages only. JSON-RPC batches are not supported and get an `Invalid Request` error. Several clients can share one directory: operations take turns on the lock, and a server that starts while another holds it still answers `initialize`, then returns `state_busy_retry` from each tool call until the lock is free. Setup prints the exact line to paste. The server never opens a keyring unlock dialog or a sign-in prompt; if the keyring is locked or the session has expired, tools return `login_required` with instructions, and with a protected file that is not unlocked they return `locked: run skykeep-mcp unlock in a terminal`. `auth_status` names the folder in that command, and says which other problem a protected file has, such as a damaged file or a blocked kernel key storage. While running it refreshes Notes and Reminders every five minutes, those of the two that the `services:` line leaves on; a failed pass waits for the next interval rather than retrying.
 
 ## Tools
 
@@ -282,7 +284,7 @@ Use your folder if it is another one. nano keeps the file's mode 600, so only yo
 
 **When the file is wrong.** iCloud-MCP reads only a regular file in the folder that belongs to you and that no one else can change. It never follows a link and reads at most 64 KiB. The format is a strict part of YAML: `version: 1`, the two settings below, `rules:`, and one rule per line indented with spaces. A broken file never makes anything looser. iCloud-MCP keeps the last valid rules and settings it loaded from the file. If there are none, the approval mode decides and every deletion asks, even under `yolo`. Each tool result says so while the file is unusable, and `status` and `permissions show` say what is wrong. A file that others can change, which is common on Ubuntu with mode 664, is reported with the command that fixes it: `chmod 600 FOLDER/permissions.yaml`.
 
-**Seeing what changed.** Each time the file's content changes, iCloud-MCP records when it loaded it and what became looser or stricter. `skykeep-mcp status` reports looser changes, for example `reminders_write.create: asks in your MCP client before, now runs without asking`, `approval mode: writes_only before, now yolo` or a new exchange folder, until you look. `status` only reads; it never records anything.
+**Seeing what changed.** Each time the file's content changes, iCloud-MCP records when it loaded it and what became looser or stricter. `skykeep-mcp status` reports looser changes, for example `reminders_write.create: asks in your MCP client before, now runs without asking`, `approval mode: writes_only before, now yolo`, `services: Photos was switched off before, now on` or a new exchange folder, until you look. `status` only reads; it never records anything.
 
 ```sh
 skykeep-mcp permissions show --state-dir FOLDER
@@ -292,12 +294,13 @@ It needs a folder that setup has prepared. It prints the rules in use, when the 
 
 ### Settings in the permissions file
 
-Two settings can stand next to the rules, each on its own line without indentation:
+Three settings can stand next to the rules, each on its own line without indentation:
 
 ```yaml
 version: 1
 approval_mode: writes_only            # reads_and_writes, writes_only or yolo
 exchange_folder: ~/Skykeep-Exchange   # a full path, or one that starts with ~/
+services: [notes, reminders, calendar]  # the services that are on
 rules:
   notes_write.delete:
     ask: client
@@ -305,8 +308,16 @@ rules:
 
 - `approval_mode:` replaces the mode chosen in setup. The modes are the ones in the table under "Get started". Every deletion, move to Recently Deleted and move or rename of a large Drive folder still asks on the card in every mode. Without the line, the mode from setup applies. In a folder where setup stored no mode, the first tool call after sign-in stores the file's mode so that queued changes are bound to it, and sets aside changes already waiting (`skykeep-mcp quarantine` lists them). That stored mode still counts only while the line is there.
 - `exchange_folder:` names the exchange folder (see "The exchange folder" for the checks). Without the line, the folder set up with `skykeep-mcp exchange` applies, if there is one.
+- `services:` lists the services the server may use, on one line, from `notes`, `reminders`, `contacts`, `calendar`, `photos` and `drive`. `[]` switches all of them off. Without the line, every service is on. For a switched-off service:
+  - its tools are left out of the tool list, and the server instructions name it. `sync` is left out only when Notes and Reminders are both off. A client reads the tool list when it connects, so restart it after switching a service on.
+  - a call to one of its tools is refused with `notes_switched_off`, `photos_switched_off` and so on, with the line to change as the next step. The check comes before rules, the approval mode and the card. `sync` reports such a service as `switched_off` and leaves its queued changes waiting; `sync_status` lists it under `switched_off`.
+  - switching off counts at the next tool call. Data cached before stays in the folder, and nothing reads it while the service is off. To remove it, set up a fresh folder and delete the old one.
+  - switching one on is a looser change and is reported like the others. A change setup makes is recorded but raises no notice, since you chose it there.
+  - rule names for its tools stay valid in `rules:`, so switching it on again needs no other edit.
 
-A line in the file wins. `skykeep-mcp policy` and `skykeep-mcp exchange` still work: each changes its line in the file, keeps every other line and comment, keeps the previous file as `permissions.yaml.bak` and writes the new one in one step with mode 600. A file with a mistake is left alone, and the command changes nothing and says what to fix. An edit counts at the next tool call, like a rule. A broken file keeps the last valid settings; if there are none, the mode from setup and the folder from `skykeep-mcp exchange` stay. `status` and `permissions show` say which mode and folder are in use and where each comes from.
+  A broken file never switches a service on: the last valid `services:` line stays. With no valid file loaded before, a file that can't be read, or a `services:` line that can't be read, switches every service off; a broken file without the line leaves every service on. Turning services off changes no approval rule: deletions still ask on the card in every mode.
+
+A line in the file wins. `skykeep-mcp policy`, `skykeep-mcp exchange` and the services step of setup still work: each changes its line in the file, keeps every other line and comment, keeps the previous file as `permissions.yaml.bak` and writes the new one in one step with mode 600. A file with a mistake is left alone, and the command changes nothing and says what to fix. An edit counts at the next tool call, like a rule. A broken file keeps the last valid settings; if there are none, the mode from setup and the folder from `skykeep-mcp exchange` stay. `status` and `permissions show` say which mode and folder are in use and where each comes from, and which services are on.
 
 Passwords, verification codes and the passphrase never go in the file. A line that looks like one (`password:`, `passphrase:`, `code:`, `token:` and similar) makes the file unusable, and the message does not repeat it. `setup`, `login`, `logout` and `unlock` stay terminal-only, and `approve` is only for actions set to `ask: terminal`.
 
@@ -316,6 +327,7 @@ Passwords, verification codes and the passphrase never go in the file. A line th
 - A write that iCloud accepts is reported as sent, not as verified field by field. Partial reminder writes are a known inherited gap.
 - Note attachments, Notes folder and Reminders list management, and bulk operations are not exposed.
 - Photos changes are only the actions of `photos_write`: no deleting for good, no picture edits, no shared albums and no changes to many photos at once. `contacts_write` doesn't change postal addresses, photos, contact lists or merged cards. Calendar has no calendar create or rename, no attendee management and no CalDAV or Nextcloud calendars.
+- Switching a service off is a limit inside iCloud-MCP, not at Apple. Apple gives one sign-in for the whole account, so anyone with the sign-in could still reach every service outside this server.
 - Mail is not implemented and not planned, because upstream Skykeep has no Mail support.
 - Only Linux is supported. The sign-in is kept in a Secret Service keyring or in the passphrase-protected file; with neither, setup and sign-in stop instead of keeping it in a plain file.
 - The protected file needs the Linux kernel key storage for `unlock`. Some containers block it (Docker's default security profile does); there `unlock` says so and the server stays locked.
