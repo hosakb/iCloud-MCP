@@ -520,8 +520,12 @@ async fn a_broken_or_removed_exchange_line_leaves_no_exchange_folder() {
     .unwrap();
     assert!(step.contains(&older_path), "{step}");
     assert!(step.contains("skykeep-mcp exchange"), "{step}");
+    assert!(step.contains("no exchange_folder: line"), "{step}");
+    // Short sentences: at most three, none over 30 words.
+    let sentences: Vec<&str> = step.split(". ").collect();
+    assert!(sentences.len() <= 3, "{step}");
     assert!(
-        step.contains("only its exchange_folder: line counts"),
+        sentences.iter().all(|s| s.split_whitespace().count() <= 30),
         "{step}"
     );
     let lines = permissions::status(&library, &dir, Some("writes_only"));
@@ -962,16 +966,86 @@ async fn an_earlier_exchange_folder_is_copied_into_the_first_file() {
         );
         assert!(!shown.contains("looser: exchange folder"), "{how}: {shown}");
     }
-    // A folder that no longer passes the checks is not copied.
+    // A folder that no longer passes the checks is not copied: one others can change, one
+    // replaced by a symbolic link, one inside a hidden or credentials folder, and one replaced
+    // by another folder of the same name.
+    let base = private("xchg-base");
+    let base_path = base.path().canonicalize().unwrap();
+    let elsewhere = private("xchg-elsewhere");
+    for case in ["shared", "link", ".ssh", "Credentials", "replaced"] {
+        let f = folder(Some("writes_only")).await;
+        let dir = f.path();
+        let earlier = match case {
+            ".ssh" | "Credentials" => base_path.join(case).join("in"),
+            other => base_path.join(other),
+        };
+        std::fs::create_dir_all(&earlier).unwrap();
+        std::fs::set_permissions(&earlier, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut library = quince_core::Library::open(&dir).unwrap();
+        skykeep_mcp::exchange::set_up(&mut library, Some(earlier.clone()), None).unwrap();
+        match case {
+            "shared" => {
+                std::fs::set_permissions(&earlier, std::fs::Permissions::from_mode(0o777)).unwrap()
+            }
+            "link" => {
+                std::fs::remove_dir(&earlier).unwrap();
+                std::os::unix::fs::symlink(elsewhere.path(), &earlier).unwrap();
+            }
+            "replaced" => {
+                // Moved aside, not removed, so the new folder can't reuse its inode.
+                std::fs::rename(&earlier, base_path.join("replaced-old")).unwrap();
+                std::fs::create_dir(&earlier).unwrap();
+                std::fs::set_permissions(&earlier, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            _ => {}
+        }
+        permissions::set_setting(&dir, permissions::MODE_KEY, "yolo").unwrap();
+        assert_eq!(
+            permissions::setting_in_file(&dir, permissions::EXCHANGE_KEY),
+            None,
+            "{case}"
+        );
+    }
+}
+
+/// Review round 2: once copied into the file, the folder is still held to the device and
+/// inode it was set up with: a folder made again at the same path is refused, never used.
+#[tokio::test]
+async fn a_copied_folder_replaced_at_the_same_path_is_refused() {
     let f = folder(Some("writes_only")).await;
     let dir = f.path();
-    let gone = private("xchg-gone");
+    let older = private("xchg-older");
+    let older_path = older.path().canonicalize().unwrap();
     let mut library = quince_core::Library::open(&dir).unwrap();
-    skykeep_mcp::exchange::set_up(&mut library, Some(gone.path().to_path_buf()), None).unwrap();
-    std::fs::set_permissions(gone.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
-    permissions::set_setting(&dir, permissions::MODE_KEY, "yolo").unwrap();
+    skykeep_mcp::exchange::set_up(&mut library, Some(older_path.clone()), None).unwrap();
+    permissions::write_starter(&dir).unwrap();
+    permissions::load(&mut library, &dir, Some("writes_only")).unwrap();
+    let in_force = |library: &quince_core::Library| {
+        skykeep_mcp::exchange::in_force(library, &dir).map(|e| e.map(|e| e.path))
+    };
+    assert_eq!(in_force(&library), Ok(Some(older_path.clone())));
+    // Moved aside, not removed, so the new folder can't reuse its inode.
+    let aside = private("xchg-aside");
+    std::fs::rename(&older_path, aside.path().join("old")).unwrap();
+    std::fs::create_dir(&older_path).unwrap();
+    std::fs::set_permissions(&older_path, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(
-        permissions::setting_in_file(&dir, permissions::EXCHANGE_KEY),
-        None
+        in_force(&library),
+        Err("exchange_folder_changed_run_skykeep_mcp_exchange")
     );
+    // Set up again in the terminal, the new folder is the one held to.
+    skykeep_mcp::exchange::set_up(&mut library, Some(older_path.clone()), None).unwrap();
+    assert_eq!(in_force(&library), Ok(Some(older_path)));
+}
+
+/// Review round 2: when the file's mistake can't be named (no library to read it from), the
+/// step does not point to a mistake "named above".
+#[test]
+fn an_unusable_file_without_a_named_mistake_says_fix_the_file() {
+    let state = private("state");
+    let dir = state.path().canonicalize().unwrap();
+    write_file(&dir, "version: 1\nexchange_folder: rel/ex\n");
+    let step = skykeep_mcp::next_step("exchange_folder_file_unusable", &dir, &Value::Null).unwrap();
+    assert!(step.contains("Fix the file, then try again."), "{step}");
+    assert!(!step.contains("named above"), "{step}");
 }

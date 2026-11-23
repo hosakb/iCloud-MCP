@@ -63,17 +63,19 @@ fn send_context(
                 .map_err(|_| "library_unavailable")?
                 .ok_or("not_found")?;
             // `Note.runs` never serializes; the sender takes runs from the payload. A save
-            // also binds the note's formatting, by its hash, so a formatting-only change
-            // since it was queued sets it aside like a change to the text.
+            // also binds the note's formatting (see [`formatting`]), so a formatting-only
+            // change since it was queued sets it aside like a change to the text.
             if kind == "save" {
                 item.body = library
                     .note_body(&p.record)
                     .map_err(|_| "library_unavailable")?;
                 let runs = library
                     .note_runs(&p.record)
-                    .map_err(|_| "library_unavailable")?
-                    .map(|r| quince_sync::queue::account_tag(&format!("note-runs:{r}")));
-                return bounded_context(json!({"item":crate::bounded_json(&item)?,"runs":runs}));
+                    .map_err(|_| "library_unavailable")?;
+                let formatting = formatting(item.body.as_deref(), runs.as_deref());
+                return bounded_context(
+                    json!({"item":crate::bounded_json(&item)?,"runs":formatting}),
+                );
             }
             bounded_context(json!({"item":crate::bounded_json(&item)?}))
         }
@@ -101,6 +103,22 @@ fn send_context(
         }
         _ => Err("unknown_service"),
     }
+}
+
+/// The cached formatting of a note's text, by a hash of its canonical runs: the same
+/// formatting cut into other runs, as Apple may send it back, gives the same value
+/// (`quince_icloud::notes::same_formatting` compares the same way). `None` when the cached
+/// runs do not describe the cached text: after a text-only save the cache keeps the runs of
+/// the text before it until Apple's copy is read, so they say nothing about this text. Such
+/// a save is not bound to formatting; it writes only text into Apple's current document, so
+/// Apple's formatting stays as it is there.
+fn formatting(body: Option<&str>, runs: Option<&str>) -> Option<String> {
+    let runs: Vec<quince_icloud::ckdocument::Run> = serde_json::from_str(runs?).ok()?;
+    let canonical = quince_icloud::notes::canonical_runs(body?, &runs)?;
+    let text = serde_json::to_string(&canonical).ok()?;
+    Some(quince_sync::queue::account_tag(&format!(
+        "note-formatting:{text}"
+    )))
 }
 
 fn bounded_context(context: Value) -> Result<Value, &'static str> {
@@ -139,7 +157,8 @@ fn without_version_stamps(mut context: Value) -> Value {
 pub(crate) const ITEM_CHANGED: &str = "item_changed_on_icloud_since_queued";
 
 /// The next step after [`ITEM_CHANGED`].
-pub(crate) const ITEM_CHANGED_STEP: &str = "The note or reminder changed on iCloud after this change was queued, or was deleted there, so the change was not sent. If it still exists, read it again with notes_get or reminders_get and ask again. If it was deleted there is nothing to redo.";
+/// It names [`MAX_REFUSED`]; a test holds the two together.
+pub(crate) const ITEM_CHANGED_STEP: &str = "The note or reminder changed on iCloud after this change was queued, or was deleted there, so the change was not sent. If it still exists, read it again with notes_get or reminders_get and ask again. If it was deleted there is nothing to redo. The set-aside change stays in the list, and counts toward the limit of 1024 set-aside changes, until you retire it with skykeep-mcp quarantine in your own terminal.";
 
 /// Grant failures that belong to one queued write. Anything else (an unreadable library,
 /// a changed policy, account or directory) still stops the whole pass.
@@ -314,15 +333,20 @@ fn authorization_check(
     // before the etag and time were left out is compared without them too. A create's
     // context holds no item; a change there is a stale grant.
     if context {
-        let queued = without_version_stamps(grant["context"].clone());
+        let mut queued = without_version_stamps(grant["context"].clone());
         let mut now = match send_context(library, p) {
             Err("not_found") => return Err(ITEM_CHANGED),
             now => now?,
         };
-        // A save queued before its formatting was bound is compared without it.
-        if queued.get("item").is_some() && queued.get("runs").is_none() {
-            if let Some(now) = now.as_object_mut() {
-                now.remove("runs");
+        // A save not bound to formatting is compared without it: one whose cached runs did not
+        // describe its text (see [`formatting`]), or one queued before formatting was bound.
+        // The latter is not set aside: the sender merges its text against Apple's current
+        // copy and keeps Apple's formatting on every line the save does not restyle.
+        if queued.get("item").is_some() && !queued["runs"].is_string() {
+            for context in [&mut queued, &mut now] {
+                if let Some(context) = context.as_object_mut() {
+                    context.remove("runs");
+                }
             }
         }
         if queued != now {

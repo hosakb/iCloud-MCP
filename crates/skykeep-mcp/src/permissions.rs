@@ -1290,7 +1290,7 @@ fn exchange_line(library: &Library, dir: &Path, active: &Active) -> (String, Opt
     if active.file_names_exchange && active.exchange.is_none() {
         if let Some(earlier) = crate::exchange::not_in_file(dir) {
             return (
-                format!("Exchange folder: none. {earlier} so Drive and Photos uploads and Drive downloads are refused."),
+                format!("Exchange folder: none, so Drive and Photos uploads and Drive downloads are refused. {earlier}"),
                 Some(crate::exchange::not_in_file_fix(dir)),
             );
         }

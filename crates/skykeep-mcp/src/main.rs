@@ -380,8 +380,11 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
                 return Ok(());
             }
             for row in &rows {
-                writeln!(tty, "{row}").map_err(|_| "terminal_unavailable")?;
-                if let Some(step) = row["next_step"].as_str() {
+                // The next step on a line of its own, not again inside the row.
+                let mut shown = row.clone();
+                let step = shown.as_object_mut().and_then(|r| r.remove("next_step"));
+                writeln!(tty, "{shown}").map_err(|_| "terminal_unavailable")?;
+                if let Some(step) = step.as_ref().and_then(|s| s.as_str()) {
                     writeln!(tty, "  Next step: {step}").map_err(|_| "terminal_unavailable")?;
                 }
             }

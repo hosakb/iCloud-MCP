@@ -1099,10 +1099,12 @@ async fn a_body_changed_or_item_deleted_on_icloud_is_refused_with_a_reason() {
     let rows = server.quarantined().unwrap();
     assert_eq!(rows.len(), 2);
     for row in rows {
+        let step = row["next_step"].as_str().unwrap_or_default();
+        assert!(step.contains("nothing to redo"), "{row}");
+        // It stays until a person retires it, and counts toward the limit.
+        assert!(step.contains("skykeep-mcp quarantine"), "{row}");
         assert!(
-            row["next_step"]
-                .as_str()
-                .is_some_and(|t| t.contains("nothing to redo")),
+            step.contains(&skykeep_mcp::sync::MAX_REFUSED.to_string()),
             "{row}"
         );
     }
@@ -1141,26 +1143,37 @@ async fn a_title_or_due_date_changed_on_icloud_refuses_a_queued_tick() {
     }
 }
 
-/// Review round 1: a formatting-only change to a note (its runs) after a save was queued sets
-/// the save aside like a body change.
-#[tokio::test]
-async fn a_formatting_change_on_icloud_refuses_a_queued_save() {
-    let (dir, mut server, mut library) = family().await;
+/// A save of `body` on the family note that carries its formatting, `runs`; it must queue.
+async fn save_with_runs(server: &mut skykeep_mcp::Server, id: i64, body: &str, runs: Value) {
     let saved = write(
-        &mut server,
-        2,
+        server,
+        id,
         "notes_write",
-        json!({"action":"save","guid":"note","body":"note\nbody edited","base_etag":"n1"}),
+        json!({"action":"save","guid":"note","body":body,"runs":runs,"base_etag":"n1"}),
     )
     .await;
     assert_eq!(saved["isError"], false, "{saved}");
+}
+
+/// Review rounds 1 and 2: a save that carries formatting is set aside when the note's
+/// formatting changed on iCloud since, even with the text unchanged.
+#[tokio::test]
+async fn a_formatting_change_on_icloud_refuses_a_queued_save() {
+    let (dir, mut server, mut library) = family().await;
+    library
+        .set_note_runs("note", &json!([{"length":9}]).to_string())
+        .unwrap();
+    save_with_runs(&mut server, 2, "note\nbody edited", json!([{"length":16}])).await;
     let p = library.outbox_pending("notes").unwrap().remove(0);
     assert_eq!(
         skykeep_mcp::sync::authorized(&library, dir.path(), &p),
         Ok(())
     );
     library
-        .set_note_runs("note", &json!([{"length":4,"bold":true}]).to_string())
+        .set_note_runs(
+            "note",
+            &json!([{"length":5,"bold":true},{"length":11}]).to_string(),
+        )
         .unwrap();
     let remote = remote().await;
     let result =
@@ -1176,4 +1189,94 @@ async fn a_formatting_change_on_icloud_refuses_a_queued_save() {
         &remote.received_requests().await.unwrap(),
         "note"
     ));
+}
+
+/// Review round 2: the same formatting cut into other runs, as Apple may send it back, is
+/// not a change.
+#[tokio::test]
+async fn the_same_formatting_in_other_runs_does_not_set_a_save_aside() {
+    let (dir, mut server, mut library) = family().await;
+    library
+        .set_note_runs("note", &json!([{"length":9}]).to_string())
+        .unwrap();
+    save_with_runs(&mut server, 2, "note\nbody edited", json!([{"length":16}])).await;
+    library
+        .set_note_runs(
+            "note",
+            &json!([{"length":5},{"length":4},{"length":7}]).to_string(),
+        )
+        .unwrap();
+    let p = library.outbox_pending("notes").unwrap().remove(0);
+    assert_eq!(
+        skykeep_mcp::sync::authorized(&library, dir.path(), &p),
+        Ok(())
+    );
+}
+
+/// Review round 2: two text-only saves in a row. The first was sent and the cache still has
+/// the formatting from before it; the next read brings Apple's formatting for the sent text,
+/// with the second save laid over it again. Nothing changed on iCloud, so it is not set aside.
+#[tokio::test]
+async fn a_second_text_only_save_after_a_sent_one_is_not_set_aside() {
+    let (dir, mut server, mut library) = family().await;
+    library
+        .set_note_runs("note", &json!([{"length":9}]).to_string())
+        .unwrap();
+    for (id, body) in [(2, "note\nbody one"), (3, "note\nbody two!")] {
+        let saved = write(
+            &mut server,
+            id,
+            "notes_write",
+            json!({"action":"save","guid":"note","body":body,"base_etag":"n1"}),
+        )
+        .await;
+        assert_eq!(saved["isError"], false, "{saved}");
+        if id == 2 {
+            // Sent: it leaves the queue, and the cache keeps its formatting as it was.
+            let first = library.outbox_pending("notes").unwrap().remove(0);
+            library.outbox_done(first.id).unwrap();
+        }
+    }
+    // The next read: Apple's copy of the first save, in its own runs, and the second save
+    // laid over it as the pass replays it.
+    library
+        .set_note_runs("note", &json!([{"length":5},{"length":8}]).to_string())
+        .unwrap();
+    let mut note = library.note("note").unwrap().unwrap();
+    note.etag = Some("n2".into());
+    library.put_notes(&[note]).unwrap();
+    let p = library.outbox_pending("notes").unwrap().remove(0);
+    assert_eq!(
+        skykeep_mcp::sync::authorized(&library, dir.path(), &p),
+        Ok(())
+    );
+}
+
+/// Review round 2: a save queued before its formatting was bound (a grant without the
+/// formatting value) is compared without it, not set aside: the sender keeps Apple's
+/// formatting on every line the save does not restyle, and its text is merged against
+/// Apple's current copy.
+#[tokio::test]
+async fn a_save_queued_before_formatting_was_bound_is_still_sent() {
+    let (dir, mut server, mut library) = family().await;
+    library
+        .set_note_runs("note", &json!([{"length":9}]).to_string())
+        .unwrap();
+    save_with_runs(&mut server, 2, "note\nbody edited", json!([{"length":16}])).await;
+    let p = library.outbox_pending("notes").unwrap().remove(0);
+    let key = format!("mcp.authorization.{}", p.id);
+    let mut grant: Value = serde_json::from_str(&library.state(&key).unwrap().unwrap()).unwrap();
+    assert!(grant["context"]["runs"].is_string(), "{grant}");
+    grant["context"].as_object_mut().unwrap().remove("runs");
+    library.set_state(&key, &grant.to_string()).unwrap();
+    library
+        .set_note_runs(
+            "note",
+            &json!([{"length":5,"bold":true},{"length":11}]).to_string(),
+        )
+        .unwrap();
+    assert_eq!(
+        skykeep_mcp::sync::authorized(&library, dir.path(), &p),
+        Ok(())
+    );
 }

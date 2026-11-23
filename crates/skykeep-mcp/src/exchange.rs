@@ -193,6 +193,13 @@ pub fn in_force(
     if let Some(written) = &active.exchange {
         let mut exchange = checked(written, state_dir, max_bytes)?;
         exchange.from_file = true;
+        // The folder set up in the terminal, named in the file (as the copy into the first
+        // file does), is still held to the device and inode it was set up with.
+        if let Ok(Some(stored)) = &stored {
+            if stored.path == exchange.path && stored.identity != exchange.identity {
+                return Err("exchange_folder_changed_run_skykeep_mcp_exchange");
+            }
+        }
         return Ok(Some(exchange));
     }
     if active.file_names_exchange {
@@ -294,16 +301,19 @@ pub fn next_step(code: &str, dir: &Path) -> String {
         return file_unusable_step(dir, false);
     }
     if code == NOT_IN_FILE {
-        return format!(
-            "{} so nothing was uploaded or downloaded. {}",
-            not_in_file(dir).unwrap_or_else(|| format!(
-                "{} has no {}: line, and once that file exists only its {}: line counts,",
-                crate::permissions::FILE_NAME,
-                crate::permissions::EXCHANGE_KEY,
-                crate::permissions::EXCHANGE_KEY
-            )),
-            not_in_file_fix(dir)
+        let because = format!(
+            "{} has no {}: line, so nothing was uploaded or downloaded.",
+            crate::permissions::FILE_NAME,
+            crate::permissions::EXCHANGE_KEY
         );
+        return match earlier_folder(dir) {
+            Some(path) => format!(
+                "{} was set up earlier with skykeep-mcp exchange. It is not used, because {because} {}",
+                crate::status::quoted(&path),
+                not_in_file_fix(dir)
+            ),
+            None => format!("{because} {}", not_in_file_fix(dir)),
+        };
     }
     match &written {
         Some(w) => format!(
@@ -341,7 +351,12 @@ pub fn file_unusable_step(dir: &Path, in_terminal: bool) -> String {
             )
         })
         .unwrap_or_default();
-    let mut text = format!("{file} can't be used{why}, so no exchange folder is in use and nothing is uploaded or downloaded. Fix the mistake named above in that file, then try again.");
+    let fix = if why.is_empty() {
+        "Fix the file, then try again."
+    } else {
+        "Fix the mistake named above in that file, then try again."
+    };
+    let mut text = format!("{file} can't be used{why}, so no exchange folder is in use and nothing is uploaded or downloaded. {fix}");
     if !in_terminal {
         text.push_str(&format!(
             " In your own terminal, {} says what is wrong.",
@@ -351,17 +366,20 @@ pub fn file_unusable_step(dir: &Path, in_terminal: bool) -> String {
     text
 }
 
-/// The sentence for [`NOT_IN_FILE`], naming the folder set up earlier, ending in a comma.
-pub(crate) fn not_in_file(dir: &Path) -> Option<String> {
+/// The folder `skykeep-mcp exchange` set up, read without making a library.
+fn earlier_folder(dir: &Path) -> Option<PathBuf> {
     let library = (dir.join("library.db").is_file())
         .then(|| quince_core::Library::open(dir).ok())
         .flatten()?;
-    let earlier = configured(&library).ok()??;
+    configured(&library).ok()?.map(|e| e.path)
+}
+
+/// What [`NOT_IN_FILE`] means, in two short sentences naming the folder set up earlier.
+pub(crate) fn not_in_file(dir: &Path) -> Option<String> {
     Some(format!(
-        "A folder was set up earlier with skykeep-mcp exchange, {}, but {} has no {}: line, and once that file exists only its {}: line counts,",
-        crate::status::quoted(&earlier.path),
+        "{} was set up earlier with skykeep-mcp exchange. It is not used, because {} has no {}: line.",
+        crate::status::quoted(&earlier_folder(dir)?),
         crate::permissions::FILE_NAME,
-        crate::permissions::EXCHANGE_KEY,
         crate::permissions::EXCHANGE_KEY
     ))
 }
@@ -369,9 +387,8 @@ pub(crate) fn not_in_file(dir: &Path) -> Option<String> {
 /// The fix for [`NOT_IN_FILE`].
 pub(crate) fn not_in_file_fix(dir: &Path) -> String {
     format!(
-        "In your own terminal, run {} to write that folder into the file, or add an {}: line to it yourself.",
-        crate::status::with_dir("skykeep-mcp exchange", dir),
-        crate::permissions::EXCHANGE_KEY
+        "To use it, run {} in your own terminal or add the line yourself.",
+        crate::status::with_dir("skykeep-mcp exchange", dir)
     )
 }
 
