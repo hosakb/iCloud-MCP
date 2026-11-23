@@ -134,12 +134,13 @@ pub const DENIED: &str = "denied_by_permissions";
 fn plain_error(error: &str) -> Value {
     let mut value = json!({"error":error});
     let message = match error {
-        DENIED => "The permissions file in Skykeep's folder sets this action to deny, so it did not run.",
+        DENIED => "The permissions file in iCloud-MCP's folder sets this action to deny, so it did not run.",
         "approval_policy_changed" => "Something changed while the approval card was open (the item, the approval mode or the permissions file), so the approval no longer counts and nothing ran. Ask again to get a new card.",
         "approval_pending" => "Another action is waiting for an answer on the approval card. Answer or close that card first, then ask again.",
         "approval_requires_form_client" => "This action needs a person to approve it on the approval card in the MCP client, and this client did not offer approval cards when it connected, so nothing ran. Ask again from a client that shows the card, such as Hermes, while someone is there to answer it.",
         "approval_denied" => "The approval card was denied, declined or closed without a choice, so nothing ran.",
         "approval_cancelled" => "The request was cancelled before the approval card was answered, so nothing ran.",
+        "not_signed_in" => "Not signed in to iCloud yet, so there is nothing to read.",
         "approval_timeout" => "Nobody answered the approval card within 3 minutes, so nothing ran. A session where nobody can answer, such as a scheduled job, can't run actions that need approval. Ask again while someone can answer the card.",
         _ => return value,
     };
@@ -429,9 +430,13 @@ fn policy(
 /// up, with this private folder in it, for the person to type in their own terminal.
 /// The same for a few Drive outcomes that leave the person something to do, and for a folder
 /// inside the exchange folder that others can change (`args` are the call's arguments).
-fn error_value(error: &'static str, dir: &Path, args: &Value) -> Value {
+/// `params` are the call's `name` and `arguments`.
+fn error_value(error: &'static str, dir: &Path, params: &Value) -> Value {
+    let args = &params["arguments"];
+    let name = params["name"].as_str().unwrap_or_default();
     let mut value = plain_error(error);
-    if let Some(instructions) = next_step(error, dir, args) {
+    if let Some(instructions) = call_step(error, name, args).or_else(|| next_step(error, dir, args))
+    {
         value["instructions"] = json!(instructions);
     }
     value
@@ -453,14 +458,21 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
         }
         drive_write::UNKNOWN => Some("The connection ended before Apple answered, so the change may or may not have been made. Run drive_refresh on the folder and look at it before trying again.".to_string()),
         drive_write::IN_RECENTLY_DELETED => Some("The item is in Recently Deleted in iCloud Drive but was not deleted for good. Delete it there (iCloud Drive on icloud.com or a Mac), or leave it: Apple deletes it by itself after about 30 days.".to_string()),
-        drive_write::IN_RECENTLY_DELETED_LOGIN => Some(format!("The item is in Recently Deleted in iCloud Drive but was not deleted for good, because the sign-in has expired. Sign in again with {} in your own terminal, then delete it from Recently Deleted in iCloud Drive, or leave it: Apple deletes it by itself after about 30 days.", status::with_dir("skykeep-mcp login", dir))),
+        drive_write::IN_RECENTLY_DELETED_LOGIN => Some(format!("The item is in Recently Deleted in iCloud Drive but was not deleted for good, because the sign-in has expired. Sign in again with {} in your own terminal, then delete it from Recently Deleted in iCloud Drive, or leave it: Apple deletes it by itself after about 30 days.", status::with_dir("skykeep-mcp setup", dir))),
         "name_taken" => Some("Something with that name is already in that iCloud Drive folder, and it was left as it is. Ask again with another name, or rename or remove the one that is there first.".to_string()),
         "local_file_exists_not_overwritten" => Some("A file with that name is already in the exchange folder, and it was left as it is. Ask again with another local name, or move that file away first.".to_string()),
         "already_has_this_name" => Some("Nothing to do: iCloud Drive already shows the item under that name.".to_string()),
         "already_in_destination" => Some("Nothing to do: the item is already in that folder in iCloud Drive.".to_string()),
         "policy_state_changed" => Some(format!("This folder was copied or moved, so its approval mode belongs to the old folder. In your own terminal, run {} to choose it again.", status::with_dir("skykeep-mcp setup", dir))),
         "policy_account_changed" => Some(format!("The approval mode was set before sign-in or for another account. In your own terminal, run {} to choose it again.", status::with_dir("skykeep-mcp setup", dir))),
-        "login_required" => Some(format!("Sign in with {} in a terminal you opened yourself, not one an AI app runs. Never send passwords or codes to MCP or chat.", status::with_dir("skykeep-mcp login", dir))),
+        "login_required" => Some(format!("Not signed in, or the sign-in has expired. Ask the person to run {} in a terminal they opened themselves, not one an AI app runs; it signs in again. Never send passwords or codes to MCP or chat.", status::with_dir("skykeep-mcp setup", dir))),
+        "not_signed_in" => Some(format!("Ask the person to run {} in a terminal they opened themselves to sign in, then run sync or a refresh tool. Never send passwords or codes to MCP or chat.", status::with_dir("skykeep-mcp setup", dir))),
+        "login_required_unlock_secure_storage" => Some(format!("The saved sign-in is in the system keyring, which is locked or can't be reached. Ask the person to unlock it by logging in to the desktop session, or to run {} in their own terminal to see why, then try again.", status::with_dir("skykeep-mcp status", dir))),
+        "invalid_arguments" => Some("An argument is missing, unknown or of the wrong type. Check the call against the tool's fields in tools/list and send it again.".to_string()),
+        "parent_required" => Some("reminders_list needs parent: the GUID of a reminder list. Get one from reminders_lists, then call reminders_list again with it.".to_string()),
+        "unknown_tool" => Some("No tool has that name. Call tools/list to see the tools this server has, then use one of those names.".to_string()),
+        "not_found" => Some("Nothing with that ID or path is in the local copy. Take the ID from a list or search reply. Right after a create, the item is only in iCloud until the next sync (Notes and Reminders) or refresh (calendar_refresh, contacts_refresh, photos_refresh, or drive_refresh on its folder): run that first, then read it again.".to_string()),
+        "already_initialized" => Some("The server is already initialized in this connection. Go on with tools/list or tools/call.".to_string()),
         "conflict" => Some("The item changed since you read it, so nothing was queued. Read it again with notes_get or reminders_get, then ask again with its current base_etag.".to_string()),
         "mutation_refused" => Some(format!("The change could not be saved to the local queue, so nothing was queued. In your own terminal, run {} to check this folder, then try again.", status::with_dir("skykeep-mcp status", dir))),
         "drive_read_failed_nothing_sent" => Some("Apple's answer about the item could not be read, so nothing was sent. Try again in a moment; if it keeps failing, run drive_refresh on the folder.".to_string()),
@@ -494,17 +506,226 @@ fn service_off(service: &str, dir: &Path) -> Option<String> {
     Some(format!("This iCloud sign-in does not offer {service}. Check that {service} is turned on for this Apple Account in iCloud settings, then in your own terminal run {} to sign in again.", status::with_dir("skykeep-mcp setup", dir)))
 }
 
+/// Instructions that name what was wrong with this call of tool `name`, where the error
+/// code alone can't: the field for `invalid_arguments`, the name for `unknown_tool`.
+fn call_step(error: &str, name: &str, args: &Value) -> Option<String> {
+    let shown = |text: &str| -> String {
+        let short: String = text.chars().take(80).collect();
+        json!(short).to_string()
+    };
+    match error {
+        "invalid_arguments" => argument_problem(name, args).map(|problem| {
+            let problem: String = problem.chars().take(300).collect();
+            format!("The arguments to {name} were not accepted: {problem}. Fix the call and send it again; tools/list shows each tool's fields.")
+        }),
+        "unknown_tool" => Some(format!(
+            "There is no tool named {}. Call tools/list to see the tools this server has, then use one of those names.",
+            shown(name)
+        )),
+        _ => None,
+    }
+}
+
+/// What is wrong with `args` for tool `name`, in words: a missing, unknown or mistyped
+/// field, or the type's own reason. `None` for a tool this server doesn't have.
+fn argument_problem(name: &str, args: &Value) -> Option<String> {
+    let action = args["action"].as_str();
+    if name == "reminders_write"
+        && matches!(action, Some("delete" | "tick"))
+        && args.get("base_etag").is_some()
+    {
+        let action = action.unwrap_or_default();
+        return Some(format!(
+            "reminders_write {action} takes no base_etag, only edit does; leave it out"
+        ));
+    }
+    let tool = tools().into_iter().find(|t| t["name"] == name)?;
+    if let Some(problem) = schema_problem(&tool["inputSchema"], args) {
+        return Some(problem);
+    }
+    let args = if args.is_null() {
+        json!({})
+    } else {
+        args.clone()
+    };
+    fn reason<T: serde::de::DeserializeOwned>(args: Value) -> Option<String> {
+        serde_json::from_value::<T>(args)
+            .err()
+            .map(|e| e.to_string().replace('`', ""))
+    }
+    match name {
+        "notes_get" | "reminders_get" => reason::<Get>(args),
+        "notes_list" | "reminders_list" => reason::<List>(args),
+        "notes_folders" | "reminders_lists" => reason::<Page>(args),
+        "notes_search" | "reminders_search" => reason::<Search>(args),
+        "sync" | "sync_status" | "auth_status" => reason::<Empty>(args),
+        "notes_write" => reason::<NoteWrite>(args),
+        "reminders_write" => reason::<ReminderWrite>(args),
+        _ => None,
+    }
+    .or_else(|| Some("a value is not one the tool takes".to_string()))
+}
+
+/// The first way `args` breaks the tool's input schema: a missing required field, a field the
+/// tool doesn't have, a value of the wrong type, outside its range or not one of its choices.
+fn schema_problem(schema: &Value, args: &Value) -> Option<String> {
+    let empty = serde_json::Map::new();
+    let given = match args {
+        Value::Null => &empty,
+        Value::Object(map) => map,
+        _ => return Some("the arguments must be a JSON object".to_string()),
+    };
+    let properties = schema["properties"].as_object().unwrap_or(&empty);
+    let quoted = |name: &str| -> String {
+        let short: String = name.chars().take(64).collect();
+        json!(short).to_string()
+    };
+    for field in schema["required"].as_array().into_iter().flatten() {
+        let field = field.as_str().unwrap_or_default();
+        if !given.contains_key(field) {
+            return Some(format!("the field {field} is missing"));
+        }
+    }
+    for (key, value) in given {
+        let Some(property) = properties.get(key) else {
+            if schema["additionalProperties"] == false {
+                let known: Vec<&str> = properties.keys().map(String::as_str).collect();
+                return Some(format!(
+                    "{} is not a field of this tool; its fields are {}",
+                    quoted(key),
+                    known.join(", ")
+                ));
+            }
+            continue;
+        };
+        let types: Vec<&str> = match &property["type"] {
+            Value::String(t) => vec![t.as_str()],
+            Value::Array(list) => list.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        let fits = |t: &str| match t {
+            "string" => value.is_string(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "null" => value.is_null(),
+            _ => true,
+        };
+        if !types.is_empty() && !types.iter().any(|t| fits(t)) {
+            let article = |t: &&str| match *t {
+                "integer" => "an integer",
+                "object" => "an object",
+                "array" => "an array",
+                "null" => "null",
+                "boolean" => "true or false",
+                "number" => "a number",
+                _ => "a string",
+            };
+            let wanted: Vec<&str> = types.iter().map(article).collect();
+            return Some(format!("the field {key} must be {}", wanted.join(" or ")));
+        }
+        if let Some(choices) = property["enum"].as_array() {
+            if !choices.contains(value) {
+                let names: Vec<String> = choices.iter().map(Value::to_string).collect();
+                return Some(format!(
+                    "the field {key} must be one of {}",
+                    names.join(", ")
+                ));
+            }
+        }
+        if let Some(n) = value.as_f64() {
+            let low = property["minimum"].as_f64().is_some_and(|m| n < m);
+            let high = property["maximum"].as_f64().is_some_and(|m| n > m);
+            if low || high {
+                return Some(format!(
+                    "the field {key} must be from {} to {}",
+                    property["minimum"],
+                    if property["maximum"].is_null() {
+                        json!("any size")
+                    } else {
+                        property["maximum"].clone()
+                    }
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Library key: whether the last sync or refresh could use the sign-in, `ok:` or `failed:`,
+/// then the Unix time and the account it was for.
+const SESSION_KEY: &str = "mcp.session.checked";
+
+fn record_session(library: &mut Library, worked: bool) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let account = library
+        .state(ACCOUNT_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let word = if worked { "ok" } else { "failed" };
+    let _ = library.set_state(SESSION_KEY, &format!("{word}:{now}:{account}"));
+}
+
+/// Records that a sync or refresh in `dir` could (`worked`) or could not use the sign-in, as
+/// the server does after each one; `auth_status` reports it.
+pub fn note_session_check(dir: &Path, worked: bool) {
+    if let Ok(mut library) = Library::open(dir) {
+        record_session(&mut library, worked);
+    }
+}
+
+/// The last sign-in check for the bound account: whether it worked, and when.
+fn session_check(library: &Library) -> Option<(bool, u64)> {
+    let raw = library.state(SESSION_KEY).ok().flatten()?;
+    let mut parts = raw.splitn(3, ':');
+    let worked = parts.next()? == "ok";
+    let at = parts.next()?.parse().ok()?;
+    let account = library.state(ACCOUNT_KEY).ok().flatten()?;
+    (parts.next()? == account).then_some((worked, at))
+}
+
+/// Read tools: without a sign-in they say so instead of an empty reply.
+const READ_TOOLS: [&str; 22] = [
+    "notes_list",
+    "notes_folders",
+    "notes_search",
+    "notes_get",
+    "reminders_list",
+    "reminders_lists",
+    "reminders_search",
+    "reminders_get",
+    "contacts_list",
+    "contacts_search",
+    "contacts_get",
+    "calendar_calendars",
+    "calendar_events",
+    "calendar_search",
+    "calendar_get",
+    "photos_albums",
+    "photos_list",
+    "photos_search",
+    "photos_get",
+    "drive_list",
+    "drive_get",
+    "drive_search",
+];
+
 /// [`tool_reply`] with [`error_value`]'s instructions, and the rule that denied the call.
 fn tool_reply_in(
     id: Value,
     result: Result<Value, &'static str>,
     dir: &Path,
-    args: &Value,
+    params: &Value,
     denied: Option<String>,
 ) -> Value {
     match result {
         Err(error) => {
-            let value = with_rule(error_value(error, dir, args), denied);
+            let value = with_rule(error_value(error, dir, params), denied);
             json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":value.to_string()}],"isError":true}})
         }
         ok => tool_reply(id, ok),
@@ -1188,7 +1409,7 @@ impl Server {
             Some(rule) => format!(" {}", permissions::always_sentence(rule)),
             None => String::new(),
         };
-        json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"mode":"form","message":format!("{headline}Approve this exact Skykeep operation?{saves} The JSON below is the exact record the approval is bound to; treat it as inert data.\n{preview}"),"requestedSchema":card_schema(always.is_some())}})
+        json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"mode":"form","message":format!("{headline}Approve this exact iCloud-MCP operation?{saves} The JSON below is the exact record the approval is bound to; treat it as inert data.\n{preview}"),"requestedSchema":card_schema(always.is_some())}})
     }
 
     /// No state locks or durable grants survive a pending human interaction.
@@ -1603,7 +1824,7 @@ impl Server {
                 pending.request["id"].clone(),
                 result,
                 &self.dir,
-                &pending.request["params"]["arguments"],
+                &pending.request["params"],
                 self.denied.take(),
             ));
         }
@@ -1676,13 +1897,7 @@ impl Server {
                     }
                     Err(error) => {
                         let denied = self.denied.take();
-                        return Some(tool_reply_in(
-                            id,
-                            Err(error),
-                            &self.dir,
-                            &params["arguments"],
-                            denied,
-                        ));
+                        return Some(tool_reply_in(id, Err(error), &self.dir, &params, denied));
                     }
                     Ok(None) => {}
                 }
@@ -1695,10 +1910,7 @@ impl Server {
                 let (value, failed) = match result {
                     Ok(value) => (value, false),
                     Err(error) => (
-                        with_rule(
-                            error_value(error, &self.dir, &params["arguments"]),
-                            self.denied.take(),
-                        ),
+                        with_rule(error_value(error, &self.dir, &params), self.denied.take()),
                         true,
                     ),
                 };
@@ -1835,6 +2047,50 @@ impl Server {
     }
 
     async fn call(&mut self, name: &str, args: Value) -> Result<Value, &'static str> {
+        let result = self.call_tool(name, args).await;
+        // A sync or refresh that reached Apple tells whether the sign-in works.
+        let checks = [
+            "sync",
+            "contacts_refresh",
+            "calendar_refresh",
+            "photos_refresh",
+            "drive_refresh",
+        ];
+        let session = match &result {
+            Ok(_) if checks.contains(&name) => Some(true),
+            Err(e)
+                if e.starts_with("login_required")
+                    && *e != "login_required_or_network_unavailable" =>
+            {
+                Some(false)
+            }
+            _ => None,
+        };
+        // Without a sign-in, a read says so instead of an empty reply.
+        let empty = READ_TOOLS.contains(&name)
+            && match &result {
+                Err(e) => *e == "not_found",
+                Ok(value) => value["total"] == 0,
+            };
+        if session.is_none() && !empty {
+            return result;
+        }
+        // Only these few replies need the library again. The call has checked the folder and
+        // let go of its lock; a small read or state write needs no lock of its own.
+        let Ok(mut library) = Library::open(&self.dir) else {
+            return result;
+        };
+        if let Some(worked) = session {
+            record_session(&mut library, worked);
+        }
+        let unbound = library.state(ACCOUNT_KEY).ok().flatten().is_none();
+        if empty && unbound {
+            return Err("not_signed_in");
+        }
+        result
+    }
+
+    async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value, &'static str> {
         let grant = self.grant.take();
         let terminal = self.terminal.take();
         let drive_seam = self.drive.clone();
@@ -2171,9 +2427,21 @@ impl Server {
                         json!({"status":if closed == storage::Closed::Locked {"locked"} else {"storage_problem"},"instructions":format!("{text}. Open your own trusted terminal, outside agent/tool capture, and type any passphrase there. Never send passwords, codes or passphrases to MCP or chat."),"session_checked":false}),
                     );
                 }
-                Ok(
-                    json!({"status":if bound {"session_unverified"} else {"login_required"},"instructions":format!("Run {here} in your own trusted terminal, outside agent/tool capture. Never send passwords or codes to MCP or chat."),"session_checked":false}),
-                )
+                let setup_step = format!("Run {here} in your own trusted terminal, outside agent/tool capture. Never send passwords or codes to MCP or chat.");
+                Ok(match (bound, session_check(library)) {
+                    (false, _) => {
+                        json!({"status":"login_required","message":"Not signed in to iCloud.","instructions":setup_step,"session_checked":false})
+                    }
+                    (true, Some((true, at))) => {
+                        json!({"status":"signed_in","message":"Signed in. The last sync or refresh used this sign-in.","checked_at":at,"session_checked":true})
+                    }
+                    (true, Some((false, at))) => {
+                        json!({"status":"login_required","message":"The last sync or refresh could not use the sign-in; it has expired or was signed out.","checked_at":at,"instructions":setup_step,"session_checked":true})
+                    }
+                    (true, None) => {
+                        json!({"status":"session_unverified","message":"A sign-in is saved for this folder, but no sync or refresh has used it yet.","instructions":"Run sync (or a refresh tool) to check the sign-in. If it answers login_required, follow its instructions.","session_checked":false})
+                    }
+                })
             }
             "reminders_get" => {
                 let args: Get = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -3080,8 +3348,8 @@ fn enqueue_reminder(library: &mut Library, args: ReminderWrite) -> Result<Value,
 }
 
 const SERVER_TITLE: &str =
-    "Skykeep: Apple iCloud Notes, Reminders, Contacts, Calendar, Photos & iCloud Drive";
-const SERVER_INSTRUCTIONS: &str = "Skykeep reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, reads the user's Apple iCloud Contacts and changes one card at a time with contacts_write, reads Apple iCloud Calendar and changes its events with calendar_write, reads Apple iCloud Photos metadata and changes it with photos_write (upload from the exchange folder, favorite, title and caption, rating, keywords, date, new and renamed albums, move to Recently Deleted), and reads and changes Apple iCloud Drive: folder listings and file details from the cache, and drive_write to create folders, rename, move, trash, delete for good, upload from and download into the exchange folder the user set up in their terminal. Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces; the Photos tools other than photos_write are read-only. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode. Notes and Reminders changes are queued until sync sends them; a Drive, Contacts, Calendar or Photos change runs once it is allowed and its reply says what Apple confirmed. calendar_write needs the etag from calendar_get, an offset or IANA zone for every time, and scope for a repeating event. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
+    "iCloud-MCP: Apple iCloud Notes, Reminders, Contacts, Calendar, Photos & iCloud Drive";
+const SERVER_INSTRUCTIONS: &str = "iCloud-MCP reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, reads the user's Apple iCloud Contacts and changes one card at a time with contacts_write, reads Apple iCloud Calendar and changes its events with calendar_write, reads Apple iCloud Photos metadata and changes it with photos_write (upload from the exchange folder, favorite, title and caption, rating, keywords, date, new and renamed albums, move to Recently Deleted), and reads and changes Apple iCloud Drive: folder listings and file details from the cache, and drive_write to create folders, rename, move, trash, delete for good, upload from and download into the exchange folder the user set up in their terminal. Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces; the Photos tools other than photos_write are read-only. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode. Notes and Reminders changes are queued until sync sends them; a Drive, Contacts, Calendar or Photos change runs once it is allowed and its reply says what Apple confirmed. calendar_write needs the etag from calendar_get, an offset or IANA zone for every time, and scope for a repeating event. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
 
 pub(crate) fn tools() -> Vec<Value> {
     // (name, description, parent property, parent required)
@@ -3132,10 +3400,10 @@ pub(crate) fn tools() -> Vec<Value> {
     ] {
         tools.push(json!({"name":name,"description":format!("Search the user's {kind} in the local cache index."),"inputSchema":{"type":"object","properties":{"query":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}},"required":["query"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     }
-    tools.push(json!({"name":"notes_write","description":"Queue a change to the user's Apple iCloud Notes (create, save, move, pin, delete). Follows the approval mode; a delete, a move into Recently Deleted or a save that empties a note always asks the user on the approval card. Queued is not remote-verified.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","save","move","pin","delete"]},"body":{"type":"string"},"pinned":{"type":"boolean"},"runs":{"type":["array","null"],"items":{"type":"object"}},"folder_guid":{"type":["string","null"]},"guid":{"type":"string"},"base_etag":{"type":["string","null"],"description":"Needed for move, save, pin and delete: the etag from notes_get. A missing or older etag returns conflict."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
-    tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). A create can also repeat daily and alert at or before its due time. Deletions always ask the user on the approval card. Queued is not CloudKit-accepted; sync reports accepted writes. No field-level remote verification.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."},"base_etag":{"type":["string","null"],"description":"Edit only: the etag from reminders_get. A newer cached copy returns conflict."},"repeat":{"type":"object","description":"Create only. Repeats daily from due_at, until the end of the given day or for ever. Needs due_at.","properties":{"frequency":{"enum":["daily"]},"until":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"YYYY-MM-DD, the last day it repeats. Read in timezone for a timed due_at, in UTC for an all-day one."}},"required":["frequency"],"additionalProperties":false},"due_time_alert":{"type":"boolean","description":"Create only. Alert at due_at. Needs a timed (not all-day) due_at."},"early_alert":{"type":"object","description":"Create only. Alert this long before due_at. Needs a timed due_at, and an early alert set on one of the user's reminders from an Apple device and then a sync, so the account id it carries is in the cache.","properties":{"amount":{"type":"integer","minimum":1,"maximum":10000},"unit":{"enum":["minutes","hours","days","weeks","months"]}},"required":["amount","unit"],"additionalProperties":false},"timezone":{"type":"string","maxLength":64,"description":"Create only. IANA zone the timed due_at and its alerts are kept in, such as Europe/Berlin. Default: this computer's zone, or UTC if it has no IANA name."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
-    tools.push(json!({"name":"reminders_get","description":"Read one cached Apple Reminders item and its supported details. Not a complete archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
-    tools.push(json!({"name":"notes_get","description":"Read one cached Apple iCloud Notes note. Not a complete preservation archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
+    tools.push(json!({"name":"notes_write","description":"Queue a change to the user's Apple iCloud Notes (create, save, move, pin, delete). Follows the approval mode; a delete, a move into Recently Deleted or a save that empties a note always asks the user on the approval card. Queued is not remote-verified. An etag can change once more after a create or a sync, so read the note again with notes_get just before a change.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","save","move","pin","delete"]},"body":{"type":"string"},"pinned":{"type":"boolean"},"runs":{"type":["array","null"],"items":{"type":"object"}},"folder_guid":{"type":["string","null"]},"guid":{"type":"string"},"base_etag":{"type":["string","null"],"description":"Needed for move, save, pin and delete: the etag from notes_get. A missing or older etag returns conflict."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
+    tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). A create can also repeat daily and alert at or before its due time. Deletions always ask the user on the approval card. Queued is not CloudKit-accepted; sync reports accepted writes. No field-level remote verification. Only edit takes base_etag; delete and tick take no base_etag. An etag can change once more after a create or a sync, so read the reminder again with reminders_get just before an edit.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."},"base_etag":{"type":["string","null"],"description":"Edit only: the etag from reminders_get. A newer cached copy returns conflict."},"repeat":{"type":"object","description":"Create only. Repeats daily from due_at, until the end of the given day or for ever. Needs due_at.","properties":{"frequency":{"enum":["daily"]},"until":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"YYYY-MM-DD, the last day it repeats. Read in timezone for a timed due_at, in UTC for an all-day one."}},"required":["frequency"],"additionalProperties":false},"due_time_alert":{"type":"boolean","description":"Create only. Alert at due_at. Needs a timed (not all-day) due_at."},"early_alert":{"type":"object","description":"Create only. Alert this long before due_at. Needs a timed due_at, and an early alert set on one of the user's reminders from an Apple device and then a sync, so the account id it carries is in the cache.","properties":{"amount":{"type":"integer","minimum":1,"maximum":10000},"unit":{"enum":["minutes","hours","days","weeks","months"]}},"required":["amount","unit"],"additionalProperties":false},"timezone":{"type":"string","maxLength":64,"description":"Create only. IANA zone the timed due_at and its alerts are kept in, such as Europe/Berlin. Default: this computer's zone, or UTC if it has no IANA name."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
+    tools.push(json!({"name":"reminders_get","description":"Read one cached Apple Reminders item and its supported details. Not a complete archive. An etag can change once more after a create or a sync, so read the item again just before a change.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
+    tools.push(json!({"name":"notes_get","description":"Read one cached Apple iCloud Notes note. Not a complete preservation archive. An etag can change once more after a create or a sync, so read the item again just before a change.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools.push(json!({"name":"sync","description":"Refresh Apple iCloud Notes and Apple Reminders and send approved queued changes. Queued/sent is not field-level remote verification. Never opens a login prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
     tools.push(json!({"name":"sync_status","description":"Local sync state for Apple iCloud Notes and Reminders: last refresh, whether the last pass failed, pending and refused queued changes. No network access.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     let page = json!({"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":contacts::MAX_LIMIT,"default":25}});
@@ -3169,11 +3437,11 @@ pub(crate) fn tools() -> Vec<Value> {
     tools.push(json!({"name":"photos_albums","description":"List the albums and folders the user made in Apple iCloud Photos, from the local cache, with how many photos each shows. Read-only; refresh with photos_refresh.","inputSchema":{"type":"object","properties":page,"additionalProperties":false},"annotations":read}));
     let mut list = page.clone();
     list["album_id"] = json!({"type":"string","minLength":1,"maxLength":photos::MAX_ID_BYTES,"description":"Album id from photos_albums; omit for the whole library."});
-    tools.push(json!({"name":"photos_list","description":"List the user's Apple iCloud Photos (personal library) from the local cache, newest first or in an album's order: dates, kind (image, video, Live Photo), size, filename, title, caption and keywords. No pictures, places or faces. Read-only.","inputSchema":{"type":"object","properties":list,"additionalProperties":false},"annotations":read}));
+    tools.push(json!({"name":"photos_list","description":"List the user's Apple iCloud Photos (personal library) from the local cache, newest first or in an album's order: dates, kind (image, video, Live Photo), size, filename, title, caption and keywords. No pictures, places or faces. Read-only. Photos are found only after photos_refresh has read them.","inputSchema":{"type":"object","properties":list,"additionalProperties":false},"annotations":read}));
     let mut search = page.clone();
     search["query"] = json!({"type":"string","minLength":1,"maxLength":photos::MAX_QUERY_BYTES,"description":"Words matched against title, filename, caption, keywords, and the year or month taken. At most 256 UTF-8 bytes."});
-    tools.push(json!({"name":"photos_search","description":"Search the user's cached Apple iCloud Photos (personal library) by title, filename, caption, keyword or the year or month taken. Read-only.","inputSchema":{"type":"object","properties":search,"required":["query"],"additionalProperties":false},"annotations":read}));
-    tools.push(json!({"name":"photos_get","description":"Read one cached Apple iCloud Photos item's details, with a longer caption. Not the picture itself: no image, video, thumbnail, place or faces.","inputSchema":{"type":"object","properties":{"id":id},"required":["id"],"additionalProperties":false},"annotations":read}));
+    tools.push(json!({"name":"photos_search","description":"Search the user's cached Apple iCloud Photos (personal library) by title, filename, caption, keyword or the year or month taken. Read-only. Photos are found only after photos_refresh has read them.","inputSchema":{"type":"object","properties":search,"required":["query"],"additionalProperties":false},"annotations":read}));
+    tools.push(json!({"name":"photos_get","description":"Read one cached Apple iCloud Photos item's details, with a longer caption. Not the picture itself: no image, video, thumbnail, place or faces. Photos are found only after photos_refresh has read them.","inputSchema":{"type":"object","properties":{"id":id},"required":["id"],"additionalProperties":false},"annotations":read}));
     tools.push(json!({"name":"photos_refresh","description":"Read the user's Apple iCloud Photos metadata (personal library) from Apple into the local cache, a bounded batch at a time; a large library takes several calls. Never downloads pictures, never changes photos or albums at Apple and sends no queued changes. Never opens a login prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}));
     let page = json!({"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":drive::MAX_LIMIT,"default":25}});
     let cloud_path = json!({"type":"string","minLength":1,"maxLength":drive::MAX_PATH_BYTES,"description":format!("Cloud path in Apple iCloud Drive, such as /Documents/Taxes. / is the top. Names are matched as Apple lists them; ., .., empty names and control characters are refused. At most {} names.", drive::MAX_DEPTH)});
@@ -3181,11 +3449,11 @@ pub(crate) fn tools() -> Vec<Value> {
     let mut folder = page.clone();
     folder["path"] = cloud_path.clone();
     folder["id"] = id.clone();
-    tools.push(json!({"name":"drive_list","description":"List one Apple iCloud Drive folder from the local cache: names, kinds, sizes and dates, folders first. Give path or id; the top folder by default. Says whether drive_refresh has read the folder. No file contents. Read-only.","inputSchema":{"type":"object","properties":folder,"additionalProperties":false},"annotations":read}));
-    tools.push(json!({"name":"drive_get","description":"Read one cached Apple iCloud Drive item's details by path or id: name, kind, size, dates, parent and cloud path. No file contents. Read-only.","inputSchema":{"type":"object","properties":{"path":cloud_path.clone(),"id":id.clone()},"additionalProperties":false},"annotations":read}));
+    tools.push(json!({"name":"drive_list","description":"List one Apple iCloud Drive folder from the local cache: names, kinds, sizes and dates, folders first. Give path or id; the top folder by default. Says whether drive_refresh has read the folder. No file contents. Read-only. Items are found only after drive_refresh has read their folder.","inputSchema":{"type":"object","properties":folder,"additionalProperties":false},"annotations":read}));
+    tools.push(json!({"name":"drive_get","description":"Read one cached Apple iCloud Drive item's details by path or id: name, kind, size, dates, parent and cloud path. No file contents. Read-only. Items are found only after drive_refresh has read their folder.","inputSchema":{"type":"object","properties":{"path":cloud_path.clone(),"id":id.clone()},"additionalProperties":false},"annotations":read}));
     let mut search = page.clone();
     search["query"] = json!({"type":"string","minLength":1,"maxLength":drive::MAX_QUERY_BYTES,"description":"Words matched against item names, ignoring case and accents. At most 256 UTF-8 bytes."});
-    tools.push(json!({"name":"drive_search","description":"Search the names of cached Apple iCloud Drive items in folders drive_refresh has read. At most 1000 matches, most recently changed first. Read-only.","inputSchema":{"type":"object","properties":search,"required":["query"],"additionalProperties":false},"annotations":read}));
+    tools.push(json!({"name":"drive_search","description":"Search the names of cached Apple iCloud Drive items in folders drive_refresh has read. At most 1000 matches, most recently changed first. Read-only. Items are found only after drive_refresh has read their folder.","inputSchema":{"type":"object","properties":search,"required":["query"],"additionalProperties":false},"annotations":read}));
     tools.push(json!({"name":"drive_refresh","description":"Read one Apple iCloud Drive folder's item list from Apple into the local cache, with each folder on its path. Give path or a cached folder id; the top folder by default. Reads names, kinds, sizes and dates only: never file contents, and never uploads, renames, moves or deletes. Sends no queued changes. Never opens a login prompt.","inputSchema":{"type":"object","properties":{"path":cloud_path,"id":id},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":true}}));
     tools.push(drive_write::tool());
     tools.push(photos_write::tool());

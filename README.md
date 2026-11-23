@@ -1,6 +1,8 @@
 # iCloud-MCP
 
-iCloud-MCP is a local MCP server for Apple Notes, Reminders, Contacts, Calendar, Photos and iCloud Drive. It is a fork of [Skykeep](https://github.com/YashwanthKamireddi/Skykeep) and runs on its Rust engine. The command is `skykeep-mcp`. It speaks newline-delimited JSON-RPC over stdio, keeps its own private library directory and has no network listener. Reads come from a private local SQLite cache.
+iCloud-MCP is an MCP server for Apple iCloud Notes, Reminders, Contacts, Calendar, Photos and Drive. It is a fork of [Skykeep](https://github.com/YashwanthKamireddi/Skykeep) and runs on its Rust engine. The command is `skykeep-mcp`.
+
+It runs on your own computer, speaks newline-delimited JSON-RPC over stdio, keeps its own private library directory and has no network listener. Reads come from a private local SQLite cache.
 
 - Notes and Reminders can be read and changed. Changes wait in a local queue until `sync` sends them. A new reminder can repeat daily and alert at its due time or before it.
 - Contacts can be read and changed with `contacts_write`, one card per call. Deletions always need your approval.
@@ -38,7 +40,7 @@ mkdir -p ~/.local/bin
 install -m 755 target/release/skykeep-mcp ~/.local/bin/
 ```
 
-If your terminal then says it can't find `skykeep-mcp`, type `~/.local/bin/skykeep-mcp` wherever this guide says `skykeep-mcp`. `skykeep-mcp --help` lists every command.
+If your terminal then says it can't find `skykeep-mcp`, type `~/.local/bin/skykeep-mcp` wherever this guide says `skykeep-mcp`. `skykeep-mcp --help` lists every command, and `skykeep-mcp COMMAND --help` explains one of them.
 
 You need a terminal window that you open yourself. Don't run these commands through an AI assistant or chat: what you type there can end up in a transcript.
 
@@ -108,7 +110,7 @@ For the code you pick a number from a short list: one sends the code to your App
 
 What is kept afterwards:
 
-- The session and trust tokens, in the storage chosen above. With the system keyring they are under the service name `skykeep-mcp`, one entry per folder. The server never imports a session from the Skykeep desktop app.
+- The session and trust tokens, in the storage chosen above. With the system keyring they are under the service name `skykeep-mcp`, one entry per folder. The server never imports a session from the upstream Skykeep desktop app.
 - A one-way account tag in the library, so a folder can't be reused for another Apple Account. Use a new folder for a different account.
 
 The folder must be owned by you, mode `0700`, and contain no symlinks or files readable by others. The one exception is `permissions.yaml`: a shared or linked copy doesn't stop the folder, and iCloud-MCP treats that file as unusable (see "Permissions file"). The server and the helper commands take an exclusive lock on it for each operation. If a command meets a request in progress it stops with `state_busy_retry`; run it again. A running server picks up the new session on its next request, without a restart.
@@ -123,11 +125,19 @@ skykeep-mcp --state-dir ~/.local/share/skykeep-mcp
 
 Configure your MCP client to start that command. Stdout carries protocol messages only. JSON-RPC batches are not supported and get an `Invalid Request` error. Several clients can share one directory: operations take turns on the lock, and a server that starts while another holds it still answers `initialize`, then returns `state_busy_retry` from each tool call until the lock is free. Setup prints the exact line to paste. The server never opens a keyring unlock dialog or a sign-in prompt; if the keyring is locked or the session has expired, tools return `login_required` with instructions, and with a protected file that is not unlocked they return `locked: run skykeep-mcp unlock in a terminal`. `auth_status` names the folder in that command, and says which other problem a protected file has, such as a damaged file or a blocked kernel key storage. While running it refreshes Notes and Reminders every five minutes; a failed pass waits for the next interval rather than retrying.
 
+Before the first sign-in, read tools answer `not_signed_in` instead of an empty list. Every error reply carries an `error` code, and where there is something to do, `instructions` with the next step: for `invalid_arguments` they name the field that is missing, unknown or of the wrong type.
+
+### Other apps
+
+Hermes ships Apple skills of its own (`apple-notes`, `apple-reminders`, `findmy`, `imessage`; see the [Hermes skills catalog](https://hermes-agent.nousresearch.com/docs/reference/skills-catalog)). They run only on macOS and drive the Mac apps. iCloud-MCP runs on Linux and talks to iCloud itself, including Calendar, Contacts, Photos and Drive.
+
+iCloud-MCP is a standard MCP server over stdio, so any MCP client can start it, not only Hermes; Claude Code and Codex, for example, start it, list its tools and run reads. Approval cards need a client that shows MCP form elicitation, as Hermes does. A client without them can't approve deletions or other changes that need a person: they are refused, and nothing runs.
+
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `auth_status` | Whether the folder is bound to an account, whether the protected file is locked, and how to sign in. Takes no arguments and never accepts secrets. |
+| `auth_status` | Whether the folder is signed in, whether the protected file is locked, and how to sign in. It says `signed_in` once a sync or refresh has used the sign-in, and `login_required` when the last one could not. Takes no arguments and never accepts secrets. |
 | `sync` | Refreshes Notes and Reminders, then sends queued changes. Nothing is sent when the refresh fails. `left_queue_this_sync` lists each write that left the queue, with outcome `cloudkit_accepted` or `finished_unconfirmed` (see Reminders below). |
 | `sync_status` | Last refresh per service, whether the last pass failed, and counts of pending and refused changes. No network access. |
 | `notes_list`, `notes_folders`, `notes_search`, `notes_get` | Read the local cache. `notes_get` returns the plain text and the native formatting runs. |
@@ -193,7 +203,7 @@ Uploads read from, and downloads write into, one local folder. Name it with an `
 skykeep-mcp exchange --state-dir ~/.local/share/skykeep-mcp
 ```
 
-Like `setup`, `status` and `unlock`, it uses `~/.local/share/skykeep-mcp` when `--state-dir` is left out, and its flags can come in any order. A symbolic link among the folders above it (such as `/home` pointing to `/var/home`) is followed once, here, and the real path is kept; the exchange folder itself must not be a link. It creates `~/Skykeep-Exchange` (mode `0700`) if needed, writes its full path into the `exchange_folder:` line of `permissions.yaml` and prints the folder and the size limit. `--path DIR` picks another folder (its parent must exist); without it, the command keeps the folder the file names. `--max-mb N` changes the limit, 100 MB by default; the limit is set only here, not in the file. No MCP argument can name the folder or change the limit. Until a folder is named, `upload` and `download` are refused.
+Like `setup`, `status` and `unlock`, it uses `~/.local/share/skykeep-mcp` when `--state-dir` is left out, and its flags can come in any order. A symbolic link among the folders above it (such as `/home` pointing to `/var/home`) is followed once, here, and the real path is kept; the exchange folder itself must not be a link. It creates `~/iCloud-MCP-Exchange` (mode `0700`) if needed, writes its full path into the `exchange_folder:` line of `permissions.yaml` and prints the folder and the size limit. `--path DIR` picks another folder (its parent must exist); without it, the command keeps the folder the file names. `--max-mb N` changes the limit, 100 MB by default; the limit is set only here, not in the file. No MCP argument can name the folder or change the limit. Until a folder is named, `upload` and `download` are refused.
 
 The folder is checked before every upload and download. It must exist and be a folder of yours that no one else can change. It can't be a symbolic link, a system folder such as `/etc` or `/usr`, your home folder or a folder above it, or a folder inside a hidden folder (a name that starts with a dot, such as `.ssh`, `.gnupg` or `.aws`) or a folder whose name has "credential" or "keyring" in it. It also can't be iCloud-MCP's own folder, a folder inside it, or a folder that holds it. A folder that fails is refused with what is wrong and what to change; iCloud-MCP never falls back to another folder, such as the one `skykeep-mcp exchange` set up earlier. `status` shows the folder in use and says where it comes from.
 
@@ -297,7 +307,7 @@ Two settings can stand next to the rules, each on its own line without indentati
 ```yaml
 version: 1
 approval_mode: writes_only            # reads_and_writes, writes_only or yolo
-exchange_folder: ~/Skykeep-Exchange   # a full path, or one that starts with ~/
+exchange_folder: ~/iCloud-MCP-Exchange   # a full path, or one that starts with ~/
 rules:
   notes_write.delete:
     ask: client

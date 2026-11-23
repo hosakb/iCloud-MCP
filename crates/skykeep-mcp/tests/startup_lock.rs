@@ -26,8 +26,9 @@ async fn server_starts_while_a_peer_holds_the_lock_and_reports_busy_per_call() {
     let busy = call(&mut server, "notes_list", json!({})).await;
     assert_eq!(busy["error"], "state_busy_retry", "{busy}");
     drop(held);
+    // The folder works again; without a sign-in a read says so.
     let read = call(&mut server, "notes_list", json!({})).await;
-    assert_eq!(read["source"], "local_cache", "{read}");
+    assert_eq!(read["error"], "not_signed_in", "{read}");
     // The deferred setup still installs the persistent document writer.
     let library = quince_core::Library::open(dir.path()).unwrap();
     let id = library.state("documents.writer").unwrap().expect("writer");

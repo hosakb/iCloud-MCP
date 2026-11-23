@@ -54,7 +54,7 @@ fn gate(enabled: bool) -> Result<()> {
         Ok(())
     } else {
         Err(Error::Refused(
-            "Skykeep can't change this yet: writing it is still being checked against Apple's apps."
+            "iCloud-MCP can't change this yet: writing it is still being checked against Apple's apps."
                 .into(),
         ))
     }
@@ -316,7 +316,8 @@ pub fn place_in_section(
 ) -> Result<Vec<u8>> {
     let refused = || {
         Error::Refused(
-            "This list's sections are in a form Skykeep doesn't read, so nothing was moved.".into(),
+            "This list's sections are in a form iCloud-MCP doesn't read, so nothing was moved."
+                .into(),
         )
     };
     let original = file.filter(|b| !b.is_empty());
@@ -875,7 +876,7 @@ pub async fn set_early_alert_cloudkit(
         .or_else(|| account.map(ToString::to_string))
         .ok_or_else(|| {
             Error::Refused(
-                "Set one early reminder on an Apple device first; Skykeep needs what it writes."
+                "Set one early reminder on an Apple device first; iCloud-MCP needs what it writes."
                     .into(),
             )
         })?;
@@ -988,7 +989,7 @@ pub async fn add_early_alert_named_cloudkit(
         .or_else(|| account.map(ToString::to_string))
         .ok_or_else(|| {
             Error::Refused(
-                "Set one early reminder on an Apple device first; Skykeep needs what it writes."
+                "Set one early reminder on an Apple device first; iCloud-MCP needs what it writes."
                     .into(),
             )
         })?;
@@ -1211,7 +1212,7 @@ pub fn out_of_section(
     };
     let unreadable = || {
         Error::Refused(
-            "This list's sections are in a form Skykeep doesn't read, so nothing was changed."
+            "This list's sections are in a form iCloud-MCP doesn't read, so nothing was changed."
                 .into(),
         )
     };

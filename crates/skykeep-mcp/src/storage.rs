@@ -182,7 +182,7 @@ impl Closed {
             Closed::Locked => "The protected file is locked: run skykeep-mcp unlock in a terminal.",
             Closed::WrongOrDamaged => "Wrong passphrase or damaged file.",
             Closed::Newer => "The protected file was written by a newer skykeep-mcp: update skykeep-mcp.",
-            Closed::HolderUnavailable => "This computer blocks the kernel key storage that the protected file needs, so it can't be unlocked here. If you are inside Docker or a similar container, run Skykeep directly on the computer.",
+            Closed::HolderUnavailable => "This computer blocks the kernel key storage that the protected file needs, so it can't be unlocked here. If you are inside Docker or a similar container, run iCloud-MCP directly on the computer.",
             Closed::Failed => "The protected file could not be read or written.",
         }
     }

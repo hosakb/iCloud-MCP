@@ -1,7 +1,7 @@
 //! Newline-delimited stdio only. Credentials are never accepted on this channel.
 use serde_json::json;
 use skykeep_mcp::{login, setup, state::PrivateState, storage, terminal, Server};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
 
@@ -13,11 +13,26 @@ async fn main() {
     }
     let mut all: Vec<_> = std::env::args_os().skip(1).collect();
     let first = all.first().and_then(|c| c.to_str()).map(str::to_string);
-    // Help after any command, too: `login --help` must not try to sign in.
-    if matches!(first.as_deref(), Some("help")) || all.iter().any(|a| a == "--help" || a == "-h") {
-        print!("{HELP}");
+    // Help after any command, too: `login --help` must not try to sign in. A command's own
+    // help for `COMMAND --help` and `help COMMAND`, the full list otherwise.
+    let help = all.iter().any(|a| a == "--help" || a == "-h");
+    if first.as_deref() == Some("help") || help {
+        let named = if help {
+            first.as_deref()
+        } else {
+            all.get(1).and_then(|c| c.to_str())
+        };
+        print!("{}", named.and_then(terminal::command_help).unwrap_or(HELP));
         return;
     }
+    // The folder a command names, for the commands its error sentence shows.
+    let named_dir = all
+        .iter()
+        .position(|a| a == "--state-dir")
+        .and_then(|at| all.get(at + 1))
+        .map(PathBuf::from)
+        .or_else(setup::default_dir)
+        .unwrap_or_else(|| PathBuf::from("FOLDER"));
     if first.as_deref() == Some("exchange") {
         all.remove(0);
         if let Err(error) = exchange(all) {
@@ -31,18 +46,19 @@ async fn main() {
     {
         all.remove(0);
         if let Err(error) = guided(&command, all).await {
-            eprintln!("skykeep-mcp: {error}");
+            eprintln!("skykeep-mcp: {}", terminal::say(&error, &named_dir));
             std::process::exit(1);
         }
         return;
     }
     if let Err(error) = run(all).await {
-        eprintln!("skykeep-mcp: {error}");
+        eprintln!("skykeep-mcp: {}", terminal::say(error, &named_dir));
         std::process::exit(1);
     }
 }
 
-const HELP: &str = "skykeep-mcp: an MCP server for Apple iCloud Notes, Reminders, Contacts, Calendar, Photos and Drive.
+const HELP: &str = "iCloud-MCP: an MCP server for Apple iCloud Notes, Reminders, Contacts, Calendar, Photos and Drive.
+The command is skykeep-mcp. Run skykeep-mcp COMMAND --help for one command's help.
 
 Start here, in a terminal window you opened yourself:
   skykeep-mcp setup [--state-dir FOLDER]    guided setup: folder, sign-in storage, Apple sign-in, approval mode
@@ -71,7 +87,7 @@ More commands (each needs --state-dir FOLDER):
   skykeep-mcp quarantine  list and retire writes that were set aside
   skykeep-mcp exchange [--state-dir FOLDER] [--path DIR] [--max-mb N]  (flags in any order)
                           set up the one folder Drive and Photos uploads read from and
-                          Drive downloads write into (default ~/Skykeep-Exchange, limit 100 MB) and print it.
+                          Drive downloads write into (default ~/iCloud-MCP-Exchange, limit 100 MB) and print it.
                           Writes exchange_folder: in permissions.yaml, which you can also edit
   skykeep-mcp --state-dir FOLDER
                           run the MCP server on stdin and stdout (your MCP client starts this)
@@ -198,15 +214,15 @@ async fn guided(command: &str, args: Vec<std::ffi::OsString>) -> Result<(), Stri
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
-            print!("{HELP}");
+            print!("{}", terminal::command_help(command).unwrap_or(HELP));
             return Ok(());
         }
         if arg == "show" && command == "permissions" && !show {
             show = true;
         } else if arg == "--state-dir" && dir.is_none() {
-            dir = Some(PathBuf::from(
-                args.next().ok_or("state_directory_required")?,
-            ));
+            dir = Some(PathBuf::from(args.next().ok_or_else(|| {
+                terminal::say("state_directory_required", Path::new("FOLDER"))
+            })?));
         } else if arg == "--hours" && command == "unlock" && hours.is_none() {
             let n: u32 = args
                 .next()
@@ -357,18 +373,19 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
                     return Err("permissions_file_unusable");
                 }
             }
-            writeln!(tty, "Set approval mode to {mode} for {}. This writes {MODE_KEY}: {mode} into permissions.yaml there, the line iCloud-MCP uses. YOLO runs reads and changes without prompts; deletions, moves to Recently Deleted and moves and renames of large Drive folders still ask on the approval card. All currently pending writes will be quarantined, including previously approved writes. Old terminal proposals cannot be released under this policy. Type confirm to persist.", dir.display()).map_err(|_| "terminal_unavailable")?;
+            writeln!(tty, "{}", terminal::policy_prompt(&mode, &dir))
+                .map_err(|_| "terminal_unavailable")?;
             let answer = terminal::hidden(&mut tty, "Confirmation: ", Duration::from_secs(180))?;
             if *answer != "confirm" {
                 return Err("policy_change_cancelled");
             }
-            let saved = Server::open(&dir)?.set_policy(&mode)?;
+            Server::open(&dir)?.set_policy(&mode)?;
             let held = PrivateState::open(&dir)?;
             if let Err(reason) = permissions::set_setting(&held.path, MODE_KEY, &mode) {
-                writeln!(tty, "The mode was stored, but permissions.yaml could not be edited ({reason}). A {MODE_KEY}: line in the file still wins; change it there.").map_err(|_| "terminal_unavailable")?;
+                writeln!(tty, "The mode was stored, but permissions.yaml could not be edited ({reason}). An {MODE_KEY}: line in the file still wins; change it there.").map_err(|_| "terminal_unavailable")?;
                 return Err("permissions_file_unusable");
             }
-            writeln!(tty, "Saved policy: {saved}\npermissions.yaml now says {MODE_KEY}: {mode}. iCloud-MCP uses that line; you can also change it in the file.").map_err(|_| "terminal_unavailable")?;
+            writeln!(tty, "Approval mode saved: {mode}.\npermissions.yaml now says {MODE_KEY}: {mode}. iCloud-MCP uses that line; you can also change it in the file.").map_err(|_| "terminal_unavailable")?;
             return Ok(());
         }
         if command == "quarantine" {
@@ -406,9 +423,6 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
             let details = match server.approval_text(&id) {
                 Ok(details) => details,
                 Err(error) => {
-                    if let Some(step) = skykeep_mcp::next_step(error, &dir, &json!(null)) {
-                        writeln!(tty, "{step}").map_err(|_| "terminal_unavailable")?;
-                    }
                     return Err(error);
                 }
             };
@@ -428,20 +442,20 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
             }
             let result = match server.approve_any(&id).await {
                 Ok(result) => result,
-                Err(error) => {
-                    if let Some(step) = skykeep_mcp::next_step(error, &dir, &json!(null)) {
-                        writeln!(tty, "{step}").map_err(|_| "terminal_unavailable")?;
-                    }
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             };
             let status = result["status"]
                 .as_str()
                 .or_else(|| result["outcome"].as_str())
                 .unwrap_or("unknown");
+            let said = match status {
+                "queued" => "Approved. The change is queued and goes to iCloud at the next sync."
+                    .to_string(),
+                status => format!("Approved. Result: {}.", status.replace('_', " ")),
+            };
             match result["checked"].as_str() {
-                Some(checked) => eprintln!("{status}: {checked}"),
-                None => eprintln!("{status}"),
+                Some(checked) => eprintln!("{said} {checked}"),
+                None => eprintln!("{said}"),
             }
             return Ok(());
         }
@@ -484,6 +498,10 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
             store.clear().map_err(login::auth_error)?;
             if store.sign_out_pending() {
                 return Err("logout_pending_unlock_keyring_and_retry");
+            }
+            // The last sign-in check no longer says anything about this folder.
+            if let Ok(mut library) = quince_core::Library::open(&held.path) {
+                let _ = library.set_state("mcp.session.checked", "");
             }
             eprintln!(
                 "Signed out locally. Cached notes and reminders remain in the private directory."

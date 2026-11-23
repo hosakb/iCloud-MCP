@@ -2201,7 +2201,7 @@ async fn startup(
     // every card it missed would read as deleted.
     if have < wanted {
         return Err(Error::Protocol(
-            "The address book is larger than Skykeep reads in one go, so it was not stored short."
+            "The address book is larger than iCloud-MCP reads in one go, so it was not stored short."
                 .into(),
         ));
     }

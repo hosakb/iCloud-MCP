@@ -414,7 +414,7 @@ where
 {
     let flag = flag_of(&pending.kind).ok_or_else(|| {
         Error::Refused(format!(
-            "Skykeep does not know how to send “{}”.",
+            "iCloud-MCP does not know how to send “{}”.",
             pending.kind
         ))
     })?;

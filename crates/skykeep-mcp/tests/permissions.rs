@@ -164,7 +164,7 @@ fn every_valid_name_takes_every_effect_and_names_come_from_the_tool_list() {
 #[test]
 fn unknown_names_and_bad_values_are_refused_with_a_plain_message() {
     let error = permissions::parse("rules:\n  notes_write.explode: allow\n").unwrap_err();
-    assert!(error.starts_with("line 2: notes_write.explode is not a Skykeep tool or action; the closest valid name is notes_write"), "{error}");
+    assert!(error.starts_with("line 2: notes_write.explode is not an iCloud-MCP tool or action; the closest valid name is notes_write"), "{error}");
     assert!(error.ends_with('.'), "{error}");
     assert!(!error.contains("permissions show"), "{error}");
     let error = permissions::parse("rules:\n  reminder_write.creat: allow\n").unwrap_err();
@@ -210,7 +210,7 @@ fn unknown_names_and_bad_values_are_refused_with_a_plain_message() {
         ("rules:\n  notes_write.delete:\n", "has no value"),
         (
             "rules:\n  \u{1b}[31mnotes: allow\n",
-            "is not a Skykeep tool",
+            "is not an iCloud-MCP tool",
         ),
     ] {
         let error = permissions::parse(text).unwrap_err();

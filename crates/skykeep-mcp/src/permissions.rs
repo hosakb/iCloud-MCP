@@ -192,9 +192,9 @@ pub fn plain(code: &'static str) -> &'static str {
     match code {
         "permissions_setup_required" => "This folder isn't set up yet. Run skykeep-mcp setup first.",
         "state_busy_retry" => "The server is using the folder right now. Run skykeep-mcp permissions show again in a moment.",
-        "state_unavailable" => "Skykeep can't open that folder. Check that it exists and belongs to you, or add --state-dir FOLDER.",
+        "state_unavailable" => "iCloud-MCP can't open that folder. Check that it exists and belongs to you, or add --state-dir FOLDER.",
         "unsafe_state_contents" | "state_must_be_owned_and_private" | "unsafe_state_path" => "The folder isn't private to you, or holds a link or a shared file. Run skykeep-mcp status to see what to fix.",
-        "library_unavailable" => "Skykeep couldn't read its records in that folder. Run skykeep-mcp status to see why.",
+        "library_unavailable" => "iCloud-MCP couldn't read its records in that folder. Run skykeep-mcp status to see why.",
         other => other,
     }
 }
@@ -335,7 +335,7 @@ fn folder_value(text: &str) -> Result<String, String> {
     let full = value.starts_with('/') || value == "~" || value.starts_with("~/");
     if !full {
         return Err(format!(
-            "{EXCHANGE_KEY} takes a full path, such as ~/Skykeep-Exchange or /home/you/Skykeep-Exchange"
+            "{EXCHANGE_KEY} takes a full path, such as ~/iCloud-MCP-Exchange or /home/you/iCloud-MCP-Exchange"
         ));
     }
     if value
@@ -505,7 +505,7 @@ pub fn parse_settings(text: &str) -> Result<Settings, String> {
         let line = lines_of.get(name).copied().unwrap_or(0);
         let Some(target) = valid.iter().find(|t| &t.name == name) else {
             return Err(format!(
-                "line {line}: {} is not a Skykeep tool or action; {}",
+                "line {line}: {} is not an iCloud-MCP tool or action; {}",
                 shown(name),
                 hint(name)
             ));
@@ -664,7 +664,9 @@ fn read_bytes(dir: &Path) -> Result<Option<Vec<u8>>, String> {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-            return Err("the file is a link; Skykeep reads only a real file in its folder".into())
+            return Err(
+                "the file is a link; iCloud-MCP reads only a real file in its folder".into(),
+            )
         }
         Err(_) => return Err("the file can't be opened".into()),
     };
@@ -761,19 +763,19 @@ impl Active {
 
     fn fallback_in(&self, in_show: bool) -> Option<String> {
         let problem = self.problem.as_deref()?;
-        let names = if !in_show && problem.contains("is not a Skykeep tool or action") {
+        let names = if !in_show && problem.contains("is not an iCloud-MCP tool or action") {
             " To see every valid name, run skykeep-mcp permissions show."
         } else {
             ""
         };
         Some(match self.kept_from {
             Some(at) => format!(
-                "The permissions file can't be used ({}). Skykeep keeps the last valid rules, loaded {}.{names}",
+                "The permissions file can't be used ({}). iCloud-MCP keeps the last valid rules, loaded {}.{names}",
                 shown_problem(problem),
                 when(at)
             ),
             None => format!(
-                "The permissions file can't be used ({}). Skykeep follows the approval mode and asks before every deletion until the file is fixed.{names}",
+                "The permissions file can't be used ({}). iCloud-MCP follows the approval mode and asks before every deletion until the file is fixed.{names}",
                 shown_problem(problem)
             ),
         })
@@ -1190,7 +1192,7 @@ pub fn status(library: &Library, dir: &Path, mode: Option<&str>) -> Vec<(String,
     let mut out = Vec::new();
     let Ok((active, change)) = evaluate(library, dir, mode) else {
         out.push((
-            "Skykeep couldn't read what it recorded about the permissions file.".into(),
+            "iCloud-MCP couldn't read what it recorded about the permissions file.".into(),
             Some("Run skykeep-mcp status again in a moment.".into()),
         ));
         return out;
@@ -1378,13 +1380,13 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or(Value::Null);
     let mut out = format!("Permissions file: {}\n", dir.join(FILE_NAME).display());
-    out.push_str("Skykeep reads it before every tool call, so a change counts at once.\n");
+    out.push_str("iCloud-MCP reads it before every tool call, so a change counts at once.\n");
     if let Some(at) = loaded["loaded_at"].as_u64() {
         out.push_str(&format!("Last change loaded: {}\n", when(at)));
     }
     if let (Some(text), Some(problem)) = (active.fallback_in(true), &active.problem) {
         out.push_str(&format!("\n{text}\n"));
-        if problem.contains("is not a Skykeep tool or action") {
+        if problem.contains("is not an iCloud-MCP tool or action") {
             out.push_str(&format!("Valid names: {}\n", names().join(", ")));
         }
     }
@@ -1531,19 +1533,19 @@ pub fn starter(dir: &Path) -> String {
         crate::status::with_dir("skykeep-mcp permissions show", dir)
     };
     let mut out = String::from(
-        "# Skykeep permissions\n\
+        "# iCloud-MCP permissions\n\
          #\n\
-         # This file decides, for each tool and action, what Skykeep does:\n\
+         # This file decides, for each tool and action, what iCloud-MCP does:\n\
          #   allow           run without asking\n\
          #   ask: client     ask on the approval card in your MCP client\n\
          #   ask: terminal   opt-in: wait until you run skykeep-mcp approve in your own terminal\n\
          #   deny            always refuse\n\
          #\n\
-         # Skykeep reads this file before every tool call, so a change counts at once.\n\
+         # iCloud-MCP reads this file before every tool call, so a change counts at once.\n\
          # Anything not listed follows the folder's approval mode.\n\
-         # If the file has a mistake, Skykeep keeps the last valid rules it loaded. If there are\n\
+         # If the file has a mistake, iCloud-MCP keeps the last valid rules it loaded. If there are\n\
          # none, the approval mode decides and every deletion asks.\n\
-         # To check it, run: SKYKEEP_SHOW\n\
+         # To check it, run: SHOW_COMMAND\n\
          #\n\
          # Write ask on its own indented line, as below, or as {ask: client}.\n\
          #\n\
@@ -1556,10 +1558,10 @@ pub fn starter(dir: &Path) -> String {
          # Passwords, codes and the passphrase never go in this file.\n\
          version: 1\n\
          # approval_mode: writes_only\n\
-         # exchange_folder: ~/Skykeep-Exchange\n\
+         # exchange_folder: ~/iCloud-MCP-Exchange\n\
          rules:\n",
     )
-    .replace("SKYKEEP_SHOW", &show);
+    .replace("SHOW_COMMAND", &show);
     for t in targets() {
         if t.action.as_deref().is_some_and(|a| is_deletion(&t.tool, a)) {
             out.push_str(&format!("  {}:\n    ask: client\n", t.name));

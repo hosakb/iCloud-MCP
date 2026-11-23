@@ -94,9 +94,9 @@ pub fn unsafe_entry_sentence(dir: &Path) -> Option<String> {
     let shown = crate::status::quoted(&path);
     Some(if link {
         format!(
-            "Skykeep won't use its folder because {shown} is a link. Remove the link: rm {shown}"
+            "iCloud-MCP won't use its folder because {shown} is a link. Remove the link: rm {shown}"
         )
     } else {
-        format!("Skykeep won't use its folder because others can read or change {shown}. Delete it if it is an editor's backup copy, or run: chmod 600 {shown}")
+        format!("iCloud-MCP won't use its folder because others can read or change {shown}. Delete it if it is an editor's backup copy, or run: chmod 600 {shown}")
     })
 }

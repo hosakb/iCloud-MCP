@@ -2,7 +2,7 @@
 
 ## Scope and trust boundary
 
-skykeep-mcp is a local stdio server for Notes and Reminders. There is no network listener. The MCP client receives the content requested through its tools and can queue routine edits under the default policy. Treat access to the server as access to the cached library and the permitted iCloud writes.
+iCloud-MCP (the `skykeep-mcp` command) is a local stdio server for Notes and Reminders. There is no network listener. The MCP client receives the content requested through its tools and can queue routine edits under the default policy. Treat access to the server as access to the cached library and the permitted iCloud writes.
 
 Terminal approval protects against MCP-only clients, not processes running as your user. Shell-capable agents can edit the database, clear agent-marker environment variables or invoke approval and policy helpers themselves. Do not give an agent shell access to the account holding state if you rely on approval.
 

@@ -143,7 +143,7 @@ pub enum Error {
     BadCode,
     #[error("Apple didn't return a trust token, so this session wouldn't survive a restart")]
     NoTrustToken,
-    #[error("this account signs in a way Skykeep can't handle yet ({0})")]
+    #[error("this account signs in a way iCloud-MCP can't handle yet ({0})")]
     UnsupportedAccount(String),
     /// Apple wants something finished on the account before it signs in anywhere new.
     #[error("Apple needs one more step on your Apple Account first. Sign in at account.apple.com, finish what it asks, then sign in here again.")]
@@ -238,7 +238,7 @@ pub const KEYRING_WORDS: &str =
 /// every keyring call is refused whatever state the keyring is in, so "locked" would send the
 /// person to the wrong fix.
 #[cfg(not(windows))]
-pub const SNAP_KEYRING_WORDS: &str = "Skykeep needs your permission to use the system keyring. In a terminal, run: sudo snap connect skykeep:password-manager-service — then try again.";
+pub const SNAP_KEYRING_WORDS: &str = "iCloud-MCP needs your permission to use the system keyring. In a terminal, run: sudo snap connect skykeep:password-manager-service — then try again.";
 
 /// What a keyring that would not answer means here: [`KEYRING_WORDS`], or inside the Snap
 /// [`SNAP_KEYRING_WORDS`].
@@ -881,7 +881,7 @@ impl Client {
     #[must_use]
     pub fn cookies_set_aside(&self) -> Option<&'static str> {
         (self.cookies == Cookies::SetAside).then_some(
-            "Skykeep couldn't open its saved connection to iCloud, so it set it aside. \
+            "iCloud-MCP couldn't open its saved connection to iCloud, so it set it aside. \
              If you're asked to sign in again, that's all it takes — your library is untouched.",
         )
     }
@@ -2003,7 +2003,7 @@ impl Client {
                     && !to.eq_ignore_ascii_case(HOME_DOMAIN)
                 {
                     return Err(Error::Protocol(format!(
-                        "Apple keeps this Apple Account at {to}, which Skykeep can't open yet"
+                        "Apple keeps this Apple Account at {to}, which iCloud-MCP can't open yet"
                     )));
                 }
                 quiet!("quince: Apple keeps this account at {to}; asking there");
@@ -2790,7 +2790,7 @@ mod tests {
         assert!(matches!(said, Error::Unavailable(502)), "got {said:?}");
         assert!(!said.to_string().contains('<'), "no markup: {said}");
         assert!(
-            !said.to_string().contains("Skykeep will"),
+            !said.to_string().contains("iCloud-MCP will"),
             "nothing it won't do"
         );
 
@@ -2974,7 +2974,7 @@ mod sealed_jar_tests {
         std::fs::write(cookies_file(dir.path()), &json).unwrap();
 
         let c = client(dir.path());
-        assert!(has_the_cookie(&c), "held for as long as Skykeep runs");
+        assert!(has_the_cookie(&c), "held for as long as iCloud-MCP runs");
         assert!(
             !cookies_file(dir.path()).exists(),
             "no plaintext left behind"

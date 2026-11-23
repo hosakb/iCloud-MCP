@@ -144,7 +144,7 @@ where
             Err(_) => {
                 crate::quiet!("outbox: sending a {service} change panicked; held as refused");
                 Err(Error::Refused(
-                    "Skykeep hit a problem sending this change, so nothing was changed in iCloud. Your text is safe here."
+                    "iCloud-MCP hit a problem sending this change, so nothing was changed in iCloud. Your text is safe here."
                         .into(),
                 ))
             }

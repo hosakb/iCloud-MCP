@@ -457,8 +457,9 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client
         "{screen}"
     );
     assert!(
-        screen
-            .contains("The client must be able to show Skykeep's approval card; Hermes shows it."),
+        screen.contains(
+            "The client must be able to show iCloud-MCP's approval card; Hermes shows it."
+        ),
         "{screen}"
     );
     assert!(screen.contains("such as a scheduled job"), "{screen}");
@@ -472,12 +473,12 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client
         "{screen}"
     );
     let line = format!(
-        "\"skykeep\": {{\"args\":[\"--state-dir\",\"{}\"],\"command\":\"/opt/skykeep/skykeep-mcp\"}}",
+        "\"icloud\": {{\"args\":[\"--state-dir\",\"{}\"],\"command\":\"/opt/skykeep/skykeep-mcp\"}}",
         dir.display()
     );
     assert!(screen.contains(&line), "{screen}");
     let hermes = format!(
-        "mcp_servers:\n  skykeep:\n    command: \"/opt/skykeep/skykeep-mcp\"\n    args:\n      - \"--state-dir\"\n      - \"{}\"\n    enabled: true\n    sampling:\n      enabled: false",
+        "mcp_servers:\n  icloud:\n    command: \"/opt/skykeep/skykeep-mcp\"\n    args:\n      - \"--state-dir\"\n      - \"{}\"\n    enabled: true\n    sampling:\n      enabled: false",
         dir.display()
     );
     assert!(screen.contains(&hermes), "{screen}");
@@ -1103,7 +1104,7 @@ async fn with_no_secure_storage_at_all_setup_stops_in_plain_words_and_writes_not
     let report = skykeep_mcp::status::check(storage::env(), &dir).render();
     holder().blocked.store(false, Ordering::SeqCst);
     assert!(
-        refused.starts_with("Setup can't find a safe place on this computer to keep your sign-in. If you are inside Docker or a similar container, run Skykeep directly on the computer."),
+        refused.starts_with("Setup can't find a safe place on this computer to keep your sign-in. If you are inside Docker or a similar container, run iCloud-MCP directly on the computer."),
         "{refused}"
     );
     assert!(!report.contains("protected file instead"), "{report}");
@@ -1442,7 +1443,7 @@ async fn unlock_names_a_missing_folder() {
     let mut script = Script::new(vec![]);
     let refused = setup::unlock(&mut script, storage::env(), &dir, None).unwrap_err();
     assert!(
-        refused.starts_with(&format!("No Skykeep folder at {}.", dir.display())),
+        refused.starts_with(&format!("No iCloud-MCP folder at {}.", dir.display())),
         "{refused}"
     );
 }

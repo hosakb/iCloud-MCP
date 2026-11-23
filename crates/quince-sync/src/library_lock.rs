@@ -425,7 +425,7 @@ pub fn hold_or_mark(dir: &Path) -> Result<Option<Hold>, String> {
         Ok(None) => Ok(None),
         Err(why) => mark(dir).map_err(|e| {
             format!(
-                "Skykeep could not make sure it is the only copy using {}: the disk refused a \
+                "iCloud-MCP could not make sure it is the only copy using {}: the disk refused a \
                  lock ({why}), and the file that stands in for one could not be made ({e}).",
                 dir.display()
             )
@@ -493,8 +493,8 @@ fn mark_as(dir: &Path, me: u32, running: impl Fn(u32) -> bool) -> std::io::Resul
             // Where whose it is cannot be asked, it is the person's to say.
             Some(_) if !cfg!(target_os = "linux") => {
                 return Err(std::io::Error::other(format!(
-                    "{} is there. If no other Skykeep is running, remove it and open \
-                     Skykeep again",
+                    "{} is there. If no other iCloud-MCP is running, remove it and open \
+                     iCloud-MCP again",
                     path.display()
                 )))
             }
@@ -512,7 +512,7 @@ fn mark_as(dir: &Path, me: u32, running: impl Fn(u32) -> bool) -> std::io::Resul
         }
     }
     Err(std::io::Error::other(
-        "skykeep.pid kept changing while Skykeep looked at it",
+        "skykeep.pid kept changing while iCloud-MCP looked at it",
     ))
 }
 
@@ -641,7 +641,7 @@ mod hold_tests {
             libc::kill(other, libc::SIGKILL);
             libc::waitpid(other, std::ptr::null_mut(), 0);
         }
-        assert!(refused.is_none(), "another Skykeep has it");
+        assert!(refused.is_none(), "another iCloud-MCP has it");
         std::fs::write(&pid, parent.to_string()).unwrap();
         assert!(
             mark(dir.path()).unwrap().is_some(),
@@ -721,7 +721,7 @@ mod hold_tests {
         };
         let hold = mark_as(dir.path(), 5, |pid| pid == 77).unwrap();
         writer.join().unwrap();
-        assert!(hold.is_none(), "the other Skykeep runs");
+        assert!(hold.is_none(), "the other iCloud-MCP runs");
         assert_eq!(marked_by(&path), Some(77), "its mark stands");
     }
 
