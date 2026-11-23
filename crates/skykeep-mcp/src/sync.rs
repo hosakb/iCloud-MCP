@@ -150,20 +150,78 @@ pub(crate) fn reread_key(service: &str) -> String {
 /// What `cloudkit_accepted` in the sync reply does and does not say.
 const LEFT_QUEUE_NOTE: &str = "cloudkit_accepted: CloudKit took every write the sender made. A reminder's repeat or alert is left out on purpose when its date was cleared, moved past the repeat's last day or made all-day on another device, or a repeat was set there meanwhile. The list-order write is not checked.";
 
-/// Whether this write's sender answers done only when CloudKit took every write it makes: a
-/// reminder create with no date or flag (one write, made once), or one with a repeat or
-/// alerts, whose every step fails the change. A dated plain create logs and skips a failed
-/// date or flag, and other senders can skip work, so they are not called accepted.
+/// Whether this write's sender answers done only when CloudKit took every write it makes:
+/// every reminder create. The create, its date or flag, and a repeat's or alert's every step
+/// each fail the change, which stays queued (or is refused) until Apple takes them all. Other
+/// senders can skip work, so they are not called accepted.
 fn every_write_checked(p: &quince_core::outbox::Pending) -> bool {
-    if p.service != "reminders" || p.kind != "create" {
-        return false;
+    p.service == "reminders"
+        && p.kind == "create"
+        && serde_json::from_str::<quince_sync::reminders::Create>(&p.payload).is_ok()
+}
+
+/// Where the last sync noted why a service's queue stopped: the change it stopped at (none
+/// when the refresh before sending failed), a fixed reason code and that change's try.
+fn waiting_key(service: &str) -> String {
+    format!("mcp.waiting.{service}")
+}
+
+/// Why a change Apple did not take this time waits, as a fixed code. Never Apple's words,
+/// which can hold HTTP bodies.
+fn waiting_reason(e: &quince_icloud::Error) -> &'static str {
+    use quince_icloud::Error as E;
+    match e {
+        E::ReauthRequired | E::NeedsDeviceApproval => "waiting_sign_in",
+        E::Busy(_) | E::StaleCursor => "waiting_apple_busy",
+        E::Protocol(_) | E::Conflict => "waiting_answer_not_understood",
+        E::Io(_) | E::Storage(_) => "waiting_local_storage",
+        _ => "waiting_for_connection",
     }
-    serde_json::from_str::<quince_sync::reminders::Create>(&p.payload).is_ok_and(|c| {
-        c.repeat.is_some()
-            || c.alarm.is_some()
-            || c.early_alert.is_some()
-            || (c.due_at.is_none() && c.flagged.is_none())
-    })
+}
+
+/// Why nothing was sent when the refresh before sending did not finish.
+fn refresh_reason(outcome: pass::Outcome) -> &'static str {
+    match outcome {
+        pass::Outcome::Paused => "waiting_sign_in",
+        pass::Outcome::Unavailable | pass::Outcome::Preparing => "waiting_apple_busy",
+        _ => "waiting_refresh_failed",
+    }
+}
+
+/// How many waiting changes a reply lists, oldest first: the first is the one the queue
+/// stopped at, and every later one waits behind it.
+const PENDING_SHOWN: usize = 20;
+
+/// The oldest waiting changes of `service` as MCP may show them: identifiers and why each
+/// waits, never the payload or Apple's words. A change the queue stopped at for an answer not
+/// understood also says which try it was of the tries allowed.
+pub(crate) fn pending_view(library: &Library, service: &str) -> Result<Vec<Value>, &'static str> {
+    let noted: Option<Value> = library
+        .state(&waiting_key(service))
+        .map_err(|_| "library_unavailable")?
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    Ok(library
+        .outbox_pending(service)
+        .map_err(|_| "library_unavailable")?
+        .iter()
+        .take(PENDING_SHOWN)
+        .map(|p| {
+            let mut view = json!({"id":p.id,"service":p.service,"kind":p.kind,"record":p.record,
+                "reason":"waiting_to_send"});
+            if let Some(noted) = &noted {
+                let at = noted["id"].as_i64();
+                // Queued after the last sync stopped is still behind the change it stopped at.
+                if at.is_none_or(|at| p.id >= at) {
+                    view["reason"] = noted["reason"].clone();
+                }
+                if at == Some(p.id) && noted["reason"] == "waiting_answer_not_understood" {
+                    view["try"] = noted["try"].clone();
+                    view["tries_allowed"] = json!(quince_sync::queue::PROTOCOL_TRIES);
+                }
+            }
+            view
+        })
+        .collect())
 }
 
 /// Skykeep's own refusal codes are shown; engine and Apple reasons can hold HTTP text.
@@ -400,6 +458,16 @@ async fn sync_pass(
     for service in ["notes", "reminders"] {
         let lock = Mutex::new(());
         let before = pass::run(service, &ctx, &data, &lock).await;
+        // Each sync says afresh why its queue stopped, if it did.
+        let noted = if matches!(before.outcome, pass::Outcome::Ok) {
+            String::new()
+        } else {
+            json!({"id":null,"reason":refresh_reason(before.outcome)}).to_string()
+        };
+        data.lock()
+            .await
+            .set_state(&waiting_key(service), &noted)
+            .map_err(|_| "library_unavailable")?;
         waiting_before.extend(
             data.lock()
                 .await
@@ -423,11 +491,23 @@ async fn sync_pass(
                             )));
                         }
                     }
-                    if service == "notes" {
+                    let (id, tries) = (p.id, p.tries);
+                    let sent = if service == "notes" {
                         quince_sync::notes::send(data, http, root, params, p).await
                     } else {
                         quince_sync::reminders::send(data, http, root, params, p).await
+                    };
+                    // Kept queued (the queue's own rule): note why, as a code, for the reply.
+                    if let Err(e) = &sent {
+                        if quince_sync::queue::transient(e, tries) {
+                            let noted = json!({"id":id,"reason":waiting_reason(e),"try":tries});
+                            let _ = data
+                                .lock()
+                                .await
+                                .set_state(&waiting_key(service), &noted.to_string());
+                        }
                     }
+                    sent
                 }
             })
             .await;
@@ -500,7 +580,10 @@ async fn sync_pass(
         .take(MAX_PENDING)
         .map(refused_view)
         .collect();
-    let mut reply = json!({"services":services,"queued":waiting,"refused":refused.len(),"refused_this_sync":refused_now,"left_queue_this_sync":left,"remote_verified":false,"verification":"upstream sync and replay only; field-level read-back is not guaranteed"});
+    let mut pending_recent = pending_view(&library, "notes")?;
+    pending_recent.extend(pending_view(&library, "reminders")?);
+    pending_recent.truncate(PENDING_SHOWN);
+    let mut reply = json!({"services":services,"queued":waiting,"pending_recent":pending_recent,"refused":refused.len(),"refused_this_sync":refused_now,"left_queue_this_sync":left,"remote_verified":false,"verification":"upstream sync and replay only; field-level read-back is not guaranteed"});
     // Said only when there is something for it to explain.
     if !left.is_empty() {
         reply["left_queue_note"] = json!(LEFT_QUEUE_NOTE);

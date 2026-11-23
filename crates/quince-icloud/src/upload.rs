@@ -42,9 +42,30 @@ async fn send_within(
     stall: Duration,
     answer: Duration,
 ) -> Result<(reqwest::StatusCode, String)> {
+    send_bounded(
+        request,
+        sent,
+        size,
+        stall,
+        answer,
+        crate::bounded::MOST_REPLY,
+    )
+    .await
+}
+
+/// [`send_within`], with Apple's reply read within `most` bytes as every answer is
+/// ([`crate::bounded::reply_within`]): one longer is refused, never held whole.
+async fn send_bounded(
+    request: reqwest::RequestBuilder,
+    sent: &AtomicU64,
+    size: u64,
+    stall: Duration,
+    answer: Duration,
+    most: u64,
+) -> Result<(reqwest::StatusCode, String)> {
     let response = watched(request.send(), sent, size, stall, answer).await??;
     let status = response.status();
-    let text = tokio::time::timeout(stall, response.text())
+    let text = tokio::time::timeout(stall, crate::bounded::reply_within(response, most))
         .await
         .map_err(|_| Error::Stalled)??;
     Ok((status, text))
@@ -195,5 +216,42 @@ mod tests {
         let stuck = send_within(post(addr, size, &sent), &sent, size as u64, stall, stall).await;
         assert!(matches!(stuck, Err(Error::Stalled)), "{stuck:?}");
         assert!(sent.load(Ordering::Relaxed) < size as u64);
+    }
+
+    /// Apple's reply to an upload is read within a size limit like every other answer: one
+    /// past it is refused, never read whole into memory; one within reads whole.
+    #[tokio::test]
+    async fn an_upload_reply_past_the_size_limit_is_refused() {
+        let chunked = |pieces: usize| {
+            let mut body = Vec::new();
+            for _ in 0..pieces {
+                body.extend_from_slice(b"400\r\n");
+                body.extend(std::iter::repeat_n(b'a', 1024));
+                body.extend_from_slice(b"\r\n");
+            }
+            body.extend_from_slice(b"0\r\n\r\n");
+            body
+        };
+        const HEAD: &str =
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n";
+        let stall = Duration::from_secs(5);
+        let request = |at: &str, sent: &Arc<AtomicU64>| {
+            reqwest::Client::new()
+                .post(format!("{at}/upload"))
+                .header("content-length", 16)
+                .body(counted(vec![7u8; 16], Arc::clone(sent)))
+        };
+
+        let at = crate::bounded::tests::raw_server(HEAD, chunked(8)).await;
+        let sent = Arc::new(AtomicU64::new(0));
+        let got = send_bounded(request(&at, &sent), &sent, 16, stall, stall, 4096).await;
+        assert!(matches!(got, Err(Error::Protocol(_))), "{got:?}");
+
+        let at = crate::bounded::tests::raw_server(HEAD, chunked(4)).await;
+        let sent = Arc::new(AtomicU64::new(0));
+        let (status, text) = send_bounded(request(&at, &sent), &sent, 16, stall, stall, 4096)
+            .await
+            .unwrap();
+        assert_eq!((status.as_u16(), text.len()), (200, 4096));
     }
 }

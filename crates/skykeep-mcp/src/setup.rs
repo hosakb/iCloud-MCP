@@ -83,6 +83,8 @@ pub fn plain(code: &'static str) -> &'static str {
         "credentials_rejected" => "Apple didn't accept that Apple Account or password. Run skykeep-mcp setup again to retry.",
         "code_incorrect_or_expired" => "The verification code was wrong or expired three times. Run skykeep-mcp setup again to get a new code.",
         "auth_cooldown_try_later" => "Apple asked to wait before the next sign-in attempt. Try again later.",
+        login::SIGN_IN_WAIT => "iCloud-MCP is waiting before the next sign-in so Apple doesn't lock the account. Run skykeep-mcp setup again later.",
+        "apple_answer_unreadable" => "Apple sent an answer iCloud-MCP couldn't read. Wait a minute, then run skykeep-mcp setup again.",
         "account_locked_visit_account_website" => "Apple has locked this Apple Account. Unlock it at iforgot.apple.com, then run skykeep-mcp setup again.",
         "secure_storage_unavailable" => "The sign-in could not be saved in the chosen storage. Run skykeep-mcp status to see why.",
         "regional_login_retry_required" => "Apple asked to sign in again. Run skykeep-mcp setup again.",
@@ -365,7 +367,29 @@ pub async fn run(
         dir: None,
     };
     let outcome = flow(&mut c, env, options).await;
-    outcome.map_err(|code| c.scope(plain(code)))
+    outcome.map_err(|code| match (code, &c.dir) {
+        (login::SIGN_IN_WAIT, Some(dir)) => c.scope(&sign_in_wait(env, dir)),
+        _ => c.scope(plain(code)),
+    })
+}
+
+/// The sign-in wait, with about how long is left, read from the wait this folder's sign-in
+/// keeps. Without it, the plain sentence.
+fn sign_in_wait(env: &Env, dir: &Path) -> String {
+    let left = storage::open_store_in(env, dir).ok().and_then(|store| {
+        quince_auth::session::wait_left(
+            store.load_cooldown().retry_after,
+            quince_auth::session::unix_now(),
+        )
+    });
+    match left {
+        Some(seconds) => {
+            let minutes = seconds.div_ceil(60).max(1);
+            let unit = if minutes == 1 { "minute" } else { "minutes" };
+            format!("iCloud-MCP is waiting before the next sign-in so Apple doesn't lock the account. Run skykeep-mcp setup again in about {minutes} {unit}.")
+        }
+        None => plain(login::SIGN_IN_WAIT).to_string(),
+    }
 }
 
 async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcome, &'static str> {

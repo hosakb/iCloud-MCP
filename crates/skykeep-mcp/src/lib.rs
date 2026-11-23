@@ -2145,10 +2145,13 @@ impl Server {
                         .outbox_pending(service)
                         .map_err(|_| "library_unavailable")?
                         .len();
+                    let pending_recent = sync::pending_view(library, service)?;
                     // Upstream error text may hold HTTP bodies; report only that one exists.
                     services.push(
                         json!({"service":service,"last_synced_at":h.and_then(|h| h.last_synced_at),
                         "last_error":h.is_some_and(|h| h.last_error.is_some()),"pending":pending,
+                        // Why each waits, as a fixed code, oldest first.
+                        "pending_recent":pending_recent,
                         "refused":mine.len(),
                         // Identifiers and reason codes only, newest last, so the user can be
                         // told which approved write will not be sent and why.

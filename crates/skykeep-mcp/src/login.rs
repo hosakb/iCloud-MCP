@@ -35,11 +35,18 @@ fn printable(text: &str) -> String {
         .to_string()
 }
 
+/// The wait this computer keeps between sign-ins after failed ones, so Apple doesn't lock
+/// the account.
+pub const SIGN_IN_WAIT: &str = "sign_in_wait_protects_account";
+
 pub fn auth_error(error: Error) -> &'static str {
     match error {
         Error::BadCredentials => "credentials_rejected",
         Error::BadCode => "code_incorrect_or_expired",
-        Error::CoolingDown { .. } | Error::RateLimited => "auth_cooldown_try_later",
+        Error::RateLimited => "auth_cooldown_try_later",
+        // This computer's own wait after failed tries; setup says how long is left.
+        Error::CoolingDown { .. } => SIGN_IN_WAIT,
+        Error::Protocol(_) => "apple_answer_unreadable",
         Error::AccountLocked => "account_locked_visit_account_website",
         Error::Keyring(_) => "secure_storage_unavailable",
         Error::CodeAgain | Error::Moved => "regional_login_retry_required",
