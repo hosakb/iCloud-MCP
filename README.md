@@ -8,7 +8,7 @@ iCloud-MCP is a local MCP server for Apple Notes, Reminders, Contacts, Calendar,
 - Photos reads give metadata only, never the pictures. `photos_write` changes photo details and albums, uploads a file from the exchange folder, and moves a photo to Recently Deleted only with your approval.
 - iCloud Drive can be read and changed with `drive_write`. File contents move only through one local exchange folder you name, and deletions always need your approval.
 - `setup` guides you through sign-in in your own terminal. `status` checks the setup and `unlock` opens the protected sign-in file after a restart.
-- Every approval happens on a card in your MCP client, in every approval mode. Hermes shows it. A client without the card, or a session where nobody answers it, can't run actions that need approval; they are refused and nothing runs.
+- Every approval happens on a card in your MCP client, in every approval mode. Hermes, Claude Code and Codex offer the card when they connect. A client without the card, or a session where nobody answers it, can't run actions that need approval; they are refused and nothing runs.
 - A permissions file sets each tool or action to `allow`, `ask` or `deny`. With `ask: client` your MCP client shows a card with "Approve this time", "Deny" and, where an allow rule would stop the asking, "Always allow this action". The server reads the file at every tool call, so an edit counts from the next call.
 
 This fork contains the MCP server and its four engine crates, not the upstream desktop or mobile applications. The source is at [hosakb/iCloud-MCP](https://github.com/hosakb/iCloud-MCP).
@@ -62,9 +62,18 @@ You need a terminal window that you open yourself. Don't run these commands thro
       | 3. Don't ask before reads or changes (`yolo`, you type `confirm`) | No question | No question, except deletions, moves to Recently Deleted and moves and renames of large Drive folders, which ask in the MCP client |
       | 4. No approval mode, the older behaviour (you type `confirm`) | No question | Like choice 3. You can later run `skykeep-mcp require-approval` to make every change ask. Most people should pick 1 |
 
-      Every choice asks on iCloud-MCP's approval card in the MCP client. Hermes supports MCP form elicitation and shows the card. In a client without the card, a request that needs approval is refused with `approval_requires_form_client`, and nothing runs. A session where nobody answers, such as a scheduled job, gets `approval_timeout` after 3 minutes, and nothing runs either. Choice 4 keeps a folder's earlier `require-approval` setting: then every change asks on the card, and setup and status say so. Once a folder has had choice 1, 2 or 3, it can't go back to 4; set up a new folder instead. You can change the mode later with an `approval_mode:` line in `permissions.yaml` (see "Settings in the permissions file"). A line there wins over the choice made here, and setup changes that line to match when you choose again.
+      Every choice asks on iCloud-MCP's approval card in the MCP client. Hermes supports MCP form elicitation and shows the card. In a client without the card, a request that needs approval is refused with `approval_requires_form_client`, and nothing runs. A client that offers the card but connects with an MCP protocol version older than `2025-06-18` gets `approval_requires_newer_protocol`, and nothing runs either. A session where nobody answers, such as a scheduled job, gets `approval_timeout` after 3 minutes, and nothing runs either. Choice 4 keeps a folder's earlier `require-approval` setting: then every change asks on the card, and setup and status say so. Once a folder has had choice 1, 2 or 3, it can't go back to 4; set up a new folder instead. You can change the mode later with an `approval_mode:` line in `permissions.yaml` (see "Settings in the permissions file"). A line there wins over the choice made here, and setup changes that line to match when you choose again.
    After step 4, setup offers to write a starter permissions file. In it every deletion asks on the card. Press Enter to skip it.
    5. **Check.** Setup checks everything it set up and prints what to paste into your MCP client's settings: a JSON line for most clients, and a `config.yaml` block for Hermes.
+
+   Claude Code and Codex add the server with one command each. Replace `DIR` with the folder setup used:
+
+   ```sh
+   claude mcp add --scope user skykeep -- skykeep-mcp --state-dir DIR
+   codex mcp add skykeep -- skykeep-mcp --state-dir DIR
+   ```
+
+   Answer approval cards in the interactive app. `claude -p` and `codex exec` close every card by themselves, which counts as Deny, so deletions and other actions that need approval can't run there. Codex also has its own setting, `default_tools_approval_mode`, for whether Codex asks you before it calls a tool. That setting is separate from iCloud-MCP's card: whatever it says, every action that needs approval still asks on the card.
 
    You can run `setup` again at any time. It checks the saved sign-in with Apple, then asks whether to keep the setup, sign in again in the same folder (same Apple Account), switch to another Apple Account, or quit. If Apple no longer accepts the saved sign-in, setup says so and goes straight to signing in again. A folder belongs to one Apple Account, so switching sets up a new folder for the other account and leaves the first one as it is. If setup stopped part way, the next run continues with the first step that is not done.
 
@@ -342,8 +351,14 @@ again. Existing terminal policy commands cannot override an activated new policy
 No migration back to legacy is provided. In each mode that asks, every approval is
 a one-shot form in the MCP client.
 
-2025-11-25 clients advertising `elicitation: {}` or `form: {}` receive standard
-`elicitation/create` with one required choice, `decision`. Only `accept` with exactly
+Clients that connect with protocol `2025-06-18` or newer and advertise
+`elicitation: {}` or `form: {}` receive standard `elicitation/create` with one
+required choice, `decision`. The server answers `initialize` with the version the
+client asked for, or `2025-11-25` for a newer one; an older version gets
+`2025-03-26` and no card. For `2025-06-18` the card lists the choices as `enum`
+with `enumNames` and has no `mode`. The card shows the call's name and arguments
+but leaves out its `_meta`, and escapes markup characters, non-ASCII characters and
+any underscore that is not inside a word. Only `accept` with exactly
 `content: {"decision": "approve"}`, or `"always_allow"` where the card offers it,
 authorizes execution. Unsupported versions, URL-only,
 absent, malformed and unknown-only capabilities fail closed when consent is needed.
@@ -429,7 +444,10 @@ MCP tool can resend, release or retire a refused write.
 Hermes 0.23.3 sends `initialize` with protocol `2025-11-25` and
 `elicitation: {form: {}, url: {}}`, so the server shows it the approval card. How
 each Hermes surface renders the three choices, and whether it returns the chosen
-value, was not tested here; a card answered without a choice counts as Deny. OpenClaw
+value, was not tested here; a card answered without a choice counts as Deny. Claude
+Code 2.1.325 connects with protocol `2025-11-25` and Codex 0.169.0 with `2025-06-18`;
+both offer form elicitation, so both get the card. The interactive card in these two
+apps was not tested here. OpenClaw
 runtime interoperability is untested.
 
 References: [MCP elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation),

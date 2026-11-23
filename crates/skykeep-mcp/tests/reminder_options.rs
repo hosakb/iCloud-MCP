@@ -325,10 +325,10 @@ async fn options_wait_for_approval_with_the_create() {
         .unwrap();
     assert_eq!(form["method"], "elicitation/create", "{form}");
     assert_eq!(library.outbox_count().unwrap(), 0);
-    // The card's text escapes `_` as \u005f.
+    // An underscore inside a word stays as it is on the card.
     let message = form["params"]["message"].as_str().unwrap();
     assert!(
-        message.contains("2026-03-20") && message.contains("America/New\\u005fYork"),
+        message.contains("2026-03-20") && message.contains("America/New_York"),
         "{message}"
     );
     let reply = server

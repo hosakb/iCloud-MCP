@@ -725,7 +725,7 @@ async fn reads_and_writes_binds_each_photos_read_to_one_approval() {
     let form = call(&mut server, 3, "photos_get", json!({"id":"P-BEACH"})).await;
     assert_eq!(form["method"], "elicitation/create", "{form}");
     let message = form["params"]["message"].as_str().unwrap();
-    assert!(message.contains("photos\\u005fget"), "{message}");
+    assert!(message.contains("photos_get"), "{message}");
     assert!(!message.contains("Beach day"), "no content before approval");
     assert_eq!(
         text(&call(&mut server, 4, "photos_list", json!({})).await)["error"],
@@ -764,7 +764,7 @@ async fn refresh_prompt_names_photos_only_and_sends_nothing() {
     let form = call(&mut server, 3, "photos_refresh", json!({})).await;
     assert_eq!(form["method"], "elicitation/create", "{form}");
     let message = form["params"]["message"].as_str().unwrap();
-    assert!(message.contains("photos\\u005frefresh"), "{message}");
+    assert!(message.contains("photos_refresh"), "{message}");
     assert!(
         message.contains("\"services\": \\u005b\n      \"photos\"\n    \\u005d"),
         "{message}"
