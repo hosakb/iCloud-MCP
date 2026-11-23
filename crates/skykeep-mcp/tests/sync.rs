@@ -257,3 +257,48 @@ async fn session_for_another_account_never_reads_or_sends() {
         .iter()
         .all(|r| !r.url.path().contains("com.apple")));
 }
+
+#[tokio::test]
+async fn a_switched_off_service_is_neither_read_nor_sent_by_sync() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/setup/ws/1/validate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"dsInfo":{"dsid":"1234567890"},"webservices":{"ckdatabasews":{"url":server.uri()}}}))).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/changes/zone$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"zones":[{"records":[],"syncToken":"synthetic-cursor","moreComing":false}]}),
+        ))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = saved_client(dir.path(), &server.uri());
+    let mut library = quince_core::Library::open(dir.path()).unwrap();
+    library
+        .set_state("account", &quince_sync::queue::account_tag("1234567890"))
+        .unwrap();
+    std::fs::write(
+        dir.path().join(skykeep_mcp::permissions::FILE_NAME),
+        "version: 1\nservices: [notes]\n",
+    )
+    .unwrap();
+    let result = skykeep_mcp::sync::with_client(dir.path(), client)
+        .await
+        .unwrap();
+    let reminders = result["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["service"] == "reminders")
+        .unwrap();
+    assert_eq!(reminders["outcome"], "switched_off", "{result}");
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests
+        .iter()
+        .any(|r| r.url.path().contains("com.apple.notes")));
+    assert!(
+        requests
+            .iter()
+            .all(|r| !r.url.path().contains("com.apple.reminders")),
+        "Reminders is switched off"
+    );
+}

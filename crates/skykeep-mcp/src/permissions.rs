@@ -382,6 +382,7 @@ fn services_when_broken(bytes: Option<&[u8]>) -> Option<Vec<String>> {
     let Some(text) = bytes.and_then(|b| std::str::from_utf8(b).ok()) else {
         return Some(Vec::new());
     };
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let lines: Vec<&str> = text
         .lines()
         .filter(|l| {
@@ -855,6 +856,8 @@ pub struct Active {
     /// The services that are on, in [`SERVICES`] order: the file's `services:` line (or the
     /// last valid file's), every service when there is none.
     pub services: Vec<&'static str>,
+    /// Whether the file in use (or the last valid one) has a `services:` line.
+    pub services_in_file: bool,
 }
 
 impl Active {
@@ -866,11 +869,7 @@ impl Active {
     /// Whether a tool may be offered and run: its service is on, and `sync` needs Notes or
     /// Reminders.
     pub fn tool_on(&self, tool: &str) -> bool {
-        match (tool, service_of(tool)) {
-            ("sync", _) => self.service_on("notes") || self.service_on("reminders"),
-            (_, Some(service)) => self.service_on(service),
-            (_, None) => true,
-        }
+        tool_on(&self.services, tool)
     }
 
     /// The services that are switched off, in [`SERVICES`] order.
@@ -1024,8 +1023,9 @@ fn stored_exchange(library: &Library) -> Option<String> {
         .map(|e| e.path.display().to_string())
 }
 
-/// The changes in the two settings: the approval mode, then the exchange folder. A different
-/// folder counts as looser, because its files become reachable; no folder counts as stricter.
+/// The changes in the three settings: the approval mode, the exchange folder, then each
+/// service. A different folder counts as looser, because its files become reachable; no folder
+/// counts as stricter. A service switched on counts as looser.
 fn setting_changes(
     library: &Library,
     stored: &Value,
@@ -1137,7 +1137,15 @@ fn evaluate(
     // The last valid rules and settings from a file, kept while a later file can't be used.
     let last_valid = stored["valid"].clone();
     let (settings, problem, valid) = match source {
-        Source::Missing => (Settings::default(), None, Value::Null),
+        // No file keeps the services in force: removing or renaming it switches none on.
+        Source::Missing => (
+            Settings {
+                services: settings_from(&stored).services,
+                ..Settings::default()
+            },
+            None,
+            Value::Null,
+        ),
         Source::Rules(settings) => {
             let valid = if changed {
                 let mut v = settings_value(&settings);
@@ -1150,9 +1158,10 @@ fn evaluate(
         }
         Source::Invalid(problem, services) => {
             let mut settings = settings_from(&last_valid);
-            // No valid file was loaded before: only what the broken file itself says.
+            // No valid file was loaded before: what the broken file itself says, and without
+            // a line there, the services in force until now.
             if last_valid.is_null() {
-                settings.services = services;
+                settings.services = services.or_else(|| settings_from(&stored).services);
             }
             (settings, Some(problem), last_valid)
         }
@@ -1168,6 +1177,7 @@ fn evaluate(
         problem,
         kept_from,
         services: services_on(settings.services.as_deref()),
+        services_in_file: settings.services.is_some() && print != "missing",
     };
     if !changed {
         return Ok((active, None));
@@ -1463,11 +1473,35 @@ pub fn status(library: &Library, dir: &Path, mode: Option<&str>) -> Vec<(String,
 
 /// Which services are on, and how to change that.
 fn services_line(dir: &Path, active: &Active) -> String {
+    let how = if active.services_off().is_empty() && !active.services_in_file {
+        "To switch one off, add a"
+    } else {
+        "To change this, edit the"
+    };
     format!(
-        "{} To change this, edit the {SERVICES_KEY}: line in {} or run skykeep-mcp setup; a switched-off service's tools are not offered, and nothing from it is read, cached or synced.",
+        "{} {how} {SERVICES_KEY}: line in {} or run skykeep-mcp setup; a switched-off service's tools are not offered, and nothing from it is read, cached or synced.",
         active.services_sentence(),
         dir.join(FILE_NAME).display()
     )
+}
+
+/// Whether `tool` may be offered and run while `services` are on: its service is on, and
+/// `sync` needs Notes or Reminders.
+pub fn tool_on(services: &[&str], tool: &str) -> bool {
+    match (tool, service_of(tool)) {
+        ("sync", _) => services.contains(&"notes") || services.contains(&"reminders"),
+        (_, Some(service)) => services.contains(&service),
+        (_, None) => true,
+    }
+}
+
+/// The services on according to the file alone, read without the folder or its records:
+/// `None` when the file is missing or can't be used, since then only the records can say.
+pub fn services_in_file(dir: &Path) -> Option<Vec<&'static str>> {
+    match read(dir).0 {
+        Source::Rules(settings) => Some(services_on(settings.services.as_deref())),
+        _ => None,
+    }
 }
 
 /// The status line for the exchange folder in force, with the fix when it can't be used.
@@ -1786,10 +1820,10 @@ pub fn starter(dir: &Path) -> String {
          #   exchange_folder: the one folder Drive and Photos uploads read from and Drive\n\
          #     downloads write into. A private folder of your own, not a link, not a system\n\
          #     folder and not inside a hidden folder such as .ssh or the private folder.\n\
-         #   services: the services Skykeep may use, on one line. A service left out is\n\
+         #   services: the services iCloud-MCP may use, on one line. A service left out is\n\
          #     switched off: its tools are not offered, and nothing from it is read, cached or\n\
-         #     synced. Without the line every service is on. Data cached before stays until you\n\
-         #     clear it. Apple signs in the whole account, so this is a limit inside Skykeep,\n\
+         #     synced. Without the line every service is on. Data cached before stays in the\n\
+         #     folder, unread; to clear it, set up a fresh folder and delete this one. Apple signs in the whole account, so this is a limit inside iCloud-MCP,\n\
          #     not at Apple: someone with the sign-in could still reach every service.\n\
          # Passwords, codes and the passphrase never go in this file.\n\
          version: 1\n\

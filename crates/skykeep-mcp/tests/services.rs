@@ -218,16 +218,16 @@ async fn a_call_to_a_switched_off_service_is_refused_with_the_next_step_at_the_n
     assert_eq!(value["error"], "reminders_switched_off", "{value}");
     // Its cached data stays until the owner clears it.
     assert!(f.library.reminder("R-1").unwrap().is_some());
-    // sync_status reports only what is on and names what is off.
+    // sync_status still lists Reminders, marked as switched off, and names what is off.
     let (value, failed) = result(&mut f, 4, "sync_status", json!({})).await;
     assert!(!failed);
-    let services: Vec<&str> = value["services"]
+    let reminders = value["services"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|s| s["service"].as_str().unwrap())
-        .collect();
-    assert_eq!(services, ["notes"], "{value}");
+        .find(|s| s["service"] == "reminders")
+        .unwrap();
+    assert_eq!(reminders["switched_off"], true, "{value}");
     assert!(
         value["switched_off"]
             .as_array()
@@ -283,7 +283,7 @@ async fn turning_a_service_on_is_listed_as_looser_until_the_person_looks() {
         shown.contains("looser: services: Photos was switched off before, now on"),
         "{shown}"
     );
-    // Removing the line (or the file) turns every service on again: also looser.
+    // Removing the line turns every service on again: also looser.
     write_file(&dir, "version: 1\n");
     f.server.handle(call(3, "reminders_lists", json!({}))).await;
     let shown = permissions::show(&dir, true).unwrap();
@@ -391,4 +391,104 @@ fn rule_names_of_a_switched_off_service_stay_valid() {
     )
     .unwrap();
     assert_eq!(parsed.rules.len(), 1);
+}
+
+#[tokio::test]
+async fn a_missing_or_renamed_file_never_turns_a_service_on() {
+    let mut f = folder(Some("yolo")).await;
+    let dir = f.path();
+    write_file(&dir, "version: 1\nservices: [reminders]\n");
+    let (_, failed) = result(&mut f, 1, "reminders_lists", json!({})).await;
+    assert!(!failed);
+    std::fs::rename(
+        dir.join(permissions::FILE_NAME),
+        dir.join("permissions.yaml.old"),
+    )
+    .unwrap();
+    for id in 2..4 {
+        let (value, failed) = result(&mut f, id, "photos_albums", json!({})).await;
+        assert!(failed, "{value}");
+        assert_eq!(value["error"], "photos_switched_off", "{value}");
+    }
+    let names = listed(&mut f).await;
+    assert!(!names.iter().any(|n| n == "photos_list"), "{names:?}");
+    let shown = permissions::show(&dir, true).unwrap();
+    assert!(shown.contains("Services on: Reminders."), "{shown}");
+    // Broken after it went missing: still not on.
+    write_file(&dir, "version: 1\nbogus: 1\n");
+    let (value, _) = result(&mut f, 4, "photos_albums", json!({})).await;
+    assert_eq!(value["error"], "photos_switched_off", "{value}");
+    // A valid file without the line is the way back to every service.
+    write_file(&dir, "version: 1\n");
+    let (_, failed) = result(&mut f, 5, "photos_albums", json!({})).await;
+    assert!(!failed);
+}
+
+#[tokio::test]
+async fn a_byte_order_mark_does_not_hide_a_broken_services_line() {
+    let mut f = folder(Some("yolo")).await;
+    write_file(&f.path(), "\u{feff}services: [reminders]\nbogus: 1\n");
+    let (value, failed) = result(&mut f, 1, "photos_albums", json!({})).await;
+    assert!(failed, "{value}");
+    assert_eq!(value["error"], "photos_switched_off", "{value}");
+    let (_, failed) = result(&mut f, 2, "reminders_lists", json!({})).await;
+    assert!(!failed);
+}
+
+#[tokio::test]
+async fn queued_changes_of_a_switched_off_service_are_set_aside_and_never_sent_later() {
+    let mut f = folder(Some("yolo")).await;
+    let dir = f.path();
+    let (value, failed) = result(
+        &mut f,
+        1,
+        "reminders_write",
+        json!({"action":"create","list_guid":"list","title":"Synthetic queued"}),
+    )
+    .await;
+    assert!(!failed, "{value}");
+    assert_eq!(f.library.outbox_pending("reminders").unwrap().len(), 1);
+    write_file(&dir, "version: 1\nservices: [notes]\n");
+    let (value, _) = result(&mut f, 2, "sync_status", json!({})).await;
+    let reminders = value["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["service"] == "reminders")
+        .unwrap()
+        .clone();
+    assert_eq!(reminders["pending"], 0, "{value}");
+    assert_eq!(reminders["refused"], 1, "{value}");
+    assert_eq!(
+        reminders["refused_recent"][0]["reason"], "mcp_quarantine:service_switched_off",
+        "{value}"
+    );
+    // Switched on again, the change stays set aside: it needs a new request.
+    write_file(&dir, "version: 1\n");
+    result(&mut f, 3, "sync_status", json!({})).await;
+    assert!(f.library.outbox_pending("reminders").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_busy_folder_never_makes_services_look_switched_off() {
+    let mut f = folder(Some("yolo")).await;
+    let dir = f.path();
+    let all = listed(&mut f).await;
+    // Another process holds the folder: the list comes from the file itself.
+    write_file(&dir, "version: 1\nservices: [reminders]\n");
+    let held = skykeep_mcp::state::PrivateState::open(&dir).unwrap();
+    let names = listed(&mut f).await;
+    assert!(names.iter().any(|n| n == "reminders_list"), "{names:?}");
+    assert!(!names.iter().any(|n| n == "photos_list"), "{names:?}");
+    // No services line, folder busy: every tool is listed, nothing is called off.
+    write_file(&dir, "version: 1\n");
+    assert_eq!(listed(&mut f).await, all);
+    let mut server = Server::open(&dir).unwrap();
+    let reply = server
+        .handle(json!({"id":0,"method":"initialize"}))
+        .await
+        .unwrap();
+    let instructions = reply["result"]["instructions"].as_str().unwrap();
+    assert!(!instructions.contains("Switched off"), "{instructions}");
+    drop(held);
 }

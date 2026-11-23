@@ -1056,7 +1056,7 @@ fn offer_permissions(console: &mut dyn Console, dir: &Path) -> Result<(), &'stat
 }
 
 /// The services prompt setup shows; tests answer it by this text.
-pub const SERVICES_CHOICE: &str = "Type the numbers of the services to keep on, such as 1 4, or none (Enter keeps them as they are): ";
+pub const SERVICES_CHOICE: &str = "Type the numbers of the services to have on, such as 1 4, or none (Enter keeps them as they are): ";
 
 /// Step 5. Which services the server may use, kept as the `services:` line in
 /// permissions.yaml. Nothing is written while the answer leaves things as they are.
