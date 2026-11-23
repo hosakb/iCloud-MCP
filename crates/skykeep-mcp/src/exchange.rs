@@ -165,14 +165,21 @@ pub fn checked(written: &str, state_dir: &Path, max_bytes: u64) -> Result<Exchan
     })
 }
 
-/// The folder uploads and downloads use now, checked: the one `permissions.yaml` names (or
-/// its last valid one while the file can't be used), else the one `skykeep-mcp exchange` set
-/// up, else `None`. A folder that fails the checks is refused, never replaced by another.
+/// `permissions.yaml` can't be used, so no exchange folder is in use.
+pub const FILE_UNUSABLE: &str = "exchange_folder_file_unusable";
+
+/// The folder uploads and downloads use now, checked: the one `permissions.yaml` names;
+/// with no file, the one `skykeep-mcp exchange` set up; else `None`. A file that can't be
+/// used refuses every transfer ([`FILE_UNUSABLE`]), and a usable file without the line names
+/// none. A folder that fails the checks is refused, never replaced by another.
 pub fn in_force(
     library: &quince_core::Library,
     state_dir: &Path,
 ) -> Result<Option<Exchange>, &'static str> {
     let active = crate::permissions::peek(library, state_dir, None)?;
+    if active.problem.is_some() {
+        return Err(FILE_UNUSABLE);
+    }
     let stored = configured(library);
     let max_bytes = stored
         .as_ref()
@@ -183,6 +190,9 @@ pub fn in_force(
         let mut exchange = checked(written, state_dir, max_bytes)?;
         exchange.from_file = true;
         return Ok(Some(exchange));
+    }
+    if active.file_names_exchange {
+        return Ok(None);
     }
     let Some(stored) = stored? else {
         return Ok(None);
@@ -222,6 +232,7 @@ pub fn problem(code: &str) -> &'static str {
             "is no longer the folder that was set up"
         }
         "exchange_folder_changed" => "changed while it was in use; try again",
+        FILE_UNUSABLE => "is not used while permissions.yaml can't be used",
         _ => "can't be opened",
     }
 }
@@ -270,6 +281,30 @@ pub fn next_step(code: &str, dir: &Path) -> String {
     };
     if code == "exchange_folder_not_set_up_run_skykeep_mcp_exchange_in_a_terminal" {
         return fix(code, dir, None);
+    }
+    if code == FILE_UNUSABLE {
+        let file = crate::status::quoted(&dir.join(crate::permissions::FILE_NAME));
+        // The file's mistake, read without making a library in a folder that has none.
+        let why = (dir.join("library.db").is_file())
+            .then(|| quince_core::Library::open(dir).ok())
+            .flatten()
+            .and_then(|l| crate::permissions::peek(&l, dir, None).ok())
+            .and_then(|a| a.problem)
+            .map(|p| {
+                format!(
+                    " ({})",
+                    p.chars()
+                        .filter(|c| !c.is_control())
+                        .take(300)
+                        .collect::<String>()
+                )
+            })
+            .unwrap_or_default();
+        return format!(
+            "{file} can't be used{why}, so no exchange folder is in use and nothing was uploaded or downloaded. Fix the {} line or the mistake in that file, then try again. In your own terminal, {} says what is wrong.",
+            crate::permissions::EXCHANGE_KEY,
+            crate::status::with_dir("skykeep-mcp permissions show", dir)
+        );
     }
     match &written {
         Some(w) => format!(

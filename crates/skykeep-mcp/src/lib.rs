@@ -461,6 +461,7 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
         "policy_state_changed" => Some(format!("This folder was copied or moved, so its approval mode belongs to the old folder. In your own terminal, run {} to choose it again.", status::with_dir("skykeep-mcp setup", dir))),
         "policy_account_changed" => Some(format!("The approval mode was set before sign-in or for another account. In your own terminal, run {} to choose it again.", status::with_dir("skykeep-mcp setup", dir))),
         "login_required" => Some(format!("Sign in with {} in a terminal you opened yourself, not one an AI app runs. Never send passwords or codes to MCP or chat.", status::with_dir("skykeep-mcp login", dir))),
+        sync::ITEM_CHANGED => Some(sync::ITEM_CHANGED_STEP.to_string()),
         "conflict" => Some("The item changed since you read it, so nothing was queued. Read it again with notes_get or reminders_get, then ask again with its current base_etag.".to_string()),
         "mutation_refused" => Some(format!("The change could not be saved to the local queue, so nothing was queued. In your own terminal, run {} to check this folder, then try again.", status::with_dir("skykeep-mcp status", dir))),
         "drive_read_failed_nothing_sent" => Some("Apple's answer about the item could not be read, so nothing was sent. Try again in a moment; if it keeps failing, run drive_refresh on the folder.".to_string()),

@@ -982,6 +982,49 @@ async fn the_exchange_folder_in_permissions_yaml_wins_and_a_bad_one_never_falls_
         assert!(!f.exchange.join("again.pdf").exists(), "no fallback");
         assert!(!other.join("again.pdf").exists());
     }
+    // A line or file that can't be used refuses downloads and uploads, with the file to fix,
+    // and never falls back to the folder used before it (issue 75).
+    write(&other);
+    std::fs::write(other.join("up.txt"), b"up").unwrap();
+    for broken in [
+        "version: 1\nexchange_folder: rel/ex\n".to_string(),
+        format!(
+            "version: 1\nexchange_folder: {}\nbogus_key: 1\n",
+            other.display()
+        ),
+    ] {
+        std::fs::write(&file, &broken).unwrap();
+        for args in [
+            json!({"action":"download","id":REPORT,"local":"again.pdf"}),
+            json!({"action":"upload","path":"/","local":"up.txt"}),
+        ] {
+            let reply = call(&mut f.server, args).await;
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            let body = text(&reply);
+            assert_eq!(body["error"], "exchange_folder_file_unusable", "{body}");
+            let next = body["instructions"].as_str().unwrap();
+            assert!(next.contains("permissions.yaml"), "{next}");
+        }
+        assert!(!f.exchange.join("again.pdf").exists(), "no fallback");
+        assert!(!other.join("again.pdf").exists(), "no fallback");
+    }
+    // The line taken out: no exchange folder, not the one set up in the terminal.
+    std::fs::write(&file, "version: 1\n").unwrap();
+    let reply = call(
+        &mut f.server,
+        json!({"action":"download","id":REPORT,"local":"again.pdf"}),
+    )
+    .await;
+    assert_eq!(
+        text(&reply)["error"],
+        "exchange_folder_not_set_up_run_skykeep_mcp_exchange_in_a_terminal",
+        "{reply}"
+    );
+    assert!(!f.exchange.join("again.pdf").exists(), "no fallback");
+    assert!(
+        !writes(&f.remote).await.iter().any(|w| w.contains("upload")),
+        "nothing was uploaded"
+    );
     std::fs::remove_dir_all(&other).unwrap();
 }
 

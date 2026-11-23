@@ -98,12 +98,41 @@ fn send_context(
 
 fn bounded_context(context: Value) -> Result<Value, &'static str> {
     crate::bounded_value(&context, crate::MAX_ARGUMENT_BYTES)?;
-    Ok(context)
+    Ok(without_version_stamps(context))
 }
+
+/// A context without the etag and modified time of its items. Apple gives a note or reminder
+/// a new etag (and time) when it next reads it back, even one just made, with nothing else
+/// changed. The native sender checks the etag against Apple's record itself, so only the
+/// fields a write depends on are compared here.
+fn without_version_stamps(mut context: Value) -> Value {
+    fn strip(item: &mut Value) {
+        if let Some(item) = item.as_object_mut() {
+            item.remove("etag");
+            item.remove("modifiedAt");
+        }
+    }
+    if let Some(context) = context.as_object_mut() {
+        if let Some(item) = context.get_mut("item") {
+            strip(item);
+        }
+        if let Some(children) = context.get_mut("children").and_then(Value::as_array_mut) {
+            children.iter_mut().for_each(strip);
+        }
+    }
+    context
+}
+
+/// The item a queued write is bound to changed on iCloud (or was deleted there) after the
+/// write was queued, so the write is never sent.
+pub(crate) const ITEM_CHANGED: &str = "item_changed_on_icloud_since_queued";
+
+/// The next step after [`ITEM_CHANGED`].
+pub(crate) const ITEM_CHANGED_STEP: &str = "The item changed on iCloud after this write was queued, or was deleted there, so the write was not sent. Read the item again with notes_get or reminders_get, then ask for the change again.";
 
 /// Grant failures that belong to one queued write. Anything else (an unreadable library,
 /// a changed policy, account or directory) still stops the whole pass.
-const QUARANTINABLE: [&str; 12] = [
+const QUARANTINABLE: [&str; 13] = [
     "payload_too_large",
     "preview_too_large",
     "invalid_preview",
@@ -111,6 +140,7 @@ const QUARANTINABLE: [&str; 12] = [
     "authorization_too_large",
     "invalid_authorization",
     "write_authorization_stale",
+    ITEM_CHANGED,
     "write_mode_stricter",
     "not_found",
     "operation_too_large",
@@ -180,7 +210,11 @@ fn shown_reason(reason: &str) -> &str {
 
 /// A refused write as MCP may show it: identifiers and a reason code, never the payload.
 pub(crate) fn refused_view(r: &quince_core::outbox::RefusedBrief) -> Value {
-    json!({"id":r.id,"service":r.service,"kind":r.kind,"record":r.record,"reason":shown_reason(&r.reason)})
+    let mut view = json!({"id":r.id,"service":r.service,"kind":r.kind,"record":r.record,"reason":shown_reason(&r.reason)});
+    if r.reason.strip_prefix("mcp_quarantine:") == Some(ITEM_CHANGED) {
+        view["instructions"] = json!(ITEM_CHANGED_STEP);
+    }
+    view
 }
 
 fn refused_ids(dir: &Path) -> Result<Vec<i64>, &'static str> {
@@ -262,9 +296,25 @@ fn authorization_check(
     if !(fields == 3 || (fields == 4 && grant["mode"].is_string()))
         || grant["policy"] != binding.policy
         || grant["pending"] != pending_value(p)
-        || (context && grant["context"] != send_context(library, p)?)
     {
         return Err("write_authorization_stale");
+    }
+    // The item itself changed, or is gone, since the write was queued. A grant recorded
+    // before the etag and time were left out is compared without them too. A create's
+    // context holds no item; a change there is a stale grant.
+    if context {
+        let queued = without_version_stamps(grant["context"].clone());
+        let now = match send_context(library, p) {
+            Err("not_found") => return Err(ITEM_CHANGED),
+            now => now?,
+        };
+        if queued != now {
+            return Err(if queued.get("item").is_some() {
+                ITEM_CHANGED
+            } else {
+                "write_authorization_stale"
+            });
+        }
     }
     // Queued under a looser mode than the one in force now: never sent.
     let queued = grant["mode"].as_str().unwrap_or(&stored.mode).to_string();
@@ -417,6 +467,9 @@ async fn sync_pass(
                     if configured {
                         let mut library = data.lock().await;
                         if let Err(reason) = authorized(&library, dir, &p) {
+                            // The drain refuses the row; its grant is emptied as before
+                            // the pass, so it can never be sent under this grant again.
+                            let _ = library.set_state(&format!("mcp.authorization.{}", p.id), "");
                             let _ = library.set_state(&reread_key(service), "1");
                             return Err(quince_icloud::Error::Refused(format!(
                                 "mcp_quarantine:{reason}"

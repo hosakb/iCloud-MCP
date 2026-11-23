@@ -5,7 +5,9 @@
 //!
 //! The server reads the file before every tool call, so an edit counts at once. A missing
 //! file leaves everything to the folder's approval mode. An unusable file never loosens
-//! anything: the last valid rules and settings stay in use, and with none every deletion asks.
+//! anything: the last valid rules and approval mode stay in use, and with none every deletion
+//! asks. No exchange folder is used while the file can't be: uploads and downloads are
+//! refused. A usable file without `exchange_folder:` names no exchange folder.
 //! Every load that changes them is recorded in the library, so `status` and `permissions
 //! show` can say what became looser. No MCP tool reads or writes the file or these records;
 //! the server writes one rule only when the person picks "Always allow" on an approval card.
@@ -740,9 +742,12 @@ pub struct Active {
     pub mode: Option<String>,
     /// Whether [`Self::mode`] comes from the file (or the last valid file).
     pub mode_in_file: bool,
-    /// The file's exchange folder as written (or the last valid file's). `None` leaves the
-    /// folder set up with `skykeep-mcp exchange`, if any.
+    /// The file's exchange folder as written. `None` while the file can't be used; with no
+    /// file, `None` leaves the folder set up with `skykeep-mcp exchange`, if any.
     pub exchange: Option<String>,
+    /// A usable file is there, so its `exchange_folder:` line, or the lack of one, is the
+    /// only exchange folder: a folder set up before is not used.
+    pub file_names_exchange: bool,
     /// Changes whenever the file's bytes change; binds approvals to the rules they saw.
     pub fingerprint: String,
     pub problem: Option<String>,
@@ -885,10 +890,12 @@ fn stored_exchange(library: &Library) -> Option<String> {
 
 /// The changes in the two settings: the approval mode, then the exchange folder. A different
 /// folder counts as looser, because its files become reachable; no folder counts as stricter.
+/// `exchange` is the folder in force after the load, as written.
 fn setting_changes(
     library: &Library,
     stored: &Value,
     settings: &Settings,
+    exchange: &Option<String>,
     mode: Option<&str>,
     require_all: bool,
 ) -> (Vec<Value>, Vec<Value>) {
@@ -904,12 +911,17 @@ fn setting_changes(
             stricter.push(change);
         }
     }
+    // The folder set up in the terminal counts only while there is no file.
     let legacy = stored_exchange(library);
     let before = stored[EXCHANGE_KEY]
         .as_str()
         .map(str::to_string)
-        .or_else(|| legacy.clone());
-    let after = settings.exchange.clone().or(legacy);
+        .or_else(|| {
+            (stored.is_null() || stored["fingerprint"] == "missing")
+                .then(|| legacy.clone())
+                .flatten()
+        });
+    let after = exchange.clone();
     if before != after {
         let change = json!({"name":EXCHANGE_KEY,"from":before.as_deref().unwrap_or("none"),"to":after.as_deref().unwrap_or("none")});
         if after.is_some() {
@@ -969,12 +981,20 @@ fn evaluate(
         Source::Invalid(problem) => (settings_from(&last_valid), Some(problem), last_valid),
     };
     let kept_from = problem.as_ref().and(valid["at"].as_u64());
+    // The last valid file's folder is never kept: a broken file names none.
+    let file_names_exchange = print != "missing";
+    let exchange = if problem.is_some() {
+        None
+    } else {
+        settings.exchange.clone()
+    };
     let active = Active {
         strict: problem.is_some() && valid.is_null(),
         rules: settings.rules.clone(),
         mode: settings.mode.clone().or(mode.map(str::to_string)),
         mode_in_file: settings.mode.is_some(),
-        exchange: settings.exchange.clone(),
+        exchange: exchange.clone(),
+        file_names_exchange,
         fingerprint: print.clone(),
         problem,
         kept_from,
@@ -985,8 +1005,14 @@ fn evaluate(
     let first = stored.is_null();
     let old = rules_from(&stored["rules"]);
     let require_all = require_all(library);
+    // The folder in force: with no file, the one set up in the terminal.
+    let in_force = if file_names_exchange {
+        exchange
+    } else {
+        stored_exchange(library)
+    };
     let (mut looser, mut stricter) =
-        setting_changes(library, &stored, &settings, mode, require_all);
+        setting_changes(library, &stored, &settings, &in_force, mode, require_all);
     let (rules_looser, rules_stricter) =
         diff(&old, &active.rules, active.mode.as_deref(), require_all);
     looser.extend(rules_looser);
@@ -995,6 +1021,7 @@ fn evaluate(
     // A folder that never had a file has nothing to report.
     let quiet = first && print == "missing";
     let mut record = settings_value(&settings);
+    record[EXCHANGE_KEY] = json!(active.exchange);
     for (key, value) in [
         ("fingerprint", json!(print)),
         ("problem", json!(active.problem)),
@@ -1240,8 +1267,17 @@ pub fn status(library: &Library, dir: &Path, mode: Option<&str>) -> Vec<(String,
 
 /// The status line for the exchange folder in force, with the fix when it can't be used.
 fn exchange_line(library: &Library, dir: &Path, active: &Active) -> (String, Option<String>) {
-    let legacy = crate::exchange::configured(library).ok().flatten();
     let file = dir.join(FILE_NAME);
+    if active.problem.is_some() {
+        return (
+            "Exchange folder: none while permissions.yaml can't be used, so Drive and Photos uploads and Drive downloads are refused.".into(),
+            Some(crate::exchange::next_step(crate::exchange::FILE_UNUSABLE, dir)),
+        );
+    }
+    let legacy = crate::exchange::configured(library)
+        .ok()
+        .flatten()
+        .filter(|_| !active.file_names_exchange);
     let (written, from) = match (&active.exchange, &legacy) {
         (Some(written), _) => (written.clone(), "set in permissions.yaml"),
         (None, Some(e)) => (
