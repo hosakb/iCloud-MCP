@@ -1078,12 +1078,19 @@ fn client_for(dir: &Path, seam: &Seam) -> Result<Client, &'static str> {
     Client::with(dir, Endpoints::default(), store).map_err(|_| "login_required")
 }
 
+/// The engine's answer past its size limit (`quince_icloud::bounded`): Apple answered, so
+/// the write may have been made, and the reply was not read.
+fn past_size_limit(e: &quince_icloud::Error) -> bool {
+    matches!(e, quince_icloud::Error::Protocol(why) if why.starts_with("the answer was larger than "))
+}
+
 fn apple_error(e: &quince_icloud::Error) -> &'static str {
     use quince_icloud::Error as E;
     match e {
         E::ReauthRequired => "login_required",
         E::NeedsDeviceApproval => PAUSED,
         E::Conflict => CHANGED,
+        _ if past_size_limit(e) => UNKNOWN,
         E::Refused(_) | E::Protocol(_) => REFUSED,
         _ => UNKNOWN,
     }
@@ -1496,6 +1503,22 @@ pub(crate) fn tool() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An answer past the engine's size limit is no refusal: the write may have been made, so
+    /// the outcome is unknown, for a create and for an update or delete alike.
+    #[test]
+    fn an_answer_past_the_size_limit_is_an_unknown_outcome() {
+        // As quince_icloud::bounded::reply_within words it.
+        let e = quince_icloud::Error::Protocol(format!(
+            "the answer was larger than {} MB",
+            quince_icloud::bounded::MOST_REPLY / (1024 * 1024)
+        ));
+        assert_eq!(apple_error(&e), UNKNOWN, "{e:?}");
+        assert_eq!(create_error(&e), UNKNOWN, "{e:?}");
+        // Any other answer not understood is still Apple's refusal.
+        let other = quince_icloud::Error::Protocol("synthetic".into());
+        assert_eq!(apple_error(&other), REFUSED);
+    }
 
     #[test]
     fn apple_and_read_failures_say_what_to_do() {
