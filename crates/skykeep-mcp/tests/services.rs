@@ -492,3 +492,53 @@ async fn a_busy_folder_never_makes_services_look_switched_off() {
     assert!(!instructions.contains("Switched off"), "{instructions}");
     drop(held);
 }
+
+#[tokio::test]
+async fn a_busy_folder_with_a_broken_file_keeps_the_services_in_force() {
+    let mut f = folder(Some("yolo")).await;
+    let dir = f.path();
+    write_file(&dir, "version: 1\nservices: [reminders]\n");
+    let (_, failed) = result(&mut f, 1, "reminders_lists", json!({})).await;
+    assert!(!failed);
+    write_file(&dir, "version: 1\nbogus: 1\n");
+    let held = skykeep_mcp::state::PrivateState::open(&dir).unwrap();
+    let names = listed(&mut f).await;
+    assert!(names.iter().any(|n| n == "reminders_list"), "{names:?}");
+    assert!(!names.iter().any(|n| n == "photos_list"), "{names:?}");
+    // Deleted while busy: still the services in force.
+    std::fs::remove_file(dir.join(permissions::FILE_NAME)).unwrap();
+    let names = listed(&mut f).await;
+    assert!(!names.iter().any(|n| n == "photos_list"), "{names:?}");
+    drop(held);
+}
+
+/// The file goes missing and gets broken, in either order: the same services stay on.
+#[tokio::test]
+async fn deleting_and_breaking_the_file_in_either_order_keeps_the_same_services() {
+    for delete_first in [true, false] {
+        let mut f = folder(Some("yolo")).await;
+        let dir = f.path();
+        let file = dir.join(permissions::FILE_NAME);
+        write_file(&dir, "version: 1\nservices: [reminders]\n");
+        result(&mut f, 1, "reminders_lists", json!({})).await;
+        let broken = "version: 1\nservices: [reminders, photos\n";
+        if delete_first {
+            std::fs::remove_file(&file).unwrap();
+            result(&mut f, 2, "reminders_lists", json!({})).await;
+            write_file(&dir, broken);
+        } else {
+            write_file(&dir, broken);
+            result(&mut f, 2, "reminders_lists", json!({})).await;
+            std::fs::remove_file(&file).unwrap();
+        }
+        for (id, tool, off) in [(3, "reminders_lists", false), (4, "photos_albums", true)] {
+            let (value, failed) = result(&mut f, id, tool, json!({})).await;
+            assert_eq!(failed, off, "delete first: {delete_first}: {value}");
+        }
+        let shown = permissions::show(&dir, true).unwrap();
+        assert!(
+            shown.contains("Services on: Reminders."),
+            "delete first: {delete_first}: {shown}"
+        );
+    }
+}

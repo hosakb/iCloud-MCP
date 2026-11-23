@@ -1593,3 +1593,73 @@ async fn a_looser_edit_made_before_the_services_step_is_still_reported() {
         script.screen
     );
 }
+
+/// Apple's answer to starting sign-in can't be read: setup says so in its own words, and the
+/// next try, refused before it reaches Apple so the account isn't locked, says about how long
+/// to wait. Neither is the text for Apple asking to wait.
+#[tokio::test]
+async fn an_unreadable_sign_in_answer_and_the_wait_after_it_are_said_plainly() {
+    let _one = serial().await;
+    let server = apple().await;
+    Mock::given(method("POST"))
+        .and(path("/appleauth/auth/signin/init"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let (_parent, dir) = folder();
+    let mut answers = folder_answers(&dir);
+    answers.push(Ask(""));
+    answers.extend([Secret(ACCOUNT), Secret(PASSWORD)]);
+    let mut script = Script::new(answers);
+    let unreadable = run(&mut script, &dir, &server).await.unwrap_err();
+    let again = format!("skykeep-mcp setup --state-dir {} again", dir.display());
+    assert_eq!(
+        unreadable,
+        format!("Apple sent an answer iCloud-MCP couldn't read. Wait a minute, then run {again}.")
+    );
+    script.done();
+
+    let mut answers = folder_answers(&dir);
+    answers.extend([Secret(ACCOUNT), Secret(PASSWORD)]);
+    let mut script = Script::new(answers);
+    let waiting = run(&mut script, &dir, &server).await.unwrap_err();
+    assert_eq!(
+        waiting,
+        format!("iCloud-MCP is waiting before the next sign-in so Apple doesn't lock the account. Run {again} in about 1 minute.")
+    );
+    assert!(!waiting.contains("Apple asked to wait"), "{waiting}");
+    script.done();
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(
+        reqs.iter()
+            .filter(|r| r.url.path() == "/appleauth/auth/signin/init")
+            .count(),
+        1,
+        "the second try never reached Apple"
+    );
+}
+
+#[tokio::test]
+async fn switching_a_service_off_in_setup_sets_its_queued_changes_aside_at_once() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    first_run_with_keyring(&dir, &server).await;
+    {
+        let mut library = quince_core::Library::open(&dir).unwrap();
+        library
+            .outbox_push("reminders", "R-1", "create", "{}")
+            .unwrap();
+        library.outbox_push("notes", "N-1", "create", "{}").unwrap();
+    }
+    // Notes only: the waiting Reminders change is set aside in the step that saves it.
+    let mut script = Script::new(vec![Ask(""), Ask(""), Services("1")]);
+    let _ = run(&mut script, &dir, &server).await;
+    let library = quince_core::Library::open(&dir).unwrap();
+    assert!(library.outbox_pending("reminders").unwrap().is_empty());
+    assert_eq!(library.outbox_pending("notes").unwrap().len(), 1);
+    let refused = library.outbox_refused_brief().unwrap();
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].reason, "mcp_quarantine:service_switched_off");
+}

@@ -1158,10 +1158,11 @@ fn evaluate(
         }
         Source::Invalid(problem, services) => {
             let mut settings = settings_from(&last_valid);
-            // No valid file was loaded before: what the broken file itself says, and without
-            // a line there, the services in force until now.
+            // No valid file since the last one went missing, or none ever: the services in
+            // force until now when some were switched off, else what the broken file says.
+            // Either way the order of deleting and breaking the file changes nothing.
             if last_valid.is_null() {
-                settings.services = services.or_else(|| settings_from(&stored).services);
+                settings.services = settings_from(&stored).services.or(services);
             }
             (settings, Some(problem), last_valid)
         }
