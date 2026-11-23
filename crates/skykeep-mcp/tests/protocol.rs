@@ -1142,7 +1142,7 @@ async fn cards_turn_on_from_protocol_2025_06_18_and_the_answer_names_the_asked_v
 }
 
 #[tokio::test]
-async fn a_client_without_cards_is_told_so_without_naming_a_product() {
+async fn a_client_without_cards_is_told_which_clients_show_the_card() {
     for version in ["2025-06-18", "2025-11-25"] {
         let (_dir, mut server, library) = configured("writes_only", json!({}), version).await;
         let reply = server

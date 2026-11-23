@@ -472,12 +472,12 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client
         "{screen}"
     );
     let line = format!(
-        "\"skykeep\": {{\"args\":[\"--state-dir\",\"{}\"],\"command\":\"/opt/skykeep/skykeep-mcp\"}}",
+        "\"icloud\": {{\"args\":[\"--state-dir\",\"{}\"],\"command\":\"/opt/skykeep/skykeep-mcp\"}}",
         dir.display()
     );
     assert!(screen.contains(&line), "{screen}");
     let hermes = format!(
-        "mcp_servers:\n  skykeep:\n    command: \"/opt/skykeep/skykeep-mcp\"\n    args:\n      - \"--state-dir\"\n      - \"{}\"\n    enabled: true\n    sampling:\n      enabled: false",
+        "mcp_servers:\n  icloud:\n    command: \"/opt/skykeep/skykeep-mcp\"\n    args:\n      - \"--state-dir\"\n      - \"{}\"\n    enabled: true\n    sampling:\n      enabled: false",
         dir.display()
     );
     assert!(screen.contains(&hermes), "{screen}");
@@ -1491,5 +1491,51 @@ async fn status_quotes_the_folder_in_its_chmod_commands() {
     assert!(
         text.contains(&format!("chmod 600 '{}'", shared.display())),
         "{text}"
+    );
+}
+
+/// Apple's answer to starting sign-in can't be read: setup says so in its own words, and the
+/// next try, refused before it reaches Apple so the account isn't locked, says about how long
+/// to wait. Neither is the text for Apple asking to wait.
+#[tokio::test]
+async fn an_unreadable_sign_in_answer_and_the_wait_after_it_are_said_plainly() {
+    let _one = serial().await;
+    let server = apple().await;
+    Mock::given(method("POST"))
+        .and(path("/appleauth/auth/signin/init"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let (_parent, dir) = folder();
+    let mut answers = folder_answers(&dir);
+    answers.push(Ask(""));
+    answers.extend([Secret(ACCOUNT), Secret(PASSWORD)]);
+    let mut script = Script::new(answers);
+    let unreadable = run(&mut script, &dir, &server).await.unwrap_err();
+    let again = format!("skykeep-mcp setup --state-dir {} again", dir.display());
+    assert_eq!(
+        unreadable,
+        format!("Apple sent an answer iCloud-MCP couldn't read. Wait a minute, then run {again}.")
+    );
+    script.done();
+
+    let mut answers = folder_answers(&dir);
+    answers.extend([Secret(ACCOUNT), Secret(PASSWORD)]);
+    let mut script = Script::new(answers);
+    let waiting = run(&mut script, &dir, &server).await.unwrap_err();
+    assert_eq!(
+        waiting,
+        format!("iCloud-MCP is waiting before the next sign-in so Apple doesn't lock the account. Run {again} in about 1 minute.")
+    );
+    assert!(!waiting.contains("Apple asked to wait"), "{waiting}");
+    script.done();
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(
+        reqs.iter()
+            .filter(|r| r.url.path() == "/appleauth/auth/signin/init")
+            .count(),
+        1,
+        "the second try never reached Apple"
     );
 }
