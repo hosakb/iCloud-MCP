@@ -13,7 +13,8 @@
 //! Apple's record at the moment of writing, so the words added and taken away here are merged
 //! into it. The reply says what Apple's answer showed; a change is not read back afterwards, so
 //! its `remote_verified` stays false. An upload is the exception: the new photo's asset and
-//! master records are then looked up by id (no library read), put in the cache, and the reply's
+//! master records are then looked up by id (no library read); when the asset points at that
+//! master and the photo is neither hidden nor deleted, it is put in the cache, and the reply's
 //! `usable_now` says whether the photo can be changed at once. The change-tag rule above holds
 //! for it as for any photo: its version is the one that lookup read.
 //!
@@ -825,30 +826,20 @@ pub(crate) async fn run(
         Err(_) => return Err(UNKNOWN),
     };
     // A new photo is read back by its two record ids, outside the upload's own time, so a
-    // slow lookup never turns a finished upload into an unknown outcome.
-    let mut read_back = false;
+    // slow lookup never turns a finished upload into an unknown outcome. Only a photo the
+    // read tools would show goes into the cache.
+    let mut read = None;
     if let Settled::Uploaded(made, zone) = &settled {
-        let found = tokio::time::timeout(limits.change_timeout, new_photo(&conn, zone, made))
-            .await
-            .ok()
-            .flatten();
-        let usable = found.as_ref().is_some_and(|p| !p.hidden && !p.deleted);
-        read_back = found.is_some();
-        value["usable_now"] = json!(usable);
-        if read_back {
-            value["checked"] = json!(
-                "Apple's upload job said the photo is made, and the photo was read back by its id"
-            );
-        }
-        value["next"] = json!(if usable {
-            "the new photo can be changed now with photos_write and its id"
-        } else {
-            "run photos_refresh before changing the new photo"
-        });
-        if let Some(p) = found {
-            settled = Settled::Photo(Box::new(p));
-        }
+        read = Some(
+            tokio::time::timeout(limits.change_timeout, new_photo(&conn, zone, made))
+                .await
+                .unwrap_or(ReadBack::NotShown),
+        );
     }
+    if let Some(ReadBack::Photo(p)) = &read {
+        settled = Settled::Photo(p.clone());
+    }
+    let mut cached = false;
     // The cache follows Apple's answer, only while the directory still belongs to the
     // account the change ran as.
     let mut note = if value["outcome"] == "sent_not_confirmed" {
@@ -861,42 +852,110 @@ pub(crate) async fn run(
             let stored = match settled {
                 Settled::Photo(p) => library.put_photos(&[*p]).is_ok(),
                 Settled::Album(a) => library.put_album(&a).is_ok(),
-                Settled::Uploaded(..) => {
-                    note = "the new photo is in the local cache after photos_refresh";
-                    true
-                }
+                // Not read back: nothing to cache; the reply says so.
+                Settled::Uploaded(..) => false,
             };
             if !stored {
                 note = "the local cache could not be updated; run photos_refresh";
             }
+            cached = stored;
         }
+    }
+    value["remote_verified"] = json!(false);
+    if let Some(read) = &read {
+        note = upload_reply(&mut value, read, cached);
     }
     value["action"] = json!(op.action());
     value["cache"] = json!(note);
-    value["remote_verified"] = json!(read_back);
     Ok(value)
 }
 
+/// What the lookup by id found of a new upload.
+enum ReadBack {
+    /// A photo the read tools show, as Apple holds it now.
+    Photo(Box<Photo>),
+    /// Apple's records, but hidden or in Recently Deleted.
+    Hidden,
+    /// The asset names a master other than the one the upload named.
+    OtherMaster,
+    /// Not both records, or the lookup failed or took too long.
+    NotShown,
+}
+
+/// The upload reply's `usable_now`, `next` and, when not usable, `not_usable`, set only from
+/// what the lookup found and whether the cache now holds the photo for the same account.
+/// Answers the cache note.
+fn upload_reply(value: &mut Value, read: &ReadBack, cached: bool) -> &'static str {
+    let read_back = matches!(read, ReadBack::Photo(_) | ReadBack::Hidden);
+    if read_back {
+        value["checked"] = json!(
+            "Apple's upload job said the photo is made, and the photo was read back by its id"
+        );
+    }
+    value["remote_verified"] = json!(read_back);
+    let (why, note) = match read {
+        ReadBack::Photo(_) if cached => {
+            value["usable_now"] = json!(true);
+            value["next"] = json!("the new photo can be changed now with photos_write and its id");
+            return "the new photo is in the local cache";
+        }
+        ReadBack::Photo(_) => (
+            "not_in_local_cache",
+            "the new photo could not be put in the local cache; run photos_refresh",
+        ),
+        ReadBack::Hidden => (
+            "hidden_or_in_recently_deleted",
+            "the new photo is hidden or in Recently Deleted at Apple, so it is not in the local cache",
+        ),
+        ReadBack::OtherMaster => (
+            "asset_points_at_another_master",
+            "Apple's new photo record points at another original file than the upload named, so it was not put in the local cache",
+        ),
+        ReadBack::NotShown => (
+            "not_shown_by_apple_yet",
+            "the new photo is in the local cache after photos_refresh",
+        ),
+    };
+    value["usable_now"] = json!(false);
+    value["not_usable"] = json!(why);
+    value["next"] = json!("the photo was uploaded but can't be changed yet; run photos_refresh, find it with photos_list, then change it");
+    note
+}
+
 /// The photo an upload made, from Apple's asset and master records looked up by id: no read
-/// of the library. `None` when Apple does not show both yet, or the lookup failed.
-async fn new_photo(conn: &Conn, zone: &str, made: &upload::Uploaded) -> Option<Photo> {
+/// of the library. The asset has to point at the master the upload named.
+async fn new_photo(conn: &Conn, zone: &str, made: &upload::Uploaded) -> ReadBack {
     let zc = ZoneClient::new(
         conn.client.http(),
         &conn.ck,
         apple::CONTAINER,
         conn.client.service_params(),
     );
-    let records = zc
+    let Ok(records) = zc
         .lookup_records(zone, &[made.asset.clone(), made.master.clone()])
         .await
-        .ok()?;
-    let asset = records.get(&made.asset)?;
-    let master = records.get(&made.master)?;
+    else {
+        return ReadBack::NotShown;
+    };
+    let (Some(asset), Some(master)) = (records.get(&made.asset), records.get(&made.master)) else {
+        return ReadBack::NotShown;
+    };
     let is = |r: &Value, t: &str| r.get("recordType").and_then(Value::as_str) == Some(t);
     if !is(asset, ASSET) || !is(master, "CPLMaster") {
-        return None;
+        return ReadBack::NotShown;
     }
-    apple::photo_of(asset, master).filter(|p| p.id == made.asset && p.change_tag.is_some())
+    if asset
+        .pointer("/fields/masterRef/value/recordName")
+        .and_then(Value::as_str)
+        != Some(made.master.as_str())
+    {
+        return ReadBack::OtherMaster;
+    }
+    match apple::photo_of(asset, master).filter(|p| p.id == made.asset && p.change_tag.is_some()) {
+        Some(p) if p.hidden || p.deleted => ReadBack::Hidden,
+        Some(p) => ReadBack::Photo(Box::new(p)),
+        None => ReadBack::NotShown,
+    }
 }
 
 /// What the cache takes from a finished change. An upload names the photo Apple made and
@@ -1255,6 +1314,38 @@ mod tests {
     #[test]
     fn a_stalled_upload_is_an_unknown_outcome_like_a_dropped_connection() {
         assert_eq!(engine(&quince_icloud::Error::Stalled), UNKNOWN);
+    }
+
+    fn read_back_photo() -> Photo {
+        apple::photo_of(
+            &json!({"recordName":"A","recordType":"CPLAsset","recordChangeTag":"t","fields":{"masterRef":{"value":{"recordName":"M"}}}}),
+            &json!({"recordName":"M","recordType":"CPLMaster","fields":{}}),
+        )
+        .unwrap()
+    }
+
+    /// A photo read back is usable only once the cache holds it for the same account.
+    #[test]
+    fn a_new_photo_read_back_but_not_cached_is_not_usable() {
+        let mut value = json!({});
+        let note = upload_reply(
+            &mut value,
+            &ReadBack::Photo(Box::new(read_back_photo())),
+            false,
+        );
+        assert_eq!(value["usable_now"], false, "{value}");
+        assert_eq!(value["not_usable"], "not_in_local_cache", "{value}");
+        assert!(value["next"].as_str().unwrap().contains("photos_refresh"));
+        assert!(note.contains("photos_refresh"), "{note}");
+        let mut value = json!({});
+        let note = upload_reply(
+            &mut value,
+            &ReadBack::Photo(Box::new(read_back_photo())),
+            true,
+        );
+        assert_eq!(value["usable_now"], true, "{value}");
+        assert!(value.get("not_usable").is_none(), "{value}");
+        assert_eq!(note, "the new photo is in the local cache");
     }
 
     #[test]

@@ -635,12 +635,22 @@ const NEW_TAG: &str = "tag-new";
 
 /// Apple's lookup of the new photo's two records by id, as it answers right after the upload.
 async fn serve_new_photo(remote: &MockServer) {
+    serve_new_photo_with(remote, json!({}), "M-NEW").await;
+}
+
+/// The same lookup, with more asset fields and the master the asset points at.
+async fn serve_new_photo_with(remote: &MockServer, extra: Value, master_ref: &str) {
+    let mut fields = json!({"assetDate":{"value":1_710_000_000_000_i64},"addedDate":{"value":1_710_000_100_000_i64},
+        "masterRef":{"value":{"recordName":master_ref}}});
+    for (k, v) in extra.as_object().unwrap() {
+        fields[k] = v.clone();
+    }
     Mock::given(method("POST"))
         .and(path(format!("{DB}/records/lookup")))
         .and(body_string_contains("M-NEW"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"records":[
             {"recordName":"A-NEW","recordType":"CPLAsset","recordChangeTag":NEW_TAG,
-             "fields":{"assetDate":{"value":1_710_000_000_000_i64},"addedDate":{"value":1_710_000_100_000_i64}}},
+             "fields":fields},
             {"recordName":"M-NEW","recordType":"CPLMaster","recordChangeTag":"master-tag",
              "fields":{"filenameEnc":{"value":b64("IMG_0001.JPG")},"itemType":{"value":"public.jpeg"},
                        "resOriginalWidth":{"value":800},"resOriginalHeight":{"value":600}}}
@@ -666,6 +676,10 @@ async fn a_new_upload_is_read_back_by_id_and_can_be_changed_without_a_refresh() 
     assert_eq!(done["usable_now"], true, "{done}");
     assert_eq!(done["remote_verified"], true, "{done}");
     assert_eq!(done["photo"]["id"], "A-NEW");
+    assert_eq!(
+        done["cache"], "the new photo is in the local cache",
+        "{done}"
+    );
     // Only the new photo's two records were asked for: no library read.
     let asked_for: Vec<String> = asked(&f.remote).await;
     assert!(
@@ -742,8 +756,80 @@ async fn a_new_upload_apple_does_not_show_yet_says_to_refresh_first() {
     .await;
     assert_eq!(done["outcome"], "done", "{done}");
     assert_eq!(done["usable_now"], false, "{done}");
+    assert_eq!(done["not_usable"], "not_shown_by_apple_yet", "{done}");
     assert_eq!(done["remote_verified"], false, "{done}");
     assert!(done["next"].as_str().unwrap().contains("photos_refresh"));
+    assert_eq!(
+        error(
+            &mut f.server,
+            json!({"action":"set_rating","id":"A-NEW","rating":3})
+        )
+        .await,
+        "photo_not_found"
+    );
+}
+
+#[tokio::test]
+async fn a_new_upload_apple_shows_hidden_or_trashed_is_not_usable() {
+    for (extra, code) in [
+        (
+            json!({"isHidden":{"value":1}}),
+            "hidden_or_in_recently_deleted",
+        ),
+        (
+            json!({"isDeleted":{"value":1}}),
+            "hidden_or_in_recently_deleted",
+        ),
+    ] {
+        let mut f = fixture_at(Some("yolo"), NEW_TAG).await;
+        jpeg(&f.exchange.join("IMG_0001.JPG"), 4096);
+        serve_upload(&f.remote).await;
+        serve_new_photo_with(&f.remote, extra.clone(), "M-NEW").await;
+        let done = ok(
+            &mut f.server,
+            json!({"action":"upload","local":"IMG_0001.JPG"}),
+        )
+        .await;
+        assert_eq!(done["outcome"], "done", "{extra}: {done}");
+        assert_eq!(done["usable_now"], false, "{extra}: {done}");
+        assert_eq!(done["not_usable"], code, "{extra}: {done}");
+        assert_eq!(
+            error(
+                &mut f.server,
+                json!({"action":"set_title_and_caption","id":"A-NEW","title":"x"})
+            )
+            .await,
+            "photo_not_found",
+            "{extra}"
+        );
+        assert!(modified(&f.remote).await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_new_upload_whose_asset_points_at_another_master_is_refused() {
+    let mut f = fixture_at(Some("yolo"), NEW_TAG).await;
+    jpeg(&f.exchange.join("IMG_0001.JPG"), 4096);
+    serve_upload(&f.remote).await;
+    serve_new_photo_with(&f.remote, json!({}), "M-OTHER").await;
+    let done = ok(
+        &mut f.server,
+        json!({"action":"upload","local":"IMG_0001.JPG"}),
+    )
+    .await;
+    assert_eq!(done["outcome"], "done", "{done}");
+    assert_eq!(done["usable_now"], false, "{done}");
+    assert_eq!(
+        done["not_usable"], "asset_points_at_another_master",
+        "{done}"
+    );
+    assert_eq!(done["remote_verified"], false, "{done}");
+    assert!(done["next"].as_str().unwrap().contains("photos_refresh"));
+    assert!(quince_core::Library::open(f.dir.path())
+        .unwrap()
+        .photo("A-NEW")
+        .unwrap()
+        .is_none());
     assert_eq!(
         error(
             &mut f.server,
