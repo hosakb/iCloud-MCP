@@ -1,6 +1,6 @@
 # Privacy
 
-iCloud-MCP (the `skykeep-mcp` command) runs locally. It has no network listener, hosted account service, analytics or crash reporting. The MCP server syncs Notes and Reminders with Apple. The retained engine supports other services, but the MCP server does not sync or contact them.
+iCloud-MCP (the `skykeep-mcp` command) runs locally. It has no network listener, hosted account service, analytics or crash reporting. The MCP server reads and changes Notes, Reminders, Contacts, Calendar, Photos and iCloud Drive at Apple, and talks to no one else.
 
 ## Local data
 

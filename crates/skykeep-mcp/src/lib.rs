@@ -467,7 +467,8 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
         "policy_account_changed" => Some(format!("The approval mode was set before sign-in or for another account. In your own terminal, run {} to choose it again.", status::with_dir("skykeep-mcp setup", dir))),
         "login_required" => Some(format!("Not signed in, or the sign-in has expired. Ask the person to run {} in a terminal they opened themselves, not one an AI app runs; it signs in again. Never send passwords or codes to MCP or chat.", status::with_dir("skykeep-mcp setup", dir))),
         "not_signed_in" => Some(format!("Ask the person to run {} in a terminal they opened themselves to sign in, then run sync or a refresh tool. Never send passwords or codes to MCP or chat.", status::with_dir("skykeep-mcp setup", dir))),
-        "login_required_unlock_secure_storage" => Some(format!("The saved sign-in is in the system keyring, which is locked or can't be reached. Ask the person to unlock it by logging in to the desktop session, or to run {} in their own terminal to see why, then try again.", status::with_dir("skykeep-mcp status", dir))),
+        "login_required_unlock_secure_storage" => Some(format!("The saved sign-in can't be read: the system keyring is locked or can't be reached. Ask the person to unlock the keyring by logging in to their desktop session, or, if this folder keeps the sign-in in a protected file, to run {} in their own terminal. Then try again.", status::with_dir("skykeep-mcp unlock", dir))),
+        "login_required_complete_account_setup" => Some(format!("Apple says this Apple Account has not finished its iCloud setup. Ask the person to sign in once at icloud.com or on an Apple device and finish the setup there, then run {} in their own terminal.", status::with_dir("skykeep-mcp setup", dir))),
         "invalid_arguments" => Some("An argument is missing, unknown or of the wrong type. Check the call against the tool's fields in tools/list and send it again.".to_string()),
         "parent_required" => Some("reminders_list needs parent: the GUID of a reminder list. Get one from reminders_lists, then call reminders_list again with it.".to_string()),
         "unknown_tool" => Some("No tool has that name. Call tools/list to see the tools this server has, then use one of those names.".to_string()),
@@ -515,7 +516,6 @@ fn call_step(error: &str, name: &str, args: &Value) -> Option<String> {
     };
     match error {
         "invalid_arguments" => argument_problem(name, args).map(|problem| {
-            let problem: String = problem.chars().take(300).collect();
             format!("The arguments to {name} were not accepted: {problem}. Fix the call and send it again; tools/list shows each tool's fields.")
         }),
         "unknown_tool" => Some(format!(
@@ -526,24 +526,25 @@ fn call_step(error: &str, name: &str, args: &Value) -> Option<String> {
     }
 }
 
-/// What is wrong with `args` for tool `name`, in words: a missing, unknown or mistyped
-/// field, or the type's own reason. `None` for a tool this server doesn't have.
+/// What is wrong with `args` for tool `name`, in words: every missing, unknown or mistyped
+/// field the schema shows, the rules between fields (such as path or id), and the type's own
+/// reason when those find nothing. `None` for a tool this server doesn't have.
 fn argument_problem(name: &str, args: &Value) -> Option<String> {
+    let tool = tools().into_iter().find(|t| t["name"] == name)?;
+    let mut problems = Vec::new();
     let action = args["action"].as_str();
     if name == "reminders_write"
         && matches!(action, Some("delete" | "tick"))
         && args.get("base_etag").is_some()
     {
         let action = action.unwrap_or_default();
-        return Some(format!(
+        problems.push(format!(
             "reminders_write {action} takes no base_etag, only edit does; leave it out"
         ));
     }
-    let tool = tools().into_iter().find(|t| t["name"] == name)?;
-    if let Some(problem) = schema_problem(&tool["inputSchema"], args) {
-        return Some(problem);
-    }
-    let args = if args.is_null() {
+    problems.extend(schema_problems(&tool["inputSchema"], args));
+    problems.extend(field_rules(name, args));
+    let given = if args.is_null() {
         json!({})
     } else {
         args.clone()
@@ -553,49 +554,124 @@ fn argument_problem(name: &str, args: &Value) -> Option<String> {
             .err()
             .map(|e| e.to_string().replace('`', ""))
     }
-    match name {
-        "notes_get" | "reminders_get" => reason::<Get>(args),
-        "notes_list" | "reminders_list" => reason::<List>(args),
-        "notes_folders" | "reminders_lists" => reason::<Page>(args),
-        "notes_search" | "reminders_search" => reason::<Search>(args),
-        "sync" | "sync_status" | "auth_status" => reason::<Empty>(args),
-        "notes_write" => reason::<NoteWrite>(args),
-        "reminders_write" => reason::<ReminderWrite>(args),
+    let typed = match name {
+        "notes_get" | "reminders_get" => reason::<Get>(given),
+        "notes_list" | "reminders_list" => reason::<List>(given),
+        "notes_folders" | "reminders_lists" => reason::<Page>(given),
+        "notes_search" | "reminders_search" => reason::<Search>(given),
+        "sync" | "sync_status" | "auth_status" => reason::<Empty>(given),
+        "notes_write" => reason::<NoteWrite>(given),
+        "reminders_write" => reason::<ReminderWrite>(given),
+        drive_write::TOOL => drive_write::serde_reason(&given),
+        calendar_write::TOOL => calendar_write::serde_reason(&given),
         _ => None,
+    };
+    // The type stops at its first problem; it adds only one the checks above did not name.
+    if let Some(typed) = typed {
+        let field = typed.split_once("field ").map(|(_, rest)| {
+            rest.split([',', ' '])
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        });
+        let new_field = field.is_some_and(|f| !problems.iter().any(|p| p.contains(f.as_str())));
+        if problems.is_empty() || new_field {
+            problems.push(typed);
+        }
     }
-    .or_else(|| Some("a value is not one the tool takes".to_string()))
+    if problems.is_empty() {
+        problems.push(
+            "a value is not one the tool takes; check each field against tools/list".to_string(),
+        );
+    }
+    let mut text = problems.join("; ");
+    if text.chars().count() > 600 {
+        text = text.chars().take(600).collect::<String>() + "...";
+    }
+    Some(text)
 }
 
-/// The first way `args` breaks the tool's input schema: a missing required field, a field the
-/// tool doesn't have, a value of the wrong type, outside its range or not one of its choices.
-fn schema_problem(schema: &Value, args: &Value) -> Option<String> {
+/// Rules between fields that a schema can't say: exactly one of path and id, and the like.
+fn field_rules(name: &str, args: &Value) -> Vec<String> {
+    let has = |field: &str| args.get(field).is_some_and(|v| !v.is_null());
+    let one_of = |a: &str, b: &str, what: &str| -> Option<String> {
+        match (has(a), has(b)) {
+            (true, true) => Some(format!("give {what} as {a} or {b}, not both")),
+            (false, false) => Some(format!("give exactly one of {a} or {b} for {what}")),
+            _ => None,
+        }
+    };
+    let mut rules = Vec::new();
+    match name {
+        "drive_list" | "drive_refresh" if has("path") && has("id") => {
+            rules.push("give the folder as path or id, not both".to_string());
+        }
+        "drive_get" => rules.extend(one_of("path", "id", "the item")),
+        drive_write::TOOL => match args["action"].as_str() {
+            Some("create_folder" | "upload") => rules.extend(one_of("path", "id", "the folder")),
+            Some("rename" | "trash" | "delete_forever" | "download") => {
+                rules.extend(one_of("path", "id", "the item"));
+            }
+            Some("move") => {
+                rules.extend(one_of("path", "id", "the item"));
+                rules.extend(one_of(
+                    "destination_path",
+                    "destination_id",
+                    "the destination",
+                ));
+            }
+            _ => {}
+        },
+        "calendar_refresh" if has("from") != has("to") => {
+            rules.push("give both from and to, or neither".to_string());
+        }
+        _ => {}
+    }
+    rules
+}
+
+/// Every way `args` breaks the tool's input schema: missing required fields, fields the tool
+/// doesn't have, values of the wrong type, length or range, or not one of the choices.
+fn schema_problems(schema: &Value, args: &Value) -> Vec<String> {
     let empty = serde_json::Map::new();
     let given = match args {
         Value::Null => &empty,
         Value::Object(map) => map,
-        _ => return Some("the arguments must be a JSON object".to_string()),
+        _ => return vec!["the arguments must be a JSON object".to_string()],
     };
     let properties = schema["properties"].as_object().unwrap_or(&empty);
     let quoted = |name: &str| -> String {
         let short: String = name.chars().take(64).collect();
         json!(short).to_string()
     };
+    let mut problems = Vec::new();
     for field in schema["required"].as_array().into_iter().flatten() {
         let field = field.as_str().unwrap_or_default();
         if !given.contains_key(field) {
-            return Some(format!("the field {field} is missing"));
+            problems.push(format!("the field {field} is missing"));
+        }
+    }
+    let unknown: Vec<String> = given
+        .keys()
+        .filter(|key| !properties.contains_key(*key))
+        .take(5)
+        .map(|key| quoted(key))
+        .collect();
+    if !unknown.is_empty() && schema["additionalProperties"] == false {
+        let which = unknown.join(", ");
+        if properties.is_empty() {
+            problems.push(format!("this tool takes no arguments; leave out {which}"));
+        } else {
+            let known: Vec<&str> = properties.keys().map(String::as_str).collect();
+            problems.push(format!(
+                "{which} {} not a field of this tool; its fields are {}",
+                if unknown.len() == 1 { "is" } else { "are" },
+                known.join(", ")
+            ));
         }
     }
     for (key, value) in given {
         let Some(property) = properties.get(key) else {
-            if schema["additionalProperties"] == false {
-                let known: Vec<&str> = properties.keys().map(String::as_str).collect();
-                return Some(format!(
-                    "{} is not a field of this tool; its fields are {}",
-                    quoted(key),
-                    known.join(", ")
-                ));
-            }
             continue;
         };
         let types: Vec<&str> = match &property["type"] {
@@ -614,22 +690,25 @@ fn schema_problem(schema: &Value, args: &Value) -> Option<String> {
             _ => true,
         };
         if !types.is_empty() && !types.iter().any(|t| fits(t)) {
-            let article = |t: &&str| match *t {
-                "integer" => "an integer",
-                "object" => "an object",
-                "array" => "an array",
-                "null" => "null",
-                "boolean" => "true or false",
-                "number" => "a number",
-                _ => "a string",
-            };
-            let wanted: Vec<&str> = types.iter().map(article).collect();
-            return Some(format!("the field {key} must be {}", wanted.join(" or ")));
+            let wanted: Vec<&str> = types
+                .iter()
+                .map(|t| match *t {
+                    "integer" => "an integer",
+                    "object" => "an object",
+                    "array" => "an array",
+                    "null" => "null",
+                    "boolean" => "true or false",
+                    "number" => "a number",
+                    _ => "a string",
+                })
+                .collect();
+            problems.push(format!("the field {key} must be {}", wanted.join(" or ")));
+            continue;
         }
         if let Some(choices) = property["enum"].as_array() {
             if !choices.contains(value) {
                 let names: Vec<String> = choices.iter().map(Value::to_string).collect();
-                return Some(format!(
+                problems.push(format!(
                     "the field {key} must be one of {}",
                     names.join(", ")
                 ));
@@ -639,54 +718,99 @@ fn schema_problem(schema: &Value, args: &Value) -> Option<String> {
             let low = property["minimum"].as_f64().is_some_and(|m| n < m);
             let high = property["maximum"].as_f64().is_some_and(|m| n > m);
             if low || high {
-                return Some(format!(
-                    "the field {key} must be from {} to {}",
-                    property["minimum"],
-                    if property["maximum"].is_null() {
-                        json!("any size")
-                    } else {
-                        property["maximum"].clone()
-                    }
+                problems.push(match (&property["minimum"], &property["maximum"]) {
+                    (Value::Null, max) => format!("the field {key} must be at most {max}"),
+                    (min, Value::Null) => format!("the field {key} must be at least {min}"),
+                    (min, max) => format!("the field {key} must be from {min} to {max}"),
+                });
+            }
+        }
+        if let Some(text) = value.as_str() {
+            let length = text.chars().count() as u64;
+            if property["minLength"].as_u64().is_some_and(|m| length < m) {
+                problems.push(format!("the field {key} must not be empty"));
+            } else if property["maxLength"]
+                .as_u64()
+                .is_some_and(|m| text.len() as u64 > m)
+            {
+                problems.push(format!(
+                    "the field {key} is too long: at most {} bytes",
+                    property["maxLength"]
                 ));
             }
         }
     }
-    None
+    problems
 }
 
-/// Library key: whether the last sync or refresh could use the sign-in, `ok:` or `failed:`,
-/// then the Unix time and the account it was for.
+/// Library key: what the last sign-in check said for the bound account, as JSON: `state`
+/// (`ok`, `failed` or `signed_out`), `at` (Unix time), `code` (the error of a failed check)
+/// and `account`. Cleared by a new sign-in.
 const SESSION_KEY: &str = "mcp.session.checked";
 
-fn record_session(library: &mut Library, worked: bool) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let account = library
-        .state(ACCOUNT_KEY)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let word = if worked { "ok" } else { "failed" };
-    let _ = library.set_state(SESSION_KEY, &format!("{word}:{now}:{account}"));
+/// What the last sign-in check said for the account the folder is bound to now.
+enum Check {
+    Worked(u64),
+    Failed(u64, String),
+    SignedOut,
 }
 
-/// Records that a sync or refresh in `dir` could (`worked`) or could not use the sign-in, as
-/// the server does after each one; `auth_status` reports it.
-pub fn note_session_check(dir: &Path, worked: bool) {
-    if let Ok(mut library) = Library::open(dir) {
-        record_session(&mut library, worked);
+fn write_check(library: &mut Library, account: &str, state: &str, code: Option<&str>) {
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let value = json!({"state":state,"at":at,"code":code,"account":account});
+    let _ = library.set_state(SESSION_KEY, &value.to_string());
+}
+
+fn read_check(library: &Library) -> Option<Check> {
+    let raw = library.state(SESSION_KEY).ok().flatten()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let account = library.state(ACCOUNT_KEY).ok().flatten()?;
+    if value["account"] != json!(account) {
+        return None;
+    }
+    let at = value["at"].as_u64().unwrap_or_default();
+    match value["state"].as_str()? {
+        "ok" => Some(Check::Worked(at)),
+        "failed" => Some(Check::Failed(
+            at,
+            value["code"]
+                .as_str()
+                .unwrap_or("login_required")
+                .to_string(),
+        )),
+        "signed_out" => Some(Check::SignedOut),
+        _ => None,
     }
 }
 
-/// The last sign-in check for the bound account: whether it worked, and when.
-fn session_check(library: &Library) -> Option<(bool, u64)> {
-    let raw = library.state(SESSION_KEY).ok().flatten()?;
-    let mut parts = raw.splitn(3, ':');
-    let worked = parts.next()? == "ok";
-    let at = parts.next()?.parse().ok()?;
-    let account = library.state(ACCOUNT_KEY).ok().flatten()?;
-    (parts.next()? == account).then_some((worked, at))
+/// Records for the account `dir` is bound to that a sync or refresh could (`Ok`) or could
+/// not (`Err` with its code) use the sign-in, as the server does after each one.
+pub fn note_session_check(dir: &Path, outcome: Result<(), &str>) {
+    if let Ok(mut library) = Library::open(dir) {
+        if let Some(account) = library.state(ACCOUNT_KEY).ok().flatten() {
+            match outcome {
+                Ok(()) => write_check(&mut library, &account, "ok", None),
+                Err(code) => write_check(&mut library, &account, "failed", Some(code)),
+            }
+        }
+    }
+}
+
+/// Records that `skykeep-mcp logout` signed this folder out; `auth_status` says so until the
+/// next sign-in.
+pub fn note_signed_out(dir: &Path) {
+    if let Ok(mut library) = Library::open(dir) {
+        if let Some(account) = library.state(ACCOUNT_KEY).ok().flatten() {
+            write_check(&mut library, &account, "signed_out", None);
+        }
+    }
+}
+
+/// A new sign-in (login or setup): no earlier check speaks for it.
+pub(crate) fn forget_session_check(library: &mut Library) {
+    let _ = library.set_state(SESSION_KEY, "");
 }
 
 /// Read tools: without a sign-in they say so instead of an empty reply.
@@ -1121,6 +1245,9 @@ pub struct Server {
     contacts: contacts_write::Seam,
     /// How long a card waits for its answer.
     card_timeout: std::time::Duration,
+    /// The account the folder was bound to when the current call began, for the sign-in
+    /// record written after it.
+    call_account: Option<String>,
 }
 
 #[cfg(test)]
@@ -1602,6 +1729,7 @@ impl Server {
                 calendar: calendar_write::Seam::default(),
                 contacts: contacts_write::Seam::default(),
                 card_timeout: CARD_TIMEOUT,
+                call_account: None,
             }),
             Err("state_busy_retry") => Ok(Self {
                 library: None,
@@ -1617,6 +1745,7 @@ impl Server {
                 calendar: calendar_write::Seam::default(),
                 contacts: contacts_write::Seam::default(),
                 card_timeout: CARD_TIMEOUT,
+                call_account: None,
             }),
             Err(error) => Err(error),
         }
@@ -2047,6 +2176,7 @@ impl Server {
     }
 
     async fn call(&mut self, name: &str, args: Value) -> Result<Value, &'static str> {
+        self.call_account = None;
         let result = self.call_tool(name, args).await;
         // A sync or refresh that reached Apple tells whether the sign-in works.
         let checks = [
@@ -2056,33 +2186,44 @@ impl Server {
             "photos_refresh",
             "drive_refresh",
         ];
-        let session = match &result {
-            Ok(_) if checks.contains(&name) => Some(true),
+        let session: Option<Result<(), &str>> = match &result {
+            Ok(_) if checks.contains(&name) => Some(Ok(())),
             Err(e)
                 if e.starts_with("login_required")
                     && *e != "login_required_or_network_unavailable" =>
             {
-                Some(false)
+                Some(Err(*e))
             }
             _ => None,
         };
+        // Written under the folder's lock, and only for the account the call began with: a
+        // sign-in to another account in between is not marked by this call's outcome.
+        if let (Some(outcome), Some(account)) = (session, self.call_account.take()) {
+            if let Ok(held) = state::PrivateState::open(&self.dir) {
+                if let Ok(library) = self.ready(&held) {
+                    if library.state(ACCOUNT_KEY).ok().flatten().as_deref() == Some(&account) {
+                        match outcome {
+                            Ok(()) => write_check(library, &account, "ok", None),
+                            Err(code) => write_check(library, &account, "failed", Some(code)),
+                        }
+                    }
+                }
+            }
+        }
         // Without a sign-in, a read says so instead of an empty reply.
         let empty = READ_TOOLS.contains(&name)
             && match &result {
                 Err(e) => *e == "not_found",
                 Ok(value) => value["total"] == 0,
             };
-        if session.is_none() && !empty {
+        if !empty {
             return result;
         }
         // Only these few replies need the library again. The call has checked the folder and
-        // let go of its lock; a small read or state write needs no lock of its own.
-        let Ok(mut library) = Library::open(&self.dir) else {
+        // let go of its lock; reading one value needs no lock of its own.
+        let Ok(library) = Library::open(&self.dir) else {
             return result;
         };
-        if let Some(worked) = session {
-            record_session(&mut library, worked);
-        }
         let unbound = library.state(ACCOUNT_KEY).ok().flatten().is_none();
         if empty && unbound {
             return Err("not_signed_in");
@@ -2098,6 +2239,10 @@ impl Server {
         let contacts_seam = self.contacts.clone();
         let held = state::PrivateState::open(&self.dir)?;
         let dir = held.path.clone();
+        self.call_account = self
+            .ready(&held)?
+            .state(ACCOUNT_KEY)
+            .map_err(|_| "library_unavailable")?;
         let library = self.ready(&held)?;
         let configured = policy(library, &dir)?;
         let stored = stored_mode(library, &dir)?;
@@ -2428,18 +2573,28 @@ impl Server {
                     );
                 }
                 let setup_step = format!("Run {here} in your own trusted terminal, outside agent/tool capture. Never send passwords or codes to MCP or chat.");
-                Ok(match (bound, session_check(library)) {
+                let check = if bound { read_check(library) } else { None };
+                Ok(match (bound, check) {
                     (false, _) => {
                         json!({"status":"login_required","message":"Not signed in to iCloud.","instructions":setup_step,"session_checked":false})
                     }
-                    (true, Some((true, at))) => {
-                        json!({"status":"signed_in","message":"Signed in. The last sync or refresh used this sign-in.","checked_at":at,"session_checked":true})
+                    (true, Some(Check::SignedOut)) => {
+                        json!({"status":"signed_out","message":"Signed out on this computer. The cached data stays in the folder.","instructions":setup_step,"session_checked":false})
                     }
-                    (true, Some((false, at))) => {
-                        json!({"status":"login_required","message":"The last sync or refresh could not use the sign-in; it has expired or was signed out.","checked_at":at,"instructions":setup_step,"session_checked":true})
+                    (true, Some(Check::Worked(at))) => {
+                        json!({"status":"signed_in","message":"Signed in as of the last check: a sync or refresh at checked_at (Unix time) used this sign-in. It may have changed since.","checked_at":at,"session_checked":true})
+                    }
+                    (true, Some(Check::Failed(at, code))) => {
+                        let (status, message) = match code.as_str() {
+                            "login_required_unlock_secure_storage" => ("locked", "The last sync or refresh could not read the saved sign-in: the system keyring is locked or can't be reached."),
+                            "login_required_complete_account_setup" => ("login_required", "The last sync or refresh found that this Apple Account has not finished its iCloud setup."),
+                            _ => ("login_required", "The last sync or refresh could not use the sign-in: it has expired or was signed out elsewhere."),
+                        };
+                        let step = next_step(&code, &dir, &Value::Null).unwrap_or(setup_step);
+                        json!({"status":status,"message":message,"reason":code,"checked_at":at,"instructions":step,"session_checked":true})
                     }
                     (true, None) => {
-                        json!({"status":"session_unverified","message":"A sign-in is saved for this folder, but no sync or refresh has used it yet.","instructions":"Run sync (or a refresh tool) to check the sign-in. If it answers login_required, follow its instructions.","session_checked":false})
+                        json!({"status":"session_unverified","message":"A sign-in is saved for this folder, but no sync or refresh has used it yet.","instructions":"To check it, run contacts_refresh: it only reads and sends nothing. sync also checks it, but sends queued changes too. If either answers login_required, follow its instructions.","session_checked":false})
                     }
                 })
             }

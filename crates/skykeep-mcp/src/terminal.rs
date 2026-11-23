@@ -227,7 +227,7 @@ FOLDER defaults to ~/.local/share/skykeep-mcp.
             "usage: skykeep-mcp permissions show [--state-dir FOLDER]
 
 Shows the rules from permissions.yaml that are in use, the approval mode and exchange folder
-the file names, what changed since you last looked, and deletions that ran without asking.
+the file names, what changed since you last looked, and the rules saved from an approval card.
 FOLDER defaults to ~/.local/share/skykeep-mcp.
 "
         }
@@ -346,6 +346,17 @@ pub fn sentence(code: &str, dir: &std::path::Path) -> Option<String> {
         }
     };
     Some(own)
+}
+
+/// [`say`], with the code in brackets after the sentence when `error` is a code, so a script
+/// or a search can still find it.
+pub fn say_with_code(error: &str, dir: &std::path::Path) -> String {
+    let said = say(error, dir);
+    if error.contains(' ') || said.contains(error) {
+        said
+    } else {
+        format!("{said} ({error})")
+    }
 }
 
 /// [`sentence`], or one that names the code and says how to check the folder.

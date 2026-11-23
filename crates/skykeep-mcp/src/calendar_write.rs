@@ -282,6 +282,13 @@ fn parse_when(text: &str, all_day: bool) -> Option<When> {
     }
 }
 
+/// The deserializer's reason the arguments don't fit, for an error's instructions.
+pub(crate) fn serde_reason(args: &Value) -> Option<String> {
+    serde_json::from_value::<CalendarWrite>(args.clone())
+        .err()
+        .map(|e| e.to_string().replace('`', ""))
+}
+
 /// Checks the arguments before any approval prompt, cache or network use.
 pub(crate) fn validate(args: &Value) -> Result<CalendarWrite, &'static str> {
     if !args["action"]

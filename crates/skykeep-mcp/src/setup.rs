@@ -87,7 +87,7 @@ pub fn plain(code: &str) -> &str {
         "secure_storage_unavailable" => "The sign-in could not be saved in the chosen storage. Run skykeep-mcp status to see why.",
         "regional_login_retry_required" => "Apple asked to sign in again. Run skykeep-mcp setup again.",
         "account_mismatch_use_new_state_directory" => "This folder belongs to a different Apple Account. Run setup again and choose a new folder for this account.",
-        "security_key_sign_in_unsupported" => "This account signs in with a security key, which iCloud-MCP can’t use yet.",
+        "security_key_sign_in_unsupported" => "This account signs in with a security key, which iCloud-MCP can't use yet.",
         "too_many_code_requests_try_later" => "Setup already asked Apple for several codes. Wait a while, then run skykeep-mcp setup again.",
         "input_cancelled" => "Setup stopped. Run skykeep-mcp setup again to continue where you left off.",
         "input_timeout" => "Setup waited three minutes without an answer and stopped. Run skykeep-mcp setup again to continue.",
@@ -450,7 +450,7 @@ async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcom
         "args": ["--state-dir", folder],
     });
     c.say(&format!(
-        "\nMost MCP clients: add this line to the list of servers in the client's settings:\n\"icloud\": {config}\n\nHermes: add this to config.yaml (if it already has mcp_servers:, add only the icloud part under it):\nmcp_servers:\n  icloud:\n    command: {}\n    args:\n      - \"--state-dir\"\n      - {}\n    enabled: true\n    sampling:\n      enabled: false",
+        "\nMost MCP clients: add this line to the list of servers in the client's settings:\n\"icloud\": {config}\n\nHermes: add this to config.yaml (if it already has mcp_servers:, add only the icloud part under it):\nmcp_servers:\n  icloud:\n    command: {}\n    args:\n      - \"--state-dir\"\n      - {}\n    enabled: true\n    sampling:\n      enabled: false\n\nThe server's name in the client is now icloud. Rules the client keeps for the old name skykeep, such as tools it may call without asking, don't apply to icloud: set them again there.",
         yaml(&command),
         yaml(&folder),
     ))?;
@@ -525,7 +525,7 @@ fn step_storage(console: &mut dyn Console, env: &Env, dir: &Path) -> Result<bool
                         let _ = old.clear();
                     }
                     let _ = std::fs::remove_file(dir.join("cookies.json"));
-                    console.say("Setup could not reach the system keyring, so an older sign-in may stay there under the name skykeep-mcp. Nothing of it is used from now on.")?;
+                    console.say("Setup could not reach the system keyring, so an older sign-in may stay there under the service name \"skykeep-mcp\". Nothing of it is used from now on.")?;
                     storage::set_kind(dir, Kind::ProtectedFile)?;
                     new_protected(console, env, dir)?;
                     Ok(true)

@@ -23,7 +23,6 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
             "early_alert_account_unavailable_set_one_on_an_apple_device_then_sync",
             "folder_not_in_cache_use_path",
             "invalid_arguments_use_move_for_another_calendar",
-            "login_required_complete_account_setup",
             "login_required_or_network_unavailable",
             "logout_pending_unlock_keyring_and_retry",
             "not_found_at_apple_run_calendar_refresh",

@@ -119,7 +119,10 @@ fn unlock_rejects_bad_hours_and_older_commands_keep_their_usage() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("from 1 to 8760"));
     let out = program().args(["login"]).output().unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("usage:"));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim_end(),
+        "skykeep-mcp: Unknown command, or --state-dir FOLDER is missing. Run skykeep-mcp --help to see the commands."
+    );
     let out = program()
         .args(["status", "--password", "x"])
         .output()
@@ -134,6 +137,11 @@ fn help_lists_every_command_and_exits_zero() {
         assert_eq!(out.status.code(), Some(0), "{args:?}");
         let text = String::from_utf8(out.stdout).unwrap();
         assert!(text.starts_with("iCloud-MCP"), "{text}");
+        assert!(!text.contains("ran without asking"), "{text}");
+        assert!(
+            text.contains("the rules saved from an approval card"),
+            "{text}"
+        );
         for command in [
             "setup",
             "status",
@@ -196,6 +204,7 @@ fn each_command_has_its_own_help() {
                 "{args:?} shows the full list: {text}"
             );
             assert!(text.lines().count() >= 2, "{args:?}: {text}");
+            assert!(!text.contains("ran without asking"), "{args:?}: {text}");
         }
     }
 }
@@ -225,13 +234,23 @@ fn terminal_commands_print_a_sentence_not_a_code() {
         let text = String::from_utf8(out.stderr).unwrap();
         assert!(text.starts_with("skykeep-mcp: "), "{text}");
         assert!(text.contains("your own terminal"), "{args:?}: {text}");
-        assert!(!text.contains("user_owned_terminal_required"), "{text}");
-        assert!(text.trim_end().ends_with('.'), "{text}");
+        // The sentence first, then the code in brackets for scripts and searches.
+        assert!(
+            text.trim_end()
+                .ends_with(". (user_owned_terminal_required)"),
+            "{text}"
+        );
     }
     let out = program().args(["policy", "--state-dir"]).output().unwrap();
     let text = String::from_utf8(out.stderr).unwrap();
-    assert!(!text.contains("state_directory_required"), "{text}");
-    assert!(text.contains("--state-dir"), "{text}");
+    assert!(
+        text.starts_with("skykeep-mcp: --state-dir needs a folder after it"),
+        "{text}"
+    );
+    assert!(
+        text.trim_end().ends_with("(state_directory_required)"),
+        "{text}"
+    );
 }
 
 /// The policy command explains the mode it sets, not another one.

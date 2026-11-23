@@ -178,6 +178,13 @@ fn cloud_name(name: &str) -> Result<(), &'static str> {
     quince_icloud::drive::unusable_name(name).map_err(|_| "invalid_name")
 }
 
+/// The deserializer's reason the arguments don't fit, for an error's instructions.
+pub(crate) fn serde_reason(args: &Value) -> Option<String> {
+    serde_json::from_value::<DriveWrite>(args.clone())
+        .err()
+        .map(|e| e.to_string().replace('`', ""))
+}
+
 /// Checks the arguments before any approval prompt, cache or network use.
 pub(crate) fn validate(args: &Value) -> Result<DriveWrite, &'static str> {
     let op: DriveWrite = serde_json::from_value(args.clone()).map_err(|_| "invalid_arguments")?;

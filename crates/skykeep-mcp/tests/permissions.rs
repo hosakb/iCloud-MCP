@@ -1357,7 +1357,7 @@ async fn a_pipe_in_place_of_the_log_never_hangs() {
         .expect("permissions show must not wait on a pipe")
         .unwrap();
     assert!(
-        shown.contains("No deletion has run without asking"),
+        shown.contains("No approval card has saved a rule yet."),
         "{shown}"
     );
     let delete = call(

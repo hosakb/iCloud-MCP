@@ -1489,9 +1489,12 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
     }
     let log = log_lines(dir, 20);
     if log.is_empty() {
-        out.push_str("\nNo deletion has run without asking because of this file, and no card has saved a rule.\n");
+        out.push_str("\nNo approval card has saved a rule yet.\n");
     } else {
-        out.push_str(&format!("\nDeletions that ran without asking, and rules saved from a card, newest last (full list in {}):\n", dir.join(LOG_NAME).display()));
+        out.push_str(&format!(
+            "\nRules saved from an approval card, newest last (full list in {}):\n",
+            dir.join(LOG_NAME).display()
+        ));
         for line in &log {
             let at = when(line["at"].as_u64().unwrap_or(0));
             if line["source"] == "card" {
@@ -1501,7 +1504,7 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
                 ));
             } else {
                 out.push_str(&format!(
-                    "  {at} ran without asking: {}.{}\n",
+                    "  {at} ran without asking, under an older version: {}.{}\n",
                     shown(line["tool"].as_str().unwrap_or_default()),
                     shown(line["action"].as_str().unwrap_or_default())
                 ));

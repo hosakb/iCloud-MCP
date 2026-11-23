@@ -483,6 +483,10 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client
     );
     assert!(screen.contains(&hermes), "{screen}");
     assert!(
+        screen.contains("Rules the client keeps for the old name skykeep, such as tools it may call without asking, don't apply to icloud"),
+        "{screen}"
+    );
+    assert!(
         screen.contains("Setup is complete. The client must be able to show"),
         "{screen}"
     );
@@ -550,11 +554,18 @@ async fn signing_in_again_on_request_keeps_the_account_and_refuses_another() {
     let server = apple().await;
     let (_parent, dir) = folder();
     first_run_with_keyring(&dir, &server).await;
+    // A sync had found the sign-in expired; signing in again clears that.
+    skykeep_mcp::note_session_check(&dir, Err("login_required"));
+    assert_eq!(tool(&dir, "auth_status").await["status"], "login_required");
     let mut answers = vec![Ask(""), Ask("2")];
     answers.extend(sign_in_answers());
     answers.push(Ask(""));
     let script = ready(answers, &dir, &server).await;
     assert!(script.screen.contains("Type your Apple Account"));
+    assert_eq!(
+        tool(&dir, "auth_status").await["status"],
+        "session_unverified"
+    );
 
     let mut script = Script::new(vec![
         Ask(""),

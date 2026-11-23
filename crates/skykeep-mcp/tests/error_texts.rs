@@ -170,23 +170,88 @@ async fn auth_status_says_signed_in_once_a_sync_worked() {
     let mut s = server(dir.path(), true).await;
     let (reply, _) = call(&mut s, "auth_status", json!({})).await;
     assert_eq!(reply["status"], "session_unverified");
-    assert!(instructions(&reply).contains("sync"), "{reply}");
+    // The first check it suggests reads only and sends nothing.
+    let text = instructions(&reply);
+    assert!(
+        text.starts_with("To check it, run contacts_refresh"),
+        "{text}"
+    );
     // A sync or refresh reached Apple with this sign-in.
-    skykeep_mcp::note_session_check(dir.path(), true);
+    skykeep_mcp::note_session_check(dir.path(), Ok(()));
     let (reply, _) = call(&mut s, "auth_status", json!({})).await;
     assert_eq!(reply["status"], "signed_in", "{reply}");
     assert_eq!(reply["session_checked"], true);
+    assert!(reply["checked_at"].as_u64().unwrap() > 0, "{reply}");
     let text = reply["message"].as_str().unwrap();
-    assert!(text.starts_with("Signed in."), "{text}");
+    assert!(text.starts_with("Signed in as of the last check"), "{text}");
+    assert!(text.contains("may have changed since"), "{text}");
     assert!(!reply.to_string().contains("setup"), "{reply}");
     // A later sign-in failure counts over it.
-    skykeep_mcp::note_session_check(dir.path(), false);
+    skykeep_mcp::note_session_check(dir.path(), Err("login_required"));
     let (reply, _) = call(&mut s, "auth_status", json!({})).await;
     assert_eq!(reply["status"], "login_required", "{reply}");
+    assert_eq!(reply["reason"], "login_required", "{reply}");
     assert!(
         instructions(&reply).contains("skykeep-mcp setup"),
         "{reply}"
     );
+}
+
+/// A failed check keeps its reason: a locked keyring or an unfinished account says its own
+/// step, not "expired, run setup".
+#[tokio::test]
+async fn auth_status_keeps_the_reason_a_check_failed() {
+    let dir = private_dir();
+    let mut s = server(dir.path(), true).await;
+    skykeep_mcp::note_session_check(dir.path(), Err("login_required_unlock_secure_storage"));
+    let (reply, _) = call(&mut s, "auth_status", json!({})).await;
+    assert_eq!(reply["status"], "locked", "{reply}");
+    let text = instructions(&reply);
+    assert!(text.contains("unlock the keyring"), "{text}");
+    assert!(text.contains("skykeep-mcp unlock"), "{text}");
+    assert!(
+        !reply["message"].as_str().unwrap().contains("expired"),
+        "{reply}"
+    );
+    skykeep_mcp::note_session_check(dir.path(), Err("login_required_complete_account_setup"));
+    let (reply, _) = call(&mut s, "auth_status", json!({})).await;
+    assert_eq!(reply["status"], "login_required", "{reply}");
+    let text = instructions(&reply);
+    assert!(text.contains("icloud.com"), "{text}");
+    assert!(
+        !reply["message"].as_str().unwrap().contains("expired"),
+        "{reply}"
+    );
+}
+
+/// After logout the account link stays, but auth_status says signed out, until the next
+/// sign-in.
+#[tokio::test]
+async fn auth_status_says_signed_out_after_logout() {
+    let dir = private_dir();
+    let mut s = server(dir.path(), true).await;
+    skykeep_mcp::note_session_check(dir.path(), Ok(()));
+    skykeep_mcp::note_signed_out(dir.path());
+    let (reply, _) = call(&mut s, "auth_status", json!({})).await;
+    assert_eq!(reply["status"], "signed_out", "{reply}");
+    assert!(
+        instructions(&reply).contains("skykeep-mcp setup"),
+        "{reply}"
+    );
+}
+
+/// A check recorded for one account says nothing once the folder is bound to another.
+#[tokio::test]
+async fn a_check_counts_only_for_the_account_it_was_made_for() {
+    let dir = private_dir();
+    let mut s = server(dir.path(), true).await;
+    skykeep_mcp::note_session_check(dir.path(), Ok(()));
+    quince_core::Library::open(dir.path())
+        .unwrap()
+        .set_state("account", "another-synthetic-account")
+        .unwrap();
+    let (reply, _) = call(&mut s, "auth_status", json!({})).await;
+    assert_eq!(reply["status"], "session_unverified", "{reply}");
 }
 
 /// Sign-in steps say `setup` everywhere: the tools and auth_status agree.
@@ -252,4 +317,85 @@ async fn the_server_introduces_itself_as_icloud_mcp() {
         .unwrap()
         .starts_with("iCloud-MCP"));
     assert!(!result.to_string().contains("Skykeep"), "{result}");
+}
+
+/// invalid_arguments names the field for the Drive, Contacts, Calendar and Photos tools too,
+/// and a call with two mistakes hears about both.
+#[tokio::test]
+async fn invalid_arguments_names_the_field_for_every_service() {
+    let dir = private_dir();
+    let mut s = server(dir.path(), true).await;
+    let cases = [
+        (
+            "drive_write",
+            json!({"action":"rename"}),
+            vec!["path or id", "name"],
+        ),
+        (
+            "drive_list",
+            json!({"path":"/","id":"FOLDER::x"}),
+            vec!["not both"],
+        ),
+        ("drive_get", json!({}), vec!["exactly one of path or id"]),
+        ("contacts_get", json!({"guid":""}), vec!["guid"]),
+        ("calendar_events", json!({}), vec!["from", "to", "timezone"]),
+        (
+            "calendar_refresh",
+            json!({"from":"2026-01-01"}),
+            vec!["both from and to"],
+        ),
+        ("photos_get", json!({}), vec!["id"]),
+        (
+            "auth_status",
+            json!({"extra":1}),
+            vec!["takes no arguments", "extra"],
+        ),
+        (
+            "notes_write",
+            json!({"colour":"red"}),
+            vec!["action", "colour"],
+        ),
+    ];
+    for (name, args, words) in cases {
+        let (reply, failed) = call(&mut s, name, args.clone()).await;
+        assert!(failed, "{name}: {reply}");
+        assert_eq!(
+            reply["error"], "invalid_arguments",
+            "{name} {args}: {reply}"
+        );
+        let text = instructions(&reply);
+        for word in words {
+            assert!(text.contains(word), "{name} {args} lacks {word}: {text}");
+        }
+        assert!(!text.contains("its fields are ."), "{text}");
+    }
+}
+
+/// Every tool that answers invalid_arguments to a field it doesn't have names that field.
+#[tokio::test]
+async fn every_tool_names_a_field_it_does_not_have() {
+    let dir = private_dir();
+    let mut s = server(dir.path(), true).await;
+    let list = s
+        .handle(json!({"id":2,"method":"tools/list"}))
+        .await
+        .unwrap();
+    let mut checked = 0;
+    for tool in list["result"]["tools"].as_array().unwrap() {
+        let name = tool["name"].as_str().unwrap();
+        let (reply, failed) = call(&mut s, name, json!({"zz_not_a_field":1})).await;
+        assert!(failed, "{name}: {reply}");
+        if reply["error"] != "invalid_arguments" {
+            continue;
+        }
+        checked += 1;
+        assert!(
+            instructions(&reply).contains("zz_not_a_field"),
+            "{name}: {reply}"
+        );
+    }
+    assert!(
+        checked >= 25,
+        "only {checked} tools answered invalid_arguments"
+    );
 }

@@ -46,13 +46,19 @@ async fn main() {
     {
         all.remove(0);
         if let Err(error) = guided(&command, all).await {
-            eprintln!("skykeep-mcp: {}", terminal::say(&error, &named_dir));
+            eprintln!(
+                "skykeep-mcp: {}",
+                terminal::say_with_code(&error, &named_dir)
+            );
             std::process::exit(1);
         }
         return;
     }
     if let Err(error) = run(all).await {
-        eprintln!("skykeep-mcp: {}", terminal::say(error, &named_dir));
+        eprintln!(
+            "skykeep-mcp: {}",
+            terminal::say_with_code(error, &named_dir)
+        );
         std::process::exit(1);
     }
 }
@@ -67,7 +73,7 @@ Start here, in a terminal window you opened yourself:
                                             after a restart, open the protected file with its passphrase
   skykeep-mcp permissions show [--state-dir FOLDER]
                                             the rules from permissions.yaml in use, what changed
-                                            since you last looked, and deletions that ran without asking
+                                            since you last looked, and the rules saved from an approval card
 
 More commands (each needs --state-dir FOLDER):
   skykeep-mcp login       sign in to Apple again
@@ -336,7 +342,7 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
         "serve".into()
     };
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--state-dir")) {
-        return Err("usage: skykeep-mcp [setup|status|unlock] or skykeep-mcp [login|logout] --state-dir PRIVATE_DIRECTORY");
+        return Err("Unknown command, or --state-dir FOLDER is missing. Run skykeep-mcp --help to see the commands.");
     }
     let dir = PathBuf::from(args.next().ok_or("state_directory_required")?);
     let policy_mode = if command == "policy" {
@@ -499,10 +505,8 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
             if store.sign_out_pending() {
                 return Err("logout_pending_unlock_keyring_and_retry");
             }
-            // The last sign-in check no longer says anything about this folder.
-            if let Ok(mut library) = quince_core::Library::open(&held.path) {
-                let _ = library.set_state("mcp.session.checked", "");
-            }
+            // auth_status says signed out until the next sign-in.
+            skykeep_mcp::note_signed_out(&held.path);
             eprintln!(
                 "Signed out locally. Cached notes and reminders remain in the private directory."
             );
