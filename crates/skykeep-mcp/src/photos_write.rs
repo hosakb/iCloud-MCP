@@ -913,12 +913,17 @@ fn upload_reply(value: &mut Value, read: &ReadBack, cached: bool) -> &'static st
         ),
         ReadBack::NotShown => (
             "not_shown_by_apple_yet",
-            "the new photo is in the local cache after photos_refresh",
+            "run photos_refresh to put the new photo in the local cache",
         ),
     };
     value["usable_now"] = json!(false);
     value["not_usable"] = json!(why);
-    value["next"] = json!("the photo was uploaded but can't be changed yet; run photos_refresh, find it with photos_list, then change it");
+    // photos_list never shows a hidden photo or one in Recently Deleted.
+    value["next"] = json!(if matches!(read, ReadBack::Hidden) {
+        "the photo was uploaded, but it is hidden or in Recently Deleted, so the photo list doesn't show it and it can't be changed here; restore it in the Photos app first, then run photos_refresh"
+    } else {
+        "the photo was uploaded but can't be changed yet; run photos_refresh, find it with photos_list, then change it"
+    });
     note
 }
 

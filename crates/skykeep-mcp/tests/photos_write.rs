@@ -757,6 +757,11 @@ async fn a_new_upload_apple_does_not_show_yet_says_to_refresh_first() {
     assert_eq!(done["outcome"], "done", "{done}");
     assert_eq!(done["usable_now"], false, "{done}");
     assert_eq!(done["not_usable"], "not_shown_by_apple_yet", "{done}");
+    assert_eq!(
+        done["cache"], "run photos_refresh to put the new photo in the local cache",
+        "{done}"
+    );
+    assert!(done["next"].as_str().unwrap().contains("photos_list"));
     assert_eq!(done["remote_verified"], false, "{done}");
     assert!(done["next"].as_str().unwrap().contains("photos_refresh"));
     assert_eq!(
@@ -793,6 +798,11 @@ async fn a_new_upload_apple_shows_hidden_or_trashed_is_not_usable() {
         assert_eq!(done["outcome"], "done", "{extra}: {done}");
         assert_eq!(done["usable_now"], false, "{extra}: {done}");
         assert_eq!(done["not_usable"], code, "{extra}: {done}");
+        // photos_list never shows such a photo: it has to be restored in Photos first.
+        let next = done["next"].as_str().unwrap();
+        assert!(next.contains("hidden or in Recently Deleted"), "{next}");
+        assert!(next.contains("Photos app"), "{next}");
+        assert!(!next.contains("photos_list"), "{next}");
         assert_eq!(
             error(
                 &mut f.server,
