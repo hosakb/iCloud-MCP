@@ -435,8 +435,8 @@ async fn sync_names_only_writes_cloudkit_took_whole() {
         json!({"action":"create","list_guid":"list","title":"Synthetic plain"}),
     )
     .await;
-    // Its date is written after the reminder, and a failure there is only logged: it leaves
-    // the queue, but CloudKit's taking it is not confirmed.
+    // Its date is written after the reminder, and a failure there keeps the create queued:
+    // leaving the queue, it is accepted like any other create.
     let (_, dated) = call(
         &mut server,
         json!({"action":"create","list_guid":"list","title":"Synthetic dated","due_at":DUE}),
@@ -460,7 +460,7 @@ async fn sync_names_only_writes_cloudkit_took_whole() {
     assert_eq!(left[0]["kind"], "create");
     assert_eq!(left[0]["outcome"], "cloudkit_accepted");
     assert_eq!(left[1]["record"], dated["guid"]);
-    assert_eq!(left[1]["outcome"], "finished_unconfirmed");
+    assert_eq!(left[1]["outcome"], "cloudkit_accepted");
     let waiting = library.outbox_pending("reminders").unwrap();
     assert_eq!(waiting.len(), 1);
     assert_eq!(waiting[0].record, repeating["guid"].as_str().unwrap());
@@ -695,4 +695,185 @@ async fn a_create_superseded_by_a_deletion_keeps_its_step_note_until_discarded()
         "superseded_by_approved_deletion",
     )
     .await;
+}
+
+/// A pretend Apple that makes a new reminder and answers its date or flag write with
+/// `update`, so a dated create is made but its second write is not taken.
+async fn apple_taking_only_the_create(update: ResponseTemplate) -> MockServer {
+    let remote = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/setup/ws/1/validate"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"dsInfo":{"dsid":"1234567890"},"webservices":{"ckdatabasews":{"url":remote.uri()}}}))).mount(&remote).await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/changes/zone$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"zones":[{"records":[],"syncToken":"synthetic","moreComing":false}]}),
+        ))
+        .mount(&remote)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/records/lookup$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"records":[]})))
+        .mount(&remote)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/records/modify$"))
+        .and(wiremock::matchers::body_string_contains(
+            r#""operationType":"create""#,
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"records":[{"recordName":"synthetic"}]})),
+        )
+        .with_priority(1)
+        .mount(&remote)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/records/modify$"))
+        .respond_with(update)
+        .mount(&remote)
+        .await;
+    remote
+}
+
+/// `sync_status` as a client calls it. The synthetic session file `saved_client` wrote is made
+/// private first, as the program's own umask keeps every file it writes.
+async fn sync_status(server: &mut Server, dir: &std::path::Path) -> Value {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    server.handle(json!({"id":1,"method":"initialize"})).await;
+    let response = server
+        .handle(
+            json!({"id":3,"method":"tools/call","params":{"name":"sync_status","arguments":{}}}),
+        )
+        .await
+        .unwrap();
+    serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+/// A dated plain create whose date Apple was busy for stays queued, is not reported as having
+/// left the queue, and `sync` and `sync_status` say why it waits with a fixed code, never
+/// Apple's words.
+#[tokio::test]
+async fn a_dated_create_apple_was_busy_for_waits_and_says_why() {
+    let remote = apple_taking_only_the_create(
+        ResponseTemplate::new(503).set_body_string("SYNTHETIC-APPLE-WORDS"),
+    )
+    .await;
+    let (dir, mut server, mut library) = setup(false);
+    library
+        .set_state("account", &quince_sync::queue::account_tag("1234567890"))
+        .unwrap();
+    server.set_policy("yolo").unwrap();
+    let (failed, dated) = call(
+        &mut server,
+        json!({"action":"create","list_guid":"list","title":"Synthetic dated","due_at":DUE,"flagged":true}),
+    )
+    .await;
+    assert!(!failed, "{dated}");
+    let result =
+        skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+            .await
+            .unwrap();
+    assert_eq!(result["left_queue_this_sync"], json!([]), "{result}");
+    assert_eq!(result["queued"], 1);
+    let waiting = result["pending_recent"].as_array().unwrap();
+    assert_eq!(waiting.len(), 1, "{result}");
+    assert_eq!(waiting[0]["service"], "reminders");
+    assert_eq!(waiting[0]["kind"], "create");
+    assert_eq!(waiting[0]["record"], dated["guid"]);
+    assert_eq!(waiting[0]["reason"], "waiting_apple_busy");
+    assert!(waiting[0].get("try").is_none(), "{result}");
+    let step = waiting[0]["next_step"].as_str().unwrap();
+    assert!(step.contains("Nothing to do"), "{step}");
+    assert!(!result.to_string().contains("SYNTHETIC-APPLE-WORDS"));
+
+    let status = sync_status(&mut server, dir.path()).await;
+    let reminders = &status["services"][1];
+    assert_eq!(reminders["service"], "reminders", "{status}");
+    assert_eq!(reminders["pending"], 1);
+    assert_eq!(reminders["pending_recent"], json!(waiting));
+    assert_eq!(status["services"][0]["pending_recent"], json!([]));
+    assert!(!status.to_string().contains("SYNTHETIC-APPLE-WORDS"));
+}
+
+/// An answer that can't be read is tried again a few times: the waiting change says which
+/// try it is and how many there are.
+#[tokio::test]
+async fn a_create_whose_answer_was_not_understood_says_which_try() {
+    let remote =
+        apple_taking_only_the_create(ResponseTemplate::new(200).set_body_string("not json")).await;
+    let (dir, mut server, mut library) = setup(false);
+    library
+        .set_state("account", &quince_sync::queue::account_tag("1234567890"))
+        .unwrap();
+    server.set_policy("yolo").unwrap();
+    let (failed, dated) = call(
+        &mut server,
+        json!({"action":"create","list_guid":"list","title":"Synthetic dated","due_at":DUE}),
+    )
+    .await;
+    assert!(!failed, "{dated}");
+    // A second change waits behind it for the same reason.
+    let (failed, second) = call(
+        &mut server,
+        json!({"action":"create","list_guid":"list","title":"Synthetic second"}),
+    )
+    .await;
+    assert!(!failed, "{second}");
+    let status = sync_status(&mut server, dir.path()).await;
+    let before = status["services"][1]["pending_recent"].as_array().unwrap();
+    assert_eq!(before.len(), 2, "{status}");
+    assert_eq!(before[0]["reason"], "waiting_to_send");
+    assert!(before[0]["next_step"].as_str().unwrap().contains("sync"));
+    for round in 1..=2 {
+        let result =
+            skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+                .await
+                .unwrap();
+        let waiting = result["pending_recent"].as_array().unwrap();
+        assert_eq!(waiting.len(), 2, "{result}");
+        assert_eq!(waiting[0]["record"], dated["guid"]);
+        assert_eq!(waiting[0]["reason"], "waiting_answer_not_understood");
+        assert_eq!(waiting[0]["try"], round);
+        assert_eq!(waiting[0]["tries_allowed"], 5);
+        let step = waiting[0]["next_step"].as_str().unwrap();
+        assert!(step.contains("run sync again"), "{step}");
+        // Never sent: it waits behind the first, and says so rather than Apple's answer.
+        assert_eq!(waiting[1]["record"], second["guid"]);
+        assert_eq!(
+            waiting[1]["reason"],
+            format!("waiting_behind_change_{}", waiting[0]["id"])
+        );
+        assert!(waiting[1].get("try").is_none(), "{result}");
+        let step = waiting[1]["next_step"].as_str().unwrap();
+        assert!(
+            step.contains(&format!("change {}", waiting[0]["id"])),
+            "{step}"
+        );
+    }
+}
+
+/// The sync and sync_status descriptions say that waiting changes come with a reason.
+#[tokio::test]
+async fn the_sync_tools_describe_pending_recent() {
+    let (_dir, mut server, _library) = setup(false);
+    server.handle(json!({"id":1,"method":"initialize"})).await;
+    let tools = server
+        .handle(json!({"id":2,"method":"tools/list"}))
+        .await
+        .unwrap();
+    for name in ["sync", "sync_status"] {
+        let tool = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap();
+        let text = tool["description"].as_str().unwrap();
+        assert!(text.contains("pending_recent"), "{name}: {text}");
+    }
 }
