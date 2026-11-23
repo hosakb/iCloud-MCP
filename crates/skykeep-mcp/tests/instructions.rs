@@ -219,6 +219,7 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
         "Only terminal commands return these, and the terminal prints its own sentence for each (checked below).",
         &[
             "account_locked_visit_account_website",
+            "apple_answer_unreadable",
             "auth_cooldown_try_later",
             "authentication_unavailable",
             "code_incorrect_or_expired",
@@ -241,6 +242,7 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
             "quarantine_retire_cancelled",
             "regional_login_retry_required",
             "security_key_sign_in_unsupported",
+            "sign_in_wait_protects_account",
             "state_directory_required",
             "storage_already_chosen",
             "terminal_unavailable",

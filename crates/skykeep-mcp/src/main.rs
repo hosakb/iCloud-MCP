@@ -55,10 +55,17 @@ async fn main() {
         return;
     }
     if let Err(error) = run(all).await {
-        eprintln!(
-            "skykeep-mcp: {}",
-            terminal::say_with_code(error, &named_dir)
-        );
+        // A sign-in code is said as setup says it, the rest as each command says it; the
+        // code follows in brackets.
+        let said = skykeep_mcp::login::terminal_text(error);
+        if said != error {
+            eprintln!("skykeep-mcp: {said} ({error})");
+        } else {
+            eprintln!(
+                "skykeep-mcp: {}",
+                terminal::say_with_code(error, &named_dir)
+            );
+        }
         std::process::exit(1);
     }
 }

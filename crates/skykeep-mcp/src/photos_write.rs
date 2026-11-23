@@ -1105,7 +1105,6 @@ impl Work<'_> {
     }
 }
 
-/// The fields each action takes, for a refusal of its arguments.
 /// The field names each action takes, besides `action`.
 fn names_of(action: &str) -> &'static [&'static str] {
     match action {
@@ -1122,6 +1121,7 @@ fn names_of(action: &str) -> &'static [&'static str] {
     }
 }
 
+/// The fields each action takes, for a refusal of its arguments.
 fn fields_of(action: &str) -> Option<&'static str> {
     Some(match action {
         "upload" => "local (a relative path inside the exchange folder)",
@@ -1159,7 +1159,7 @@ pub(crate) fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String>
                 let named = if unknown.is_empty() {
                     String::new()
                 } else {
-                    format!("{} is not a field of photos_write {action}. ", unknown.join(", "))
+                    format!("{} of photos_write {action}. ", crate::not_fields(&unknown))
                 };
                 format!("{named}photos_write {action} takes {fields}, and no other fields. Check the names and types and ask again.")
             }

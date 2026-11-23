@@ -465,6 +465,7 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
         "already_in_destination" => Some("Nothing to do: the item is already in that folder in iCloud Drive.".to_string()),
         "policy_state_changed" => Some(format!("This folder was copied or moved, so its approval mode belongs to the old folder. In your own terminal, run {} to choose it again.", status::with_dir("skykeep-mcp setup", dir))),
         "policy_account_changed" => Some(format!("The approval mode was set before sign-in or for another account. In your own terminal, run {} to choose it again.", status::with_dir("skykeep-mcp setup", dir))),
+        e if e.starts_with("waiting_") => sync::waiting_step(e, dir),
         "login_required" => Some(format!("Not signed in, or the sign-in has expired. Ask the person to run {} in a terminal they opened themselves, not one an AI app runs; it signs in again. Never send passwords or codes to MCP or chat.", status::with_dir("skykeep-mcp setup", dir))),
         "not_signed_in" => Some(format!("Ask the person to run {} in a terminal they opened themselves to sign in, then run sync or a refresh tool. Never send passwords or codes to MCP or chat.", status::with_dir("skykeep-mcp setup", dir))),
         "login_required_unlock_secure_storage" => Some(format!("The saved sign-in can't be read: the system keyring is locked or can't be reached. Ask the person to unlock the keyring by logging in to their desktop session, or, if this folder keeps the sign-in in a protected file, to run {} in their own terminal. Then try again.", status::with_dir("skykeep-mcp unlock", dir))),
@@ -591,6 +592,16 @@ fn argument_problem(name: &str, args: &Value) -> Option<String> {
     Some(text)
 }
 
+/// "a is not a field", "a and b are not fields", "a, b and c are not fields": the start of a
+/// sentence that names fields a tool doesn't have.
+pub(crate) fn not_fields(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => format!("{one} is not a field"),
+        [rest @ .., last] => format!("{} and {last} are not fields", rest.join(", ")),
+    }
+}
+
 /// Rules between fields that a schema can't say: exactly one of path and id, and the like.
 fn field_rules(name: &str, args: &Value) -> Vec<String> {
     let has = |field: &str| args.get(field).is_some_and(|v| !v.is_null());
@@ -664,8 +675,8 @@ fn schema_problems(schema: &Value, args: &Value) -> Vec<String> {
         } else {
             let known: Vec<&str> = properties.keys().map(String::as_str).collect();
             problems.push(format!(
-                "{which} {} not a field of this tool; its fields are {}",
-                if unknown.len() == 1 { "is" } else { "are" },
+                "{} of this tool; its fields are {}",
+                not_fields(&unknown),
                 known.join(", ")
             ));
         }
@@ -2559,10 +2570,13 @@ impl Server {
                         .outbox_pending(service)
                         .map_err(|_| "library_unavailable")?
                         .len();
+                    let pending_recent = sync::pending_view(library, &dir, service)?;
                     // Upstream error text may hold HTTP bodies; report only that one exists.
                     services.push(
                         json!({"service":service,"last_synced_at":h.and_then(|h| h.last_synced_at),
                         "last_error":h.is_some_and(|h| h.last_error.is_some()),"pending":pending,
+                        // Why each waits, as a fixed code, oldest first.
+                        "pending_recent":pending_recent,
                         "refused":mine.len(),
                         // Identifiers and reason codes only, newest last, so the user can be
                         // told which approved write will not be sent and why.
@@ -3572,8 +3586,8 @@ pub(crate) fn tools() -> Vec<Value> {
     tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). A create can also repeat daily and alert at or before its due time. Deletions always ask the user on the approval card. Queued is not CloudKit-accepted; sync reports accepted writes. No field-level remote verification. Only edit takes base_etag; delete and tick take no base_etag. An etag can change once more after a create or a sync, so read the reminder again with reminders_get just before an edit.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."},"base_etag":{"type":["string","null"],"description":"Edit only: the etag from reminders_get. A newer cached copy returns conflict."},"repeat":{"type":"object","description":"Create only. Repeats daily from due_at, until the end of the given day or for ever. Needs due_at.","properties":{"frequency":{"enum":["daily"]},"until":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"YYYY-MM-DD, the last day it repeats. Read in timezone for a timed due_at, in UTC for an all-day one."}},"required":["frequency"],"additionalProperties":false},"due_time_alert":{"type":"boolean","description":"Create only. Alert at due_at. Needs a timed (not all-day) due_at."},"early_alert":{"type":"object","description":"Create only. Alert this long before due_at. Needs a timed due_at, and an early alert set on one of the user's reminders from an Apple device and then a sync, so the account id it carries is in the cache.","properties":{"amount":{"type":"integer","minimum":1,"maximum":10000},"unit":{"enum":["minutes","hours","days","weeks","months"]}},"required":["amount","unit"],"additionalProperties":false},"timezone":{"type":"string","maxLength":64,"description":"Create only. IANA zone the timed due_at and its alerts are kept in, such as Europe/Berlin. Default: this computer's zone, or UTC if it has no IANA name."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
     tools.push(json!({"name":"reminders_get","description":"Read one cached Apple Reminders item and its supported details. Not a complete archive. An etag can change once more after a create or a sync, so read the item again just before a change.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools.push(json!({"name":"notes_get","description":"Read one cached Apple iCloud Notes note. Not a complete preservation archive. An etag can change once more after a create or a sync, so read the item again just before a change.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
-    tools.push(json!({"name":"sync","description":"Refresh Apple iCloud Notes and Apple Reminders and send approved queued changes. Queued/sent is not field-level remote verification. Never opens a login prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
-    tools.push(json!({"name":"sync_status","description":"Local sync state for Apple iCloud Notes and Reminders: last refresh, whether the last pass failed, pending and refused queued changes. No network access.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
+    tools.push(json!({"name":"sync","description":"Refresh Apple iCloud Notes and Apple Reminders and send approved queued changes. Queued/sent is not field-level remote verification. pending_recent lists changes still waiting, oldest first, each with a reason code and a next_step to follow. Never opens a login prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
+    tools.push(json!({"name":"sync_status","description":"Local sync state for Apple iCloud Notes and Reminders: last refresh, whether the last pass failed, pending and refused queued changes. pending_recent gives each waiting change's reason code and next_step, as of the last sync. No network access.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     let page = json!({"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":contacts::MAX_LIMIT,"default":25}});
     let read = json!({"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false});
     tools.push(json!({"name":"contacts_list","description":"List the user's Apple iCloud Contacts from the local cache, in name order, as summaries with emails and phones. Read-only; refresh with contacts_refresh.","inputSchema":{"type":"object","properties":page,"additionalProperties":false},"annotations":read}));

@@ -35,11 +35,56 @@ fn printable(text: &str) -> String {
         .to_string()
 }
 
+/// The wait this computer keeps between sign-ins after failed ones, so Apple doesn't lock
+/// the account.
+pub const SIGN_IN_WAIT: &str = "sign_in_wait_protects_account";
+
+/// The seconds left of that wait, as the last refused sign-in carried them
+/// (`Error::CoolingDown`). Codes are fixed strings, so the number is kept here for
+/// [`wait_text`]; nothing reads the secret store for it.
+static WAIT_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The sign-in wait said to the person, with about how many minutes are left.
+pub fn wait_text() -> String {
+    let seconds = WAIT_LEFT.load(std::sync::atomic::Ordering::Relaxed);
+    if seconds == 0 {
+        return crate::setup::plain(SIGN_IN_WAIT).to_string();
+    }
+    let minutes = seconds.div_ceil(60);
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    format!("iCloud-MCP is waiting before the next sign-in so Apple doesn't lock the account. Run skykeep-mcp setup again in about {minutes} {unit}.")
+}
+
+/// What the terminal prints for a sign-in code: the sentence setup prints, the wait with its
+/// minutes. Any other code is printed as it is.
+pub fn terminal_text(code: &'static str) -> String {
+    match code {
+        SIGN_IN_WAIT => wait_text(),
+        "credentials_rejected"
+        | "code_incorrect_or_expired"
+        | "auth_cooldown_try_later"
+        | "apple_answer_unreadable"
+        | "account_locked_visit_account_website"
+        | "secure_storage_unavailable"
+        | "regional_login_retry_required"
+        | "security_key_sign_in_unsupported"
+        | "too_many_code_requests_try_later"
+        | "authentication_unavailable" => crate::setup::plain(code).to_string(),
+        other => other.to_string(),
+    }
+}
+
 pub fn auth_error(error: Error) -> &'static str {
     match error {
         Error::BadCredentials => "credentials_rejected",
         Error::BadCode => "code_incorrect_or_expired",
-        Error::CoolingDown { .. } | Error::RateLimited => "auth_cooldown_try_later",
+        Error::RateLimited => "auth_cooldown_try_later",
+        // This computer's own wait after failed tries; setup says how long is left.
+        Error::CoolingDown { seconds } => {
+            WAIT_LEFT.store(seconds, std::sync::atomic::Ordering::Relaxed);
+            SIGN_IN_WAIT
+        }
+        Error::Protocol(_) => "apple_answer_unreadable",
         Error::AccountLocked => "account_locked_visit_account_website",
         Error::Keyring(_) => "secure_storage_unavailable",
         Error::CodeAgain | Error::Moved => "regional_login_retry_required",
@@ -215,4 +260,42 @@ pub fn bind_account(dir: &std::path::Path, client: &mut Client) -> Result<(), &'
     // A new sign-in: an earlier failed check or sign-out no longer speaks for it.
     crate::forget_session_check(&mut library);
     Ok(())
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::*;
+
+    /// The wait says about how many minutes are left, from the seconds the refused sign-in
+    /// carried, and an unreadable answer has its own code. Apple's own limit keeps its code.
+    #[test]
+    fn a_sign_in_wait_carries_its_minutes() {
+        assert_eq!(
+            auth_error(Error::CoolingDown { seconds: 125 }),
+            SIGN_IN_WAIT
+        );
+        assert!(
+            wait_text().ends_with("Run skykeep-mcp setup again in about 3 minutes."),
+            "{}",
+            wait_text()
+        );
+        assert_eq!(auth_error(Error::CoolingDown { seconds: 5 }), SIGN_IN_WAIT);
+        assert!(
+            wait_text().ends_with("in about 1 minute."),
+            "{}",
+            wait_text()
+        );
+        assert_eq!(auth_error(Error::RateLimited), "auth_cooldown_try_later");
+        assert_eq!(
+            auth_error(Error::Protocol("synthetic".into())),
+            "apple_answer_unreadable"
+        );
+        // The login command prints the sentences setup prints, not the codes.
+        assert_eq!(
+            terminal_text("apple_answer_unreadable"),
+            crate::setup::plain("apple_answer_unreadable")
+        );
+        assert!(terminal_text(SIGN_IN_WAIT).contains("about 1 minute"));
+        assert_eq!(terminal_text("state_busy_retry"), "state_busy_retry");
+    }
 }

@@ -444,3 +444,28 @@ async fn contacts_and_photos_writes_name_a_field_they_do_not_have() {
         assert!(text.contains("is not a field"), "{name} {args}: {reply}");
     }
 }
+
+/// Two fields a tool doesn't have are named together: "a and b are not fields".
+#[tokio::test]
+async fn two_unknown_fields_are_named_together() {
+    let dir = private_dir();
+    let mut s = server(dir.path(), true).await;
+    for (name, args) in [
+        ("notes_list", json!({"zz_one":1,"zz_two":2})),
+        (
+            "contacts_write",
+            json!({"action":"create","fields":{"first_name":"Ada"},"zz_one":1,"zz_two":2}),
+        ),
+        (
+            "photos_write",
+            json!({"action":"set_rating","id":"p","rating":1,"zz_one":1,"zz_two":2}),
+        ),
+    ] {
+        let (reply, _) = call(&mut s, name, args).await;
+        let text = instructions(&reply);
+        assert!(
+            text.contains("\"zz_one\" and \"zz_two\" are not fields"),
+            "{name}: {text}"
+        );
+    }
+}
