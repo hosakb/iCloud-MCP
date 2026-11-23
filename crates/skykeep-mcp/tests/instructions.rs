@@ -326,12 +326,6 @@ const NOT_CODES: &[&str] = &[
     "unlock",
     "verification",
     "video",
-    "waiting_answer_not_understood",
-    "waiting_apple_busy",
-    "waiting_for_connection",
-    "waiting_local_storage",
-    "waiting_refresh_failed",
-    "waiting_sign_in",
     "writes_only",
     "yolo",
 ];

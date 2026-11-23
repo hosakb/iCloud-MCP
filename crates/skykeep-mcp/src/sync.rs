@@ -173,7 +173,8 @@ fn waiting_reason(e: &quince_icloud::Error) -> &'static str {
     match e {
         E::ReauthRequired | E::NeedsDeviceApproval => "waiting_sign_in",
         E::Busy(_) | E::StaleCursor => "waiting_apple_busy",
-        E::Protocol(_) | E::Conflict => "waiting_answer_not_understood",
+        E::Protocol(_) => "waiting_answer_not_understood",
+        E::Conflict => "waiting_changed_at_apple",
         E::Io(_) | E::Storage(_) => "waiting_local_storage",
         _ => "waiting_for_connection",
     }
@@ -192,10 +193,35 @@ fn refresh_reason(outcome: pass::Outcome) -> &'static str {
 /// stopped at, and every later one waits behind it.
 const PENDING_SHOWN: usize = 20;
 
-/// The oldest waiting changes of `service` as MCP may show them: identifiers and why each
-/// waits, never the payload or Apple's words. A change the queue stopped at for an answer not
-/// understood also says which try it was of the tries allowed.
-pub(crate) fn pending_view(library: &Library, service: &str) -> Result<Vec<Value>, &'static str> {
+/// What to do about a change waiting for `reason`, said to the person. `None` for a code
+/// that is not a waiting reason.
+pub(crate) fn waiting_step(reason: &str, dir: &Path) -> Option<String> {
+    if let Some(first) = reason.strip_prefix("waiting_behind_change_") {
+        let first: i64 = first.parse().ok()?;
+        return Some(format!("This change was not sent yet: changes go to Apple in order, and it waits behind change {first}. It goes once change {first} is sent or refused; see the reason given for change {first}."));
+    }
+    Some(match reason {
+        "waiting_for_connection" => "Apple couldn't be reached, or the connection dropped. Nothing to do: the next sync sends it again.".to_string(),
+        "waiting_apple_busy" => "Apple was busy or not ready. Nothing to do: the next sync sends it again.".to_string(),
+        "waiting_sign_in" => format!("The sign-in has to be renewed, or Apple is waiting for approval on one of your devices. Sign in with {} in a terminal you opened yourself, approve on your device if it asks, then run sync again.", crate::status::with_dir("skykeep-mcp login", dir)),
+        "waiting_answer_not_understood" => "Apple's answer couldn't be read. Wait a few minutes, then run sync again: it tries the change again, up to 5 times in all, and then holds it as refused.".to_string(),
+        "waiting_changed_at_apple" => "The item changed in iCloud since this change was queued. Run sync again: it reads the item again and tries the change, up to 5 times in all, and then holds it as refused. If it is refused, read the item again with notes_get or reminders_get and make the change again.".to_string(),
+        "waiting_local_storage" => format!("iCloud-MCP couldn't read or write its own files. In your own terminal, run {} to check this folder, then run sync again.", crate::status::with_dir("skykeep-mcp status", dir)),
+        "waiting_refresh_failed" => "The refresh before sending failed, so nothing was sent. Run sync again in a few minutes.".to_string(),
+        "waiting_to_send" => "No sync has tried to send it yet. Run sync to send it.".to_string(),
+        _ => return None,
+    })
+}
+
+/// The oldest waiting changes of `service` as MCP may show them: identifiers, why each waits
+/// and what to do, never the payload or Apple's words. The change the queue stopped at for
+/// an answer not understood or a record changed at Apple also says which try it was of the
+/// tries allowed; the changes after it wait behind it and were not sent.
+pub(crate) fn pending_view(
+    library: &Library,
+    dir: &Path,
+    service: &str,
+) -> Result<Vec<Value>, &'static str> {
     let noted: Option<Value> = library
         .state(&waiting_key(service))
         .map_err(|_| "library_unavailable")?
@@ -206,22 +232,43 @@ pub(crate) fn pending_view(library: &Library, service: &str) -> Result<Vec<Value
         .iter()
         .take(PENDING_SHOWN)
         .map(|p| {
-            let mut view = json!({"id":p.id,"service":p.service,"kind":p.kind,"record":p.record,
-                "reason":"waiting_to_send"});
+            let mut reason = "waiting_to_send".to_string();
+            let mut tried = None;
             if let Some(noted) = &noted {
-                let at = noted["id"].as_i64();
-                // Queued after the last sync stopped is still behind the change it stopped at.
-                if at.is_none_or(|at| p.id >= at) {
-                    view["reason"] = noted["reason"].clone();
+                let said = noted["reason"].as_str().unwrap_or("waiting_to_send");
+                match noted["id"].as_i64() {
+                    // The refresh failed: nothing was sent, each waits for the same reason.
+                    None => reason = said.to_string(),
+                    Some(at) if p.id == at => {
+                        reason = said.to_string();
+                        if matches!(
+                            said,
+                            "waiting_answer_not_understood" | "waiting_changed_at_apple"
+                        ) {
+                            tried = noted["try"].as_i64();
+                        }
+                    }
+                    Some(at) if p.id > at => reason = format!("waiting_behind_change_{at}"),
+                    Some(_) => {}
                 }
-                if at == Some(p.id) && noted["reason"] == "waiting_answer_not_understood" {
-                    view["try"] = noted["try"].clone();
-                    view["tries_allowed"] = json!(quince_sync::queue::PROTOCOL_TRIES);
-                }
+            }
+            let mut view = json!({"id":p.id,"service":p.service,"kind":p.kind,"record":p.record,
+                "reason":reason,"next_step":waiting_step(&reason, dir)});
+            if let Some(tried) = tried {
+                view["try"] = json!(tried);
+                view["tries_allowed"] = json!(quince_sync::queue::PROTOCOL_TRIES);
             }
             view
         })
         .collect())
+}
+
+/// Two services' waiting lists as one, oldest first, cut to [`PENDING_SHOWN`].
+fn oldest_first(mut first: Vec<Value>, second: Vec<Value>) -> Vec<Value> {
+    first.extend(second);
+    first.sort_by_key(|v| v["id"].as_i64());
+    first.truncate(PENDING_SHOWN);
+    first
 }
 
 /// Skykeep's own refusal codes are shown; engine and Apple reasons can hold HTTP text.
@@ -580,13 +627,82 @@ async fn sync_pass(
         .take(MAX_PENDING)
         .map(refused_view)
         .collect();
-    let mut pending_recent = pending_view(&library, "notes")?;
-    pending_recent.extend(pending_view(&library, "reminders")?);
-    pending_recent.truncate(PENDING_SHOWN);
+    let pending_recent = oldest_first(
+        pending_view(&library, dir, "notes")?,
+        pending_view(&library, dir, "reminders")?,
+    );
     let mut reply = json!({"services":services,"queued":waiting,"pending_recent":pending_recent,"refused":refused.len(),"refused_this_sync":refused_now,"left_queue_this_sync":left,"remote_verified":false,"verification":"upstream sync and replay only; field-level read-back is not guaranteed"});
     // Said only when there is something for it to explain.
     if !left.is_empty() {
         reply["left_queue_note"] = json!(LEFT_QUEUE_NOTE);
     }
     Ok(reply)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each reason Apple's error can give is its own code, and a record changed at Apple is
+    /// not said as an answer that couldn't be read.
+    #[test]
+    fn each_error_waits_with_its_own_reason() {
+        use quince_icloud::Error as E;
+        assert_eq!(waiting_reason(&E::Conflict), "waiting_changed_at_apple");
+        assert_eq!(
+            waiting_reason(&E::Protocol("synthetic".into())),
+            "waiting_answer_not_understood"
+        );
+        assert_eq!(waiting_reason(&E::Busy(None)), "waiting_apple_busy");
+        assert_eq!(waiting_reason(&E::Stalled), "waiting_for_connection");
+        assert_eq!(waiting_reason(&E::ReauthRequired), "waiting_sign_in");
+        assert_eq!(
+            waiting_reason(&E::Io(std::io::Error::other("synthetic"))),
+            "waiting_local_storage"
+        );
+    }
+
+    /// Every reason has a next step, and one waiting behind names the change it waits for.
+    #[test]
+    fn every_waiting_reason_says_what_to_do() {
+        let dir = std::path::Path::new("/synthetic/state");
+        for reason in [
+            "waiting_for_connection",
+            "waiting_apple_busy",
+            "waiting_sign_in",
+            "waiting_answer_not_understood",
+            "waiting_changed_at_apple",
+            "waiting_local_storage",
+            "waiting_refresh_failed",
+            "waiting_to_send",
+        ] {
+            assert!(waiting_step(reason, dir).is_some(), "{reason}");
+        }
+        assert!(waiting_step("waiting_sign_in", dir)
+            .unwrap()
+            .contains("skykeep-mcp login"));
+        assert!(waiting_step("waiting_local_storage", dir)
+            .unwrap()
+            .contains("skykeep-mcp status"));
+        assert!(waiting_step("waiting_behind_change_42", dir)
+            .unwrap()
+            .contains("change 42"));
+        assert!(waiting_step("waiting_behind_change_x", dir).is_none());
+        assert!(waiting_step("waiting_unknown", dir).is_none());
+    }
+
+    /// The list across Notes and Reminders is the oldest changes, whichever service.
+    #[test]
+    fn the_waiting_list_is_oldest_first_across_services() {
+        let view = |id: i64| json!({"id":id});
+        let notes: Vec<Value> = (100..130).map(view).collect();
+        let reminders: Vec<Value> = (1..5).map(view).collect();
+        let shown = oldest_first(notes, reminders);
+        assert_eq!(shown.len(), PENDING_SHOWN);
+        let ids: Vec<i64> = shown.iter().map(|v| v["id"].as_i64().unwrap()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted);
+        assert_eq!(&ids[..4], &[1, 2, 3, 4]);
+    }
 }

@@ -723,6 +723,16 @@ pub async fn send(
             if c.has_options() {
                 return send_create_options(library, http, root, params, &p.record, &c).await;
             }
+            // A date Apple already holds was written by an earlier send whose answer was
+            // lost, or set on a phone since: it stays, and the flag beside it went with it,
+            // as the options path keeps it (`send_create_options`).
+            if c.due_at.is_some()
+                && r::due_at_cloudkit(http, root, params.clone(), &p.record)
+                    .await?
+                    .is_some()
+            {
+                return Ok(());
+            }
             if c.due_at.is_some() || c.flagged.is_some() {
                 let made = Reminder {
                     guid: p.record.clone(),

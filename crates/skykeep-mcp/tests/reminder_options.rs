@@ -787,6 +787,8 @@ async fn a_dated_create_apple_was_busy_for_waits_and_says_why() {
     assert_eq!(waiting[0]["record"], dated["guid"]);
     assert_eq!(waiting[0]["reason"], "waiting_apple_busy");
     assert!(waiting[0].get("try").is_none(), "{result}");
+    let step = waiting[0]["next_step"].as_str().unwrap();
+    assert!(step.contains("Nothing to do"), "{step}");
     assert!(!result.to_string().contains("SYNTHETIC-APPLE-WORDS"));
 
     let status = sync_status(&mut server, dir.path()).await;
@@ -826,6 +828,7 @@ async fn a_create_whose_answer_was_not_understood_says_which_try() {
     let before = status["services"][1]["pending_recent"].as_array().unwrap();
     assert_eq!(before.len(), 2, "{status}");
     assert_eq!(before[0]["reason"], "waiting_to_send");
+    assert!(before[0]["next_step"].as_str().unwrap().contains("sync"));
     for round in 1..=2 {
         let result =
             skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
@@ -837,8 +840,40 @@ async fn a_create_whose_answer_was_not_understood_says_which_try() {
         assert_eq!(waiting[0]["reason"], "waiting_answer_not_understood");
         assert_eq!(waiting[0]["try"], round);
         assert_eq!(waiting[0]["tries_allowed"], 5);
+        let step = waiting[0]["next_step"].as_str().unwrap();
+        assert!(step.contains("run sync again"), "{step}");
+        // Never sent: it waits behind the first, and says so rather than Apple's answer.
         assert_eq!(waiting[1]["record"], second["guid"]);
-        assert_eq!(waiting[1]["reason"], "waiting_answer_not_understood");
+        assert_eq!(
+            waiting[1]["reason"],
+            format!("waiting_behind_change_{}", waiting[0]["id"])
+        );
         assert!(waiting[1].get("try").is_none(), "{result}");
+        let step = waiting[1]["next_step"].as_str().unwrap();
+        assert!(
+            step.contains(&format!("change {}", waiting[0]["id"])),
+            "{step}"
+        );
+    }
+}
+
+/// The sync and sync_status descriptions say that waiting changes come with a reason.
+#[tokio::test]
+async fn the_sync_tools_describe_pending_recent() {
+    let (_dir, mut server, _library) = setup(false);
+    server.handle(json!({"id":1,"method":"initialize"})).await;
+    let tools = server
+        .handle(json!({"id":2,"method":"tools/list"}))
+        .await
+        .unwrap();
+    for name in ["sync", "sync_status"] {
+        let tool = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap();
+        let text = tool["description"].as_str().unwrap();
+        assert!(text.contains("pending_recent"), "{name}: {text}");
     }
 }

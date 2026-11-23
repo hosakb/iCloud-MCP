@@ -367,29 +367,10 @@ pub async fn run(
         dir: None,
     };
     let outcome = flow(&mut c, env, options).await;
-    outcome.map_err(|code| match (code, &c.dir) {
-        (login::SIGN_IN_WAIT, Some(dir)) => c.scope(&sign_in_wait(env, dir)),
+    outcome.map_err(|code| match code {
+        login::SIGN_IN_WAIT => c.scope(&login::wait_text()),
         _ => c.scope(plain(code)),
     })
-}
-
-/// The sign-in wait, with about how long is left, read from the wait this folder's sign-in
-/// keeps. Without it, the plain sentence.
-fn sign_in_wait(env: &Env, dir: &Path) -> String {
-    let left = storage::open_store_in(env, dir).ok().and_then(|store| {
-        quince_auth::session::wait_left(
-            store.load_cooldown().retry_after,
-            quince_auth::session::unix_now(),
-        )
-    });
-    match left {
-        Some(seconds) => {
-            let minutes = seconds.div_ceil(60).max(1);
-            let unit = if minutes == 1 { "minute" } else { "minutes" };
-            format!("iCloud-MCP is waiting before the next sign-in so Apple doesn't lock the account. Run skykeep-mcp setup again in about {minutes} {unit}.")
-        }
-        None => plain(login::SIGN_IN_WAIT).to_string(),
-    }
 }
 
 async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcome, &'static str> {

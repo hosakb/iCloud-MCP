@@ -37,7 +37,8 @@ async fn main() {
         return;
     }
     if let Err(error) = run(all).await {
-        eprintln!("skykeep-mcp: {error}");
+        // A sign-in code is said as setup says it; any other code as it is.
+        eprintln!("skykeep-mcp: {}", skykeep_mcp::login::terminal_text(error));
         std::process::exit(1);
     }
 }

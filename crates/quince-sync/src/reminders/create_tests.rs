@@ -1018,3 +1018,45 @@ async fn a_full_send_notes_every_step_taken() {
         Some(ALL_STEPS.to_string())
     );
 }
+
+/// A plain dated create (no repeat or alert) whose date write landed but whose answer was
+/// lost, and whose date a phone then moved: sent again, it finds a date at Apple and writes
+/// nothing more, as the options path does, so the phone's date stays.
+#[tokio::test]
+async fn a_plain_dated_create_sent_again_keeps_the_date_apple_holds() {
+    let plain = Create {
+        repeat: None,
+        alarm: None,
+        early_alert: None,
+        ..create()
+    };
+    let (server, apple) = cloud().await;
+    let mut l = library();
+    let guid = record_reminder_create(&mut l, &plain).unwrap();
+    let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+    let lock = LibraryLock::new(l, None);
+    apple.fail_once("\"DueDate\"", Fault::AnswerLost);
+    assert!(send_one(&lock, &server.uri(), &p).await.is_err());
+    // 10:30 on 9 March in New York (EDT).
+    let phone = 1_773_066_600;
+    apple.phone_moves_due(&guid, phone);
+    let updates = apple.reminder_updates();
+    send_one(&lock, &server.uri(), &p).await.unwrap();
+    let reminder = apple.record(&guid).unwrap();
+    assert_eq!(reminder["fields"]["DueDate"]["value"], phone * 1000);
+    assert_eq!(apple.reminder_updates(), updates, "no write again");
+    assert_eq!(apple.made(), std::slice::from_ref(&guid), "made once");
+
+    // One whose date write never landed gets it on the next send.
+    let (server, apple) = cloud().await;
+    let mut l = library();
+    let guid = record_reminder_create(&mut l, &plain).unwrap();
+    let p = l.outbox_pending(REMINDERS).unwrap().remove(0);
+    let lock = LibraryLock::new(l, None);
+    apple.fail_once("\"DueDate\"", Fault::Before);
+    assert!(send_one(&lock, &server.uri(), &p).await.is_err());
+    send_one(&lock, &server.uri(), &p).await.unwrap();
+    let reminder = apple.record(&guid).unwrap();
+    assert_eq!(reminder["fields"]["DueDate"]["value"], DUE * 1000);
+    assert_eq!(reminder["fields"]["Flagged"]["value"], 1);
+}
