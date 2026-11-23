@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use wiremock::matchers::{method, path, path_regex};
+use wiremock::matchers::{body_string_contains, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const DSID: &str = "1234567890";
@@ -346,6 +346,9 @@ async fn the_tool_is_listed_with_a_strict_schema_and_its_rule_names() {
         json!(skykeep_mcp::photos_write::ACTIONS)
     );
     assert_eq!(tool["annotations"]["destructiveHint"], true);
+    // A new upload can be changed at once, as its reply's usable_now says.
+    let words = tool["description"].as_str().unwrap();
+    assert!(words.contains("usable_now"), "{words}");
     let names = skykeep_mcp::permissions::names();
     for action in skykeep_mcp::photos_write::ACTIONS {
         assert!(
@@ -626,6 +629,145 @@ async fn an_upload_sends_exactly_the_exchange_file_and_waits_for_apples_job() {
     // The staged copy is gone.
     let staging = f.dir.path().join("drive-upload");
     assert!(std::fs::read_dir(&staging).map_or(true, |mut d| d.next().is_none()));
+}
+
+const NEW_TAG: &str = "tag-new";
+
+/// Apple's lookup of the new photo's two records by id, as it answers right after the upload.
+async fn serve_new_photo(remote: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path(format!("{DB}/records/lookup")))
+        .and(body_string_contains("M-NEW"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"records":[
+            {"recordName":"A-NEW","recordType":"CPLAsset","recordChangeTag":NEW_TAG,
+             "fields":{"assetDate":{"value":1_710_000_000_000_i64},"addedDate":{"value":1_710_000_100_000_i64}}},
+            {"recordName":"M-NEW","recordType":"CPLMaster","recordChangeTag":"master-tag",
+             "fields":{"filenameEnc":{"value":b64("IMG_0001.JPG")},"itemType":{"value":"public.jpeg"},
+                       "resOriginalWidth":{"value":800},"resOriginalHeight":{"value":600}}}
+        ]})))
+        .with_priority(1)
+        .mount(remote)
+        .await;
+}
+
+#[tokio::test]
+async fn a_new_upload_is_read_back_by_id_and_can_be_changed_without_a_refresh() {
+    // Apple holds the new photo at the tag its lookup by id showed.
+    let mut f = fixture_at(Some("yolo"), NEW_TAG).await;
+    jpeg(&f.exchange.join("IMG_0001.JPG"), 4096);
+    serve_upload(&f.remote).await;
+    serve_new_photo(&f.remote).await;
+    let done = ok(
+        &mut f.server,
+        json!({"action":"upload","local":"IMG_0001.JPG"}),
+    )
+    .await;
+    assert_eq!(done["outcome"], "done", "{done}");
+    assert_eq!(done["usable_now"], true, "{done}");
+    assert_eq!(done["remote_verified"], true, "{done}");
+    assert_eq!(done["photo"]["id"], "A-NEW");
+    // Only the new photo's two records were asked for: no library read.
+    let asked_for: Vec<String> = asked(&f.remote).await;
+    assert!(
+        !asked_for
+            .iter()
+            .any(|p| p.ends_with("/changes/zone") || p.ends_with("/records/query")),
+        "{asked_for:?}"
+    );
+    let new = cached(f.dir.path(), "A-NEW");
+    assert_eq!(new.master, "M-NEW");
+    assert_eq!(new.filename.as_deref(), Some("IMG_0001.JPG"));
+    assert_eq!(new.change_tag.as_deref(), Some(NEW_TAG));
+    // The title goes over exactly the version read back, with no photos_refresh in between.
+    let titled = ok(
+        &mut f.server,
+        json!({"action":"set_title_and_caption","id":"A-NEW","title":"Harbour"}),
+    )
+    .await;
+    assert_eq!(titled["outcome"], "done", "{titled}");
+    let sent = modified(&f.remote).await;
+    assert_eq!(sent[0]["record"]["recordName"], "A-NEW");
+    assert_eq!(sent[0]["record"]["recordChangeTag"], NEW_TAG);
+    assert_eq!(
+        sent[0]["record"]["fields"]["captionEnc"]["value"],
+        b64("Harbour")
+    );
+    assert_eq!(
+        cached(f.dir.path(), "A-NEW").title.as_deref(),
+        Some("Harbour")
+    );
+}
+
+#[tokio::test]
+async fn a_new_upload_changed_elsewhere_after_it_was_read_back_is_refused() {
+    // Apple's version check shows a tag other than the one the lookup by id gave.
+    let mut f = fixture_at(Some("yolo"), "tag-moved").await;
+    jpeg(&f.exchange.join("IMG_0001.JPG"), 4096);
+    serve_upload(&f.remote).await;
+    serve_new_photo(&f.remote).await;
+    let done = ok(
+        &mut f.server,
+        json!({"action":"upload","local":"IMG_0001.JPG"}),
+    )
+    .await;
+    assert_eq!(done["usable_now"], true, "{done}");
+    assert_eq!(
+        error(
+            &mut f.server,
+            json!({"action":"set_favorite","id":"A-NEW","favorite":true})
+        )
+        .await,
+        "photos_item_changed_run_photos_refresh"
+    );
+    assert!(modified(&f.remote).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_new_upload_apple_does_not_show_yet_says_to_refresh_first() {
+    let mut f = fixture(Some("yolo")).await;
+    jpeg(&f.exchange.join("IMG_0001.JPG"), 4096);
+    serve_upload(&f.remote).await;
+    // The lookup by id finds no records.
+    Mock::given(method("POST"))
+        .and(path(format!("{DB}/records/lookup")))
+        .and(body_string_contains("M-NEW"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"records":[]})))
+        .with_priority(1)
+        .mount(&f.remote)
+        .await;
+    let done = ok(
+        &mut f.server,
+        json!({"action":"upload","local":"IMG_0001.JPG"}),
+    )
+    .await;
+    assert_eq!(done["outcome"], "done", "{done}");
+    assert_eq!(done["usable_now"], false, "{done}");
+    assert_eq!(done["remote_verified"], false, "{done}");
+    assert!(done["next"].as_str().unwrap().contains("photos_refresh"));
+    assert_eq!(
+        error(
+            &mut f.server,
+            json!({"action":"set_rating","id":"A-NEW","rating":3})
+        )
+        .await,
+        "photo_not_found"
+    );
+}
+
+#[tokio::test]
+async fn trash_of_a_new_upload_still_asks_a_person() {
+    let mut f = fixture_at(Some("yolo"), NEW_TAG).await;
+    jpeg(&f.exchange.join("IMG_0001.JPG"), 4096);
+    serve_upload(&f.remote).await;
+    serve_new_photo(&f.remote).await;
+    ok(
+        &mut f.server,
+        json!({"action":"upload","local":"IMG_0001.JPG"}),
+    )
+    .await;
+    let form = call(&mut f.server, json!({"action":"trash","id":"A-NEW"})).await;
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+    assert!(modified(&f.remote).await.is_empty());
 }
 
 #[tokio::test]
