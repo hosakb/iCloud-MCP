@@ -177,7 +177,10 @@ async fn auth_status_says_signed_in_once_a_sync_worked() {
         "{text}"
     );
     // A sync or refresh reached Apple with this sign-in.
-    skykeep_mcp::note_session_check(dir.path(), Ok(()));
+    skykeep_mcp::note_session_check(
+        &skykeep_mcp::state::PrivateState::open(dir.path()).unwrap(),
+        Ok(()),
+    );
     let (reply, _) = call(&mut s, "auth_status", json!({})).await;
     assert_eq!(reply["status"], "signed_in", "{reply}");
     assert_eq!(reply["session_checked"], true);
@@ -187,7 +190,10 @@ async fn auth_status_says_signed_in_once_a_sync_worked() {
     assert!(text.contains("may have changed since"), "{text}");
     assert!(!reply.to_string().contains("setup"), "{reply}");
     // A later sign-in failure counts over it.
-    skykeep_mcp::note_session_check(dir.path(), Err("login_required"));
+    skykeep_mcp::note_session_check(
+        &skykeep_mcp::state::PrivateState::open(dir.path()).unwrap(),
+        Err("login_required"),
+    );
     let (reply, _) = call(&mut s, "auth_status", json!({})).await;
     assert_eq!(reply["status"], "login_required", "{reply}");
     assert_eq!(reply["reason"], "login_required", "{reply}");
@@ -203,7 +209,10 @@ async fn auth_status_says_signed_in_once_a_sync_worked() {
 async fn auth_status_keeps_the_reason_a_check_failed() {
     let dir = private_dir();
     let mut s = server(dir.path(), true).await;
-    skykeep_mcp::note_session_check(dir.path(), Err("login_required_unlock_secure_storage"));
+    skykeep_mcp::note_session_check(
+        &skykeep_mcp::state::PrivateState::open(dir.path()).unwrap(),
+        Err("login_required_unlock_secure_storage"),
+    );
     let (reply, _) = call(&mut s, "auth_status", json!({})).await;
     assert_eq!(reply["status"], "locked", "{reply}");
     let text = instructions(&reply);
@@ -213,7 +222,10 @@ async fn auth_status_keeps_the_reason_a_check_failed() {
         !reply["message"].as_str().unwrap().contains("expired"),
         "{reply}"
     );
-    skykeep_mcp::note_session_check(dir.path(), Err("login_required_complete_account_setup"));
+    skykeep_mcp::note_session_check(
+        &skykeep_mcp::state::PrivateState::open(dir.path()).unwrap(),
+        Err("login_required_complete_account_setup"),
+    );
     let (reply, _) = call(&mut s, "auth_status", json!({})).await;
     assert_eq!(reply["status"], "login_required", "{reply}");
     let text = instructions(&reply);
@@ -230,8 +242,11 @@ async fn auth_status_keeps_the_reason_a_check_failed() {
 async fn auth_status_says_signed_out_after_logout() {
     let dir = private_dir();
     let mut s = server(dir.path(), true).await;
-    skykeep_mcp::note_session_check(dir.path(), Ok(()));
-    skykeep_mcp::note_signed_out(dir.path());
+    skykeep_mcp::note_session_check(
+        &skykeep_mcp::state::PrivateState::open(dir.path()).unwrap(),
+        Ok(()),
+    );
+    skykeep_mcp::note_signed_out(&skykeep_mcp::state::PrivateState::open(dir.path()).unwrap());
     let (reply, _) = call(&mut s, "auth_status", json!({})).await;
     assert_eq!(reply["status"], "signed_out", "{reply}");
     assert!(
@@ -245,7 +260,10 @@ async fn auth_status_says_signed_out_after_logout() {
 async fn a_check_counts_only_for_the_account_it_was_made_for() {
     let dir = private_dir();
     let mut s = server(dir.path(), true).await;
-    skykeep_mcp::note_session_check(dir.path(), Ok(()));
+    skykeep_mcp::note_session_check(
+        &skykeep_mcp::state::PrivateState::open(dir.path()).unwrap(),
+        Ok(()),
+    );
     quince_core::Library::open(dir.path())
         .unwrap()
         .set_state("account", "another-synthetic-account")
@@ -398,4 +416,31 @@ async fn every_tool_names_a_field_it_does_not_have() {
         checked >= 25,
         "only {checked} tools answered invalid_arguments"
     );
+}
+
+/// A field contacts_write or photos_write doesn't have is named, as calendar_write does.
+#[tokio::test]
+async fn contacts_and_photos_writes_name_a_field_they_do_not_have() {
+    let dir = private_dir();
+    let mut s = server(dir.path(), true).await;
+    for (name, args) in [
+        (
+            "contacts_write",
+            json!({"action":"update","guid":"g","etag":"e","fields":{"first_name":"Ada"},"zz_extra":1}),
+        ),
+        (
+            "contacts_write",
+            json!({"action":"create","fields":{"first_name":"Ada"},"zz_extra":1}),
+        ),
+        (
+            "photos_write",
+            json!({"action":"set_rating","id":"p","rating":1,"zz_extra":1}),
+        ),
+    ] {
+        let (reply, failed) = call(&mut s, name, args.clone()).await;
+        assert!(failed, "{name}: {reply}");
+        let text = instructions(&reply);
+        assert!(text.contains("zz_extra"), "{name} {args}: {reply}");
+        assert!(text.contains("is not a field"), "{name} {args}: {reply}");
+    }
 }

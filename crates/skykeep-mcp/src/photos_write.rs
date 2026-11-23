@@ -1106,6 +1106,22 @@ impl Work<'_> {
 }
 
 /// The fields each action takes, for a refusal of its arguments.
+/// The field names each action takes, besides `action`.
+fn names_of(action: &str) -> &'static [&'static str] {
+    match action {
+        "upload" => &["local"],
+        "set_favorite" => &["id", "favorite"],
+        "set_title_and_caption" => &["id", "title", "caption"],
+        "set_rating" => &["id", "rating"],
+        "set_keywords" => &["id", "keywords"],
+        "set_date" => &["id", "taken_at"],
+        "create_album" => &["name"],
+        "rename_album" => &["album_id", "name"],
+        "trash" => &["id"],
+        _ => &[],
+    }
+}
+
 fn fields_of(action: &str) -> Option<&'static str> {
     Some(match action {
         "upload" => "local (a relative path inside the exchange folder)",
@@ -1128,7 +1144,25 @@ pub(crate) fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String>
         "Run photos_refresh, look at it again with photos_get or photos_albums, then ask again.";
     let text = match error {
         BAD_ARGUMENTS => match args["action"].as_str().and_then(fields_of) {
-            Some(fields) => format!("photos_write {} takes {fields}, and no other fields. Check the names and types and ask again.", args["action"].as_str().unwrap_or_default()),
+            Some(fields) => {
+                let action = args["action"].as_str().unwrap_or_default();
+                let unknown: Vec<String> = args
+                    .as_object()
+                    .map(|m| {
+                        m.keys()
+                            .filter(|k| *k != "action" && !names_of(action).contains(&k.as_str()))
+                            .take(5)
+                            .map(|k| serde_json::json!(k.chars().take(64).collect::<String>()).to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let named = if unknown.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} is not a field of photos_write {action}. ", unknown.join(", "))
+                };
+                format!("{named}photos_write {action} takes {fields}, and no other fields. Check the names and types and ask again.")
+            }
             None => format!("photos_write needs action, one of {}, with that action's fields.", ACTIONS.join(", ")),
         },
         NO_PHOTO => "That photo is not among the photos the local cache shows. Run photos_refresh and find it with photos_list or photos_search. Hidden photos, photos in Recently Deleted and Shared Library photos can't be changed.".into(),

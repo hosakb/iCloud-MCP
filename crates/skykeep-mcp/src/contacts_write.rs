@@ -519,6 +519,12 @@ fn shape_error(args: &Value) -> Problem {
     let Some(object) = args.as_object() else {
         return Problem::of("invalid_arguments");
     };
+    if object
+        .keys()
+        .any(|k| !["action", "guid", "etag", "fields"].contains(&k.as_str()))
+    {
+        return Problem::of("contact_unknown_argument");
+    }
     let only = |keys: &[&str]| {
         object.keys().all(|k| keys.contains(&k.as_str()))
             && keys.iter().all(|k| object.contains_key(*k))
@@ -611,6 +617,19 @@ fn argument_step(args: &Value) -> Option<String> {
         "contact_update_needs_guid_etag_and_fields" => "update takes action, guid, etag and fields. Take guid and etag from contacts_get, and name in fields only what changes.".to_string(),
         "contact_delete_needs_only_guid_and_etag" => "delete takes action, guid and etag only. Take guid and etag from contacts_get.".to_string(),
         "contact_invalid_guid_or_etag" => "guid and etag are text as contacts_get shows them: guid at most 512 bytes, etag at most 256.".to_string(),
+        "contact_unknown_argument" => {
+            let unknown: Vec<String> = args
+                .as_object()
+                .map(|m| {
+                    m.keys()
+                        .filter(|k| !["action", "guid", "etag", "fields"].contains(&k.as_str()))
+                        .take(5)
+                        .map(|k| serde_json::json!(k.chars().take(64).collect::<String>()).to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            format!("{} is not a field of contacts_write; it takes action, guid, etag and fields. Card details such as first_name go inside fields.", unknown.join(", "))
+        }
         "contact_unknown_field" => format!("fields takes {}. contacts_get's details are given flat in fields; postal addresses, photos and lists can't be changed here.", FIELD_NAMES.join(", ")),
         _ => return None,
     })

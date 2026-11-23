@@ -61,7 +61,15 @@ fn typed(text: &str, at: usize) -> bool {
         return true;
     }
     match after.chars().next() {
-        None | Some('`' | '"' | '-' | '\'' | '\\') => true,
+        // The whole text, such as the keyring service, or the crate after `cargo -p`.
+        None => before.is_empty() || before.ends_with("-p "),
+        // A closing quote or code mark: a quote only closes one the name opened with.
+        Some('`') => true,
+        Some('"') => before.ends_with('"'),
+        Some('\\') => before.ends_with('"') && after.starts_with("\\\""),
+        Some('\'') => before.ends_with('\''),
+        // A stored name that goes on, such as `skykeep-mcp-memory`.
+        Some('-') => true,
         // A stored name such as `skykeep-mcp:{dev}`, or the prefix of an error line.
         Some(':') => !after[1..].starts_with(' ') || before.trim().is_empty(),
         Some(' ') => {
@@ -342,6 +350,8 @@ fn the_command_name_is_kept_only_where_it_is_typed() {
         "iCloud-MCP (the skykeep-mcp command)",
         "skykeep-mcp --help",
         "skykeep-mcp-memory",
+        "skykeep-mcp",
+        "the name 'skykeep-mcp' in the keyring",
     ] {
         assert!(!old_name_in(kept), "{kept}");
     }
@@ -349,6 +359,8 @@ fn the_command_name_is_kept_only_where_it_is_typed() {
         "The protected file was written by a newer skykeep-mcp: update skykeep-mcp.",
         "which skykeep-mcp can't use yet",
         "skykeep-mcp is a local server",
+        "written by a newer skykeep-mcp's version",
+        "Please update skykeep-mcp",
     ] {
         assert!(old_name_in(product), "{product}");
     }

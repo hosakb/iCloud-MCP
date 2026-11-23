@@ -31,8 +31,11 @@ async fn the_background_sync_records_a_failed_sign_in() {
         .handle(json!({"id":0,"method":"initialize"}))
         .await
         .unwrap();
-    // The scheduler's pass: the saved store holds no session, so the sign-in failed.
+    // The scheduler's pass. The saved store holds no session, so the sign-in failed. The
+    // pass and its record take the folder's lock once: nothing can come in between.
+    let before = skykeep_mcp::state::opens();
     assert_eq!(server.refresh().await, Err("login_required"));
+    assert_eq!(skykeep_mcp::state::opens() - before, 1);
     let reply = server
         .handle(
             json!({"id":1,"method":"tools/call","params":{"name":"auth_status","arguments":{}}}),

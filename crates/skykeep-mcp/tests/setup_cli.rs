@@ -37,6 +37,7 @@ fn setup_and_unlock_refuse_without_a_real_terminal_in_one_sentence() {
         assert!(!out.status.success());
         let text = String::from_utf8(out.stderr).unwrap();
         assert!(text.starts_with(&format!("skykeep-mcp: {start}")), "{text}");
+        assert!(text.trim_end().ends_with('.'), "{text}");
         assert_eq!(text.trim_end().lines().count(), 1, "{text}");
         assert!(out.stdout.is_empty());
     }
@@ -308,6 +309,26 @@ fn the_exchange_command_gives_the_real_reason_for_an_unusable_path() {
     assert!(text.contains("is a symbolic link"), "{text}");
     assert!(
         text.contains(&target.path().canonicalize().unwrap().display().to_string()),
+        "{text}"
+    );
+}
+
+/// `permissions show` on a folder that is not set up names that folder in the setup command.
+#[test]
+fn permissions_show_on_a_new_folder_names_it_in_the_setup_command() {
+    let dir = private_dir();
+    let out = program()
+        .args(["permissions", "show", "--state-dir"])
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let text = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        text.contains(&format!(
+            "skykeep-mcp setup --state-dir {}",
+            dir.path().display()
+        )),
         "{text}"
     );
 }

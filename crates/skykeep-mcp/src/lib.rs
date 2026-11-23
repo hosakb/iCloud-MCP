@@ -785,10 +785,12 @@ fn read_check(library: &Library) -> Option<Check> {
     }
 }
 
-/// Records for the account `dir` is bound to that a sync or refresh could (`Ok`) or could
-/// not (`Err` with its code) use the sign-in, as the server does after each one.
-pub fn note_session_check(dir: &Path, outcome: Result<(), &str>) {
-    if let Ok(mut library) = Library::open(dir) {
+/// Records for the account the folder is bound to that a sync or refresh could (`Ok`) or
+/// could not (`Err` with its code) use the sign-in, as the server does after each one. The
+/// caller holds the folder's lock through `held`. For tests and tools that check by hand.
+#[doc(hidden)]
+pub fn note_session_check(held: &state::PrivateState, outcome: Result<(), &str>) {
+    if let Ok(mut library) = Library::open(&held.path) {
         if let Some(account) = library.state(ACCOUNT_KEY).ok().flatten() {
             match outcome {
                 Ok(()) => write_check(&mut library, &account, "ok", None),
@@ -799,9 +801,9 @@ pub fn note_session_check(dir: &Path, outcome: Result<(), &str>) {
 }
 
 /// Records that `skykeep-mcp logout` signed this folder out; `auth_status` says so until the
-/// next sign-in.
-pub fn note_signed_out(dir: &Path) {
-    if let Ok(mut library) = Library::open(dir) {
+/// next sign-in. The caller holds the folder's lock through `held`.
+pub fn note_signed_out(held: &state::PrivateState) {
+    if let Ok(mut library) = Library::open(&held.path) {
         if let Some(account) = library.state(ACCOUNT_KEY).ok().flatten() {
             write_check(&mut library, &account, "signed_out", None);
         }
@@ -1245,9 +1247,6 @@ pub struct Server {
     contacts: contacts_write::Seam,
     /// How long a card waits for its answer.
     card_timeout: std::time::Duration,
-    /// The account the folder was bound to when the current call began, for the sign-in
-    /// record written after it.
-    call_account: Option<String>,
 }
 
 #[cfg(test)]
@@ -1729,7 +1728,6 @@ impl Server {
                 calendar: calendar_write::Seam::default(),
                 contacts: contacts_write::Seam::default(),
                 card_timeout: CARD_TIMEOUT,
-                call_account: None,
             }),
             Err("state_busy_retry") => Ok(Self {
                 library: None,
@@ -1745,7 +1743,6 @@ impl Server {
                 calendar: calendar_write::Seam::default(),
                 contacts: contacts_write::Seam::default(),
                 card_timeout: CARD_TIMEOUT,
-                call_account: None,
             }),
             Err(error) => Err(error),
         }
@@ -2176,8 +2173,35 @@ impl Server {
     }
 
     async fn call(&mut self, name: &str, args: Value) -> Result<Value, &'static str> {
-        self.call_account = None;
-        let result = self.call_tool(name, args).await;
+        // The call, its sign-in record and the not-signed-in check all happen under one hold
+        // of the folder's lock: nothing (a logout, a new sign-in) can come in between.
+        let held = match state::PrivateState::open(&self.dir) {
+            Ok(held) => held,
+            Err(error) => {
+                // An approval given for this call is used up even when it can't run.
+                self.grant = None;
+                self.terminal = None;
+                return Err(error);
+            }
+        };
+        let account = match self.ready(&held) {
+            Ok(library) => library
+                .state(ACCOUNT_KEY)
+                .map_err(|_| "library_unavailable"),
+            Err(error) => Err(error),
+        };
+        let account = match account {
+            Ok(account) => account,
+            Err(error) => {
+                self.grant = None;
+                self.terminal = None;
+                return Err(error);
+            }
+        };
+        let result = self.call_locked(&held, name, args).await;
+        let Ok(library) = self.ready(&held) else {
+            return result;
+        };
         // A sync or refresh that reached Apple tells whether the sign-in works.
         let checks = [
             "sync",
@@ -2196,17 +2220,14 @@ impl Server {
             }
             _ => None,
         };
-        // Written under the folder's lock, and only for the account the call began with: a
-        // sign-in to another account in between is not marked by this call's outcome.
-        if let (Some(outcome), Some(account)) = (session, self.call_account.take()) {
-            if let Ok(held) = state::PrivateState::open(&self.dir) {
-                if let Ok(library) = self.ready(&held) {
-                    if library.state(ACCOUNT_KEY).ok().flatten().as_deref() == Some(&account) {
-                        match outcome {
-                            Ok(()) => write_check(library, &account, "ok", None),
-                            Err(code) => write_check(library, &account, "failed", Some(code)),
-                        }
-                    }
+        let now = library.state(ACCOUNT_KEY).ok().flatten();
+        // Only for the account the call began with: a sign-in to another account during the
+        // call is not marked by this call's outcome.
+        if let (Some(outcome), Some(account)) = (session, account.as_deref()) {
+            if now.as_deref() == Some(account) {
+                match outcome {
+                    Ok(()) => write_check(library, account, "ok", None),
+                    Err(code) => write_check(library, account, "failed", Some(code)),
                 }
             }
         }
@@ -2216,34 +2237,26 @@ impl Server {
                 Err(e) => *e == "not_found",
                 Ok(value) => value["total"] == 0,
             };
-        if !empty {
-            return result;
-        }
-        // Only these few replies need the library again. The call has checked the folder and
-        // let go of its lock; reading one value needs no lock of its own.
-        let Ok(library) = Library::open(&self.dir) else {
-            return result;
-        };
-        let unbound = library.state(ACCOUNT_KEY).ok().flatten().is_none();
-        if empty && unbound {
+        if empty && now.is_none() {
             return Err("not_signed_in");
         }
         result
     }
 
-    async fn call_tool(&mut self, name: &str, args: Value) -> Result<Value, &'static str> {
+    /// One tool call. The caller holds the folder's lock through `held` for all of it.
+    async fn call_locked(
+        &mut self,
+        held: &state::PrivateState,
+        name: &str,
+        args: Value,
+    ) -> Result<Value, &'static str> {
         let grant = self.grant.take();
         let terminal = self.terminal.take();
         let drive_seam = self.drive.clone();
         let calendar_seam = self.calendar.clone();
         let contacts_seam = self.contacts.clone();
-        let held = state::PrivateState::open(&self.dir)?;
         let dir = held.path.clone();
-        self.call_account = self
-            .ready(&held)?
-            .state(ACCOUNT_KEY)
-            .map_err(|_| "library_unavailable")?;
-        let library = self.ready(&held)?;
+        let library = self.ready(held)?;
         let configured = policy(library, &dir)?;
         let stored = stored_mode(library, &dir)?;
         let active = permissions::load(library, &dir, stored.as_deref())?;

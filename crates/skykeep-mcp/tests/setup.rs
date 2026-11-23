@@ -555,7 +555,10 @@ async fn signing_in_again_on_request_keeps_the_account_and_refuses_another() {
     let (_parent, dir) = folder();
     first_run_with_keyring(&dir, &server).await;
     // A sync had found the sign-in expired; signing in again clears that.
-    skykeep_mcp::note_session_check(&dir, Err("login_required"));
+    skykeep_mcp::note_session_check(
+        &skykeep_mcp::state::PrivateState::open(&dir).unwrap(),
+        Err("login_required"),
+    );
     assert_eq!(tool(&dir, "auth_status").await["status"], "login_required");
     let mut answers = vec![Ask(""), Ask("2")];
     answers.extend(sign_in_answers());

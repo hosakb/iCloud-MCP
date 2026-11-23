@@ -262,7 +262,7 @@ async fn guided(command: &str, args: Vec<std::ffi::OsString>) -> Result<(), Stri
         let person = !terminal::agent_marked(|name| std::env::var_os(name))
             && unsafe { libc::isatty(1) } == 1;
         let text = skykeep_mcp::permissions::show(&dir, person)
-            .map_err(|e| skykeep_mcp::permissions::plain(e).to_string())?;
+            .map_err(|e| skykeep_mcp::status::with_dir(skykeep_mcp::permissions::plain(e), &dir))?;
         print!("{}", skykeep_mcp::status::with_dir(&text, &dir));
         return Ok(());
     }
@@ -280,13 +280,13 @@ async fn guided(command: &str, args: Vec<std::ffi::OsString>) -> Result<(), Stri
         return Ok(());
     }
     if terminal::agent_marked(|name| std::env::var_os(name)) {
-        return Err("this command refuses to run in an AI agent's terminal, because what you type there can end up in a transcript: open your own terminal window and run it there".into());
+        return Err("this command refuses to run in an AI agent's terminal, because what you type there can end up in a transcript: open your own terminal window and run it there.".into());
     }
     if unsafe { libc::isatty(0) } != 1 || unsafe { libc::isatty(1) } != 1 {
         return Err(if command == "setup" {
-            "setup needs a real terminal: open a terminal window and run skykeep-mcp setup there, not through a pipe or another program"
+            "setup needs a real terminal: open a terminal window and run skykeep-mcp setup there, not through a pipe or another program."
         } else {
-            "unlock needs a real terminal: open a terminal window and run skykeep-mcp unlock there, not through a pipe or another program"
+            "unlock needs a real terminal: open a terminal window and run skykeep-mcp unlock there, not through a pipe or another program."
         }
         .into());
     }
@@ -506,7 +506,7 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
                 return Err("logout_pending_unlock_keyring_and_retry");
             }
             // auth_status says signed out until the next sign-in.
-            skykeep_mcp::note_signed_out(&held.path);
+            skykeep_mcp::note_signed_out(&held);
             eprintln!(
                 "Signed out locally. Cached notes and reminders remain in the private directory."
             );

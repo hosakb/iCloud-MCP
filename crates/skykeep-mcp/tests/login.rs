@@ -618,7 +618,10 @@ async fn a_new_sign_in_clears_an_earlier_failed_check() {
         .unwrap()
         .set_state("account", &quince_sync::queue::account_tag("1234567890"))
         .unwrap();
-    skykeep_mcp::note_session_check(dir.path(), Err("login_required"));
+    skykeep_mcp::note_session_check(
+        &skykeep_mcp::state::PrivateState::open(dir.path()).unwrap(),
+        Err("login_required"),
+    );
     let auth = |reply: serde_json::Value| -> serde_json::Value {
         serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
     };

@@ -8,8 +8,19 @@ pub struct PrivateState {
     _lock: File,
 }
 
+/// How many times this process asked for a folder's lock.
+static OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times this process asked for a folder's lock, so a test can show that a call
+/// and what it records share one hold.
+#[doc(hidden)]
+pub fn opens() -> usize {
+    OPENS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 impl PrivateState {
     pub fn open(path: &Path) -> Result<Self, &'static str> {
+        OPENS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let absolute = if path.is_absolute() {
             path.to_owned()
         } else {
