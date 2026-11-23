@@ -15,8 +15,9 @@
 //! `remote_verified` stays false.
 //!
 //! Who approves. [`is_destructive`] (the permissions rules' own classification) names `trash`
-//! as the only removal. It always needs the person's approval, in the approval form or with
-//! `skykeep-mcp approve` in their terminal, and its card never offers "Always allow". Every
+//! as the only removal. It always needs the person's approval on the approval card (or with
+//! `skykeep-mcp approve` under an `ask: terminal` rule), and its card never offers "Always
+//! allow". Every
 //! other action follows the approval mode and the permissions file. Deleting for good, editing
 //! pictures, shared albums and changing many photos at once are not offered. An upload reads one
 //! file from the exchange folder ([`crate::exchange`]), under its size limit.
@@ -622,7 +623,7 @@ fn engine(e: &quince_icloud::Error) -> &'static str {
     match e {
         E::ReauthRequired => "login_required",
         E::NeedsDeviceApproval => PAUSED,
-        E::Network(_) | E::Busy(_) => UNKNOWN,
+        E::Network(_) | E::Stalled | E::Busy(_) => UNKNOWN,
         E::Conflict => CHANGED,
         _ => NOT_CONFIRMED,
     }
@@ -739,7 +740,7 @@ pub(crate) async fn run(
         return Err("login_required");
     }
     if !approved {
-        let mode = crate::policy(&library, dir)?.map(|(p, _)| p.mode);
+        let mode = crate::mode_in_force(&library, dir)?;
         if mode.as_deref().is_some_and(|m| m != "yolo") || needs_person(&op) {
             return Err("approval_required");
         }
@@ -770,7 +771,7 @@ pub(crate) async fn run(
     // The local side first: nothing is asked of Apple for a file that cannot be read.
     let staged = match &op {
         PhotosWrite::Upload { local } => {
-            let exchange = exchange::configured(&library)?.ok_or(NO_EXCHANGE)?;
+            let exchange = exchange::in_force(&library, dir)?.ok_or(NO_EXCHANGE)?;
             let (file, size) = exchange::open_upload(&exchange, local)?;
             let name = local.rsplit('/').next().ok_or("invalid_local_path")?;
             if let Some(refused) = upload::refusal(name, size) {
@@ -894,8 +895,11 @@ impl Work<'_> {
                     .service_url("photosupload")
                     .ok_or("photos_service_unavailable")?;
                 let quiet: Arc<dyn Fn(upload::Stage) + Send + Sync> = Arc::new(|_| {});
+                // The photo's bytes go through the session's uploads client, watched while
+                // they go; the read timeout of the plain client cut off long uploads.
                 let outcome = upload::upload(
                     http,
+                    conn.client.uploads(),
                     &up,
                     &conn.dsid,
                     &zone,
@@ -1167,7 +1171,7 @@ pub(crate) fn tool() -> Value {
     let id = json!({"description":"Photo id from photos_list, photos_search or photos_get.","type":"string","minLength":1,"maxLength":crate::photos::MAX_ID_BYTES});
     json!({
         "name": TOOL,
-        "description": "Change the user's Apple iCloud Photos (personal library): upload (local, a photo or video file in the exchange folder the user set up in their terminal), set_favorite (id, favorite), set_title_and_caption (id, title and/or caption; empty text clears), set_rating (id, rating 0 to 5), set_keywords (id, keywords: the whole new list; the words added or taken away are merged into Apple's list as it is at that moment, so a word another device adds at the same time stays; run photos_refresh before the next change to that photo), set_date (id, taken_at such as 2024-05-01T14:30:00+02:00), create_album (name), rename_album (album_id, name) and trash (id; moves the photo to Recently Deleted). Photos and albums are found in the local cache, so run photos_refresh first. A photo or album changed at Apple since the cache read it is refused, never written over; run photos_refresh and ask again. trash always needs the user's approval, in the approval form or with skykeep-mcp approve in their terminal; every change follows the approval mode. Nothing is deleted for good, no picture is edited, and shared albums are not touched. The reply says done with what Apple's answer showed, or sent_not_confirmed when Apple accepted the change but its answer did not show it (run photos_refresh and look), or an error; an unknown outcome means run photos_refresh and look before trying again.",
+        "description": "Change the user's Apple iCloud Photos (personal library): upload (local, a photo or video file in the exchange folder the user set up in their terminal), set_favorite (id, favorite), set_title_and_caption (id, title and/or caption; empty text clears), set_rating (id, rating 0 to 5), set_keywords (id, keywords: the whole new list; the words added or taken away are merged into Apple's list as it is at that moment, so a word another device adds at the same time stays; run photos_refresh before the next change to that photo), set_date (id, taken_at such as 2024-05-01T14:30:00+02:00), create_album (name), rename_album (album_id, name) and trash (id; moves the photo to Recently Deleted). Photos and albums are found in the local cache, so run photos_refresh first. A photo or album changed at Apple since the cache read it is refused, never written over; run photos_refresh and ask again. trash always needs the user's approval on the approval card; every change follows the approval mode. Nothing is deleted for good, no picture is edited, and shared albums are not touched. The reply says done with what Apple's answer showed, or sent_not_confirmed when Apple accepted the change but its answer did not show it (run photos_refresh and look), or an error; an unknown outcome means run photos_refresh and look before trying again.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1193,6 +1197,14 @@ pub(crate) fn tool() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An upload that stopped part way, or got no answer once every byte was in, can not
+    /// tell whether Apple made the photo. Before the watched upload such a stop came back
+    /// as a network timeout, and it still reads the same way.
+    #[test]
+    fn a_stalled_upload_is_an_unknown_outcome_like_a_dropped_connection() {
+        assert_eq!(engine(&quince_icloud::Error::Stalled), UNKNOWN);
+    }
 
     #[test]
     fn only_trash_is_a_removal_and_it_is_recoverable() {

@@ -1528,7 +1528,7 @@ impl<'a> CalendarClient<'a> {
         let status = response.status();
         let text = crate::bounded::reply(response).await?;
 
-        if status.as_u16() == 450 {
+        if crate::session_lapsed(status) {
             return Err(Error::ReauthRequired);
         }
         if status.as_u16() == 404 {
@@ -1570,7 +1570,7 @@ impl<'a> CalendarClient<'a> {
         let status = response.status();
         let text = crate::bounded::reply(response).await?;
 
-        if status.as_u16() == 450 {
+        if crate::session_lapsed(status) {
             return Err(Error::ReauthRequired);
         }
         if status.as_u16() == 404 {

@@ -16,10 +16,10 @@
 //!
 //! Who approves. [`is_destructive`] names the deletions in one place. They, and a rename or
 //! move of a folder that holds many items (or an unknown number), always need the person's
-//! approval, with a preview of what they affect. The person approves or denies them either
-//! in the MCP client's approval form, under the `reads_and_writes` and `writes_only` modes
-//! (where every Drive change is asked), or with `skykeep-mcp approve` in their own terminal,
-//! under `yolo` or with no approval mode. No mode lets them run without one of the two. Upload and download touch only the exchange folder ([`crate::exchange`]).
+//! approval, with a preview of what they affect, on the MCP client's approval card in every
+//! approval mode (`reads_and_writes` and `writes_only` ask every Drive change there). Only an
+//! `ask: terminal` rule sends them to `skykeep-mcp approve` instead. No mode lets them run
+//! unasked. Upload and download touch only the exchange folder ([`crate::exchange`]).
 use crate::account::{binding, Binding};
 use crate::drive::{self, Stop, Target, PAUSED};
 use crate::exchange::{self, hides_text};
@@ -432,16 +432,6 @@ pub(crate) fn needs_person(library: &Library, op: &DriveWrite) -> Result<bool, &
     Ok(false)
 }
 
-/// Whether the approval is asked in the terminal: when the approval mode has no form for it
-/// (no mode set, or `yolo`). The other modes ask every Drive change in the form.
-pub(crate) fn goes_to_terminal(
-    library: &Library,
-    mode: Option<&str>,
-    op: &DriveWrite,
-) -> Result<bool, &'static str> {
-    Ok(mode.is_none_or(|m| m == "yolo") && needs_person(library, op)?)
-}
-
 /// What the approval shows and is bound to: the action, and what it reaches as cached. The
 /// same arguments over the same cache give the same preview, so a change in between makes an
 /// approval stale.
@@ -570,7 +560,8 @@ pub(crate) fn plain_preview(preview: &Value) -> String {
 pub struct WriteLimits {
     /// create_folder, rename, move, trash and delete_forever.
     pub change_timeout: Duration,
-    /// upload and download; `None` scales with the size limit ([`transfer_time`]).
+    /// upload and download; `None` scales with the size limit ([`upload_time`],
+    /// [`transfer_time`]).
     pub transfer_timeout: Option<Duration>,
     /// The folder reads made before a change.
     pub read: drive::RefreshLimits,
@@ -590,6 +581,13 @@ impl Default for WriteLimits {
 /// and one second more per 256 KB of the limit (about nine minutes at 100 MB).
 pub fn transfer_time(max_bytes: u64) -> Duration {
     Duration::from_secs(120 + max_bytes / (256 * 1024))
+}
+
+/// How long one upload may take: [`transfer_time`], plus the time Apple may take to answer
+/// once it has every byte ([`quince_icloud::upload::ANSWER`], five minutes), as a Photos
+/// upload has.
+pub fn upload_time(max_bytes: u64) -> Duration {
+    transfer_time(max_bytes) + quince_icloud::upload::ANSWER
 }
 
 /// Makes the session's client for a private directory.
@@ -662,7 +660,7 @@ fn apple(e: &quince_icloud::Error) -> &'static str {
     match e {
         E::ReauthRequired => "login_required",
         E::NeedsDeviceApproval => PAUSED,
-        E::Network(_) | E::Busy(_) => UNKNOWN,
+        E::Network(_) | E::Stalled | E::Busy(_) => UNKNOWN,
         E::Refused(_) if quince_icloud::drive::transient(e) => UNKNOWN,
         E::Conflict => CHANGED,
         _ => NOT_CONFIRMED,
@@ -773,7 +771,7 @@ pub(crate) async fn run(
         return Err("login_required");
     }
     if !approved {
-        let mode = crate::policy(&library, dir)?.map(|(p, _)| p.mode);
+        let mode = crate::mode_in_force(&library, dir)?;
         if mode.as_deref().is_some_and(|m| m != "yolo") || needs_person(&library, &op)? {
             return Err("approval_required");
         }
@@ -793,7 +791,7 @@ pub(crate) async fn run(
     // name that is taken.
     let local = match &op {
         DriveWrite::Upload { local, name, .. } => {
-            let exchange = exchange::configured(&library)?.ok_or(NO_EXCHANGE)?;
+            let exchange = exchange::in_force(&library, dir)?.ok_or(NO_EXCHANGE)?;
             let (file, size) = exchange::open_upload(&exchange, local)?;
             let name = name
                 .clone()
@@ -803,7 +801,7 @@ pub(crate) async fn run(
             Local::Upload(staged, name, exchange.max_bytes)
         }
         DriveWrite::Download { local, .. } => {
-            let exchange = exchange::configured(&library)?.ok_or(NO_EXCHANGE)?;
+            let exchange = exchange::in_force(&library, dir)?.ok_or(NO_EXCHANGE)?;
             let item = plan.item.as_ref().ok_or("not_found")?;
             if item
                 .size
@@ -827,7 +825,8 @@ pub(crate) async fn run(
     let limits = seam.limits;
     let timeout = match &local {
         Local::None => limits.change_timeout,
-        Local::Upload(_, _, max) | Local::Download(_, _, max) => limits
+        Local::Upload(_, _, max) => limits.transfer_timeout.unwrap_or_else(|| upload_time(*max)),
+        Local::Download(_, _, max) => limits
             .transfer_timeout
             .unwrap_or_else(|| transfer_time(*max)),
     };
@@ -1006,8 +1005,11 @@ async fn act(
             }
             effects.unlist.push(folder.clone());
             let progress: quince_icloud::drive::Progress = Arc::new(|_, _| {});
+            // The file's bytes go through the session's uploads client, watched while they
+            // go; the read timeout of the plain client cut off uploads longer than a minute.
             let filed = quince_icloud::drive::upload(
                 http,
+                conn.client.uploads(),
                 docws,
                 root,
                 params(),
@@ -1139,7 +1141,7 @@ pub(crate) fn tool() -> Value {
     let id = json!({"description":"move only: id of the folder to move the item into, from drive_list, drive_get or drive_search, instead of destination_path.","type":"string","minLength":1,"maxLength":drive::MAX_ID_BYTES});
     json!({
         "name": TOOL,
-        "description": "Change the user's Apple iCloud Drive: create_folder (path or id of the parent, name), rename (path or id, name), move (path or id, destination_path or destination_id), trash (to Recently Deleted), delete_forever, upload (path or id of the folder, local, optional name) and download (path or id of the file, optional local). Targets are found in the local cache as drive_get finds them, so run drive_refresh on the folder first. local names a file inside the exchange folder the user set up in their terminal: a relative path, never absolute. An existing name is refused, never replaced, in iCloud Drive and locally. Deletions and moves or renames of a folder with many items always need the user's approval, in the approval form or with skykeep-mcp approve in their terminal; every change follows the approval mode. already_has_this_name and already_in_destination mean the change is already done. The reply says done with what was checked, or an error; an unknown outcome means run drive_refresh and look before trying again.",
+        "description": "Change the user's Apple iCloud Drive: create_folder (path or id of the parent, name), rename (path or id, name), move (path or id, destination_path or destination_id), trash (to Recently Deleted), delete_forever, upload (path or id of the folder, local, optional name) and download (path or id of the file, optional local). Targets are found in the local cache as drive_get finds them, so run drive_refresh on the folder first. local names a file inside the exchange folder the user set up in their terminal: a relative path, never absolute. An existing name is refused, never replaced, in iCloud Drive and locally. Deletions and moves or renames of a folder with many items always need the user's approval on the approval card; every change follows the approval mode. already_has_this_name and already_in_destination mean the change is already done. The reply says done with what was checked, or an error; an unknown outcome means run drive_refresh and look before trying again.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1161,6 +1163,14 @@ pub(crate) fn tool() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An upload that stopped part way, or got no answer once every byte was in, can not
+    /// tell whether Apple filed it. Before the watched upload such a stop came back as a
+    /// network timeout, and it still reads the same way.
+    #[test]
+    fn a_stalled_upload_is_an_unknown_outcome_like_a_dropped_connection() {
+        assert_eq!(apple(&quince_icloud::Error::Stalled), UNKNOWN);
+    }
 
     #[test]
     fn every_action_parses_and_only_deletions_are_destructive() {

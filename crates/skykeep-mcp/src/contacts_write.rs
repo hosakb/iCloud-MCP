@@ -15,9 +15,9 @@
 //! as Apple has it. Contact lists, photos and merging cards are not part of this tool.
 //!
 //! Who approves. A delete is permanent ([`is_destructive`], from the permissions rules), so
-//! it always needs the person: on the card in the MCP client under `reads_and_writes` and
-//! `writes_only`, or with `skykeep-mcp approve` in their terminal under `yolo` or with no
-//! approval mode. No rule lets it run unasked, and its card offers no "Always allow".
+//! it always needs the person, on the card in the MCP client in every approval mode (or with
+//! `skykeep-mcp approve` where an `ask: terminal` rule asks for that). No rule lets it run
+//! unasked, and its card offers no "Always allow".
 use crate::account::{binding, Binding};
 use crate::contacts::{self, RefreshLimits, Stop};
 use crate::drive_write::{shown, MakeClient};
@@ -1472,7 +1472,7 @@ pub(crate) fn tool() -> Value {
     );
     json!({
         "name": TOOL,
-        "description": "Change the user's Apple iCloud Contacts, one card per call: create (fields), update (guid, etag, fields) or delete (guid, etag). Take guid and etag from contacts_get; the etag is the card's version. An update or delete of a card that changed since, on another device or in the cache, is refused with contact_changed_conflict and nothing is written: run contacts_refresh, read the card again and ask with its new etag. An update changes only the fields it names; null or an empty string clears a field, and a list of emails, phones or URLs replaces that list (each entry is {label, value}; order is not kept). When contacts_get showed the card cut short (card_truncated), an update that replaces its notes or a list of emails, phones or URLs is refused, because part of it was not seen; change those on an Apple device. Postal addresses, photos, contact lists and merging cards are not changed by this tool. Contacts has no Recently Deleted, so a delete is permanent; every delete needs the user's approval, in the approval form or with skykeep-mcp approve in their terminal; every change follows the approval mode and the rules the user set. The reply says done with what was checked, unchanged when Apple already holds the values, or an error; an unknown outcome means run contacts_refresh and look before trying again; a create tried again without that can make a second card.",
+        "description": "Change the user's Apple iCloud Contacts, one card per call: create (fields), update (guid, etag, fields) or delete (guid, etag). Take guid and etag from contacts_get; the etag is the card's version. An update or delete of a card that changed since, on another device or in the cache, is refused with contact_changed_conflict and nothing is written: run contacts_refresh, read the card again and ask with its new etag. An update changes only the fields it names; null or an empty string clears a field, and a list of emails, phones or URLs replaces that list (each entry is {label, value}; order is not kept). When contacts_get showed the card cut short (card_truncated), an update that replaces its notes or a list of emails, phones or URLs is refused, because part of it was not seen; change those on an Apple device. Postal addresses, photos, contact lists and merging cards are not changed by this tool. Contacts has no Recently Deleted, so a delete is permanent; every delete needs the user's approval on the approval card; every change follows the approval mode and the rules the user set. The reply says done with what was checked, unchanged when Apple already holds the values, or an error; an unknown outcome means run contacts_refresh and look before trying again; a create tried again without that can make a second card.",
         "inputSchema": {
             "type": "object",
             "properties": {

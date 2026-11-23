@@ -431,8 +431,7 @@ pub(crate) fn get(library: &Library, args: Value) -> Result<Value, &'static str>
 /// `reads_and_writes`, or a directory not yet bound to an account. Touches no queued write.
 pub(crate) fn gate(dir: &Path, approved: bool) -> Result<(), &'static str> {
     let library = Library::open(dir).map_err(|_| "library_unavailable")?;
-    if crate::policy(&library, dir)?.is_some_and(|(p, _)| p.mode == "reads_and_writes") && !approved
-    {
+    if crate::mode_in_force(&library, dir)?.as_deref() == Some("reads_and_writes") && !approved {
         return Err("read_approval_required");
     }
     if library
@@ -516,7 +515,8 @@ impl Stop {
 fn refused(status: u16) -> Option<Stop> {
     match status {
         200..=299 => None,
-        450 => Some(Stop::Reauth),
+        // Apple's lapsed session, in either of its two answers (#59).
+        421 | 450 => Some(Stop::Reauth),
         429 | 500..=599 => Some(Stop::Busy),
         _ => Some(Stop::Failed),
     }

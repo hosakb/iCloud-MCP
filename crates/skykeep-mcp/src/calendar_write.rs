@@ -32,7 +32,8 @@
 //! with no earlier valid rules refuses it.
 //!
 //! Who approves. A delete (`permissions::removal_of` decides it, as for every tool) always
-//! needs the person's approval, on the card or with `skykeep-mcp approve`, and the card never
+//! needs the person's approval, on the card (or with `skykeep-mcp approve` under an
+//! `ask: terminal` rule), and the card never
 //! offers "Always allow" for it. Other actions follow the approval mode and the rules.
 use crate::account::{binding, Binding};
 use crate::calendar;
@@ -422,12 +423,6 @@ pub(crate) fn validate(args: &Value) -> Result<CalendarWrite, &'static str> {
 /// Whether this action needs the person's approval whatever the rules and the mode say.
 pub(crate) fn needs_person(args: &Value) -> bool {
     validate(args).is_ok_and(|op| is_destructive(op.action()))
-}
-
-/// Whether the approval is asked in the terminal: when the approval mode has no form for it
-/// (no mode set, or `yolo`). The other modes ask every Calendar change in the form.
-pub(crate) fn goes_to_terminal(mode: Option<&str>, op: &CalendarWrite) -> bool {
-    mode.is_none_or(|m| m == "yolo") && is_destructive(op.action())
 }
 
 // --- Times.
@@ -1017,6 +1012,7 @@ pub(crate) fn next_step(error: &str, args: &Value) -> Option<String> {
         }
         FLOATING => "This event has no time zone: a floating event, or an all-day one becoming timed, is shown at the same clock time everywhere. New times would tie it to a zone, so give timezone with them, such as timezone: Europe/Berlin, or timezone: UTC to keep offset times as they are.".into(),
         UNKNOWN_ACTION => format!("action must be one of {}.", ACTIONS.join(", ")),
+        "calendar_change_refused_by_apple_nothing_changed" => "Apple refused the change, and nothing changed. Run calendar_refresh and look at the event with calendar_get before trying again, or change it in Apple Calendar.".into(),
         CALENDAR_CHANGED => "The calendar changed at Apple while the event was being added, and nothing was saved. Run calendar_refresh, then try the create again.".into(),
         NOTES_TOO_LONG => format!("The event's notes are longer than {MAX_NOTES_BYTES} characters, too long to show whole in the terminal approval. Make this change in Apple Calendar, or approve it on the card in an MCP client."),
         "event_too_long" => format!("An event may last at most {MAX_EVENT_DAYS} days. Give an earlier end."),
@@ -1202,7 +1198,7 @@ pub(crate) async fn run(
         return Err("login_required");
     }
     if !approved {
-        let mode = crate::policy(&library, dir)?.map(|(p, _)| p.mode);
+        let mode = crate::mode_in_force(&library, dir)?;
         if mode.as_deref().is_some_and(|m| m != "yolo") || is_destructive(op.action()) {
             return Err("approval_required");
         }

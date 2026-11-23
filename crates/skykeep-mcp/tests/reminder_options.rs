@@ -310,25 +310,34 @@ async fn the_default_zone_is_chosen_once_and_queued() {
     assert!(plain_payload.get("timezone").is_none(), "{plain_payload}");
 }
 
-/// Under the approval policy the options wait with the rest of the create, and the human's
-/// approval queues exactly them.
+/// Under the approval policy the options wait with the rest of the create on the card, and
+/// the human's approval queues exactly them.
 #[tokio::test]
 async fn options_wait_for_approval_with_the_create() {
     let (_dir, mut server, mut library) = setup(true);
     library
         .set_state("mcp.require_write_approval", "true")
         .unwrap();
-    let (_, result) = call(&mut server, full()).await;
-    assert_eq!(result["status"], "approval_required", "{result}");
+    server.handle(json!({"id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}}}})).await;
+    let form = server
+        .handle(json!({"id":2,"method":"tools/call","params":{"name":"reminders_write","arguments":full()}}))
+        .await
+        .unwrap();
+    assert_eq!(form["method"], "elicitation/create", "{form}");
     assert_eq!(library.outbox_count().unwrap(), 0);
-    let details = server
-        .approval_details(result["request_id"].as_str().unwrap())
+    // The card's text escapes `_` as \u005f.
+    let message = form["params"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("2026-03-20") && message.contains("America/New\\u005fYork"),
+        "{message}"
+    );
+    let reply = server
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
+        .await
         .unwrap();
-    assert!(details.contains("2026-03-20") && details.contains("America/New_York"));
-    let approved = server
-        .approve(result["request_id"].as_str().unwrap())
-        .unwrap();
-    assert_eq!(approved["status"], "queued");
+    let approved: Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(approved["status"], "queued", "{approved}");
     assert_eq!(approved["remote_verified"], false);
     assert_eq!(approved["options"]["early_alert"]["amount"], 15);
     let payload: Value =
@@ -659,6 +668,8 @@ async fn a_create_quarantined_by_a_policy_change_keeps_its_step_note_until_disca
 async fn a_create_superseded_by_a_deletion_keeps_its_step_note_until_discarded() {
     let (_dir, mut server, mut library) = setup(false);
     server.set_policy("yolo").unwrap();
+    // A client that shows the card: the deletion asks there, also under yolo.
+    server.handle(json!({"id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}}}})).await;
     let (failed, made) = call(
         &mut server,
         json!({"action":"create","list_guid":"list","title":"Synthetic","due_at":DUE,"repeat":{"frequency":"daily"}}),
@@ -667,8 +678,16 @@ async fn a_create_superseded_by_a_deletion_keeps_its_step_note_until_discarded()
     assert!(!failed, "{made}");
     let guid = made["guid"].as_str().unwrap();
     library.set_state(&steps_key(guid), "2").unwrap();
-    let (failed, gone) = call(&mut server, json!({"action":"delete","guid":guid})).await;
-    assert!(!failed, "{gone}");
+    let form = server
+        .handle(json!({"id":2,"method":"tools/call","params":{"name":"reminders_write","arguments":{"action":"delete","guid":guid}}}))
+        .await
+        .unwrap();
+    assert_eq!(form["method"], "elicitation/create", "{form}");
+    let gone = server
+        .handle(json!({"jsonrpc":"2.0","id":form["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
+        .await
+        .unwrap();
+    assert_eq!(gone["result"]["isError"], false, "{gone}");
     kept_until_discarded(
         &mut server,
         &library,

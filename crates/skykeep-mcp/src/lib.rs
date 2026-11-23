@@ -124,6 +124,9 @@ struct PendingConsent {
     always: Option<String>,
 }
 
+/// How long an approval card waits for the person before it counts as Deny.
+const CARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// The error for a call the permissions file sets to deny.
 pub const DENIED: &str = "denied_by_permissions";
 
@@ -132,7 +135,12 @@ fn plain_error(error: &str) -> Value {
     let mut value = json!({"error":error});
     let message = match error {
         DENIED => "The permissions file in Skykeep's folder sets this action to deny, so it did not run.",
-        "approval_requires_form_client" => "This action needs approval on a card in the MCP client, and this client did not offer approval forms when it connected. Approve it in a client or session that shows the card, or change the rule for this action in permissions.yaml to ask: terminal (approve it with skykeep-mcp approve in your own terminal), allow or deny.",
+        "approval_policy_changed" => "Something changed while the approval card was open (the item, the approval mode or the permissions file), so the approval no longer counts and nothing ran. Ask again to get a new card.",
+        "approval_pending" => "Another action is waiting for an answer on the approval card. Answer or close that card first, then ask again.",
+        "approval_requires_form_client" => "This action needs a person to approve it on the approval card in the MCP client, and this client did not offer approval cards when it connected, so nothing ran. Ask again from a client that shows the card, such as Hermes, while someone is there to answer it.",
+        "approval_denied" => "The approval card was denied, declined or closed without a choice, so nothing ran.",
+        "approval_cancelled" => "The request was cancelled before the approval card was answered, so nothing ran.",
+        "approval_timeout" => "Nobody answered the approval card within 3 minutes, so nothing ran. A session where nobody can answer, such as a scheduled job, can't run actions that need approval. Ask again while someone can answer the card.",
         _ => return value,
     };
     value["message"] = json!(message);
@@ -210,30 +218,24 @@ fn gate_for(
             }
         },
     };
-    // Drive deletions and renames or moves of large folders always need a person: an allow
-    // rule (or yolo) can't let them run unasked. The approval mode decides where it is asked.
-    // This comes before the broken-file step below, so a Drive deletion under yolo still
-    // waits for the terminal then.
-    let gate = match gate {
-        Gate::Run
-            if drive_needs_person(library, name, args)?
-                || contacts_write::needs_person(name, args) =>
-        {
-            match mode {
-                Some(mode) if mode != "yolo" => Gate::Client,
-                _ => Gate::Terminal,
-            }
-        }
-        gate => gate,
-    };
+    // Deletions, trash, moves to Recently Deleted and renames or moves of large Drive folders
+    // always need a person: an allow rule, yolo or a folder without an approval mode can't let
+    // them run unasked. They are asked on the card in every mode; only an explicit
+    // ask: terminal rule sends them to skykeep-mcp approve instead.
+    let person =
+        drive_needs_person(library, name, args)? || contacts_write::needs_person(name, args);
     let removes = permissions::removal(name, args) != permissions::Removal::None;
-    let gate = match (gate, mode) {
-        // Without an approval mode, deletions always wait for skykeep-mcp approve: a rule
-        // can make them stricter, never looser.
-        (Gate::Run | Gate::Client, None) if removes => Gate::Terminal,
-        // A broken file with no earlier valid rules: every deletion asks.
-        (Gate::Run, Some(_)) if removes && active.strict => Gate::Client,
-        (gate, _) => gate,
+    // A folder without a mode that was set to approve every change (require-approval). Drive
+    // and Calendar keep asking then even where a rule allows the change.
+    let every_change = mode.is_none()
+        && require_all
+        && args["action"].is_string()
+        && (gate == Gate::Legacy || [drive_write::TOOL, calendar_write::TOOL].contains(&name));
+    // Every deletion asks in every mode, yolo included: a rule can make it stricter (deny or
+    // ask: terminal), never looser. A broken file therefore never lets one run either.
+    let gate = match gate {
+        Gate::Run | Gate::Legacy if person || every_change || removes => Gate::Client,
+        gate => gate,
     };
     Ok((gate, explicit))
 }
@@ -355,6 +357,33 @@ struct Policy {
     state_identity: (u64, u64),
 }
 
+/// Library key: the stored approval mode was taken over from the permissions file, not chosen
+/// by the person. It counts only while the file names a mode.
+const ADOPTED_KEY: &str = "mcp.policy.from_file";
+/// Library key: how many waiting changes taking over the file's mode set aside, said once.
+const SET_ASIDE_KEY: &str = "mcp.policy.set_aside";
+
+/// Whether the stored approval mode was taken over from the permissions file.
+pub(crate) fn adopted(library: &Library) -> bool {
+    library.state(ADOPTED_KEY).ok().flatten().as_deref() == Some("1")
+}
+
+/// The stored approval mode as the fallback when the file names none: the one setup or
+/// `skykeep-mcp policy` stored. One taken over from the file doesn't count then, so the
+/// folder is back to its setup choice (no approval mode).
+pub(crate) fn stored_mode(library: &Library, dir: &Path) -> Result<Option<String>, &'static str> {
+    Ok(policy(library, dir)?
+        .map(|(p, _)| p.mode)
+        .filter(|_| !adopted(library)))
+}
+
+/// The approval mode in force: the permissions file's `approval_mode:`, else the stored one.
+/// Read only; the server records file loads at each tool call.
+pub(crate) fn mode_in_force(library: &Library, dir: &Path) -> Result<Option<String>, &'static str> {
+    let stored = stored_mode(library, dir)?;
+    Ok(permissions::peek(library, dir, stored.as_deref())?.mode)
+}
+
 fn policy(
     library: &Library,
     dir: &Path,
@@ -417,10 +446,7 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
     }
     match error {
         "unsafe_state_contents" => state::unsafe_entry_sentence(dir),
-        e if e.starts_with("exchange_folder_") => Some(format!(
-            "In your own terminal, run: {}",
-            status::with_dir("skykeep-mcp exchange", dir)
-        )),
+        e if e.starts_with("exchange_folder_") => Some(exchange::next_step(e, dir)),
         // contacts_write's own codes, by their prefix.
         e if e.starts_with("contact_") || e.starts_with("contacts_write_") => {
             contacts_write::next_step(e, args)
@@ -432,6 +458,24 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
         "local_file_exists_not_overwritten" => Some("A file with that name is already in the exchange folder, and it was left as it is. Ask again with another local name, or move that file away first.".to_string()),
         "already_has_this_name" => Some("Nothing to do: iCloud Drive already shows the item under that name.".to_string()),
         "already_in_destination" => Some("Nothing to do: the item is already in that folder in iCloud Drive.".to_string()),
+        "policy_state_changed" => Some(format!("This folder was copied or moved, so its approval mode belongs to the old folder. In your own terminal, run {} to choose it again.", status::with_dir("skykeep-mcp setup", dir))),
+        "policy_account_changed" => Some(format!("The approval mode was set before sign-in or for another account. In your own terminal, run {} to choose it again.", status::with_dir("skykeep-mcp setup", dir))),
+        "login_required" => Some(format!("Sign in with {} in a terminal you opened yourself, not one an AI app runs. Never send passwords or codes to MCP or chat.", status::with_dir("skykeep-mcp login", dir))),
+        "conflict" => Some("The item changed since you read it, so nothing was queued. Read it again with notes_get or reminders_get, then ask again with its current base_etag.".to_string()),
+        "mutation_refused" => Some(format!("The change could not be saved to the local queue, so nothing was queued. In your own terminal, run {} to check this folder, then try again.", status::with_dir("skykeep-mcp status", dir))),
+        "drive_read_failed_nothing_sent" => Some("Apple's answer about the item could not be read, so nothing was sent. Try again in a moment; if it keeps failing, run drive_refresh on the folder.".to_string()),
+        "local_file_not_found" => Some("No file with that local name is in the exchange folder. Check the name, or put the file there first.".to_string()),
+        "local_folder_not_found" => Some("A folder on that local path is not in the exchange folder. Check the path, or make the folder first.".to_string()),
+        "local_not_a_folder" => Some("A name on that local path is a file, not a folder. Check the path and ask again.".to_string()),
+        "local_symlink_refused" => Some("That local path goes through a symbolic link, which is refused. Use the real file or folder inside the exchange folder.".to_string()),
+        "path_not_in_cache_run_drive_refresh" => Some("A folder on that path is not in the local copy of iCloud Drive yet. Run drive_refresh with the same path, then try again.".to_string()),
+        "range_too_wide" => Some(format!("The date range is too long. calendar_events and calendar_search take at most {} days, calendar_refresh at most {} days. Ask again with a shorter range.", calendar::MAX_RANGE_DAYS, calendar::MAX_REFRESH_DAYS)),
+        photos::APPLE_FAILED => Some("Apple's Photos server was busy, had asked to wait, or sent a reply that could not be used. The local copy was kept as it was. Run photos_refresh again in a few minutes.".to_string()),
+        photos::STORE_FAILED => Some(format!("Apple's Photos reply arrived, but it could not be saved to the local copy, which was kept as it was. In your own terminal, run {} to check this folder, then run photos_refresh again.", status::with_dir("skykeep-mcp status", dir))),
+        "calendar_service_unavailable" => service_off("Apple Calendar", dir),
+        "contacts_service_unavailable" => service_off("Apple Contacts", dir),
+        "drive_service_unavailable" => service_off("iCloud Drive", dir),
+        "photos_service_unavailable" => service_off("iCloud Photos", dir),
         "local_folder_not_private" => Some(
             args["local"]
                 .as_str()
@@ -443,6 +487,11 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
         ),
         other => calendar_write::next_step(other, args),
     }
+}
+
+/// The next step when the sign-in does not offer `service`.
+fn service_off(service: &str, dir: &Path) -> Option<String> {
+    Some(format!("This iCloud sign-in does not offer {service}. Check that {service} is turned on for this Apple Account in iCloud settings, then in your own terminal run {} to sign in again.", status::with_dir("skykeep-mcp setup", dir)))
 }
 
 /// [`tool_reply`] with [`error_value`]'s instructions, and the rule that denied the call.
@@ -491,6 +540,98 @@ fn tool_reply(id: Value, result: Result<Value, &'static str>) -> Value {
     let failed = result.is_err();
     let value = result.unwrap_or_else(plain_error);
     json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":value.to_string()}],"isError":failed}})
+}
+
+/// The card's first line: what the change does, in one plain sentence, from the same preview
+/// the card binds. Names from the cache are shown as escaped JSON text, like the rest of the
+/// card, so they can't pose as the card's own words. Empty for a call that changes nothing.
+fn card_headline(name: &str, args: &Value, snapshot: Option<&Value>) -> String {
+    let Some(action) = args["action"].as_str().filter(|_| name.ends_with("_write")) else {
+        return String::new();
+    };
+    let service = match name {
+        "notes_write" => "Notes",
+        "reminders_write" => "Reminders",
+        contacts_write::TOOL => "Contacts",
+        calendar_write::TOOL => "Calendar",
+        photos_write::TOOL => "Photos",
+        drive_write::TOOL => "iCloud Drive",
+        _ => return String::new(),
+    };
+    let empty = Value::Null;
+    let snap = snapshot.unwrap_or(&empty);
+    let label = [
+        &snap["drive"]["item"]["path"],
+        &snap["drive"]["item"]["name"],
+        &snap["photos"]["photo"]["title"],
+        &snap["photos"]["photo"]["filename"],
+        &snap["photos"]["album"]["name"],
+        &snap["calendar"]["event"]["title"],
+        &snap["contact"]["display_name"],
+        &snap["item"]["title"],
+        &args["title"],
+        &args["name"],
+    ]
+    .into_iter()
+    .find_map(|v| v.as_str().filter(|t| !t.trim().is_empty()))
+    .map(|t| {
+        let short: String = t.chars().take(120).collect();
+        inert_preview(&json!(short)).unwrap_or_default()
+    });
+    let removal = bound_removal(name, args, snapshot);
+    let verb = match (name, action, removal) {
+        ("notes_write", "save", permissions::Removal::Permanent) => "Erase all text of".to_string(),
+        ("notes_write", "delete", permissions::Removal::Permanent) => "Delete forever".to_string(),
+        (_, _, permissions::Removal::Recoverable) => "Move to Recently Deleted".to_string(),
+        (_, "delete_forever", _) => "Delete forever".to_string(),
+        _ => {
+            let words = action.replace('_', " ");
+            let mut chars = words.chars();
+            chars
+                .next()
+                .map(|c| c.to_uppercase().chain(chars).collect())
+                .unwrap_or_default()
+        }
+    };
+    // A Calendar delete names its scope: one occurrence or the whole series.
+    let scope = if name == calendar_write::TOOL && action == "delete" {
+        snap["calendar"]["scope"].as_str()
+    } else {
+        None
+    };
+    let series = label.as_deref().unwrap_or("the series");
+    let (what, rest) = match (scope, &label) {
+        (Some("whole_series"), _) => (
+            format!(" every occurrence of {series}, past and future,"),
+            "",
+        ),
+        (Some("this_occurrence"), _) => (
+            format!(" one occurrence of {series}"),
+            "; the rest of the series stays",
+        ),
+        (_, Some(l)) => (format!(" {l}"), ""),
+        (_, None) => (String::new(), ""),
+    };
+    let after = match removal {
+        permissions::Removal::Permanent => " This can't be undone.",
+        permissions::Removal::Recoverable => {
+            " Apple keeps it in Recently Deleted for about 30 days."
+        }
+        permissions::Removal::None => "",
+    };
+    format!("{verb}{what} in {service}{rest}.{after}")
+}
+
+/// What a call removes, judged against the item the card binds. A Notes delete of a note that
+/// is already in Recently Deleted is Apple's "Delete Now", which is permanent.
+fn bound_removal(name: &str, args: &Value, snapshot: Option<&Value>) -> permissions::Removal {
+    let in_trash = snapshot.is_some_and(|snap| {
+        snap["item"]["folderGuid"].as_str() == Some(quince_core::notes::TRASH_FOLDER)
+    });
+    if name == "notes_write" && args["action"] == "delete" && in_trash {
+        return permissions::Removal::Permanent;
+    }
+    permissions::removal(name, args)
 }
 
 /// What the person chose on an approval card.
@@ -631,16 +772,9 @@ pub(crate) fn needs_consent(mode: &str, name: &str) -> Result<bool, &'static str
         "drive_list" | "drive_get" | "drive_search" | "drive_refresh" => {
             Ok(mode == "reads_and_writes")
         }
-        // Every Drive change is asked in the form, except under yolo. Deletions and large
-        // folder moves are then asked in the terminal instead (drive_write::goes_to_terminal).
-        "drive_write" => Ok(mode != "yolo"),
-        // Photos changes too; a move to Recently Deleted then waits for the terminal.
-        "photos_write" => Ok(mode != "yolo"),
-        // The same for Calendar changes; deletes then go to the terminal.
-        "calendar_write" => Ok(mode != "yolo"),
-        // Every Contacts change is asked in the form, except under yolo; a delete then waits
-        // for the terminal (gate_for).
-        "contacts_write" => Ok(mode != "yolo"),
+        // Every Drive, Photos, Calendar and Contacts change is asked on the card, except under
+        // yolo. Deletions and large Drive folder moves still ask there then (gate_for).
+        "drive_write" | "photos_write" | "calendar_write" | "contacts_write" => Ok(mode != "yolo"),
         _ => Err("unknown_tool"),
     }
 }
@@ -759,16 +893,46 @@ pub struct Server {
     /// The rule that denied the last call, for its error message.
     denied: Option<String>,
     /// Set by the last consent check: the card must not offer "Always allow", because an
-    /// allow rule would not stop it asking (a Drive deletion or large folder move).
+    /// allow rule would not stop it asking (a deletion or a large Drive folder move).
     always_blocked: bool,
     drive: drive_write::Seam,
     calendar: calendar_write::Seam,
     contacts: contacts_write::Seam,
+    /// How long a card waits for its answer.
+    card_timeout: std::time::Duration,
 }
 
 #[cfg(test)]
 mod consent_tests {
     use super::*;
+
+    /// A queued write is recorded under the mode the gate decided with, not one read again
+    /// afterwards: a file made stricter in between leaves it marked looser, so it is set
+    /// aside instead of sent.
+    #[test]
+    fn a_queued_write_keeps_the_mode_its_gate_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let mut server = Server::open(&dir).unwrap();
+        let mut library = Library::open(&dir).unwrap();
+        library.set_state(ACCOUNT_KEY, "synthetic").unwrap();
+        server.set_policy("yolo").unwrap();
+        // The file turned stricter after the gate let the write through under yolo.
+        let file = dir.join(permissions::FILE_NAME);
+        std::fs::write(&file, "version: 1\napproval_mode: writes_only\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let args: NoteWrite =
+            serde_json::from_value(json!({"action":"create","body":"synthetic"})).unwrap();
+        authorized_enqueue(&mut library, &dir, Some("yolo"), |l| enqueue_note(l, args)).unwrap();
+        let pending = library.outbox_all_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            sync::authorized(&library, &dir, &pending[0]),
+            Err("write_mode_stricter")
+        );
+    }
     #[tokio::test]
     async fn timeout_and_disconnect_drop_unconsumed_consent() {
         use std::os::unix::fs::PermissionsExt;
@@ -867,8 +1031,14 @@ impl Server {
         let dir = held.path.clone();
         let library = self.ready(&held)?;
         let configured = policy(library, &held.path)?;
-        let mode = configured.as_ref().map(|(p, _)| p.mode.clone());
-        let active = permissions::load(library, &dir, mode.as_deref())?;
+        let stored = stored_mode(library, &held.path)?;
+        let active = permissions::load(library, &dir, stored.as_deref())?;
+        let configured = match configured {
+            None if adopt_file_mode(library, &dir, &active)? => policy(library, &dir)?,
+            configured => configured,
+        };
+        // The file's approval_mode, when it names one, replaces the mode setup stored.
+        let mode = active.mode.clone();
         let name = params["name"].as_str().ok_or("invalid_tool")?;
         let (gate, _) = gate_for(
             library,
@@ -892,7 +1062,28 @@ impl Server {
         if gate != Gate::Client {
             return Ok(None);
         }
-        let blocked = drive_needs_person(library, name, &params["arguments"])?;
+        // Whether an allow rule for this action would still leave it asking.
+        let blocked = match permissions::name_for(name, &params["arguments"]) {
+            Some(rule) => {
+                let mut rules = active.rules.clone();
+                rules.insert(rule, permissions::Effect::Allow);
+                let allowed = permissions::Active {
+                    rules,
+                    problem: None,
+                    kept_from: None,
+                    ..active.clone()
+                };
+                gate_for(
+                    library,
+                    mode.as_deref(),
+                    &allowed,
+                    name,
+                    &params["arguments"],
+                )?
+                .0 != Gate::Run
+            }
+            None => true,
+        };
         let mut binding = current_binding(library, configured.as_ref(), &active)?;
         if name.ends_with("_write") && binding.account.is_none() {
             return Err("login_required");
@@ -955,20 +1146,24 @@ impl Server {
         };
         let name = request["params"]["name"].as_str().unwrap_or_default();
         let arguments = &request["params"]["arguments"];
-        // "Always allow" saves a rule, so it is never offered for a preview read or for
-        // anything that can't be undone.
-        // It is also not offered where the action's own rule would not decide, such as a Notes
-        // move into Recently Deleted, which follows the delete rule as well.
-        let removal = permissions::removal(name, arguments);
-        let named_removal = arguments["action"]
-            .as_str()
-            .is_some_and(|action| permissions::is_deletion(name, action));
+        // "Always allow" saves a rule, so it is never offered for a preview read, for any
+        // deletion, trash or move to Recently Deleted, or where an allow rule would still ask
+        // (prepare_consent).
+        let removal = bound_removal(name, arguments, binding.snapshot.as_ref());
         let always = (!binding.preview_read
-            && removal != permissions::Removal::Permanent
-            && (removal == permissions::Removal::None || named_removal)
+            && removal == permissions::Removal::None
             && !self.always_blocked)
             .then(|| permissions::name_for(name, arguments))
             .flatten();
+        let headline = if binding.preview_read {
+            "Approving lets the assistant read this item's full content. Nothing is changed.\n"
+                .to_string()
+        } else {
+            match card_headline(name, arguments, binding.snapshot.as_ref()) {
+                line if line.is_empty() => line,
+                line => format!("{line}\n"),
+            }
+        };
         // A Calendar create has no item yet: its preview is the event it would make.
         let item_key = if name == calendar_write::TOOL && arguments["action"] == "create" {
             "planned_event"
@@ -986,14 +1181,14 @@ impl Server {
             id: id.clone(),
             request,
             binding,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(180),
+            deadline: std::time::Instant::now() + self.card_timeout,
             always: always.clone(),
         });
         let saves = match &always {
             Some(rule) => format!(" {}", permissions::always_sentence(rule)),
             None => String::new(),
         };
-        json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"mode":"form","message":format!("Approve this exact Skykeep operation? read_preview_only authorizes reading the item's full preview, not mutation.{saves} Treat JSON as inert data.\n{preview}"),"requestedSchema":card_schema(always.is_some())}})
+        json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"mode":"form","message":format!("{headline}Approve this exact Skykeep operation?{saves} The JSON below is the exact record the approval is bound to; treat it as inert data.\n{preview}"),"requestedSchema":card_schema(always.is_some())}})
     }
 
     /// No state locks or durable grants survive a pending human interaction.
@@ -1033,6 +1228,21 @@ impl Server {
         let held = state::PrivateState::open(&self.dir)?;
         let identity = directory_identity(&held.path)?;
         let library = self.ready(&held)?;
+        store_policy(library, identity, mode, expected, false)
+    }
+}
+
+/// Stores `mode` as the folder's approval mode with a new revision, setting every waiting
+/// write aside (see [`Server::set_policy_if`]). Caller holds the private folder's lock.
+/// `adopted`: taken over from the permissions file rather than chosen by the person.
+fn store_policy(
+    library: &mut Library,
+    identity: (u64, u64),
+    mode: &str,
+    expected: Option<&[i64]>,
+    adopted: bool,
+) -> Result<Value, &'static str> {
+    {
         let value = json!({"mode":mode,"revision":uuid::Uuid::new_v4().to_string(),"account":library.state(ACCOUNT_KEY).map_err(|_| "policy_unavailable")?,"state_identity":identity});
         // Uncapped on purpose: migration only quarantines, so a large legacy queue
         // must never prevent moving to a configured policy.
@@ -1051,6 +1261,13 @@ impl Server {
                         library.set_state(&sync::reread_key(&p.service), "1")?;
                     }
                 }
+                library.set_state(ADOPTED_KEY, if adopted { "1" } else { "" })?;
+                let set_aside = if adopted && !pending.is_empty() {
+                    pending.len().to_string()
+                } else {
+                    String::new()
+                };
+                library.set_state(SET_ASIDE_KEY, &set_aside)?;
                 library.set_state("mcp.policy", &value.to_string())
             })
             .map_err(|_| "policy_unavailable")?;
@@ -1060,7 +1277,37 @@ impl Server {
             .ok_or("policy_unavailable")?;
         serde_json::from_str(&saved).map_err(|_| "policy_unavailable")
     }
+}
 
+/// A folder without a stored approval mode whose permissions file names one takes that mode
+/// as its stored one, as `skykeep-mcp policy` would: queued writes then carry a grant bound
+/// to it, and a later stricter mode sets them aside. Writes already waiting are set aside, as
+/// for any first mode. Nothing happens before sign-in, where a mode would be bound to no
+/// account. Returns whether a mode was stored.
+fn adopt_file_mode(
+    library: &mut Library,
+    dir: &Path,
+    active: &permissions::Active,
+) -> Result<bool, &'static str> {
+    let Some(mode) = active.mode.as_deref().filter(|_| active.mode_in_file) else {
+        return Ok(false);
+    };
+    if library
+        .state("mcp.policy")
+        .map_err(|_| "policy_unavailable")?
+        .is_some()
+        || library
+            .state(ACCOUNT_KEY)
+            .map_err(|_| "library_unavailable")?
+            .is_none()
+    {
+        return Ok(false);
+    }
+    store_policy(library, directory_identity(dir)?, mode, None, true)?;
+    Ok(true)
+}
+
+impl Server {
     /// Human CLI only. Refused writes kept for review, without their payloads.
     pub fn quarantined(&mut self) -> Result<Vec<Value>, &'static str> {
         let held = state::PrivateState::open(&self.dir)?;
@@ -1133,6 +1380,7 @@ impl Server {
                 drive: drive_write::Seam::default(),
                 calendar: calendar_write::Seam::default(),
                 contacts: contacts_write::Seam::default(),
+                card_timeout: CARD_TIMEOUT,
             }),
             Err("state_busy_retry") => Ok(Self {
                 library: None,
@@ -1147,6 +1395,7 @@ impl Server {
                 drive: drive_write::Seam::default(),
                 calendar: calendar_write::Seam::default(),
                 contacts: contacts_write::Seam::default(),
+                card_timeout: CARD_TIMEOUT,
             }),
             Err(error) => Err(error),
         }
@@ -1177,6 +1426,12 @@ impl Server {
     #[doc(hidden)]
     pub fn set_contacts_seam(&mut self, seam: contacts_write::Seam) {
         self.contacts = seam;
+    }
+
+    /// Test seam: how long the next card waits, as for the other seams.
+    #[doc(hidden)]
+    pub fn set_card_timeout(&mut self, timeout: std::time::Duration) {
+        self.card_timeout = timeout;
     }
 
     /// Trusted local CLI only, after `approval_details` was shown: runs one approved
@@ -1236,8 +1491,9 @@ impl Server {
         }
         // The permissions file as it is now: a later deny refuses, and any edit since the
         // request makes it stale, as for other terminal requests.
-        let mode = policy(library, &dir)?.map(|(p, _)| p.mode);
-        let active = permissions::load(library, &dir, mode.as_deref())?;
+        let stored = stored_mode(library, &dir)?;
+        let active = permissions::load(library, &dir, stored.as_deref())?;
+        let mode = active.mode.clone();
         if gate_for(library, mode.as_deref(), &active, &tool, &proposal["args"])?.0 == Gate::Deny {
             return Err(DENIED);
         }
@@ -1588,8 +1844,14 @@ impl Server {
         let dir = held.path.clone();
         let library = self.ready(&held)?;
         let configured = policy(library, &dir)?;
-        let mode = configured.as_ref().map(|(p, _)| p.mode.clone());
-        let active = permissions::load(library, &dir, mode.as_deref())?;
+        let stored = stored_mode(library, &dir)?;
+        let active = permissions::load(library, &dir, stored.as_deref())?;
+        let configured = match configured {
+            None if adopt_file_mode(library, &dir, &active)? => policy(library, &dir)?,
+            configured => configured,
+        };
+        // The file's approval_mode, when it names one, replaces the mode setup stored.
+        let mode = active.mode.clone();
         let (gate, explicit) = gate_for(library, mode.as_deref(), &active, name, &args)?;
         if gate == Gate::Deny {
             self.denied = Some(deny_rule(&active.rules, name, &args));
@@ -1675,15 +1937,6 @@ impl Server {
         }
         // A refresh needs approval under reads_and_writes; a rule or a card can give it.
         let approved = grant.is_some() || terminal_approved || gate == Gate::Run;
-        // The older no-mode behaviour applies only where no rule decided.
-        let legacy = gate == Gate::Legacy && !terminal_approved;
-        // A deletion that runs only because the file allows it is logged once it ran.
-        let logged = (gate == Gate::Run
-            && explicit == Some(permissions::Effect::Allow)
-            && grant.is_none()
-            && !terminal_approved
-            && permissions::removal(name, &args) != permissions::Removal::None)
-            .then(|| args["action"].as_str().unwrap_or_default().to_string());
         let result = match name {
             "sync" => {
                 let _: Empty = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -1760,18 +2013,9 @@ impl Server {
                     .state(ACCOUNT_KEY)
                     .map_err(|_| "library_unavailable")?
                     .ok_or("login_required")?;
-                let mode = configured.as_ref().map(|(p, _)| p.mode.as_str());
-                // A card the person approved is that person's approval: no second ask.
-                let terminal = grant.is_none()
-                    && (gate == Gate::Terminal
-                        || drive_write::goes_to_terminal(library, mode, &op)?
-                        || (configured.is_none()
-                            && library
-                                .state("mcp.require_write_approval")
-                                .map_err(|_| "library_unavailable")?
-                                .as_deref()
-                                == Some("true")));
-                if terminal {
+                // Only an ask: terminal rule waits for the terminal; a card the person approved
+                // is that person's approval, with no second ask.
+                if grant.is_none() && gate == Gate::Terminal {
                     let id = uuid::Uuid::new_v4().to_string();
                     let args = serde_json::to_value(&op).map_err(|_| "invalid_arguments")?;
                     let proposal = json!({"tool":name,"args":args,"account":account,
@@ -1801,26 +2045,6 @@ impl Server {
                     .is_none()
                 {
                     return Err("login_required");
-                }
-                // A folder without an approval mode and no rule: a move to Recently Deleted, or
-                // any change where every change needs approval, waits for the terminal.
-                if legacy
-                    && (photos_write::needs_person(&op)
-                        || library
-                            .state("mcp.require_write_approval")
-                            .map_err(|_| "library_unavailable")?
-                            .as_deref()
-                            == Some("true"))
-                {
-                    return terminal_proposal(
-                        library,
-                        &dir,
-                        name,
-                        &args,
-                        policy_raw.as_deref(),
-                        current.identity,
-                        &active.fingerprint,
-                    );
                 }
                 // A terminal request holds to the preview it showed, and is used up before it
                 // runs, so it runs once.
@@ -1855,18 +2079,8 @@ impl Server {
                     .state(ACCOUNT_KEY)
                     .map_err(|_| "library_unavailable")?
                     .ok_or("login_required")?;
-                let mode = configured.as_ref().map(|(p, _)| p.mode.as_str());
-                // As for Drive: a card the person approved is that person's approval.
-                let terminal = grant.is_none()
-                    && (gate == Gate::Terminal
-                        || calendar_write::goes_to_terminal(mode, &op)
-                        || (configured.is_none()
-                            && library
-                                .state("mcp.require_write_approval")
-                                .map_err(|_| "library_unavailable")?
-                                .as_deref()
-                                == Some("true")));
-                if terminal {
+                // As for Drive: only an ask: terminal rule waits for the terminal.
+                if grant.is_none() && gate == Gate::Terminal {
                     let id = uuid::Uuid::new_v4().to_string();
                     let args = serde_json::to_value(&op).map_err(|_| "invalid_arguments")?;
                     let proposal = json!({"tool":name,"args":args,"account":account,
@@ -1901,27 +2115,6 @@ impl Server {
                     .state(ACCOUNT_KEY)
                     .map_err(|_| "library_unavailable")?
                     .ok_or("login_required")?;
-                // Without a mode or a rule, a delete waits for the terminal, and the folder's
-                // earlier require-approval decides the rest.
-                if legacy
-                    && (contacts_write::needs_person(name, &args)
-                        || library
-                            .state("mcp.require_write_approval")
-                            .map_err(|_| "library_unavailable")?
-                            .as_deref()
-                            == Some("true"))
-                {
-                    contacts_write::preview(library, &args)?;
-                    return terminal_proposal(
-                        library,
-                        &dir,
-                        name,
-                        &args,
-                        policy_raw.as_deref(),
-                        current.identity,
-                        &active.fingerprint,
-                    );
-                }
                 // A delete runs only with a person's approval, whatever let it this far.
                 if !(grant.is_some() || terminal_approved)
                     && (contacts_write::needs_person(name, &args)
@@ -2090,27 +2283,11 @@ impl Server {
                 {
                     return Err("login_required");
                 }
-                if legacy
-                    && (matches!(args, ReminderWrite::Delete { .. })
-                        || library
-                            .state("mcp.require_write_approval")
-                            .map_err(|_| "library_unavailable")?
-                            .as_deref()
-                            == Some("true"))
-                {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    let proposal = json!({"tool":name,"args":args,"account":library.state(ACCOUNT_KEY).map_err(|_| "library_unavailable")?});
-                    library
-                        .set_state(&format!("mcp.approval.{id}"), &proposal.to_string())
-                        .map_err(|_| "library_unavailable")?;
-                    return Ok(
-                        json!({"status":"approval_required","request_id":id,"remote_verified":false}),
-                    );
-                }
                 if configured.is_some() {
                     authorized_enqueue(
                         library,
                         &dir,
+                        mode.as_deref(),
                         once(&terminal, |l| enqueue_reminder(l, args)),
                     )
                 } else {
@@ -2127,25 +2304,13 @@ impl Server {
                 {
                     return Err("login_required");
                 }
-                if legacy
-                    && (args.is_destructive()
-                        || library
-                            .state("mcp.require_write_approval")
-                            .map_err(|_| "library_unavailable")?
-                            .as_deref()
-                            == Some("true"))
-                {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    let proposal = json!({"tool":name,"args":args,"account":library.state(ACCOUNT_KEY).map_err(|_| "library_unavailable")?});
-                    library
-                        .set_state(&format!("mcp.approval.{id}"), &proposal.to_string())
-                        .map_err(|_| "library_unavailable")?;
-                    return Ok(
-                        json!({"status":"approval_required","request_id":id,"remote_verified":false}),
-                    );
-                }
                 if configured.is_some() {
-                    authorized_enqueue(library, &dir, once(&terminal, |l| enqueue_note(l, args)))
+                    authorized_enqueue(
+                        library,
+                        &dir,
+                        mode.as_deref(),
+                        once(&terminal, |l| enqueue_note(l, args)),
+                    )
                 } else {
                     in_one(library, once(&terminal, |l| enqueue_note(l, args)))
                 }
@@ -2161,13 +2326,24 @@ impl Server {
         }
         let mut result = result;
         if let Some(value) = result.as_mut().ok().filter(|v| v.is_object()) {
-            if let Some(action) = &logged {
-                if let Err(error) = permissions::log_allowed(&dir, name, action) {
-                    value["permissions_log"] = json!(format!("The deletion ran, but it could not be written to the permissions log: {error}."));
-                }
-            }
             if let Some(text) = active.fallback() {
                 value["permissions_file"] = json!(text);
+            }
+            // Said once: changes set aside when the file's mode was taken over.
+            let set_aside = library
+                .state(SET_ASIDE_KEY)
+                .map_err(|_| "library_unavailable")?
+                .and_then(|n| n.parse::<u64>().ok())
+                .filter(|n| *n > 0);
+            if let Some(n) = set_aside {
+                library
+                    .set_state(SET_ASIDE_KEY, "")
+                    .map_err(|_| "library_unavailable")?;
+                value["set_aside"] = json!(format!(
+                    "{n} waiting change{} set aside when the approval mode from permissions.yaml was first stored; none will be sent. To see them, run {} in your own terminal.",
+                    if n == 1 { " was" } else { "s were" },
+                    status::with_dir("skykeep-mcp quarantine", &dir)
+                ));
             }
         }
         result
@@ -2207,9 +2383,11 @@ fn in_one(
         .map_err(|Refused(error)| error)
 }
 
+/// `mode` is the approval mode the call's gate decided with; each write is recorded under it.
 fn authorized_enqueue(
     library: &mut Library,
     dir: &Path,
+    mode: Option<&str>,
     enqueue: impl FnOnce(&mut Library) -> Result<Value, &'static str>,
 ) -> Result<Value, &'static str> {
     if library
@@ -2219,6 +2397,8 @@ fn authorized_enqueue(
     {
         return Err("quarantine_full_retire_in_terminal");
     }
+    // Writes queued under a looser mode than the one in force are set aside first.
+    sync::quarantine_looser(library, dir)?;
     let before = sync::pending_operations(library)?;
     for p in &before {
         sync::authorized_payload(library, dir, p)?;
@@ -2242,11 +2422,17 @@ fn authorized_enqueue(
             present.push(p.id);
         }
     }
+    // A refusal from the write keeps its own code; a library failure is `mutation_refused`.
+    struct Refused(&'static str);
+    impl From<quince_core::Error> for Refused {
+        fn from(_: quince_core::Error) -> Self {
+            Refused("mutation_refused")
+        }
+    }
     library
-        .atomically(|library| -> quince_core::Result<Value> {
-            let convert = |error| quince_core::Error::Io(std::io::Error::other(error));
-            let result = enqueue(library).map_err(convert)?;
-            let after = sync::pending_operations(library).map_err(convert)?;
+        .atomically(|library| -> Result<Value, Refused> {
+            let result = enqueue(library).map_err(Refused)?;
+            let after = sync::pending_operations(library).map_err(Refused)?;
             for p in &after {
                 let old = before.iter().find(|old| old.id == p.id);
                 if old.is_some()
@@ -2269,7 +2455,7 @@ fn authorized_enqueue(
                     || result["guid"] == p.record
                     || (old == Some(p) && current.contains(&p.id))
                 {
-                    sync::record_authorization(library, p).map_err(convert)?;
+                    sync::record_authorization(library, dir, p, mode).map_err(Refused)?;
                 }
             }
             for p in &before {
@@ -2279,7 +2465,7 @@ fn authorized_enqueue(
             }
             Ok(result)
         })
-        .map_err(|_| "mutation_refused")
+        .map_err(|Refused(error)| error)
 }
 
 /// One-time setup under the directory lock: persistent document writer and private modes.
@@ -2391,21 +2577,6 @@ enum NoteWrite {
         guid: String,
         base_etag: Option<String>,
     },
-}
-
-impl NoteWrite {
-    /// Legacy writes that remove content need terminal approval. Upstream deletes a note by moving
-    /// it into the trash folder, so such a move is a deletion; so is erasing the whole body.
-    fn is_destructive(&self) -> bool {
-        match self {
-            NoteWrite::Delete { .. } => true,
-            NoteWrite::Save { body, .. } => body.trim().is_empty(),
-            NoteWrite::Move { folder_guid, .. } => {
-                folder_guid.as_deref() == Some(quince_core::notes::TRASH_FOLDER)
-            }
-            _ => false,
-        }
-    }
 }
 
 /// `None` files a note in the default folder; a named folder must be in the synced cache.
@@ -2961,8 +3132,8 @@ pub(crate) fn tools() -> Vec<Value> {
     ] {
         tools.push(json!({"name":name,"description":format!("Search the user's {kind} in the local cache index."),"inputSchema":{"type":"object","properties":{"query":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}},"required":["query"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     }
-    tools.push(json!({"name":"notes_write","description":"Queue a change to the user's Apple iCloud Notes (create, save, move, pin, delete). Follows the approval mode. Queued is not remote-verified.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","save","move","pin","delete"]},"body":{"type":"string"},"pinned":{"type":"boolean"},"runs":{"type":["array","null"],"items":{"type":"object"}},"folder_guid":{"type":["string","null"]},"guid":{"type":"string"},"base_etag":{"type":["string","null"]}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
-    tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). A create can also repeat daily and alert at or before its due time. Deletions need local terminal approval. Queued is not CloudKit-accepted; sync reports accepted writes. No field-level remote verification.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."},"base_etag":{"type":["string","null"],"description":"Edit only: the etag from reminders_get. A newer cached copy returns conflict."},"repeat":{"type":"object","description":"Create only. Repeats daily from due_at, until the end of the given day or for ever. Needs due_at.","properties":{"frequency":{"enum":["daily"]},"until":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"YYYY-MM-DD, the last day it repeats. Read in timezone for a timed due_at, in UTC for an all-day one."}},"required":["frequency"],"additionalProperties":false},"due_time_alert":{"type":"boolean","description":"Create only. Alert at due_at. Needs a timed (not all-day) due_at."},"early_alert":{"type":"object","description":"Create only. Alert this long before due_at. Needs a timed due_at, and an early alert set on one of the user's reminders from an Apple device and then a sync, so the account id it carries is in the cache.","properties":{"amount":{"type":"integer","minimum":1,"maximum":10000},"unit":{"enum":["minutes","hours","days","weeks","months"]}},"required":["amount","unit"],"additionalProperties":false},"timezone":{"type":"string","maxLength":64,"description":"Create only. IANA zone the timed due_at and its alerts are kept in, such as Europe/Berlin. Default: this computer's zone, or UTC if it has no IANA name."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
+    tools.push(json!({"name":"notes_write","description":"Queue a change to the user's Apple iCloud Notes (create, save, move, pin, delete). Follows the approval mode; a delete, a move into Recently Deleted or a save that empties a note always asks the user on the approval card. Queued is not remote-verified.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","save","move","pin","delete"]},"body":{"type":"string"},"pinned":{"type":"boolean"},"runs":{"type":["array","null"],"items":{"type":"object"}},"folder_guid":{"type":["string","null"]},"guid":{"type":"string"},"base_etag":{"type":["string","null"],"description":"Needed for move, save, pin and delete: the etag from notes_get. A missing or older etag returns conflict."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
+    tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). A create can also repeat daily and alert at or before its due time. Deletions always ask the user on the approval card. Queued is not CloudKit-accepted; sync reports accepted writes. No field-level remote verification.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."},"base_etag":{"type":["string","null"],"description":"Edit only: the etag from reminders_get. A newer cached copy returns conflict."},"repeat":{"type":"object","description":"Create only. Repeats daily from due_at, until the end of the given day or for ever. Needs due_at.","properties":{"frequency":{"enum":["daily"]},"until":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"YYYY-MM-DD, the last day it repeats. Read in timezone for a timed due_at, in UTC for an all-day one."}},"required":["frequency"],"additionalProperties":false},"due_time_alert":{"type":"boolean","description":"Create only. Alert at due_at. Needs a timed (not all-day) due_at."},"early_alert":{"type":"object","description":"Create only. Alert this long before due_at. Needs a timed due_at, and an early alert set on one of the user's reminders from an Apple device and then a sync, so the account id it carries is in the cache.","properties":{"amount":{"type":"integer","minimum":1,"maximum":10000},"unit":{"enum":["minutes","hours","days","weeks","months"]}},"required":["amount","unit"],"additionalProperties":false},"timezone":{"type":"string","maxLength":64,"description":"Create only. IANA zone the timed due_at and its alerts are kept in, such as Europe/Berlin. Default: this computer's zone, or UTC if it has no IANA name."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
     tools.push(json!({"name":"reminders_get","description":"Read one cached Apple Reminders item and its supported details. Not a complete archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools.push(json!({"name":"notes_get","description":"Read one cached Apple iCloud Notes note. Not a complete preservation archive.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools.push(json!({"name":"sync","description":"Refresh Apple iCloud Notes and Apple Reminders and send approved queued changes. Queued/sent is not field-level remote verification. Never opens a login prompt.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));

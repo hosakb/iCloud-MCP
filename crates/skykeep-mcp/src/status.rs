@@ -15,7 +15,7 @@ pub const MODES: [(&str, &str); 3] = [
     ),
     (
         "yolo",
-        "Don't ask, not even before deleting notes or reminders. Drive and Contacts deletions, moves and renames of large Drive folders, Calendar deletes and Photos moves to Recently Deleted still wait for skykeep-mcp approve.",
+        "Don't ask before reads or changes. Deletions, moves to Recently Deleted and moves and renames of large Drive folders still ask on the approval card.",
     ),
 ];
 
@@ -39,8 +39,8 @@ pub struct Report {
     pub dir: Option<std::path::PathBuf>,
 }
 
-/// Library key: setup chose to leave the folder without an approval mode, for MCP clients that
-/// can't show approval forms. Only setup and status read it; it changes no policy.
+/// Library key: setup chose to leave the folder without an approval mode. Only setup and status
+/// read it; it changes no policy.
 pub const NO_MODE_KEY: &str = "mcp.setup.no_approval_mode";
 
 pub(crate) fn quoted(path: &Path) -> String {
@@ -58,17 +58,29 @@ pub(crate) fn quoted(path: &Path) -> String {
 /// What "no approval mode" means in a folder: the older behaviour, including an earlier
 /// `require-approval`, which setup never loosens.
 pub fn no_mode_effect(library: &quince_core::Library) -> &'static str {
-    if library
+    if require_all(library) {
+        "Every change asks on the approval card in your MCP client, because this folder was set earlier to approve every change (skykeep-mcp require-approval)."
+    } else {
+        "Routine changes run without asking; deletions and renames or moves of large Drive folders ask on the approval card in your MCP client."
+    }
+}
+
+/// Setup's choice 4 in words: how it differs from yolo in this folder.
+pub fn no_mode_choice(library: &quince_core::Library) -> &'static str {
+    if require_all(library) {
+        no_mode_effect(library)
+    } else {
+        "Like 3, but you can later run skykeep-mcp require-approval to make every change ask."
+    }
+}
+
+fn require_all(library: &quince_core::Library) -> bool {
+    library
         .state("mcp.require_write_approval")
         .ok()
         .flatten()
         .as_deref()
         == Some("true")
-    {
-        "Every change waits until you approve it with skykeep-mcp approve, because this folder was set earlier to approve every change (skykeep-mcp require-approval)."
-    } else {
-        "Routine changes run without asking; deletions wait until you approve them with skykeep-mcp approve."
-    }
 }
 
 /// `text` with `--state-dir DIR` added to every `skykeep-mcp` command in it. For the default
@@ -97,6 +109,7 @@ pub fn with_dir(text: &str, dir: &Path) -> String {
             "quarantine",
             "permissions",
             "exchange",
+            "policy",
         ]
         .contains(&word.as_str());
         // `permissions show` is one command: the folder goes after both words.
@@ -296,10 +309,30 @@ pub fn check(env: &Env, dir: &Path) -> Report {
         (Some(_), _) => report.ok("The folder is tied to one Apple Account."),
     }
 
+    // The file's approval_mode, when it names one, replaces the mode stored by setup.
+    let in_file = library.as_ref().and_then(|l| {
+        let stored = crate::stored_mode(l, dir).ok().flatten();
+        crate::permissions::peek(l, dir, stored.as_deref())
+            .ok()
+            .filter(|a| a.mode_in_file)
+            .and_then(|a| a.mode)
+    });
     match library.as_ref().map(|l| crate::policy(l, dir)) {
-        Some(Ok(Some((policy, _)))) => {
-            report.ok(format!("Approval mode: {}", describe_mode(&policy.mode)))
-        }
+        Some(Ok(_)) if in_file.is_some() => report.ok(format!(
+            "Approval mode: {} Set in permissions.yaml ({}:), which replaces the mode chosen in setup; skykeep-mcp policy edits that line.",
+            describe_mode(in_file.as_deref().unwrap_or_default()),
+            crate::permissions::MODE_KEY
+        )),
+        Some(Ok(Some(_))) if library.as_ref().is_some_and(crate::adopted) => report.ok(format!(
+            "Approval mode: none. {} A mode taken over from an earlier {}: line in permissions.yaml counts only while the file names one.",
+            library.as_ref().map(no_mode_effect).unwrap_or_default(),
+            crate::permissions::MODE_KEY
+        )),
+        Some(Ok(Some((policy, _)))) => report.ok(format!(
+            "Approval mode: {} Chosen in setup; an {}: line in permissions.yaml would replace it.",
+            describe_mode(&policy.mode),
+            crate::permissions::MODE_KEY
+        )),
         Some(Ok(None))
             if library
                 .as_ref()
@@ -308,7 +341,7 @@ pub fn check(env: &Env, dir: &Path) -> Report {
                 == Some("1") =>
         {
             report.ok(format!(
-                "Approval mode: none, for MCP clients without approval forms. {}",
+                "Approval mode: none. {}",
                 library.as_ref().map(no_mode_effect).unwrap_or_default()
             ))
         }
@@ -331,10 +364,7 @@ pub fn check(env: &Env, dir: &Path) -> Report {
     }
     // Read only: status never records a load; the server does that at its next tool call.
     if let Some(library) = library.as_ref() {
-        let mode = crate::policy(library, dir)
-            .ok()
-            .flatten()
-            .map(|(p, _)| p.mode);
+        let mode = crate::stored_mode(library, dir).ok().flatten();
         for (text, next) in crate::permissions::status(library, dir, mode.as_deref()) {
             match next {
                 Some(next) => report.fix(text, next),

@@ -1297,6 +1297,27 @@ async fn an_answer_without_calendars_is_refused_not_stored() {
     assert_eq!(cached(dir.path()), kept);
 }
 
+/// Apple's 421 is a lapsed session, as its 450 is (#59).
+#[tokio::test]
+async fn a_421_from_calendar_is_a_lapsed_session() {
+    let remote = apple().await;
+    Mock::given(method("GET"))
+        .and(path("/ca/startup"))
+        .respond_with(
+            ResponseTemplate::new(421)
+                .set_body_string(r#"{"reason":"Missing X-APPLE-WEBAUTH-TOKEN cookie","error":1}"#),
+        )
+        .mount(&remote)
+        .await;
+    let (dir, _server) = bound_with_unrelated_state(Some("writes_only"));
+    assert_eq!(
+        refresh(dir.path(), &remote.uri(), json!({}))
+            .await
+            .unwrap_err(),
+        "login_required"
+    );
+}
+
 #[tokio::test]
 async fn refresh_fails_closed_on_session_account_or_service_problems() {
     // Apple ends the session for Calendar.

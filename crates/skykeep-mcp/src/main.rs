@@ -57,23 +57,28 @@ More commands (each needs --state-dir FOLDER):
   skykeep-mcp login       sign in to Apple again
   skykeep-mcp logout      sign out and forget the saved sign-in
   skykeep-mcp policy --state-dir FOLDER MODE
-                          set the approval mode: reads_and_writes, writes_only or yolo
-  skykeep-mcp approve     approve one waiting change by its request ID: a Notes or
+                          set the approval mode: reads_and_writes, writes_only or yolo.
+                          Writes approval_mode: in permissions.yaml, which you can also edit
+  skykeep-mcp approve     only for actions set to ask: terminal in permissions.yaml:
+                          approve one waiting change by its request ID. A Notes or
                           Reminders change is queued, a Drive, Contacts, Photos or
                           Calendar change runs at once and can't be undone from here
   skykeep-mcp require-approval
-                          folders without an approval mode: every change waits for approve
+                          folders without an approval mode: every change asks on the card
   skykeep-mcp allow-routine
                           folders without an approval mode: routine changes run again,
-                          deletions still wait for approve
+                          deletions still ask on the card
   skykeep-mcp quarantine  list and retire writes that were set aside
   skykeep-mcp exchange [--state-dir FOLDER] [--path DIR] [--max-mb N]  (flags in any order)
                           set up the one folder Drive and Photos uploads read from and
-                          Drive downloads write into (default ~/Skykeep-Exchange, limit 100 MB) and print it
+                          Drive downloads write into (default ~/Skykeep-Exchange, limit 100 MB) and print it.
+                          Writes exchange_folder: in permissions.yaml, which you can also edit
   skykeep-mcp --state-dir FOLDER
                           run the MCP server on stdin and stdout (your MCP client starts this)
 
 FOLDER defaults to ~/.local/share/skykeep-mcp for setup, status, unlock and exchange.
+The approval mode and the exchange folder are settings in permissions.yaml in FOLDER; a line
+there wins over what setup stored. Passwords, codes and the passphrase never go in that file.
 ";
 
 /// `exchange`: the flags in any order. Sets up the Drive exchange folder and prints it; each
@@ -121,8 +126,23 @@ fn exchange(args: Vec<std::ffi::OsString>) -> Result<(), String> {
         "this command needs a real terminal: open a terminal window and run it there".to_string()
     })?;
     let held = PrivateState::open(&dir).map_err(|e| explain(e, None))?;
+    use skykeep_mcp::permissions::{self, EXCHANGE_KEY};
+    // The setting lives in permissions.yaml: a file that can't be edited changes nothing.
+    if let Err(reason) = permissions::editable(&held.path) {
+        return Err(format!(
+            "{} ({reason})",
+            explain("permissions_file_unusable", None)
+        ));
+    }
     let mut library =
         quince_core::Library::open(&held.path).map_err(|_| explain("library_unavailable", None))?;
+    // Without --path, the folder the file names now is the one kept.
+    let path = match path {
+        Some(path) => Some(path),
+        None => permissions::setting_in_file(&held.path, EXCHANGE_KEY)
+            .map(|w| skykeep_mcp::exchange::expand(&w).map_err(|e| explain(e, None)))
+            .transpose()?,
+    };
     let shown = path
         .as_ref()
         .and_then(|p| std::path::absolute(p).ok())
@@ -133,14 +153,21 @@ fn exchange(args: Vec<std::ffi::OsString>) -> Result<(), String> {
                 .map(|e| e.path)
         })
         .or_else(skykeep_mcp::exchange::default_path);
-    let exchange = skykeep_mcp::exchange::set_up(&mut library, path, mb)
+    let exchange = skykeep_mcp::exchange::set_up_checked(&mut library, &held.path, path, mb)
         .map_err(|e| explain(e, shown.as_deref()))?;
+    let written = exchange
+        .path
+        .to_str()
+        .ok_or_else(|| explain("exchange_folder_path_unsafe", Some(&exchange.path)))?;
+    permissions::set_setting(&held.path, EXCHANGE_KEY, written)
+        .map_err(|reason| format!("{} ({reason})", explain("permissions_file_unusable", None)))?;
     use std::io::Write;
     writeln!(
         tty,
-        "Drive exchange folder: {}\nSize limit: {} MB per upload or download.",
+        "Drive exchange folder: {}\nSize limit: {} MB per upload or download.\npermissions.yaml now says {EXCHANGE_KEY}: {}. iCloud-MCP uses that line; you can also change it in the file.",
         exchange.path.display(),
-        exchange.max_bytes / (1024 * 1024)
+        exchange.max_bytes / (1024 * 1024),
+        exchange.path.display()
     )
     .map_err(|_| "terminal_unavailable".to_string())?;
     Ok(())
@@ -317,14 +344,31 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
         // Check the user terminal before touching a keyring or any network.
         let mut tty = terminal::controlling()?;
         if let Some(mode) = policy_mode {
+            use skykeep_mcp::permissions::{self, MODE_KEY};
             use std::io::Write;
-            writeln!(tty, "Set approval mode to {mode} for {}. YOLO runs Notes and Reminders deletions without prompts; Drive and Contacts deletions, moves and renames of large Drive folders, Calendar deletes and Photos moves to Recently Deleted still wait for skykeep-mcp approve. All currently pending writes will be quarantined, including previously approved writes. Old terminal proposals cannot be released under this policy. Type confirm to persist.", dir.display()).map_err(|_| "terminal_unavailable")?;
+            if !["reads_and_writes", "writes_only", "yolo"].contains(&mode.as_str()) {
+                return Err("invalid_policy_mode");
+            }
+            // The mode lives in permissions.yaml: a file that can't be edited changes nothing.
+            {
+                let held = PrivateState::open(&dir)?;
+                if let Err(reason) = permissions::editable(&held.path) {
+                    writeln!(tty, "permissions.yaml can't be edited ({reason}), so the approval mode was not changed. Fix the file, then run this command again.").map_err(|_| "terminal_unavailable")?;
+                    return Err("permissions_file_unusable");
+                }
+            }
+            writeln!(tty, "Set approval mode to {mode} for {}. This writes {MODE_KEY}: {mode} into permissions.yaml there, the line iCloud-MCP uses. YOLO runs reads and changes without prompts; deletions, moves to Recently Deleted and moves and renames of large Drive folders still ask on the approval card. All currently pending writes will be quarantined, including previously approved writes. Old terminal proposals cannot be released under this policy. Type confirm to persist.", dir.display()).map_err(|_| "terminal_unavailable")?;
             let answer = terminal::hidden(&mut tty, "Confirmation: ", Duration::from_secs(180))?;
             if *answer != "confirm" {
                 return Err("policy_change_cancelled");
             }
             let saved = Server::open(&dir)?.set_policy(&mode)?;
-            writeln!(tty, "Saved policy: {saved}").map_err(|_| "terminal_unavailable")?;
+            let held = PrivateState::open(&dir)?;
+            if let Err(reason) = permissions::set_setting(&held.path, MODE_KEY, &mode) {
+                writeln!(tty, "The mode was stored, but permissions.yaml could not be edited ({reason}). A {MODE_KEY}: line in the file still wins; change it there.").map_err(|_| "terminal_unavailable")?;
+                return Err("permissions_file_unusable");
+            }
+            writeln!(tty, "Saved policy: {saved}\npermissions.yaml now says {MODE_KEY}: {mode}. iCloud-MCP uses that line; you can also change it in the file.").map_err(|_| "terminal_unavailable")?;
             return Ok(());
         }
         if command == "quarantine" {
