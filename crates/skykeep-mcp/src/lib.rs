@@ -1330,8 +1330,12 @@ impl Server {
         Ok(refused
             .iter()
             .map(|r| {
-                json!({"id":r.change.id,"service":plain(&r.change.service, 40),"kind":plain(&r.change.kind, 40),
-                    "record":plain(&r.change.record, 200),"reason":plain(&r.reason, 160),"refused_at":r.refused_at})
+                let mut row = json!({"id":r.change.id,"service":plain(&r.change.service, 40),"kind":plain(&r.change.kind, 40),
+                    "record":plain(&r.change.record, 200),"reason":plain(&r.reason, 160),"refused_at":r.refused_at});
+                if r.reason.strip_prefix("mcp_quarantine:") == Some(sync::ITEM_CHANGED) {
+                    row["next_step"] = json!(sync::ITEM_CHANGED_STEP);
+                }
+                row
             })
             .collect())
     }

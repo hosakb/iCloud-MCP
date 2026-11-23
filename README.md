@@ -304,7 +304,7 @@ rules:
 ```
 
 - `approval_mode:` replaces the mode chosen in setup. The modes are the ones in the table under "Get started". Every deletion, move to Recently Deleted and move or rename of a large Drive folder still asks on the card in every mode. Without the line, the mode from setup applies. In a folder where setup stored no mode, the first tool call after sign-in stores the file's mode so that queued changes are bound to it, and sets aside changes already waiting (`skykeep-mcp quarantine` lists them). That stored mode still counts only while the line is there.
-- `exchange_folder:` names the exchange folder (see "The exchange folder" for the checks). A file without the line names no exchange folder, so uploads and downloads are refused. Only when there is no file at all does the folder set up with `skykeep-mcp exchange` apply.
+- `exchange_folder:` names the exchange folder (see "The exchange folder" for the checks). A file without the line names no exchange folder, so uploads and downloads are refused. Only when there is no file at all does the folder set up with `skykeep-mcp exchange` apply. When Skykeep writes the first file (setup's starter file, `skykeep-mcp policy` or a rule saved from a card), it copies that folder into the file as its `exchange_folder:` line if the folder still passes the checks.
 
 A line in the file wins. `skykeep-mcp policy` and `skykeep-mcp exchange` still work: each changes its line in the file, keeps every other line and comment, keeps the previous file as `permissions.yaml.bak` and writes the new one in one step with mode 600. A file with a mistake is left alone, and the command changes nothing and says what to fix. An edit counts at the next tool call, like a rule. A broken file keeps the last valid approval mode; if there is none, the mode from setup stays. It names no exchange folder, not the last valid one and not the one from `skykeep-mcp exchange`. `status` and `permissions show` say which mode and folder are in use and where each comes from.
 
@@ -401,6 +401,10 @@ if it were on its way, so after its drain the same sync re-reads that service in
 full. A full pass replays only waiting writes, which drops the quarantined change
 from the cache. If that pass fails, the next sync that reaches the drain tries
 again. Until it succeeds, reads can still show the unsent change.
+A note or reminder that changed or was deleted on iCloud after a change to it was
+queued is set aside as `mcp_quarantine:item_changed_on_icloud_since_queued`, with an
+`instructions` field that says what to do next. A new etag or modified time alone,
+which Apple gives an item when it next reads it back, no longer sets a change aside.
 Native sends recheck exact payload, account, policy, directory and the bound cached
 rows after refresh, before entering the writer, and refuse that write if they
 changed. A sync has a 60-second async deadline. At most 128 waiting writes are
@@ -414,7 +418,8 @@ The `sync` reply reports `queued` (waiting writes only), `refused` (all kept
 refused writes) and `refused_this_sync` with each write this sync refused or
 quarantined. `sync_status` reports per service the refused count and the 20 newest
 as `refused_recent`. Both show id, service, kind, record and a reason code, never
-payloads; engine and Apple reasons appear only as `refused_by_sync_engine`. A
+payloads, and an `instructions` field for a reason that has a next step; engine and
+Apple reasons appear only as `refused_by_sync_engine`. A
 sync that fails after its local gate does not list its quarantines; `sync_status`
 does.
 
@@ -422,7 +427,8 @@ Refused writes stay in the private directory and `sync_status` counts them. They
 do not count toward the 128 waiting writes. Up to 1024 refused writes are kept;
 after that new writes fail with `quarantine_full_retire_in_terminal`. The
 human-only `skykeep-mcp quarantine --state-dir DIR` lists them in a user-owned
-terminal (id, service, kind, record, reason; no payloads) and deletes exactly the
+terminal (id, service, kind, record, reason, and the next step where there is one; no
+payloads) and deletes exactly the
 listed rows after the literal answer `retire`. Retired writes are never sent. No
 MCP tool can resend, release or retire a refused write.
 

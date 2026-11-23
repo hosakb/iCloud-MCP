@@ -62,11 +62,18 @@ fn send_context(
                 .note(&p.record)
                 .map_err(|_| "library_unavailable")?
                 .ok_or("not_found")?;
-            // `Note.runs` never serializes; the sender takes runs from the payload.
+            // `Note.runs` never serializes; the sender takes runs from the payload. A save
+            // also binds the note's formatting, by its hash, so a formatting-only change
+            // since it was queued sets it aside like a change to the text.
             if kind == "save" {
                 item.body = library
                     .note_body(&p.record)
                     .map_err(|_| "library_unavailable")?;
+                let runs = library
+                    .note_runs(&p.record)
+                    .map_err(|_| "library_unavailable")?
+                    .map(|r| quince_sync::queue::account_tag(&format!("note-runs:{r}")));
+                return bounded_context(json!({"item":crate::bounded_json(&item)?,"runs":runs}));
             }
             bounded_context(json!({"item":crate::bounded_json(&item)?}))
         }
@@ -103,8 +110,12 @@ fn bounded_context(context: Value) -> Result<Value, &'static str> {
 
 /// A context without the etag and modified time of its items. Apple gives a note or reminder
 /// a new etag (and time) when it next reads it back, even one just made, with nothing else
-/// changed. The native sender checks the etag against Apple's record itself, so only the
-/// fields a write depends on are compared here.
+/// changed, so neither is compared. What is compared is the item as the cache showed it when
+/// the write was queued and as it shows it after this sync's read from Apple. The senders
+/// then write with an etag: some send the cached one, and CloudKit refuses the write if
+/// Apple's record changed since that read; others look the record up first and write over
+/// what Apple holds then (a note save merges its text against that copy). A change made on
+/// another device between this sync's read and the send is not caught here.
 fn without_version_stamps(mut context: Value) -> Value {
     fn strip(item: &mut Value) {
         if let Some(item) = item.as_object_mut() {
@@ -128,7 +139,7 @@ fn without_version_stamps(mut context: Value) -> Value {
 pub(crate) const ITEM_CHANGED: &str = "item_changed_on_icloud_since_queued";
 
 /// The next step after [`ITEM_CHANGED`].
-pub(crate) const ITEM_CHANGED_STEP: &str = "The item changed on iCloud after this write was queued, or was deleted there, so the write was not sent. Read the item again with notes_get or reminders_get, then ask for the change again.";
+pub(crate) const ITEM_CHANGED_STEP: &str = "The note or reminder changed on iCloud after this change was queued, or was deleted there, so the change was not sent. If it still exists, read it again with notes_get or reminders_get and ask again. If it was deleted there is nothing to redo.";
 
 /// Grant failures that belong to one queued write. Anything else (an unreadable library,
 /// a changed policy, account or directory) still stops the whole pass.
@@ -304,10 +315,16 @@ fn authorization_check(
     // context holds no item; a change there is a stale grant.
     if context {
         let queued = without_version_stamps(grant["context"].clone());
-        let now = match send_context(library, p) {
+        let mut now = match send_context(library, p) {
             Err("not_found") => return Err(ITEM_CHANGED),
             now => now?,
         };
+        // A save queued before its formatting was bound is compared without it.
+        if queued.get("item").is_some() && queued.get("runs").is_none() {
+            if let Some(now) = now.as_object_mut() {
+                now.remove("runs");
+            }
+        }
         if queued != now {
             return Err(if queued.get("item").is_some() {
                 ITEM_CHANGED

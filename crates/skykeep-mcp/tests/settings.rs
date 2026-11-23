@@ -476,6 +476,19 @@ async fn a_broken_or_removed_exchange_line_leaves_no_exchange_folder() {
             skykeep_mcp::next_step("exchange_folder_file_unusable", &dir, &Value::Null).unwrap();
         assert!(step.contains("permissions.yaml"), "{step}");
         assert!(step.contains(mistake), "{step}");
+        assert!(
+            step.contains("Fix the mistake named above in that file, then try again."),
+            "{step}"
+        );
+        // In the terminal, status itself is the place that says what is wrong.
+        let lines = permissions::status(&library, &dir, Some("writes_only"));
+        let (line, fix) = lines
+            .iter()
+            .find(|(t, _)| t.starts_with("Exchange folder:"))
+            .unwrap();
+        let fix = fix.as_deref().unwrap_or_default();
+        assert!(fix.contains(mistake), "{line} {fix}");
+        assert!(!fix.contains("permissions show"), "{fix}");
         assert!(!step.contains(&good_path.display().to_string()), "{step}");
         write_file(&dir, &good_file);
         permissions::load(&mut library, &dir, Some("writes_only")).unwrap();
@@ -486,10 +499,45 @@ async fn a_broken_or_removed_exchange_line_leaves_no_exchange_folder() {
     std::fs::create_dir(&file).unwrap();
     assert_eq!(in_force(&library), Err("exchange_folder_file_unusable"));
     std::fs::remove_dir(&file).unwrap();
-    // The line taken out: no folder, not the one set up before.
+    // The line taken out: no folder, not the one set up before, and the refusal and status
+    // say that folder is no longer used, with the command that writes it into the file.
     write_file(&dir, "version: 1\n");
-    assert_eq!(in_force(&library), Ok(None));
+    assert_eq!(
+        in_force(&library),
+        Err("exchange_folder_not_in_permissions_file")
+    );
     permissions::load(&mut library, &dir, Some("writes_only")).unwrap();
+    assert_eq!(
+        in_force(&library),
+        Err("exchange_folder_not_in_permissions_file")
+    );
+    let older_path = older.path().canonicalize().unwrap().display().to_string();
+    let step = skykeep_mcp::next_step(
+        "exchange_folder_not_in_permissions_file",
+        &dir,
+        &Value::Null,
+    )
+    .unwrap();
+    assert!(step.contains(&older_path), "{step}");
+    assert!(step.contains("skykeep-mcp exchange"), "{step}");
+    assert!(
+        step.contains("only its exchange_folder: line counts"),
+        "{step}"
+    );
+    let lines = permissions::status(&library, &dir, Some("writes_only"));
+    let (line, fix) = lines
+        .iter()
+        .find(|(t, _)| t.starts_with("Exchange folder:"))
+        .unwrap();
+    assert!(line.contains(&older_path), "{line}");
+    assert!(
+        fix.as_deref()
+            .unwrap_or_default()
+            .contains("skykeep-mcp exchange"),
+        "{fix:?}"
+    );
+    // With no folder set up before, a file without the line simply names none.
+    library.set_state("mcp.drive.exchange", "").unwrap();
     assert_eq!(in_force(&library), Ok(None));
     // A good file works again.
     write_file(&dir, &good_file);
@@ -870,4 +918,60 @@ async fn taking_over_the_files_mode_says_where_set_aside_changes_are() {
     // Said once.
     let reply = handle(&mut f.server, call(3, "reminders_lists", json!({}))).await;
     assert!(!reply.to_string().contains("set_aside"), "{reply}");
+}
+
+/// Review round 1: a folder set up with `skykeep-mcp exchange` before the file existed is
+/// copied into the file as its exchange_folder: line when Skykeep writes the first file (setup's
+/// starter, the policy command, a rule saved from a card), and the copy is in the history.
+#[tokio::test]
+async fn an_earlier_exchange_folder_is_copied_into_the_first_file() {
+    for how in ["starter", "policy", "card"] {
+        let f = folder(Some("writes_only")).await;
+        let dir = f.path();
+        let older = private("xchg-older");
+        let older_path = older.path().canonicalize().unwrap();
+        let mut library = quince_core::Library::open(&dir).unwrap();
+        skykeep_mcp::exchange::set_up(&mut library, Some(older_path.clone()), None).unwrap();
+        // The server has loaded the folder without a file first, as before an upgrade.
+        permissions::load(&mut library, &dir, Some("writes_only")).unwrap();
+        match how {
+            "starter" => permissions::write_starter(&dir).unwrap(),
+            "policy" => permissions::set_setting(&dir, permissions::MODE_KEY, "yolo").unwrap(),
+            _ => permissions::save_allow(&dir, "notes_list", "missing").unwrap(),
+        }
+        assert_eq!(
+            permissions::setting_in_file(&dir, permissions::EXCHANGE_KEY).as_deref(),
+            Some(older_path.to_str().unwrap()),
+            "{how}"
+        );
+        permissions::load(&mut library, &dir, Some("writes_only")).unwrap();
+        assert_eq!(
+            skykeep_mcp::exchange::in_force(&library, &dir)
+                .unwrap()
+                .map(|e| e.path),
+            Some(older_path.clone()),
+            "{how}"
+        );
+        let shown = retried(|| permissions::show(&dir, true));
+        assert!(
+            shown.contains(&format!(
+                "the exchange folder set up with skykeep-mcp exchange, {}, was written into the file",
+                older_path.display()
+            )),
+            "{how}: {shown}"
+        );
+        assert!(!shown.contains("looser: exchange folder"), "{how}: {shown}");
+    }
+    // A folder that no longer passes the checks is not copied.
+    let f = folder(Some("writes_only")).await;
+    let dir = f.path();
+    let gone = private("xchg-gone");
+    let mut library = quince_core::Library::open(&dir).unwrap();
+    skykeep_mcp::exchange::set_up(&mut library, Some(gone.path().to_path_buf()), None).unwrap();
+    std::fs::set_permissions(gone.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    permissions::set_setting(&dir, permissions::MODE_KEY, "yolo").unwrap();
+    assert_eq!(
+        permissions::setting_in_file(&dir, permissions::EXCHANGE_KEY),
+        None
+    );
 }

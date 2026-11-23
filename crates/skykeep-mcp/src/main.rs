@@ -381,6 +381,9 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
             }
             for row in &rows {
                 writeln!(tty, "{row}").map_err(|_| "terminal_unavailable")?;
+                if let Some(step) = row["next_step"].as_str() {
+                    writeln!(tty, "  Next step: {step}").map_err(|_| "terminal_unavailable")?;
+                }
             }
             writeln!(tty, "These {} writes were refused or quarantined and will never be sent. Retiring deletes exactly these rows from {} for good.", rows.len(), dir.display()).map_err(|_| "terminal_unavailable")?;
             let answer = terminal::hidden(

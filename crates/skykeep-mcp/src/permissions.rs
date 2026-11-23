@@ -1013,6 +1013,15 @@ fn evaluate(
     };
     let (mut looser, mut stricter) =
         setting_changes(library, &stored, &settings, &in_force, mode, require_all);
+    // The folder set up with `skykeep-mcp exchange` now named in the file: the same folder,
+    // so neither looser nor stricter, but recorded so the person sees where it went.
+    let legacy = stored_exchange(library);
+    let copied = (file_names_exchange
+        && (stored.is_null() || stored["fingerprint"] == "missing")
+        && legacy.is_some()
+        && in_force == legacy)
+        .then_some(legacy)
+        .flatten();
     let (rules_looser, rules_stricter) =
         diff(&old, &active.rules, active.mode.as_deref(), require_all);
     looser.extend(rules_looser);
@@ -1032,8 +1041,12 @@ fn evaluate(
         record[key] = value;
     }
     let event = (!quiet).then(|| {
-        json!({"seq":seq,"at":at,"looser":looser,"stricter":stricter,
-            "problem":active.problem,"kept":active.kept_from,"missing":print == "missing"})
+        let mut event = json!({"seq":seq,"at":at,"looser":looser,"stricter":stricter,
+            "problem":active.problem,"kept":active.kept_from,"missing":print == "missing"});
+        if let Some(copied) = &copied {
+            event["exchange_copied"] = json!(copied);
+        }
+        event
     });
     Ok((active, Some((record, event))))
 }
@@ -1271,8 +1284,16 @@ fn exchange_line(library: &Library, dir: &Path, active: &Active) -> (String, Opt
     if active.problem.is_some() {
         return (
             "Exchange folder: none while permissions.yaml can't be used, so Drive and Photos uploads and Drive downloads are refused.".into(),
-            Some(crate::exchange::next_step(crate::exchange::FILE_UNUSABLE, dir)),
+            Some(crate::exchange::file_unusable_step(dir, true)),
         );
+    }
+    if active.file_names_exchange && active.exchange.is_none() {
+        if let Some(earlier) = crate::exchange::not_in_file(dir) {
+            return (
+                format!("Exchange folder: none. {earlier} so Drive and Photos uploads and Drive downloads are refused."),
+                Some(crate::exchange::not_in_file_fix(dir)),
+            );
+        }
     }
     let legacy = crate::exchange::configured(library)
         .ok()
@@ -1508,6 +1529,11 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
                 ));
             } else if event["missing"] == true {
                 out.push_str(&format!("  {at}: the file was removed.\n"));
+            } else if let Some(copied) = event["exchange_copied"].as_str() {
+                out.push_str(&format!(
+                    "  {at}: the exchange folder set up with skykeep-mcp exchange, {}, was written into the file as its {EXCHANGE_KEY}: line; only that line counts now.\n",
+                    shown(copied)
+                ));
             } else if looser.is_empty() && stricter.is_empty() {
                 out.push_str(&format!(
                     "  {at}: the file changed; no action behaves differently.\n"
@@ -1617,6 +1643,7 @@ pub fn starter(dir: &Path) -> String {
 pub fn write_starter(dir: &Path) -> Result<(), &'static str> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+    let text = with_earlier_exchange(dir, starter(dir));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1624,7 +1651,7 @@ pub fn write_starter(dir: &Path) -> Result<(), &'static str> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(dir.join(FILE_NAME))
         .map_err(|_| "permissions_file_unavailable")?;
-    file.write_all(starter(dir).as_bytes())
+    file.write_all(text.as_bytes())
         .map_err(|_| "permissions_file_unavailable")
 }
 
@@ -1779,7 +1806,8 @@ fn save_allow_checked(
             shown_problem(&problem)
         ));
     }
-    let text = text.unwrap_or_else(|| String::from("version: 1\nrules:\n"));
+    let text =
+        text.unwrap_or_else(|| with_earlier_exchange(dir, String::from("version: 1\nrules:\n")));
     let mut want = parse(&text)?;
     want.insert(name.to_string(), Effect::Allow);
     let new = with_allow(&text, name).ok_or("the file's layout can't be edited safely")?;
@@ -1838,6 +1866,23 @@ fn with_setting(text: &str, key: &str, value: &str) -> String {
     lines.join("\n") + "\n"
 }
 
+/// `text`, the first file Skykeep writes in `dir`, with the folder set up earlier with
+/// `skykeep-mcp exchange` as its `exchange_folder:` line, when that folder still passes every
+/// check. Once the file exists only its line counts, so the folder is not lost.
+fn with_earlier_exchange(dir: &Path, text: String) -> String {
+    match crate::exchange::earlier_still_valid(dir) {
+        Some(path) => {
+            let new = with_setting(&text, EXCHANGE_KEY, &written(&path));
+            // Only when the line reads back as that folder.
+            match parse_settings(&new) {
+                Ok(s) if s.exchange.as_deref() == Some(path.as_str()) => new,
+                _ => text,
+            }
+        }
+        None => text,
+    }
+}
+
 /// A value as the file writes it: plain, or in double quotes when it would not read back.
 fn written(value: &str) -> String {
     let plain = !value.contains(" #")
@@ -1894,7 +1939,8 @@ pub fn set_setting(dir: &Path, key: &str, value: &str) -> Result<(), String> {
         Some(bytes) => {
             String::from_utf8(bytes.clone()).map_err(|_| "the file is not UTF-8 text")?
         }
-        None => String::from("version: 1\n"),
+        None if key == EXCHANGE_KEY => String::from("version: 1\n"),
+        None => with_earlier_exchange(dir, String::from("version: 1\n")),
     };
     let mut want = parse_settings(&text)?;
     match key {

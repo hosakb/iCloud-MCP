@@ -1030,12 +1030,10 @@ async fn an_item_moved_on_icloud_in_the_sync_read_is_refused_and_its_grant_empti
     assert_eq!(grant(&library, id).as_deref(), Some(""));
     let refused = &result["refused_this_sync"][0];
     assert_eq!(refused["record"], "other", "{result}");
-    assert!(
-        refused["instructions"]
-            .as_str()
-            .is_some_and(|t| t.contains("reminders_get")),
-        "{result}"
-    );
+    let step = refused["instructions"].as_str().unwrap_or_default();
+    assert!(step.contains("after this change was queued"), "{result}");
+    assert!(step.contains("reminders_get"), "{result}");
+    assert!(step.contains("nothing to redo"), "{result}");
     assert!(!modified(&remote.received_requests().await.unwrap())
         .iter()
         .any(|b| b.contains("approved")));
@@ -1090,4 +1088,92 @@ async fn a_body_changed_or_item_deleted_on_icloud_is_refused_with_a_reason() {
     let requests = remote.received_requests().await.unwrap();
     assert!(!handed_to_sender(&requests, "note"));
     assert!(!handed_to_sender(&requests, "child"));
+    // The terminal's quarantine list gives the same next step under each row.
+    use std::os::unix::fs::PermissionsExt;
+    for file in std::fs::read_dir(dir.path()).unwrap() {
+        let file = file.unwrap();
+        if file.file_type().unwrap().is_file() {
+            std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    let rows = server.quarantined().unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert!(
+            row["next_step"]
+                .as_str()
+                .is_some_and(|t| t.contains("nothing to redo")),
+            "{row}"
+        );
+    }
+}
+
+/// Review round 1: a change on iCloud to a field the queued write does not set (the title,
+/// the due date) still sets a queued tick aside.
+#[tokio::test]
+async fn a_title_or_due_date_changed_on_icloud_refuses_a_queued_tick() {
+    let (dir, mut server, mut library) = family().await;
+    for (id, guid) in [(2, "other"), (3, "parent")] {
+        approved(
+            &mut server,
+            id,
+            json!({"action":"tick","guid":guid,"done":true}),
+        )
+        .await;
+    }
+    let mut other = library.reminder("other").unwrap().unwrap();
+    other.title = "renamed on a phone".into();
+    library.put_reminder_local(&other).unwrap();
+    let mut parent = library.reminder("parent").unwrap().unwrap();
+    parent.due_at = Some(1_800_000_000);
+    library.put_reminder_local(&parent).unwrap();
+    let remote = remote().await;
+    let result =
+        skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+            .await
+            .unwrap();
+    for guid in ["other", "parent"] {
+        assert_eq!(
+            refused_reason(&library, guid).as_deref(),
+            Some("mcp_quarantine:item_changed_on_icloud_since_queued"),
+            "{guid}: {result}"
+        );
+    }
+}
+
+/// Review round 1: a formatting-only change to a note (its runs) after a save was queued sets
+/// the save aside like a body change.
+#[tokio::test]
+async fn a_formatting_change_on_icloud_refuses_a_queued_save() {
+    let (dir, mut server, mut library) = family().await;
+    let saved = write(
+        &mut server,
+        2,
+        "notes_write",
+        json!({"action":"save","guid":"note","body":"note\nbody edited","base_etag":"n1"}),
+    )
+    .await;
+    assert_eq!(saved["isError"], false, "{saved}");
+    let p = library.outbox_pending("notes").unwrap().remove(0);
+    assert_eq!(
+        skykeep_mcp::sync::authorized(&library, dir.path(), &p),
+        Ok(())
+    );
+    library
+        .set_note_runs("note", &json!([{"length":4,"bold":true}]).to_string())
+        .unwrap();
+    let remote = remote().await;
+    let result =
+        skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+            .await
+            .unwrap();
+    assert_eq!(
+        library.outbox_refused().unwrap()[0].reason,
+        "mcp_quarantine:item_changed_on_icloud_since_queued",
+        "{result}"
+    );
+    assert!(!handed_to_sender(
+        &remote.received_requests().await.unwrap(),
+        "note"
+    ));
 }

@@ -1008,18 +1008,21 @@ async fn the_exchange_folder_in_permissions_yaml_wins_and_a_bad_one_never_falls_
         assert!(!f.exchange.join("again.pdf").exists(), "no fallback");
         assert!(!other.join("again.pdf").exists(), "no fallback");
     }
-    // The line taken out: no exchange folder, not the one set up in the terminal.
+    // The line taken out: no exchange folder, not the one set up in the terminal, and the
+    // reply says that folder is no longer used and how to write it into the file.
     std::fs::write(&file, "version: 1\n").unwrap();
     let reply = call(
         &mut f.server,
         json!({"action":"download","id":REPORT,"local":"again.pdf"}),
     )
     .await;
+    let body = text(&reply);
     assert_eq!(
-        text(&reply)["error"],
-        "exchange_folder_not_set_up_run_skykeep_mcp_exchange_in_a_terminal",
+        body["error"], "exchange_folder_not_in_permissions_file",
         "{reply}"
     );
+    let next = body["instructions"].as_str().unwrap();
+    assert!(next.contains("skykeep-mcp exchange"), "{next}");
     assert!(!f.exchange.join("again.pdf").exists(), "no fallback");
     assert!(
         !writes(&f.remote).await.iter().any(|w| w.contains("upload")),
