@@ -814,6 +814,19 @@ async fn get_and_events_agree_on_whether_the_last_refresh_read_the_day() {
     assert_eq!(day["coverage"]["range_within_last_refresh"], false);
     let got = ok(&mut server, "calendar_get", json!({"guid":"A-1"})).await;
     assert_eq!(got["coverage"]["range_within_last_refresh"], false);
+    // A trip that starts before the window and runs into a covered day: both say covered.
+    refresh(
+        dir.path(),
+        &remote.uri(),
+        json!({"from":"2026-10-12","to":"2026-11-01"}),
+    )
+    .await
+    .unwrap();
+    let day = events(&mut server, "2026-10-12", "2026-10-13", "UTC").await;
+    assert_eq!(guids(&day), ["A-3"]);
+    assert_eq!(day["coverage"]["range_within_last_refresh"], true);
+    let got = ok(&mut server, "calendar_get", json!({"guid":"A-3"})).await;
+    assert_eq!(got["coverage"]["range_within_last_refresh"], true);
 }
 
 #[tokio::test]

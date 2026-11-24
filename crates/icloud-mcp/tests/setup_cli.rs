@@ -111,6 +111,69 @@ fn the_server_refuses_a_missing_folder_without_creating_it() {
     assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
 }
 
+/// The older terminal commands refuse a missing folder as the server does, before they look
+/// for a terminal, and create nothing. Only setup makes the folder.
+#[test]
+fn terminal_commands_refuse_a_missing_folder_without_creating_it() {
+    let parent = private_dir();
+    let missing = parent.path().join("not-there");
+    for command in [
+        &["login"][..],
+        &["logout"],
+        &["approve"],
+        &["quarantine"],
+        &["require-approval"],
+        &["allow-routine"],
+        &["policy", "yolo"],
+    ] {
+        let out = program()
+            .arg(command[0])
+            .arg("--state-dir")
+            .arg(&missing)
+            .args(&command[1..])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{command:?}");
+        let text = String::from_utf8(out.stderr).unwrap();
+        assert!(text.contains("does not exist"), "{command:?}: {text}");
+        assert!(
+            text.contains(&format!(
+                "icloud-mcp setup --state-dir {}",
+                missing.display()
+            )),
+            "{command:?}: {text}"
+        );
+        assert!(!missing.exists(), "{command:?}");
+    }
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+}
+
+/// A folder that can't be looked at (here under a file, so the error is not "not found",
+/// even as root) is not called missing: the general state_unavailable sentence is given.
+#[test]
+fn a_folder_that_cannot_be_checked_is_not_called_missing() {
+    let parent = private_dir();
+    let file = parent.path().join("a-file");
+    std::fs::write(&file, "synthetic").unwrap();
+    let below = file.join("state");
+    for command in [&[][..], &["login"]] {
+        let out = program()
+            .args(command)
+            .arg("--state-dir")
+            .arg(&below)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{command:?}");
+        let text = String::from_utf8(out.stderr).unwrap();
+        assert!(!text.contains("does not exist"), "{command:?}: {text}");
+        assert!(text.contains("state_unavailable"), "{command:?}: {text}");
+    }
+}
+
 #[test]
 fn status_on_a_fresh_folder_lists_each_problem_with_a_next_step() {
     let dir = private_dir();

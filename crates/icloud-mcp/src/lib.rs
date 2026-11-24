@@ -1506,6 +1506,7 @@ impl Server {
         calendar::validate(name, &params["arguments"])?;
         photos::validate(name, &params["arguments"])?;
         drive::validate(name, &params["arguments"])?;
+        validate_cache_read(name, &params["arguments"])?;
         if name == photos_write::TOOL {
             photos_write::validate(&params["arguments"])?;
         }
@@ -3157,14 +3158,37 @@ impl From<Page> for List {
     }
 }
 
+/// A Notes or Reminders page size. As the schema says: 1 to 1000, refused outside it like
+/// every other service's limit.
+fn cache_limit(limit: Option<usize>) -> Result<usize, &'static str> {
+    match limit {
+        None => Ok(100),
+        Some(n) if (1..=1000).contains(&n) => Ok(n),
+        Some(_) => Err("invalid_arguments"),
+    }
+}
+
+/// Checks a Notes or Reminders read's limit before any approval card. Arguments that don't
+/// parse are left to the tool, which refuses them with its own reason.
+fn validate_cache_read(name: &str, args: &Value) -> Result<(), &'static str> {
+    let limit = match name {
+        "notes_list" | "reminders_list" => serde_json::from_value::<List>(args.clone())
+            .ok()
+            .and_then(|a| a.limit),
+        "notes_search" | "reminders_search" => serde_json::from_value::<Search>(args.clone())
+            .ok()
+            .and_then(|a| a.limit),
+        "notes_folders" | "reminders_lists" => serde_json::from_value::<Page>(args.clone())
+            .ok()
+            .and_then(|a| a.limit),
+        _ => None,
+    };
+    cache_limit(limit).map(|_| ())
+}
+
 fn page<T: serde::Serialize>(items: Vec<T>, args: List) -> Result<Value, &'static str> {
     let total = items.len();
-    // As the schema says: 1 to 1000, refused outside it like every other service's limit.
-    let limit = match args.limit {
-        None => 100,
-        Some(n) if (1..=1000).contains(&n) => n,
-        Some(_) => return Err("invalid_arguments"),
-    };
+    let limit = cache_limit(args.limit)?;
     let items: Vec<_> = items.into_iter().skip(args.offset).take(limit).collect();
     let next = args.offset.saturating_add(items.len());
     Ok(

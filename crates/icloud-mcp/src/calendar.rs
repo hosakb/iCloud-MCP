@@ -453,6 +453,16 @@ fn cache_state(library: &Library) -> Result<Value, &'static str> {
     }))
 }
 
+/// The part of `[start, end)` (at least its first second) inside the last refresh's window,
+/// or the event's start when none of it is.
+fn covered_part(library: &Library, start: i64, end: i64) -> (i64, i64) {
+    let end = end.max(start.saturating_add(1));
+    match stored_window(library).map(Window::covers) {
+        Some((a, b)) if start < b && a < end => (start.max(a), end.min(b)),
+        _ => (start, start.saturating_add(1)),
+    }
+}
+
 /// Whether the last refresh read `[lo, hi)`, in the cache's seconds (see [`Window::covers`]).
 fn coverage(library: &Library, read: (i64, i64)) -> Value {
     let window = stored_window(library);
@@ -913,12 +923,10 @@ pub(crate) fn get(library: &mut Library, args: Value) -> Result<Value, &'static 
         );
     }
     let cache = cache_state(library)?;
-    // The event's start is what a refresh judges it by, so the one second there is the
-    // range: an event on a covered day reads as covered, as calendar_events says of the day.
-    let coverage = coverage(
-        library,
-        (event.starts_at, event.starts_at.saturating_add(1)),
-    );
+    // Covered when any of the event's time lies in the refreshed window: calendar_events
+    // then says the same of a day the event is on.
+    let read = covered_part(library, event.starts_at, event.ends_at);
+    let coverage = coverage(library, read);
     for level in EVENT_LEVELS {
         let mut cut_any = false;
         let shown = match level {
