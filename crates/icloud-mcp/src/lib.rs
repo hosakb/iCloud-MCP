@@ -637,14 +637,14 @@ fn fix_step(error: &str, dir: &Path) -> Option<String> {
         "local_file_changed_while_read" => "The file changed while it was read, so nothing was sent. Wait until nothing is writing to it, then ask again.".into(),
         "local_write_failed" => "The file could not be written to the exchange folder, so nothing was kept. Check that the disk has room and that you can write to the folder, then ask again.".into(),
         // The call itself, and queued changes that can't be sent.
-        "operation_too_large" => queued_or_live("The arguments are too large or too deeply nested."),
+        "operation_too_large" => format!("The change, or the note or reminder it is for, is too large or too deeply nested. If a tool call returned this, nothing was queued: send smaller arguments, or, when the note or reminder itself is very large in the local copy, make the change in Apple Notes or Apple Reminders. If sync returned it, a waiting change was set aside and never sent; to see it, run {quarantine} in your own terminal. That command lists every set-aside change and can delete any of them, so read the list first."),
         "frame_too_large" => "The message was larger than 64 KB, so the connection was closed. Send smaller requests.".into(),
         "invalid_utf8" => "The message was not valid UTF-8 text. Send it as UTF-8.".into(),
         "invalid_tool" => "The request names no tool iCloud-MCP can run. Ask for the change again with a tool from tools/list.".into(),
         "payload_too_large" => waiting("A queued change is larger than 256 KB, too large to send."),
         "preview_too_large" => queued_or_live("The change is too large to show for approval."),
         "invalid_preview" => queued_or_live("The change could not be shown for approval."),
-        "template_too_large" => waiting("A queued new note needs the note template Apple sent, and that template is too large to use."),
+        "template_too_large" => format!("The note template Apple sent is too large to use, so a new note can't be queued. If a tool call that creates a note returned this, nothing was queued: create the note in Apple Notes instead, and iCloud-MCP reads it on the next sync. If sync returned it, a waiting new note was set aside and never sent; to see it, run {quarantine} in your own terminal. That command lists every set-aside change and can delete any of them, so read the list first."),
         "unknown_service" => waiting("A queued change belongs to no service iCloud-MCP sends."),
         _ => return None,
     })

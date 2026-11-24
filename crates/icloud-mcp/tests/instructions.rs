@@ -433,7 +433,7 @@ fn the_errors_from_issue_91_say_what_to_do_next() {
         assert!(text.contains("read the list first"), "{code}: {text}");
     }
     // An older waiting change can fail a new write: nothing is queued or set aside then.
-    for code in ["payload_too_large", "template_too_large", "unknown_service"] {
+    for code in ["payload_too_large", "unknown_service"] {
         let text = line(code);
         assert!(
             text.contains("nothing was queued or set aside by this call"),
@@ -443,6 +443,16 @@ fn the_errors_from_issue_91_say_what_to_do_next() {
         assert!(text.contains("read the list first"), "{code}: {text}");
         assert!(!text.contains("smaller change"), "{code}: {text}");
         assert!(!text.contains("It was set aside"), "{code}: {text}");
+    }
+    // A live note create or a large cached item fails the new write itself: no older
+    // change is to blame, and the note can still be made in Apple Notes.
+    for code in ["template_too_large", "operation_too_large"] {
+        let text = line(code);
+        assert!(text.contains("nothing was queued"), "{code}: {text}");
+        assert!(text.contains("in Apple Notes"), "{code}: {text}");
+        assert!(text.contains("icloud-mcp quarantine"), "{code}: {text}");
+        assert!(text.contains("read the list first"), "{code}: {text}");
+        assert!(!text.contains("older change"), "{code}: {text}");
     }
     let path = line("invalid_path");
     assert!(path.contains("255 bytes"), "{path}");
