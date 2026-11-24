@@ -1345,7 +1345,10 @@ async fn a_lost_reply_save_is_kept_and_retried_after_a_second_save_is_refused() 
     // nothing shows n2 came after the save: the mark moves to n2 and stays until a read
     // brings a newer etag.
     assert_eq!(
-        library.state("mcp.notes.save_mark.note").unwrap().as_deref(),
+        library
+            .state("mcp.notes.save_mark.note")
+            .unwrap()
+            .as_deref(),
         Some(r#"{"from":"n2"}"#)
     );
     assert_ne!(shown_etag(&mut server).await, json!("n2"));
