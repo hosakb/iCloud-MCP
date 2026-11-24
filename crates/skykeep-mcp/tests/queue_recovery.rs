@@ -1156,7 +1156,7 @@ async fn save_with_runs(server: &mut skykeep_mcp::Server, id: i64, body: &str, r
 }
 
 /// A synthetic remote whose Notes read and lookup both give the family note as Apple holds
-/// it now: `text`, set with `runs` when given.
+/// it now: `text`, set with `runs` when given, titled by its first line.
 async fn remote_with_note(text: &str, runs: Option<Value>) -> MockServer {
     use quince_icloud::ckdocument as doc;
     let remote = remote().await;
@@ -1166,7 +1166,7 @@ async fn remote_with_note(text: &str, runs: Option<Value>) -> MockServer {
         encoded = doc::replace_rich_in_base64(&encoded, text, &runs).unwrap();
     }
     let record = json!({"recordName":"note","recordType":"Note","recordChangeTag":"n2","fields":{
-        "TitleEncrypted":{"type":"ENCRYPTED_BYTES","value":doc::bare_text_to_base64("note")},
+        "TitleEncrypted":{"type":"ENCRYPTED_BYTES","value":doc::bare_text_to_base64(text.lines().next().unwrap_or_default())},
         "SnippetEncrypted":{"type":"ENCRYPTED_BYTES","value":doc::bare_text_to_base64("body")},
         "TextDataEncrypted":{"type":"ENCRYPTED_BYTES","value":encoded},
         "Deleted":{"type":"INT64","value":0}}});
@@ -1262,6 +1262,51 @@ async fn a_save_over_an_unchanged_copy_on_icloud_is_sent() {
             .unwrap();
     assert_eq!(mcp_refusals(&library), Vec::<String>::new(), "{result}");
     assert!(!modified(&remote.received_requests().await.unwrap()).is_empty());
+}
+
+/// Final check: a save Apple already took, whose reply was lost, is tried again. Apple now
+/// holds the save's own text (and its own formatting, when it sets any), not the text it was
+/// typed over. That is no change on iCloud: it is not set aside, and the sender finishes
+/// without writing again.
+#[tokio::test]
+async fn a_save_apple_already_holds_is_not_set_aside_when_tried_again() {
+    for formatted in [false, true] {
+        let (dir, mut server, mut library) = family().await;
+        library
+            .set_note_runs("note", &json!([{"length":9}]).to_string())
+            .unwrap();
+        let remote = if formatted {
+            save_with_runs(&mut server, 2, "note\nbody!", json!([{"length":10}])).await;
+            remote_with_note("note\nbody!", Some(json!([{"length":4},{"length":6}]))).await
+        } else {
+            let saved = write(
+                &mut server,
+                2,
+                "notes_write",
+                json!({"action":"save","guid":"note","body":"NOTE\nbody","base_etag":"n1"}),
+            )
+            .await;
+            assert_eq!(saved["isError"], false, "{saved}");
+            remote_with_note("NOTE\nbody", None).await
+        };
+        let result =
+            skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+                .await
+                .unwrap();
+        assert_eq!(
+            mcp_refusals(&library),
+            Vec::<String>::new(),
+            "{formatted}: {result}"
+        );
+        assert!(
+            library.outbox_pending("notes").unwrap().is_empty(),
+            "{formatted}: {result}"
+        );
+        assert!(
+            modified(&remote.received_requests().await.unwrap()).is_empty(),
+            "{formatted}: nothing written again"
+        );
+    }
 }
 
 /// Review round 2: the same formatting cut into other runs, as Apple may send it back, is

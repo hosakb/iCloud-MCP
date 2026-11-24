@@ -107,7 +107,9 @@ const NOTES_ZONE: &str = "Notes";
 /// its text is not the text the save was typed over, or, for a save that sets formatting
 /// of its own, Apple's formatting is not the formatting it was typed over (compared as
 /// `quince_icloud::notes::same_formatting` does, so the same formatting cut into other runs
-/// is no change). A text-only save writes its text into Apple's current document and keeps
+/// is no change). Apple already holding the save's own text, and its own formatting when it
+/// sets any, is no change either: a send that landed but whose reply was lost. A text-only
+/// save writes its text into Apple's current document and keeps
 /// Apple's formatting, so its formatting is not compared; nor is formatting the save was
 /// typed over that does not describe its text (the cache can keep the runs of an earlier
 /// text). Read just before the send, after the sync's own read, so a change between that
@@ -135,6 +137,20 @@ async fn note_changed_on_icloud(
     let (Some(theirs), Some(base)) = (doc::stored_text_from_base64(&encoded), save.base) else {
         return Ok(false);
     };
+    // Apple already holds this save (a send that landed, its reply lost): no change on
+    // iCloud. The sender then finds nothing to write and finishes quietly.
+    let saved = doc::apple_line_breaks(&save.body);
+    let holds_formatting = match &save.runs {
+        None => true,
+        Some(runs) => quince_icloud::notes::same_formatting(
+            &saved,
+            &doc::runs_with_apple_line_breaks(&save.body, runs.clone()),
+            &doc::runs_from_base64(&encoded),
+        ),
+    };
+    if saved == theirs && holds_formatting {
+        return Ok(false);
+    }
     let typed_over = doc::apple_line_breaks(&base);
     if typed_over != theirs {
         return Ok(true);
