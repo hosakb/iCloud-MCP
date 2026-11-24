@@ -47,4 +47,4 @@ jobs:
       - name: Test MCP and engine crates
         run: cargo test --locked --workspace
       - name: Build MCP server
-        run: cargo build --locked -p skykeep-mcp
+        run: cargo build --locked -p icloud-mcp

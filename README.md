@@ -1,6 +1,6 @@
 # iCloud-MCP
 
-iCloud-MCP is an MCP server for Apple iCloud Notes, Reminders, Contacts, Calendar, Photos and Drive. It is a fork of [Skykeep](https://github.com/YashwanthKamireddi/Skykeep) and runs on its Rust engine. The command is `skykeep-mcp`.
+iCloud-MCP is an MCP server for Apple iCloud Notes, Reminders, Contacts, Calendar, Photos and Drive. It is a fork of [Skykeep](https://github.com/YashwanthKamireddi/Skykeep) and runs on its Rust engine. The command is `icloud-mcp`.
 
 It runs on your own computer, speaks newline-delimited JSON-RPC over stdio, keeps its own private library directory and has no network listener. Reads come from a private local SQLite cache.
 
@@ -18,19 +18,19 @@ This fork contains the MCP server and its four engine crates, not the upstream d
 
 ## Architecture
 
-![iCloud-MCP architecture diagram](crates/skykeep-mcp/docs/architecture.webp)
+![iCloud-MCP architecture diagram](crates/icloud-mcp/docs/architecture.webp)
 
-Edit `crates/skykeep-mcp/docs/architecture.html` and re-export `crates/skykeep-mcp/docs/architecture.webp` whenever a route changes.
+Edit `crates/icloud-mcp/docs/architecture.html` and re-export `crates/icloud-mcp/docs/architecture.webp` whenever a route changes.
 
 ## Build
 
 Install the Rust version pinned in [rust-toolchain.toml](rust-toolchain.toml); [rustup.rs](https://rustup.rs) picks it up. Linux also needs a C build toolchain, `pkg-config` and the D-Bus development headers for the Secret Service client: on Debian or Ubuntu `sudo apt install build-essential pkg-config libdbus-1-dev`, on Fedora `sudo dnf install gcc pkgconf-pkg-config dbus-devel`, on Arch `sudo pacman -S base-devel pkgconf dbus`.
 
 ```sh
-cargo build --locked --release -p skykeep-mcp
+cargo build --locked --release -p icloud-mcp
 ```
 
-The binary is `target/release/skykeep-mcp`. The workspace's default member is this server, so `cargo build` and `cargo test` without `-p` build only the server. The other members are the four engine crates.
+The binary is `target/release/icloud-mcp`. The workspace's default member is this server, so `cargo build` and `cargo test` without `-p` build only the server. The other members are the four engine crates.
 
 ## Get started
 
@@ -38,22 +38,24 @@ Install the program where your terminal finds programs:
 
 ```sh
 mkdir -p ~/.local/bin
-install -m 755 target/release/skykeep-mcp ~/.local/bin/
+install -m 755 target/release/icloud-mcp ~/.local/bin/
 ```
 
-If your terminal then says it can't find `skykeep-mcp`, type `~/.local/bin/skykeep-mcp` wherever this guide says `skykeep-mcp`. `skykeep-mcp --help` lists every command, and `skykeep-mcp COMMAND --help` explains one of them.
+If your terminal then says it can't find `icloud-mcp`, type `~/.local/bin/icloud-mcp` wherever this guide says `icloud-mcp`. `icloud-mcp --help` lists every command, and `icloud-mcp COMMAND --help` explains one of them.
 
 You need a terminal window that you open yourself. Don't run these commands through an AI assistant or chat: what you type there can end up in a transcript.
 
 1. Run the guided setup:
 
    ```sh
-   skykeep-mcp setup
+   icloud-mcp setup
    ```
 
    It walks you through six steps and tells you what each one does:
 
-   1. **Folder.** Where iCloud-MCP keeps its private data. Press Enter to use the suggested folder, `~/.local/share/skykeep-mcp`, or type another one as a full path starting with `/` or `~`. Setup asks before it creates a folder. With another folder, add `--state-dir FOLDER` to every command; setup and status print each command with it already filled in.
+   1. **Folder.** Where iCloud-MCP keeps its private data. Press Enter to use the suggested folder, `~/.local/share/icloud-mcp`, or type another one as a full path starting with `/` or `~`. Setup asks before it creates a folder. With another folder, add `--state-dir FOLDER` to every command; setup and status print each command with it already filled in.
+
+      If you set up under the program's old name, your folder is `~/.local/share/skykeep-mcp`. While `~/.local/share/icloud-mcp` does not exist, every command uses the old folder as it is, and status says so. It can stay where it is: nothing is moved or copied, and you don't sign in again. If you still run the old `skykeep-mcp` command, install `icloud-mcp` and change the command in your MCP client's settings to it. If you used a protected file and unlocked it before the upgrade, the first start of `icloud-mcp` may ask you once to run `icloud-mcp unlock` again.
    2. **Where your sign-in is kept.** Your computer's password store when it has one, otherwise a protected file (see below).
    3. **Apple sign-in.** Your Apple Account, your password and then a verification code. Your account, password and code are not shown as you type. You pick a number for where Apple sends the code: your Apple devices, or a text message to one of your phone numbers if Apple lists any. At the code you can type `b` to go back and pick the other way without typing your password again.
    4. **Approval mode.** When the assistant has to ask you before it acts:
@@ -63,18 +65,18 @@ You need a terminal window that you open yourself. Don't run these commands thro
       | 1. Ask before every read and every change (recommended, `reads_and_writes`) | Asks you in the MCP client | Asks you in the MCP client |
       | 2. Read without asking, ask before every change (`writes_only`) | No question | Asks you in the MCP client |
       | 3. Don't ask before reads or changes (`yolo`, you type `confirm`) | No question | No question, except deletions, moves to Recently Deleted and moves and renames of large Drive folders, which ask in the MCP client |
-      | 4. No approval mode, the older behaviour (you type `confirm`) | No question | Like choice 3. You can later run `skykeep-mcp require-approval` to make every change ask. Most people should pick 1 |
+      | 4. No approval mode, the older behaviour (you type `confirm`) | No question | Like choice 3. You can later run `icloud-mcp require-approval` to make every change ask. Most people should pick 1 |
 
       Every choice asks on iCloud-MCP's approval card in the MCP client. Hermes, Claude Code and Codex offer the card when they connect. In a client without the card, a request that needs approval is refused with `approval_requires_form_client`, and nothing runs. A client that offers the card but connects with an MCP protocol version older than `2025-06-18` gets `approval_requires_newer_protocol`. A session where nobody answers, such as a scheduled job, gets `approval_timeout` after 3 minutes. In both cases nothing runs. Choice 4 keeps a folder's earlier `require-approval` setting: then every change asks on the card, and setup and status say so. Once a folder has had choice 1, 2 or 3, it can't go back to 4; set up a new folder instead. You can change the mode later with an `approval_mode:` line in `permissions.yaml` (see "Settings in the permissions file"). A line there wins over the choice made here, and setup changes that line to match when you choose again.
    After step 4, setup offers to write a starter permissions file. In it every deletion asks on the card. Press Enter to skip it.
    5. **Services.** Which of Notes, Reminders, Contacts, Calendar, Photos and Drive the assistant may use. Setup lists them with numbers and whether each is on; type the numbers of the services to have on (such as `1 4`), `none`, or press Enter to keep them as they are. The choice is stored as the `services:` line in `permissions.yaml` (see "Settings in the permissions file"); with every service on and no line, nothing is written. Apple gives one sign-in for the whole account, so this is a limit inside iCloud-MCP, not at Apple: someone with the sign-in file could still reach the other services outside this server.
-   6. **Check.** Setup checks everything it set up and prints what to paste into your MCP client's settings, all under the server name `icloud`: a JSON line for most clients, a `config.yaml` block for Hermes, and one command each for Claude Code and Codex. If your client had rules for the old name `skykeep`, such as tools it may call without asking, they don't apply to `icloud`; set them again there.
+   6. **Check.** Setup checks everything it set up and prints what to paste into your MCP client's settings, all under the server name `icloud`: a JSON line for most clients, a `config.yaml` block for Hermes, and one command each for Claude Code and Codex. If your client had rules for an older server name, such as tools it may call without asking, they don't apply to `icloud`; set them again there.
 
    Claude Code and Codex add the server with one command each, and setup prints both with your folder filled in. Replace `DIR` with the folder setup used:
 
    ```sh
-   claude mcp add --scope user icloud -- skykeep-mcp --state-dir DIR
-   codex mcp add icloud -- skykeep-mcp --state-dir DIR
+   claude mcp add --scope user icloud -- icloud-mcp --state-dir DIR
+   codex mcp add icloud -- icloud-mcp --state-dir DIR
    ```
 
    Answer approval cards in the interactive app. `claude -p` and `codex exec` may close cards by themselves, and a closed card counts as Deny, so use the interactive app for deletions and other actions that need approval. Codex also has its own setting, `default_tools_approval_mode`, for whether Codex asks you before it calls a tool. It goes under `[mcp_servers.<name>]` in Codex's `config.toml`, so `[mcp_servers.icloud]` for the command above. That setting is separate from iCloud-MCP's card: whatever it says, every action that needs approval still asks on the card.
@@ -84,7 +86,7 @@ You need a terminal window that you open yourself. Don't run these commands thro
 2. Check that everything is ready:
 
    ```sh
-   skykeep-mcp status
+   icloud-mcp status
    ```
 
    It only looks at this computer: it never contacts Apple and never asks for a password. Each problem comes with the next step to take. It ends with an error code when something needs fixing, so scripts can check it.
@@ -92,7 +94,7 @@ You need a terminal window that you open yourself. Don't run these commands thro
 3. Only if setup chose the protected file: after each restart of the computer, run this once before you use the assistant:
 
    ```sh
-   skykeep-mcp unlock
+   icloud-mcp unlock
    ```
 
 ### Where your sign-in is kept
@@ -100,7 +102,7 @@ You need a terminal window that you open yourself. Don't run these commands thro
 iCloud-MCP never writes your sign-in to a plain file. There are two options:
 
 - **Your computer's password store** (the system keyring, such as GNOME Keyring or KWallet). Setup uses it when it is running and unlocked. Nothing more to do after a restart once you have logged in to your desktop.
-- **A protected file** in the iCloud-MCP folder, for computers without a usable password store, such as a server you reach over SSH. You choose a passphrase of at least 12 characters, typed twice. The file is encrypted with it (AES-256-GCM, key derived with PBKDF2-HMAC-SHA256). After each restart, `skykeep-mcp unlock` asks for the passphrase once and gives the server the key through the Linux kernel's own key storage, so the server can read the file without a desktop. The key is never written to a file. Like the system keyring, it can be read by programs running as your user, and by nobody else. Until you unlock, the server's tools answer `locked: run skykeep-mcp unlock in a terminal`. To make the key expire earlier than the next restart, use `skykeep-mcp unlock --hours 8`; a later plain `skykeep-mcp unlock` removes that limit again.
+- **A protected file** in the iCloud-MCP folder, for computers without a usable password store, such as a server you reach over SSH. You choose a passphrase of at least 12 characters, typed twice. The file is encrypted with it (AES-256-GCM, key derived with PBKDF2-HMAC-SHA256). After each restart, `icloud-mcp unlock` asks for the passphrase once and gives the server the key through the Linux kernel's own key storage, so the server can read the file without a desktop. The key is never written to a file. Like the system keyring, it can be read by programs running as your user, and by nobody else. Until you unlock, the server's tools answer `locked: run icloud-mcp unlock in a terminal`. To make the key expire earlier than the next restart, use `icloud-mcp unlock --hours 8`; a later plain `icloud-mcp unlock` removes that limit again.
 
 If neither is available, setup stops and says so instead of keeping the sign-in anywhere less safe. If you are inside Docker or a similar container, run iCloud-MCP directly on the computer; on a desktop, log in to the desktop session first. When the option you chose stops working (the keyring is gone, or the kernel key storage is blocked), setup offers the other one. Switching asks you to type `switch`, removes the sign-in kept the old way, and you sign in to Apple again. If the old keyring can't be reached at all, setup says that an older entry may stay there unused; before the folder ever uses that keyring again, setup erases it. A locked keyring is never switched away from: unlock it instead. If you forget the passphrase, run `setup` again and choose to start over with a new one; you then sign in to Apple again, and your cached data stays.
 
@@ -111,8 +113,8 @@ Your Apple password is never stored. When Apple asks you to sign in again, run `
 `setup` uses the same sign-in as these commands, which still work on their own:
 
 ```sh
-skykeep-mcp login --state-dir ~/.local/share/skykeep-mcp
-skykeep-mcp logout --state-dir ~/.local/share/skykeep-mcp
+icloud-mcp login --state-dir ~/.local/share/icloud-mcp
+icloud-mcp logout --state-dir ~/.local/share/icloud-mcp
 ```
 
 `login` asks for your Apple Account, password and verification code with echo turned off. It reads only from the terminal you opened, never from a pipe, an argument or an environment variable. It refuses to start when it sees markers that an agent runtime launched it (`HERMES_AGENT`, `AI_AGENT`, `HERMES_SESSION_ID`, `CODEX_SANDBOX`, `CLAUDECODE`), because an agent-owned terminal can copy what you type into a transcript. That check only catches runtimes that set those markers; an agent with shell access can unset them (see "Write approval" below).
@@ -121,7 +123,7 @@ For the code you pick a number from a short list: one sends the code to your App
 
 What is kept afterwards:
 
-- The session and trust tokens, in the storage chosen above. With the system keyring they are under the service name `skykeep-mcp`, one entry per folder. The server never imports a session from the upstream Skykeep desktop app.
+- The session and trust tokens, in the storage chosen above. With the system keyring they are under the service name `skykeep-mcp`, one entry per folder; the upstream engine sets that name, and it stays so saved sign-ins keep working. The server never imports a session from the upstream Skykeep desktop app.
 - A one-way account tag in the library, so a folder can't be reused for another Apple Account. Use a new folder for a different account.
 
 The folder must be owned by you, mode `0700`, and contain no symlinks or files readable by others. The one exception is `permissions.yaml`: a shared or linked copy doesn't stop the folder, and iCloud-MCP treats that file as unusable (see "Permissions file"). The server and the helper commands take an exclusive lock on it for each operation. If a command meets a request in progress it stops with `state_busy_retry`; run it again. A running server picks up the new session on its next request, without a restart.
@@ -131,10 +133,10 @@ The folder must be owned by you, mode `0700`, and contain no symlinks or files r
 ## Run the server
 
 ```sh
-skykeep-mcp --state-dir ~/.local/share/skykeep-mcp
+icloud-mcp --state-dir ~/.local/share/icloud-mcp
 ```
 
-Configure your MCP client to start that command. Stdout carries protocol messages only. JSON-RPC batches are not supported and get an `Invalid Request` error. Several clients can share one directory: operations take turns on the lock, and a server that starts while another holds it still answers `initialize`, then returns `state_busy_retry` from each tool call until the lock is free. Setup prints the exact line to paste. The server never opens a keyring unlock dialog or a sign-in prompt. If the keyring is locked, tools return `login_required_unlock_secure_storage`, and if the session has expired, `login_required`, each with instructions. With a protected file that is not unlocked they return `locked: run skykeep-mcp unlock in a terminal`. `auth_status` names the folder in that command, and says which other problem a protected file has, such as a damaged file or a blocked kernel key storage. While running it refreshes Notes and Reminders every five minutes, those of the two that the `services:` line leaves on; a failed pass waits for the next interval rather than retrying.
+Configure your MCP client to start that command. Stdout carries protocol messages only. JSON-RPC batches are not supported and get an `Invalid Request` error. Several clients can share one directory: operations take turns on the lock, and a server that starts while another holds it still answers `initialize`, then returns `state_busy_retry` from each tool call until the lock is free. Setup prints the exact line to paste. The server never opens a keyring unlock dialog or a sign-in prompt. If the keyring is locked, tools return `login_required_unlock_secure_storage`, and if the session has expired, `login_required`, each with instructions. With a protected file that is not unlocked they return `locked: run icloud-mcp unlock in a terminal`. `auth_status` names the folder in that command, and says which other problem a protected file has, such as a damaged file or a blocked kernel key storage. While running it refreshes Notes and Reminders every five minutes, those of the two that the `services:` line leaves on; a failed pass waits for the next interval rather than retrying.
 
 Before the first sign-in, read tools answer `not_signed_in` instead of an empty list. Every error reply carries an `error` code, and where there is something to do, `instructions` with the next step: for `invalid_arguments` they name the field that is missing, unknown or of the wrong type.
 
@@ -148,7 +150,7 @@ iCloud-MCP is a standard MCP server over stdio, so any MCP client can start it, 
 
 | Tool | What it does |
 |---|---|
-| `auth_status` | Whether the folder is signed in, and how to sign in. `signed_in` holds only as of the last sync or refresh that used the sign-in (`checked_at`); it may have changed since. `session_unverified` means none has used it yet. `login_required` with a `reason` means the last one could not use it; without a `reason` it means this folder was never signed in. `locked` means the keyring or the protected file is locked, `storage_problem` that the protected file is missing, damaged or can't be opened here, and `signed_out` that `skykeep-mcp logout` ran. Takes no arguments and never accepts secrets. |
+| `auth_status` | Whether the folder is signed in, and how to sign in. `signed_in` holds only as of the last sync or refresh that used the sign-in (`checked_at`); it may have changed since. `session_unverified` means none has used it yet. `login_required` with a `reason` means the last one could not use it; without a `reason` it means this folder was never signed in. `locked` means the keyring or the protected file is locked, `storage_problem` that the protected file is missing, damaged or can't be opened here, and `signed_out` that `icloud-mcp logout` ran. Takes no arguments and never accepts secrets. |
 | `sync` | Refreshes Notes and Reminders, then sends queued changes. Nothing is sent when the refresh fails. `left_queue_this_sync` lists each write that left the queue, with outcome `cloudkit_accepted` or `finished_unconfirmed` (see Reminders below). `pending_recent` lists up to 20 writes still waiting, oldest first, each with a reason code (see "Why a change waits" below). |
 | `sync_status` | Last refresh per service, whether the last pass failed, counts of pending and refused changes, and per service `pending_recent` (why each waiting change waits, as of the last `sync`) and `refused_recent`. No network access. |
 | `notes_list`, `notes_folders`, `notes_search`, `notes_get` | Read the local cache. `notes_get` returns the plain text and the native formatting runs. |
@@ -211,12 +213,12 @@ The permissions file can name `drive_write` and each of its actions (see "Permis
 Uploads read from, and downloads write into, one local folder. Name it with an `exchange_folder:` line in `permissions.yaml` (see "Settings in the permissions file"), or set it up in your own terminal:
 
 ```sh
-skykeep-mcp exchange --state-dir ~/.local/share/skykeep-mcp
+icloud-mcp exchange --state-dir ~/.local/share/icloud-mcp
 ```
 
-Like `setup`, `status` and `unlock`, it uses `~/.local/share/skykeep-mcp` when `--state-dir` is left out, and its flags can come in any order. A symbolic link among the folders above it (such as `/home` pointing to `/var/home`) is followed once, here, and the real path is kept; the exchange folder itself must not be a link. It creates `~/iCloud-MCP-Exchange` (mode `0700`) if needed, writes its full path into the `exchange_folder:` line of `permissions.yaml` and prints the folder and the size limit. `--path DIR` picks another folder (its parent must exist); without it, the command keeps the folder the file names. `--max-mb N` changes the limit, 100 MB by default; the limit is set only here, not in the file. No MCP argument can name the folder or change the limit. Until a folder is named, `upload` and `download` are refused.
+Like `setup`, `status` and `unlock`, it uses `~/.local/share/icloud-mcp` when `--state-dir` is left out, and its flags can come in any order. A symbolic link among the folders above it (such as `/home` pointing to `/var/home`) is followed once, here, and the real path is kept; the exchange folder itself must not be a link. It creates `~/iCloud-MCP-Exchange` (mode `0700`) if needed, writes its full path into the `exchange_folder:` line of `permissions.yaml` and prints the folder and the size limit. `--path DIR` picks another folder (its parent must exist); without it, the command keeps the folder the file names. `--max-mb N` changes the limit, 100 MB by default; the limit is set only here, not in the file. No MCP argument can name the folder or change the limit. Until a folder is named, `upload` and `download` are refused.
 
-The folder is checked before every upload and download. It must exist and be a folder of yours that no one else can change. It can't be a symbolic link, a system folder such as `/etc` or `/usr`, your home folder or a folder above it, or a folder inside a hidden folder (a name that starts with a dot, such as `.ssh`, `.gnupg` or `.aws`) or a folder whose name has "credential" or "keyring" in it. It also can't be iCloud-MCP's own folder, a folder inside it, or a folder that holds it. A folder that fails is refused with what is wrong and what to change; iCloud-MCP never falls back to another folder, such as the one `skykeep-mcp exchange` set up earlier. `status` shows the folder in use and says where it comes from.
+The folder is checked before every upload and download. It must exist and be a folder of yours that no one else can change. It can't be a symbolic link, a system folder such as `/etc` or `/usr`, your home folder or a folder above it, or a folder inside a hidden folder (a name that starts with a dot, such as `.ssh`, `.gnupg` or `.aws`) or a folder whose name has "credential" or "keyring" in it. It also can't be iCloud-MCP's own folder, a folder inside it, or a folder that holds it. A folder that fails is refused with what is wrong and what to change; iCloud-MCP never falls back to another folder, such as the one `icloud-mcp exchange` set up earlier. `status` shows the folder in use and says where it comes from.
 
 The `local` argument names a file inside the folder as a relative path, such as `report.pdf` or `in/report.pdf`. Absolute paths, `..` and symbolic links anywhere on the way are refused; each name is opened with no-follow semantics, and the folder must still be the one you set up. An upload must be a regular file with no other hard link. A download never replaces an existing file: it arrives as a hidden partial file and takes its name only if the name is still free. Without `local`, a download takes the item's name with control and text-direction characters removed, and a name that could leave the folder is refused. The limit is checked while bytes are read or arrive, not afterwards, and a stopped transfer leaves nothing behind; a partial download left by a crash is removed by the next download into that folder once it is ten minutes old. The exchange folder, and every folder inside it on the way to the file, must be yours and not writable by others; a refusal says the exact `chmod 700` line that fixes it. The folders above the exchange folder are not checked. One upload or download may take two minutes plus one second per 256 KB of the limit, about nine minutes at 100 MB; past that it stops and keeps nothing.
 
@@ -241,10 +243,10 @@ Why a change waits. Queued Notes and Reminders changes go out in order, so the f
 
 - `waiting_for_connection`: Apple couldn't be reached, or the connection dropped. Nothing to do; the next `sync` sends it again.
 - `waiting_apple_busy`: Apple was busy or not ready. Nothing to do; the next `sync` sends it again.
-- `waiting_sign_in`: the sign-in has to be renewed, or Apple waits for approval on one of your devices. Run `skykeep-mcp login` in your own terminal, approve on your device if asked, then run `sync`.
+- `waiting_sign_in`: the sign-in has to be renewed, or Apple waits for approval on one of your devices. Run `icloud-mcp login` in your own terminal, approve on your device if asked, then run `sync`.
 - `waiting_answer_not_understood`: Apple's answer couldn't be read. Wait a few minutes and run `sync` again.
 - `waiting_changed_at_apple`: the item changed in iCloud since the change was queued. Run `sync` again. If the change ends up refused, read the item again with `notes_get` or `reminders_get` and make the change again.
-- `waiting_local_storage`: iCloud-MCP couldn't read or write its own files. Run `skykeep-mcp status` in your own terminal, then `sync`.
+- `waiting_local_storage`: iCloud-MCP couldn't read or write its own files. Run `icloud-mcp status` in your own terminal, then `sync`.
 - `waiting_refresh_failed`: the refresh before sending failed, so nothing was sent. Run `sync` again in a few minutes.
 - `waiting_to_send`: no `sync` has tried it yet. Run `sync`.
 - `waiting_behind_change_N`: the change wasn't sent. It waits behind change `N`, the one Apple didn't take, and goes once that one is sent or refused.
@@ -270,9 +272,9 @@ For Notes and Reminders, a deletion means `delete`, a `move` into Recently Delet
 
 The card is the only way to approve by default. Deny, a card closed without a choice, a cancelled request, no answer within 3 minutes and any error all count as Deny, and nothing runs. An approval runs the one action it showed, once. It is tied to the account and the folder, and it is refused if the item, the approval mode or the permissions file changed while the card was open. A client without the card gets `approval_requires_form_client`, and nothing runs; no request waits anywhere for later.
 
-To make every change ask on the card in a folder with no approval mode, run `skykeep-mcp require-approval --state-dir DIR`; `allow-routine` switches back. Both commands ask you to type `confirm`.
+To make every change ask on the card in a folder with no approval mode, run `icloud-mcp require-approval --state-dir DIR`; `allow-routine` switches back. Both commands ask you to type `confirm`.
 
-**Approving in a terminal instead (opt-in).** If you want a terminal step for an action, set it to `ask: terminal` in the permissions file (see below). That action then returns `approval_required` with a request ID instead of a card. Run `skykeep-mcp approve --state-dir DIR` in your own terminal: it asks for the request ID, shows the exact change and allows it only after you type `approve`. A Notes or Reminders change is then queued; a Drive, Contacts, Calendar or Photos change runs at once, can't be undone from here, and the command prints its outcome. A request is used once, and it is refused if the account, the approval mode, the folder, the cached item or the permissions file changed since it was made, or if the file now says `deny`. Nothing goes to the terminal without such a rule.
+**Approving in a terminal instead (opt-in).** If you want a terminal step for an action, set it to `ask: terminal` in the permissions file (see below). That action then returns `approval_required` with a request ID instead of a card. Run `icloud-mcp approve --state-dir DIR` in your own terminal: it asks for the request ID, shows the exact change and allows it only after you type `approve`. A Notes or Reminders change is then queued; a Drive, Contacts, Calendar or Photos change runs at once, can't be undone from here, and the command prints its outcome. A request is used once, and it is refused if the account, the approval mode, the folder, the cached item or the permissions file changed since it was made, or if the file now says `deny`. Nothing goes to the terminal without such a rule.
 
 There is no volume limit. Under the default policy an agent can queue any number of routine edits, ticks and saves that shorten a note without emptying it. If you want to see every write first, use `require-approval`.
 
@@ -280,7 +282,7 @@ What approval protects against: an agent that reaches this server only through M
 
 ## Permissions file
 
-One file in the folder decides, for each tool and action, whether iCloud-MCP runs it, asks first or refuses it: `permissions.yaml`, so by default `~/.local/share/skykeep-mcp/permissions.yaml`. iCloud-MCP reads it before every tool call, so an edit counts at once. There is no apply step.
+One file in the folder decides, for each tool and action, whether iCloud-MCP runs it, asks first or refuses it: `permissions.yaml`, so by default `~/.local/share/icloud-mcp/permissions.yaml`. iCloud-MCP reads it before every tool call, so an edit counts at once. There is no apply step.
 
 ```yaml
 version: 1
@@ -308,7 +310,7 @@ Anything the file does not list follows the folder's approval mode. A rule can m
 **Editing the file from Hermes.** Ask the assistant to change the file, or edit it yourself; the next tool call uses it. To edit it yourself, open it in a terminal:
 
 ```sh
-nano ~/.local/share/skykeep-mcp/permissions.yaml
+nano ~/.local/share/icloud-mcp/permissions.yaml
 ```
 
 Use your folder if it is another one. nano keeps the file's mode 600, so only you can read or change it. A new file gets your usual mode, often 664 on Ubuntu, and iCloud-MCP then reports it with the `chmod 600` command to run. Some editors leave a backup copy such as `permissions.yaml~` next to it; if others can read that copy, iCloud-MCP refuses the whole folder and names the file to delete or `chmod 600`.
@@ -317,10 +319,10 @@ Use your folder if it is another one. nano keeps the file's mode 600, so only yo
 
 **When the file is wrong.** iCloud-MCP reads only a regular file in the folder that belongs to you and that no one else can change. It never follows a link and reads at most 64 KiB. The format is a strict part of YAML: `version: 1`, the three settings below, `rules:`, and one rule per line indented with spaces. A broken file never makes anything looser. iCloud-MCP keeps the last valid rules, approval mode and `services:` line it loaded from the file. If there are none, the approval mode decides and every deletion asks, even under `yolo`. No exchange folder is used while the file is broken: uploads and downloads are refused, and the tool result names the file and its mistake. Each tool result says so while the file is unusable, and `status` and `permissions show` say what is wrong. A file that others can change, which is common on Ubuntu with mode 664, is reported with the command that fixes it: `chmod 600 FOLDER/permissions.yaml`.
 
-**Seeing what changed.** Each time the file's content changes, iCloud-MCP records when it loaded it and what became looser or stricter. `skykeep-mcp status` reports looser changes, for example `reminders_write.create: asks in your MCP client before, now runs without asking`, `approval mode: writes_only before, now yolo`, `services: Photos was switched off before, now on` or a new exchange folder, until you look. `status` only reads; it never records anything.
+**Seeing what changed.** Each time the file's content changes, iCloud-MCP records when it loaded it and what became looser or stricter. `icloud-mcp status` reports looser changes, for example `reminders_write.create: asks in your MCP client before, now runs without asking`, `approval mode: writes_only before, now yolo`, `services: Photos was switched off before, now on` or a new exchange folder, until you look. `status` only reads; it never records anything.
 
 ```sh
-skykeep-mcp permissions show --state-dir FOLDER
+icloud-mcp permissions show --state-dir FOLDER
 ```
 
 It needs a folder that setup has prepared. It prints the rules in use, when the last change was loaded, any problem with the file, every change since you last ran it in your own terminal, and the newest lines of `permissions-log.jsonl`. That log gets one line, with the rule name and time but no content, for each rule saved from a card. A deletion never runs without asking, so the log has no lines for that. A run through an agent's terminal shows the changes but does not mark them as seen. An agent that can edit files can also edit the log, so it is a record, not a protection.
@@ -339,19 +341,19 @@ rules:
     ask: client
 ```
 
-- `approval_mode:` replaces the mode chosen in setup. The modes are the ones in the table under "Get started". Every deletion, move to Recently Deleted and move or rename of a large Drive folder still asks on the card in every mode. Without the line, the mode from setup applies. In a folder where setup stored no mode, the first tool call after sign-in stores the file's mode so that queued changes are bound to it, and sets aside changes already waiting (`skykeep-mcp quarantine` lists them). That stored mode still counts only while the line is there.
-- `exchange_folder:` names the exchange folder (see "The exchange folder" for the checks). A file without the line names no exchange folder, so uploads and downloads are refused. Only when there is no file at all does the folder set up with `skykeep-mcp exchange` apply. When iCloud-MCP writes the first file (setup's starter file, `skykeep-mcp policy` or a rule saved from a card), it copies that folder into the file as its `exchange_folder:` line if the folder still passes the checks.
+- `approval_mode:` replaces the mode chosen in setup. The modes are the ones in the table under "Get started". Every deletion, move to Recently Deleted and move or rename of a large Drive folder still asks on the card in every mode. Without the line, the mode from setup applies. In a folder where setup stored no mode, the first tool call after sign-in stores the file's mode so that queued changes are bound to it, and sets aside changes already waiting (`icloud-mcp quarantine` lists them). That stored mode still counts only while the line is there.
+- `exchange_folder:` names the exchange folder (see "The exchange folder" for the checks). A file without the line names no exchange folder, so uploads and downloads are refused. Only when there is no file at all does the folder set up with `icloud-mcp exchange` apply. When iCloud-MCP writes the first file (setup's starter file, `icloud-mcp policy` or a rule saved from a card), it copies that folder into the file as its `exchange_folder:` line if the folder still passes the checks.
 - `services:` lists the services the server may use, on one line, from `notes`, `reminders`, `contacts`, `calendar`, `photos` and `drive`. `[]` switches all of them off. Without the line, every service is on. For a switched-off service:
   - its tools are left out of the tool list, and the server instructions name it. `sync` is left out only when Notes and Reminders are both off. A client reads the tool list when it connects, so restart it after switching a service on.
   - a call to one of its tools is refused with `notes_switched_off`, `photos_switched_off` and so on, with the line to change as the next step. The check comes before rules, the approval mode and the card. `sync` reports such a service as `switched_off` and reads nothing from it.
-  - switching off counts at the next tool call. Notes or Reminders changes still waiting to be sent are set aside then (by setup itself when you switch the service off there) and never sent, also not after the service is switched on again; ask for them again. While the service is off, `sync_status` shows only that it is switched off; once it is on again, it counts them as refused, with the reason `mcp_quarantine:service_switched_off`. `skykeep-mcp quarantine` lists them at any time.
-  - data cached before stays in the folder, and nothing reads it while the service is off. iCloud-MCP has no command that clears one service's cache. To clear it today: run `skykeep-mcp setup --state-dir NEW_FOLDER` to set up a new folder, choose the services there, change the `--state-dir` in your MCP client's settings to the new folder, then delete the old folder.
+  - switching off counts at the next tool call. Notes or Reminders changes still waiting to be sent are set aside then (by setup itself when you switch the service off there) and never sent, also not after the service is switched on again; ask for them again. While the service is off, `sync_status` shows only that it is switched off; once it is on again, it counts them as refused, with the reason `mcp_quarantine:service_switched_off`. `icloud-mcp quarantine` lists them at any time.
+  - data cached before stays in the folder, and nothing reads it while the service is off. iCloud-MCP has no command that clears one service's cache. To clear it today: run `icloud-mcp setup --state-dir NEW_FOLDER` to set up a new folder, choose the services there, change the `--state-dir` in your MCP client's settings to the new folder, then delete the old folder.
   - switching one on is a looser change and is reported like the others. A change setup makes is recorded but raises no notice, since you chose it there.
   - rule names for its tools stay valid in `rules:`, so switching it on again needs no other edit.
 
   A missing, renamed, broken or unreadable file never switches a service on. A missing or renamed file keeps the services in force before it went. A broken file keeps the last valid `services:` line. With no valid file loaded before, a file that can't be read, or a `services:` line that can't be read, switches every service off; a broken file without the line keeps what was in force, and that is every service when nothing was ever switched off. To switch every service on again, write a valid file without the line, list all six, or run setup. Turning services off changes no approval rule: deletions still ask on the card in every mode.
 
-A line in the file wins. `skykeep-mcp policy`, `skykeep-mcp exchange` and the services step of setup still work: each changes its line in the file, keeps every other line and comment, keeps the previous file as `permissions.yaml.bak` and writes the new one in one step with mode 600. A file with a mistake is left alone, and the command changes nothing and says what to fix. An edit counts at the next tool call, like a rule. A broken file keeps the last valid approval mode and `services:` line; if there is none, the mode from setup stays. It names no exchange folder, not the last valid one and not the one from `skykeep-mcp exchange`. `status` and `permissions show` say which mode and folder are in use and where each comes from, and which services are on.
+A line in the file wins. `icloud-mcp policy`, `icloud-mcp exchange` and the services step of setup still work: each changes its line in the file, keeps every other line and comment, keeps the previous file as `permissions.yaml.bak` and writes the new one in one step with mode 600. A file with a mistake is left alone, and the command changes nothing and says what to fix. An edit counts at the next tool call, like a rule. A broken file keeps the last valid approval mode and `services:` line; if there is none, the mode from setup stays. It names no exchange folder, not the last valid one and not the one from `icloud-mcp exchange`. `status` and `permissions show` say which mode and folder are in use and where each comes from, and which services are on.
 
 Passwords, verification codes and the passphrase never go in the file. A line that looks like one (`password:`, `passphrase:`, `code:`, `token:` and similar) makes the file unusable, and the message does not repeat it. `setup`, `login`, `logout` and `unlock` stay terminal-only, and `approve` is only for actions set to `ask: terminal`.
 
@@ -368,11 +370,11 @@ Passwords, verification codes and the passphrase never go in the file. A line th
 
 ### Approval modes in detail
 
-Setup's choices 1 to 3 are the approval modes `reads_and_writes`, `writes_only` and `yolo` (the table is under "Get started"). They decide whether reads, sync and changes in each service ask first. Every deletion is always asked: Notes, Reminders, Contacts and Calendar deletes, Drive trash and delete forever, and Photos moves to Recently Deleted. So is every move or rename of a large Drive folder; see "Drive changes", "Contacts changes", "Calendar changes" and "Photos changes". A folder with no mode (choice 4) runs reads and routine changes without asking and asks on the card before every deletion and large Drive folder move or rename, like choice 3. The difference is that `skykeep-mcp require-approval` can make every change ask there.
+Setup's choices 1 to 3 are the approval modes `reads_and_writes`, `writes_only` and `yolo` (the table is under "Get started"). They decide whether reads, sync and changes in each service ask first. Every deletion is always asked: Notes, Reminders, Contacts and Calendar deletes, Drive trash and delete forever, and Photos moves to Recently Deleted. So is every move or rename of a large Drive folder; see "Drive changes", "Contacts changes", "Calendar changes" and "Photos changes". A folder with no mode (choice 4) runs reads and routine changes without asking and asks on the card before every deletion and large Drive folder move or rename, like choice 3. The difference is that `icloud-mcp require-approval` can make every change ask there.
 
-**Changing the mode.** Only a person can change it, with `skykeep-mcp policy --state-dir DIR MODE` in a terminal they opened themselves, where MODE is `reads_and_writes`, `writes_only` or `yolo`. The command asks you to type `confirm`, saves the mode for this Apple Account and this exact folder, writes `approval_mode: MODE` into `permissions.yaml` and says which mode it saved. It refuses before asking anything when the file has a mistake. No MCP tool can change the mode. A mode saved for another account, or in a folder that was copied or moved, stops working until a person chooses it again. Older terminal approvals can't override a newly saved mode, and a folder can't go back to having no mode.
+**Changing the mode.** Only a person can change it, with `icloud-mcp policy --state-dir DIR MODE` in a terminal they opened themselves, where MODE is `reads_and_writes`, `writes_only` or `yolo`. The command asks you to type `confirm`, saves the mode for this Apple Account and this exact folder, writes `approval_mode: MODE` into `permissions.yaml` and says which mode it saved. It refuses before asking anything when the file has a mistake. No MCP tool can change the mode. A mode saved for another account, or in a folder that was copied or moved, stops working until a person chooses it again. Older terminal approvals can't override a newly saved mode, and a folder can't go back to having no mode.
 
-**The approval card.** In each mode that asks, every approval is one card in the MCP client. A client gets the card when it connects with protocol `2025-06-18` or newer and says it can show forms (`elicitation: {}` or `form: {}`). The server answers with the version the client asked for, or `2025-11-25` for a newer one; an older version gets `2025-03-26` and no card. For `2025-06-18` the card lists the choices as `enum` with `enumNames` and has no `mode`. The card shows the tool and its arguments but leaves out the call's `_meta`. It escapes markup characters, control and non-ASCII characters, and any underscore that is not inside a word. The card has one required choice. Only "Approve this time", or "Always allow this action" where the card offers it, lets the action run. A client that can't show the card, connects with a protocol version older than `2025-06-18` or offers only links gets a refusal whenever approval is needed. Approval in the terminal (`skykeep-mcp approve`) exists only for actions a rule sets to `ask: terminal`.
+**The approval card.** In each mode that asks, every approval is one card in the MCP client. A client gets the card when it connects with protocol `2025-06-18` or newer and says it can show forms (`elicitation: {}` or `form: {}`). The server answers with the version the client asked for, or `2025-11-25` for a newer one; an older version gets `2025-03-26` and no card. For `2025-06-18` the card lists the choices as `enum` with `enumNames` and has no `mode`. The card shows the tool and its arguments but leaves out the call's `_meta`. It escapes markup characters, control and non-ASCII characters, and any underscore that is not inside a word. The card has one required choice. Only "Approve this time", or "Always allow this action" where the card offers it, lets the action run. A client that can't show the card, connects with a protocol version older than `2025-06-18` or offers only links gets a refusal whenever approval is needed. Approval in the terminal (`icloud-mcp approve`) exists only for actions a rule sets to `ask: terminal`.
 
 **While a card is open.** The server keeps answering other messages while the person decides, and does not hold the folder's lock. One card can be open per connection; `ping`, `auth_status` and `sync_status` still answer. The server keeps the request, its full arguments, the account, the mode and the folder in memory only, and checks all of them again under the lock before the action runs. Only the client's answer to that card can approve it. A declined, cancelled or malformed answer, a change of mode, 180 seconds without an answer, a dropped connection or a repeated answer runs nothing. Nothing about an open card is written to disk, and closing the connection drops it. Cancelling after the change was queued can't undo it.
 
@@ -382,11 +384,11 @@ Setup's choices 1 to 3 are the approval modes `reads_and_writes`, `writes_only` 
 
 **What an approval covers.** An approval covers only the cached data the sender uses for that change: the item itself, a note's text for `save`, the subtasks of a reminder that moves to another list, and the notes template for a new note. Refreshing other lists, folders or items doesn't make it stale. When an approved change rewrites the cached data of another queued change (a subtask under a parent that moves lists, for example), that change keeps its approval only if it was current just before. An approved deletion refuses older queued changes to the same items with `superseded_by_approved_deletion`. A changed request is never approved again on its own.
 
-**What sync checks.** Before it uses the sign-in, sync checks that reading is allowed and that the saved mode still belongs to this account and folder. In `reads_and_writes`, the automatic refresh at startup and every five minutes doesn't run; only a `sync` call can ask for it on the card. The other modes refresh in the background. A queued change whose approval is missing, out of date, too large, or whose item is gone is set aside alone with the reason `mcp_quarantine:<code>` and never sent; the rest of the queue goes on. Because the cache still shows a set-aside change as if it were on its way, the same sync then reads that service again in full; until that works, reads can still show the unsent change. A note or reminder that changed or was deleted on iCloud after a change to it was queued is set aside as `mcp_quarantine:item_changed_on_icloud_since_queued`, with an `instructions` field that says what to do next. It stays in the list, and counts toward the 1024 kept, until you retire it with `skykeep-mcp quarantine`. A new etag or modified time alone, which Apple gives an item when it next reads it back, doesn't set a change aside. Right before sending, the server checks again that the change, account, mode, folder and cached item are what was approved, and refuses the change if anything differs. A sync lays a waiting note save over the copy it reads from Apple, so the cache can't show a change made on iCloud to that note. Just before a note save is sent, iCloud-MCP reads Apple's copy again and compares it with the text the save was typed over; a save that sets its own formatting is also compared with the formatting it was typed over. If either changed, or the note is gone, the save is set aside. A text-only save keeps Apple's formatting, so its formatting is not compared. A sync stops after 60 seconds, and at most 128 waiting changes are taken in. If time runs out after sending began, the change may or may not have arrived; it stays queued to be sent again. These checks can refuse a change when someone edited the same item elsewhere at the same time. How Apple merges conflicting edits is up to Apple; a change accepted here is not checked field by field at Apple.
+**What sync checks.** Before it uses the sign-in, sync checks that reading is allowed and that the saved mode still belongs to this account and folder. In `reads_and_writes`, the automatic refresh at startup and every five minutes doesn't run; only a `sync` call can ask for it on the card. The other modes refresh in the background. A queued change whose approval is missing, out of date, too large, or whose item is gone is set aside alone with the reason `mcp_quarantine:<code>` and never sent; the rest of the queue goes on. Because the cache still shows a set-aside change as if it were on its way, the same sync then reads that service again in full; until that works, reads can still show the unsent change. A note or reminder that changed or was deleted on iCloud after a change to it was queued is set aside as `mcp_quarantine:item_changed_on_icloud_since_queued`, with an `instructions` field that says what to do next. It stays in the list, and counts toward the 1024 kept, until you retire it with `icloud-mcp quarantine`. A new etag or modified time alone, which Apple gives an item when it next reads it back, doesn't set a change aside. Right before sending, the server checks again that the change, account, mode, folder and cached item are what was approved, and refuses the change if anything differs. A sync lays a waiting note save over the copy it reads from Apple, so the cache can't show a change made on iCloud to that note. Just before a note save is sent, iCloud-MCP reads Apple's copy again and compares it with the text the save was typed over; a save that sets its own formatting is also compared with the formatting it was typed over. If either changed, or the note is gone, the save is set aside. A text-only save keeps Apple's formatting, so its formatting is not compared. A sync stops after 60 seconds, and at most 128 waiting changes are taken in. If time runs out after sending began, the change may or may not have arrived; it stays queued to be sent again. These checks can refuse a change when someone edited the same item elsewhere at the same time. How Apple merges conflicting edits is up to Apple; a change accepted here is not checked field by field at Apple.
 
 **Reporting refused changes.** The `sync` reply reports `queued` (waiting changes only), `refused` (all refused changes kept) and `refused_this_sync`, each change this sync refused or set aside. `sync_status` reports, per service, how many were refused and the 20 newest as `refused_recent`. Both show the id, service, kind, item and a reason code, never the content, and an `instructions` field for a reason that has a next step; reasons from Apple or the sync engine appear only as `refused_by_sync_engine`. A sync that fails after its local check doesn't list the changes it set aside; `sync_status` does.
 
-Refused changes stay in the private folder and `sync_status` counts them. They don't count toward the 128 waiting changes. Up to 1024 are kept; after that, new changes fail with `quarantine_full_retire_in_terminal`. The person-only command `skykeep-mcp quarantine --state-dir DIR` lists them in a terminal you opened yourself (id, service, kind, item, reason and the next step where there is one, never the content) and deletes exactly those rows after you type `retire`. Retired changes are never sent. No MCP tool can send again, release or delete a refused change.
+Refused changes stay in the private folder and `sync_status` counts them. They don't count toward the 128 waiting changes. Up to 1024 are kept; after that, new changes fail with `quarantine_full_retire_in_terminal`. The person-only command `icloud-mcp quarantine --state-dir DIR` lists them in a terminal you opened yourself (id, service, kind, item, reason and the next step where there is one, never the content) and deletes exactly those rows after you type `retire`. Retired changes are never sent. No MCP tool can send again, release or delete a refused change.
 
 Hermes 0.23.3 connects with protocol `2025-11-25` and says it can show forms and links (`elicitation: {form: {}, url: {}}`), so the server shows it the approval card. How each Hermes screen shows the three choices, and whether it sends the chosen one back, was not tested here; a card answered without a choice counts as Deny. Claude Code 2.1.325 connects with protocol `2025-11-25` and Codex 0.169.0 with `2025-06-18`; both say they can show forms, so both get the card. The interactive card in these two apps was not tested here. OpenClaw has not been tested.
 

@@ -10,7 +10,7 @@ Use the Rust version in `rust-toolchain.toml`, including rustfmt and clippy. Lin
 
 ```sh
 sudo apt-get install build-essential pkg-config libdbus-1-dev
-cargo build --locked -p skykeep-mcp
+cargo build --locked -p icloud-mcp
 ```
 
 A Secret Service keyring is needed for real login, not for the normal synthetic test suite. Never enter credentials in an agent-owned terminal. Do not mount your home directory or personal keyring into test containers.
@@ -21,7 +21,7 @@ A Secret Service keyring is needed for real login, not for the normal synthetic 
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
-cargo build --locked -p skykeep-mcp
+cargo build --locked -p icloud-mcp
 ```
 
 Plain `cargo test --locked` selects the default MCP member. `--workspace` also runs the four engine crates' tests. Add `--offline` when dependencies are cached. With a prepared container, disable its network and mount source read-only, with separate writable target and temporary directories. Loopback mock servers remain available inside that container.
