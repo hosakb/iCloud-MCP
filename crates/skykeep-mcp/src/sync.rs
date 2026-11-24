@@ -543,6 +543,42 @@ pub(crate) fn quarantine_looser(library: &mut Library, dir: &Path) -> Result<(),
     Ok(())
 }
 
+/// Notes and Reminders, as far as the permissions file's `services:` line leaves them on.
+fn services_on(library: &Library, dir: &Path) -> Result<Vec<&'static str>, &'static str> {
+    let on = crate::permissions::peek(library, dir, None)?.services;
+    Ok(["notes", "reminders"]
+        .into_iter()
+        .filter(|s| on.contains(s))
+        .collect())
+}
+
+/// Sets aside every queued write of Notes or Reminders while that service is switched off,
+/// as [`quarantine_looser`] does: it is never sent, also not after the service is switched
+/// on again, and `skykeep-mcp quarantine` and `sync_status` count it.
+pub(crate) fn set_aside_switched_off(
+    library: &mut Library,
+    on: &[&str],
+) -> Result<(), &'static str> {
+    for service in ["notes", "reminders"]
+        .into_iter()
+        .filter(|s| !on.contains(s))
+    {
+        for p in library
+            .outbox_pending(service)
+            .map_err(|_| "library_unavailable")?
+        {
+            library
+                .atomically(|library| -> quince_core::Result<()> {
+                    library.outbox_refuse(p.id, "mcp_quarantine:service_switched_off")?;
+                    library.set_state(&format!("mcp.authorization.{}", p.id), "")?;
+                    library.set_state(&reread_key(service), "1")
+                })
+                .map_err(|_| "library_unavailable")?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn run(dir: &Path) -> Result<Value, &'static str> {
     run_authorized(dir, false).await
 }
@@ -550,6 +586,11 @@ pub async fn run(dir: &Path) -> Result<Value, &'static str> {
 fn refresh_gate(dir: &Path, approved: bool) -> Result<bool, &'static str> {
     let mut library = Library::open(dir).map_err(|_| "library_unavailable")?;
     let configured = crate::policy(&library, dir)?;
+    let on = services_on(&library, dir)?;
+    set_aside_switched_off(&mut library, &on)?;
+    if on.is_empty() {
+        return Err("sync_switched_off");
+    }
     if crate::mode_in_force(&library, dir)?.as_deref() == Some("reads_and_writes") && !approved {
         return Err("read_approval_required");
     }
@@ -620,6 +661,7 @@ async fn sync_pass(
     let dsid = client.session().dsid.as_deref().ok_or("login_required")?;
     let tag = queue::account_tag(dsid);
     let library = Library::open(dir).map_err(|_| "library_unavailable")?;
+    let on = services_on(&library, dir)?;
     if crate::account::binding(&library, dsid)? != crate::account::Binding::Same {
         return Err("account_mismatch_use_new_state_directory");
     }
@@ -640,6 +682,12 @@ async fn sync_pass(
     // back.
     let mut waiting_before = Vec::new();
     for service in ["notes", "reminders"] {
+        // Switched off in permissions.yaml: nothing is read. Its queued changes were set
+        // aside in refresh_gate and are never sent.
+        if !on.contains(&service) {
+            services.push(json!({"service":service,"outcome":"switched_off","sent":false}));
+            continue;
+        }
         let lock = Mutex::new(());
         let before = pass::run(service, &ctx, &data, &lock).await;
         // Each sync says afresh why its queue stopped, if it did.

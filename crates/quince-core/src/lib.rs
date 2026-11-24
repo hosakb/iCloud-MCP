@@ -353,6 +353,40 @@ impl Library {
         })
     }
 
+    /// A read-only handle on the library under `dir` while another handle has it open, for
+    /// reading without the folder's lock. It never changes the table layout or any row, and
+    /// never waits for a writer. The library and its `-wal` and `-shm` files must already be
+    /// regular files of this user (no links); otherwise it is refused, since opening a WAL
+    /// library without them would create them. The check runs before the open: if the other
+    /// handle closes the library in between, SQLite may create a new `-shm` in the same
+    /// folder.
+    pub fn open_read_only(dir: &Path) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        use std::os::unix::fs::MetadataExt;
+        let refused = || Error::Io(std::io::Error::other("library_not_readable"));
+        let uid = std::fs::symlink_metadata(dir).map_err(|_| refused())?.uid();
+        for name in ["library.db", "library.db-wal", "library.db-shm"] {
+            let meta = std::fs::symlink_metadata(dir.join(name)).map_err(|_| refused())?;
+            if !meta.file_type().is_file() || meta.uid() != uid {
+                return Err(refused());
+            }
+        }
+        let conn = Connection::open_with_flags(
+            dir.join("library.db"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.pragma_update(None, "query_only", true)?;
+        conn.busy_timeout(std::time::Duration::ZERO)?;
+        Ok(Self {
+            conn,
+            zone: None,
+            watch: changes::Watch::default(),
+            months: std::sync::Mutex::new(None),
+        })
+    }
+
     /// An in-memory library. Tests, and nothing else.
     pub fn in_memory() -> Result<Self> {
         Self::from_connection(Connection::open_in_memory()?)

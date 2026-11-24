@@ -1,6 +1,6 @@
-//! Per-tool permissions from `permissions.yaml` in the private folder, and two settings
-//! beside them: the approval mode (`approval_mode:`) and the exchange folder
-//! (`exchange_folder:`). A setting in the file wins over the one stored by setup or the older
+//! Per-tool permissions from `permissions.yaml` in the private folder, and three settings
+//! beside them: the approval mode (`approval_mode:`), the exchange folder
+//! (`exchange_folder:`) and the services the server may use (`services:`). A setting in the file wins over the one stored by setup or the older
 //! terminal commands; `skykeep-mcp policy` and `skykeep-mcp exchange` edit the file's line.
 //!
 //! The server reads the file before every tool call, so an edit counts at once. A missing
@@ -23,6 +23,18 @@ pub const FILE_NAME: &str = "permissions.yaml";
 pub const MODE_KEY: &str = "approval_mode";
 /// The file's line for the exchange folder.
 pub const EXCHANGE_KEY: &str = "exchange_folder";
+/// The file's line for the services the server may use.
+pub const SERVICES_KEY: &str = "services";
+/// Every service a `services:` line can name, in the order the file and the texts use, with
+/// its name for people.
+pub const SERVICES: [(&str, &str); 6] = [
+    ("notes", "Notes"),
+    ("reminders", "Reminders"),
+    ("contacts", "Contacts"),
+    ("calendar", "Calendar"),
+    ("photos", "Photos"),
+    ("drive", "Drive"),
+];
 /// The approval modes the file accepts, strictest first.
 const MODE_NAMES: [&str; 3] = ["reads_and_writes", "writes_only", "yolo"];
 /// Append-only lines for rules saved from a card (older folders may also hold lines for
@@ -303,7 +315,7 @@ fn inline_value(text: &str) -> Option<Effect> {
 
 const VALUE_HELP: &str = "use allow, deny, {ask: client} or {ask: terminal}";
 
-/// What a permissions file says: its rules and the two settings, as written.
+/// What a permissions file says: its rules and the settings, as written.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
     pub rules: Rules,
@@ -311,6 +323,86 @@ pub struct Settings {
     pub mode: Option<String>,
     /// `exchange_folder:` as written: a full path, or one that starts with `~/`.
     pub exchange: Option<String>,
+    /// `services:`, in the order of [`SERVICES`]. `None` when the file has no such line: every
+    /// service is on.
+    pub services: Option<Vec<String>>,
+}
+
+/// The service a tool belongs to, by the first word of its name. `sync` refreshes Notes and
+/// Reminders and has none of its own; `auth_status` and `sync_status` belong to none.
+pub fn service_of(tool: &str) -> Option<&'static str> {
+    let first = tool.split('_').next()?;
+    SERVICES.iter().map(|(s, _)| *s).find(|s| *s == first)
+}
+
+/// The services as people read them: `Notes, Contacts and Drive`.
+pub fn service_names(services: &[&str]) -> String {
+    let names: Vec<&str> = services
+        .iter()
+        .filter_map(|s| SERVICES.iter().find(|(k, _)| k == s).map(|(_, n)| *n))
+        .collect();
+    match names.as_slice() {
+        [] => "none".into(),
+        [one] => (*one).into(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+const SERVICES_HELP: &str = "write it on one line, such as services: [notes, calendar]";
+
+/// A `services:` value: `[name, ...]` on one line, each name once, kept in [`SERVICES`] order.
+fn services_value(text: &str) -> Result<Vec<String>, String> {
+    let inner = unquote(text)
+        .strip_prefix('[')
+        .and_then(|t| t.strip_suffix(']'))
+        .ok_or_else(|| format!("{SERVICES_KEY} lists the services that are on; {SERVICES_HELP}"))?;
+    let mut named = Vec::new();
+    for word in inner.split(',').map(unquote).filter(|w| !w.is_empty()) {
+        if !SERVICES.iter().any(|(s, _)| *s == word) {
+            return Err(format!(
+                "{} is not a service; {SERVICES_KEY} takes notes, reminders, contacts, calendar, photos and drive",
+                shown(word)
+            ));
+        }
+        if named.contains(&word) {
+            return Err(format!("{} is named twice in {SERVICES_KEY}", shown(word)));
+        }
+        named.push(word);
+    }
+    Ok(SERVICES
+        .iter()
+        .map(|(s, _)| *s)
+        .filter(|s| named.contains(s))
+        .map(str::to_string)
+        .collect())
+}
+
+/// What a file that can't be used says about services, when no valid file was loaded before:
+/// `None` (every service on) when it has no `services:` line, the line when it reads on its
+/// own, and every service off when the line can't be read or the file can't be read at all.
+fn services_when_broken(bytes: Option<&[u8]>) -> Option<Vec<String>> {
+    let Some(text) = bytes.and_then(|b| std::str::from_utf8(b).ok()) else {
+        return Some(Vec::new());
+    };
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| {
+            uncommented(l)
+                .split_once(':')
+                .is_some_and(|(k, _)| unquote(&k.replace('\t', " ")) == SERVICES_KEY)
+        })
+        .collect();
+    match lines.as_slice() {
+        [] => None,
+        [line] if !line.starts_with([' ', '\t']) => Some(
+            uncommented(line)
+                .split_once(':')
+                .and_then(|(_, v)| services_value(v.trim_end()).ok())
+                .unwrap_or_default(),
+        ),
+        _ => Some(Vec::new()),
+    }
 }
 
 /// The rules in a permissions file (see [`parse_settings`]).
@@ -442,6 +534,12 @@ pub fn parse_settings(text: &str) -> Result<Settings, String> {
                     }
                     settings.exchange = Some(folder_value(value).map_err(at)?);
                 }
+                SERVICES_KEY => {
+                    if settings.services.is_some() {
+                        return Err(at(format!("{SERVICES_KEY} is listed twice")));
+                    }
+                    settings.services = Some(services_value(value).map_err(at)?);
+                }
                 other if secret_like(other) => {
                     return Err(at("passwords, codes and the passphrase never go in this file; type them only in your own terminal, when skykeep-mcp setup, login or unlock asks".into()))
                 }
@@ -453,7 +551,7 @@ pub fn parse_settings(text: &str) -> Result<Settings, String> {
                 }
                 other => {
                     return Err(at(format!(
-                        "unknown setting {}; the file has version:, {MODE_KEY}:, {EXCHANGE_KEY}: and rules:",
+                        "unknown setting {}; the file has version:, {MODE_KEY}:, {EXCHANGE_KEY}:, {SERVICES_KEY}: and rules:",
                         shown(other)
                     )))
                 }
@@ -650,7 +748,8 @@ pub fn default_effect(
 pub enum Source {
     Missing,
     Rules(Settings),
-    Invalid(String),
+    /// The problem, and what the file says about services (see [`services_when_broken`]).
+    Invalid(String, Option<Vec<String>>),
 }
 
 /// The file's bytes from `dir`, `None` when there is none: a regular file owned by this
@@ -710,21 +809,25 @@ pub fn read(dir: &Path) -> (Source, String) {
         Err(problem) => return invalid(&problem),
     };
     let print = fingerprint(&bytes);
+    let services = services_when_broken(Some(&bytes));
     let Ok(text) = String::from_utf8(bytes) else {
         return (
-            Source::Invalid("the file is not UTF-8 text".into()),
+            Source::Invalid("the file is not UTF-8 text".into(), services),
             format!("invalid:{print}"),
         );
     };
     match parse_settings(&text) {
         Ok(settings) => (Source::Rules(settings), print),
-        Err(problem) => (Source::Invalid(problem), format!("invalid:{print}")),
+        Err(problem) => (
+            Source::Invalid(problem, services),
+            format!("invalid:{print}"),
+        ),
     }
 }
 
 fn invalid(problem: &str) -> (Source, String) {
     (
-        Source::Invalid(problem.into()),
+        Source::Invalid(problem.into(), services_when_broken(None)),
         format!("invalid:{problem}"),
     )
 }
@@ -757,9 +860,46 @@ pub struct Active {
     pub kept_from: Option<u64>,
     /// The file is unusable and there are no earlier valid rules: every deletion asks.
     pub strict: bool,
+    /// The services that are on, in [`SERVICES`] order: the file's `services:` line (or the
+    /// last valid file's), every service when there is none.
+    pub services: Vec<&'static str>,
+    /// Whether the file in use (or the last valid one) has a `services:` line.
+    pub services_in_file: bool,
 }
 
 impl Active {
+    /// Whether `service` is on.
+    pub fn service_on(&self, service: &str) -> bool {
+        self.services.contains(&service)
+    }
+
+    /// Whether a tool may be offered and run: its service is on, and `sync` needs Notes or
+    /// Reminders.
+    pub fn tool_on(&self, tool: &str) -> bool {
+        tool_on(&self.services, tool)
+    }
+
+    /// The services that are switched off, in [`SERVICES`] order.
+    pub fn services_off(&self) -> Vec<&'static str> {
+        SERVICES
+            .iter()
+            .map(|(s, _)| *s)
+            .filter(|s| !self.service_on(s))
+            .collect()
+    }
+
+    /// One sentence on which services are on.
+    pub fn services_sentence(&self) -> String {
+        let off = self.services_off();
+        if off.is_empty() {
+            return "Services on: all six (Notes, Reminders, Contacts, Calendar, Photos and Drive).".into();
+        }
+        format!(
+            "Services on: {}. Switched off: {}.",
+            service_names(&self.services),
+            service_names(&off)
+        )
+    }
     /// A sentence on what Skykeep does while the file can't be used, for tool results and
     /// status. `permissions show` lists the valid names itself, so it passes `in_show`.
     pub fn fallback(&self) -> Option<String> {
@@ -890,9 +1030,10 @@ fn stored_exchange(library: &Library) -> Option<String> {
         .map(|e| e.path.display().to_string())
 }
 
-/// The changes in the two settings: the approval mode, then the exchange folder. A different
-/// folder counts as looser, because its files become reachable; no folder counts as stricter.
-/// `exchange` is the folder in force after the load, as written.
+/// The changes in the three settings: the approval mode, the exchange folder, then each
+/// service. A different folder counts as looser, because its files become reachable; no folder
+/// counts as stricter. A service switched on counts as looser. `exchange` is the folder in
+/// force after the load, as written.
 fn setting_changes(
     library: &Library,
     stored: &Value,
@@ -932,11 +1073,45 @@ fn setting_changes(
             stricter.push(change);
         }
     }
+    let before = settings_from(stored).services;
+    service_changes(
+        before.as_deref(),
+        settings.services.as_deref(),
+        &mut looser,
+        &mut stricter,
+    );
     (looser, stricter)
 }
 
 fn settings_value(settings: &Settings) -> Value {
-    json!({"rules":rules_value(&settings.rules),MODE_KEY:settings.mode,EXCHANGE_KEY:settings.exchange})
+    json!({"rules":rules_value(&settings.rules),MODE_KEY:settings.mode,EXCHANGE_KEY:settings.exchange,SERVICES_KEY:settings.services})
+}
+
+/// The services that are on for a `services:` value (`None`: every service).
+fn services_on(services: Option<&[String]>) -> Vec<&'static str> {
+    SERVICES
+        .iter()
+        .map(|(s, _)| *s)
+        .filter(|s| services.is_none_or(|list| list.iter().any(|l| l == s)))
+        .collect()
+}
+
+/// Each service switched on (looser) or off (stricter) between two `services:` values.
+fn service_changes(
+    before: Option<&[String]>,
+    after: Option<&[String]>,
+    looser: &mut Vec<Value>,
+    stricter: &mut Vec<Value>,
+) {
+    let (was, now) = (services_on(before), services_on(after));
+    for (service, _) in SERVICES {
+        let change = |from: &str, to: &str| json!({"name":SERVICES_KEY,"service":service,"from":from,"to":to});
+        match (was.contains(&service), now.contains(&service)) {
+            (false, true) => looser.push(change("off", "on")),
+            (true, false) => stricter.push(change("on", "off")),
+            _ => {}
+        }
+    }
 }
 
 fn settings_from(value: &Value) -> Settings {
@@ -947,6 +1122,13 @@ fn settings_from(value: &Value) -> Settings {
             .filter(|m| MODE_NAMES.contains(m))
             .map(str::to_string),
         exchange: value[EXCHANGE_KEY].as_str().map(str::to_string),
+        // Kept as recorded: names are checked again where they are used.
+        services: value[SERVICES_KEY].as_array().map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        }),
     }
 }
 
@@ -969,7 +1151,15 @@ fn evaluate(
     // The last valid rules and settings from a file, kept while a later file can't be used.
     let last_valid = stored["valid"].clone();
     let (settings, problem, valid) = match source {
-        Source::Missing => (Settings::default(), None, Value::Null),
+        // No file keeps the services in force: removing or renaming it switches none on.
+        Source::Missing => (
+            Settings {
+                services: settings_from(&stored).services,
+                ..Settings::default()
+            },
+            None,
+            Value::Null,
+        ),
         Source::Rules(settings) => {
             let valid = if changed {
                 let mut v = settings_value(&settings);
@@ -980,7 +1170,16 @@ fn evaluate(
             };
             (settings, None, valid)
         }
-        Source::Invalid(problem) => (settings_from(&last_valid), Some(problem), last_valid),
+        Source::Invalid(problem, services) => {
+            let mut settings = settings_from(&last_valid);
+            // No valid file since the last one went missing, or none ever: the services in
+            // force until now when some were switched off, else what the broken file says.
+            // Either way the order of deleting and breaking the file changes nothing.
+            if last_valid.is_null() {
+                settings.services = settings_from(&stored).services.or(services);
+            }
+            (settings, Some(problem), last_valid)
+        }
     };
     let kept_from = problem.as_ref().and(valid["at"].as_u64());
     // The last valid file's folder is never kept: a broken file names none.
@@ -1000,6 +1199,8 @@ fn evaluate(
         fingerprint: print.clone(),
         problem,
         kept_from,
+        services: services_on(settings.services.as_deref()),
+        services_in_file: settings.services.is_some() && print != "missing",
     };
     if !changed {
         return Ok((active, None));
@@ -1062,10 +1263,32 @@ pub fn peek(library: &Library, dir: &Path, mode: Option<&str>) -> Result<Active,
 /// Reads the file and, when its bytes changed since the last load, records the load and what
 /// it made looser or stricter. Fails only when the library can't record it.
 pub fn load(library: &mut Library, dir: &Path, mode: Option<&str>) -> Result<Active, &'static str> {
+    load_as(library, dir, mode, None)
+}
+
+/// [`load`] right after setup wrote the file in the person's own terminal. When the file is
+/// still the one setup wrote (`print`, from [`set_setting_print`]), the change goes into the
+/// history but raises no "became looser" notice: the person just chose it. Any other file
+/// is loaded as usual.
+pub fn load_own(
+    library: &mut Library,
+    dir: &Path,
+    mode: Option<&str>,
+    print: &str,
+) -> Result<Active, &'static str> {
+    load_as(library, dir, mode, Some(print))
+}
+
+fn load_as(
+    library: &mut Library,
+    dir: &Path,
+    mode: Option<&str>,
+    own: Option<&str>,
+) -> Result<Active, &'static str> {
     let (active, change) = evaluate(library, dir, mode)?;
     if let Some((record, event)) = change {
         let mut pending = looser_unseen(library);
-        if let Some(event) = &event {
+        if let Some(event) = event.as_ref().filter(|_| own != Some(&active.fingerprint)) {
             add_looser(&mut pending, event);
         }
         let mut history = history(library);
@@ -1193,6 +1416,16 @@ fn change_line(c: &Value) -> String {
             text("to")
         );
     }
+    if c["name"] == SERVICES_KEY {
+        let service = c["service"].as_str().unwrap_or_default();
+        let state = |key: &str| if c[key] == "on" { "on" } else { "switched off" };
+        return format!(
+            "{SERVICES_KEY}: {} was {} before, now {}",
+            service_names(&[service]),
+            state("from"),
+            state("to")
+        );
+    }
     // Not an action: allow lets changes run, anything else refuses them.
     if c["name"] == crate::calendar_write::INVITATIONS_RULE {
         let runs = |key: &str| c[key] == Effect::Allow.as_str();
@@ -1258,6 +1491,7 @@ pub fn status(library: &Library, dir: &Path, mode: Option<&str>) -> Vec<(String,
         )),
     }
     out.push(exchange_line(library, dir, &active));
+    out.push((services_line(dir, &active), None));
     let mut pending = looser_unseen(library);
     if let Some(event) = change.and_then(|(_, event)| event) {
         add_looser(&mut pending, &event);
@@ -1278,6 +1512,39 @@ pub fn status(library: &Library, dir: &Path, mode: Option<&str>) -> Vec<(String,
         ));
     }
     out
+}
+
+/// Which services are on, and how to change that.
+fn services_line(dir: &Path, active: &Active) -> String {
+    let how = if active.services_off().is_empty() && !active.services_in_file {
+        "To switch one off, add a"
+    } else {
+        "To change this, edit the"
+    };
+    format!(
+        "{} {how} {SERVICES_KEY}: line in {} or run skykeep-mcp setup; a switched-off service's tools are not offered, and nothing from it is read, cached or synced.",
+        active.services_sentence(),
+        dir.join(FILE_NAME).display()
+    )
+}
+
+/// Whether `tool` may be offered and run while `services` are on: its service is on, and
+/// `sync` needs Notes or Reminders.
+pub fn tool_on(services: &[&str], tool: &str) -> bool {
+    match (tool, service_of(tool)) {
+        ("sync", _) => services.contains(&"notes") || services.contains(&"reminders"),
+        (_, Some(service)) => services.contains(&service),
+        (_, None) => true,
+    }
+}
+
+/// The services on according to the file alone, read without the folder or its records:
+/// `None` when the file is missing or can't be used, since then only the records can say.
+pub fn services_in_file(dir: &Path) -> Option<Vec<&'static str>> {
+    match read(dir).0 {
+        Source::Rules(settings) => Some(services_on(settings.services.as_deref())),
+        _ => None,
+    }
 }
 
 /// The status line for the exchange folder in force, with the fix when it can't be used.
@@ -1495,6 +1762,7 @@ pub fn show(dir: &Path, mark_seen: bool) -> Result<String, &'static str> {
     if let Some(fix) = fix {
         out.push_str(&format!("  Next step: {fix}\n"));
     }
+    out.push_str(&format!("{}\n", services_line(dir, &active)));
     let unseen = unseen(&library);
     let pending = looser_unseen(&library);
     let total = pending["count"].as_u64().unwrap_or(0);
@@ -1614,16 +1882,22 @@ pub fn starter(dir: &Path) -> String {
          #\n\
          # Write ask on its own indented line, as below, or as {ask: client}.\n\
          #\n\
-         # Two settings can stand beside the rules. Each replaces what setup or the older\n\
-         # terminal commands stored, and skykeep-mcp policy and skykeep-mcp exchange edit them:\n\
+         # Three settings can stand beside the rules. The first two replace what setup or the\n\
+         # older terminal commands stored; skykeep-mcp policy, exchange and setup edit them:\n\
          #   approval_mode: reads_and_writes, writes_only or yolo. Deletions ask in every mode.\n\
          #   exchange_folder: the one folder Drive and Photos uploads read from and Drive\n\
          #     downloads write into. A private folder of your own, not a link, not a system\n\
          #     folder and not inside a hidden folder such as .ssh or the private folder.\n\
+         #   services: the services iCloud-MCP may use, on one line. A service left out is\n\
+         #     switched off: its tools are not offered, and nothing from it is read, cached or\n\
+         #     synced. Without the line every service is on. Data cached before stays in the\n\
+         #     folder, unread; to clear it, set up a fresh folder and delete this one. Apple signs in the whole account, so this is a limit inside iCloud-MCP,\n\
+         #     not at Apple: someone with the sign-in could still reach every service.\n\
          # Passwords, codes and the passphrase never go in this file.\n\
          version: 1\n\
          # approval_mode: writes_only\n\
          # exchange_folder: ~/iCloud-MCP-Exchange\n\
+         # services: [notes, reminders, contacts, calendar, photos, drive]\n\
          rules:\n",
     )
     .replace("SHOW_COMMAND", &show);
@@ -1908,6 +2182,7 @@ pub fn setting_in_file(dir: &Path, key: &str) -> Option<String> {
     match key {
         MODE_KEY => settings.mode,
         EXCHANGE_KEY => settings.exchange,
+        SERVICES_KEY => settings.services.map(|s| format!("[{}]", s.join(", "))),
         _ => None,
     }
 }
@@ -1926,13 +2201,25 @@ pub fn editable(dir: &Path) -> Result<(), String> {
     }
 }
 
-/// Sets `approval_mode:` or `exchange_folder:` in the file, for `skykeep-mcp policy`,
+/// Sets `approval_mode:`, `exchange_folder:` or `services:` in the file, for `skykeep-mcp policy`,
 /// `skykeep-mcp exchange` and setup, in the person's own terminal. Every other line and
 /// comment stays as it was; the old file is kept as `permissions.yaml.bak`, and the new one is
 /// written whole and private. A missing file becomes a short one; a file with a mistake is
 /// left alone. Returns why nothing was written.
 pub fn set_setting(dir: &Path, key: &str, value: &str) -> Result<(), String> {
-    if ![MODE_KEY, EXCHANGE_KEY].contains(&key) {
+    set_setting_print(dir, key, value, None).map(|_| ())
+}
+
+/// [`set_setting`], returning the fingerprint of the file it wrote. With `expected`, the
+/// fingerprint of the file as last loaded ([`Active::fingerprint`]), a file changed since then
+/// is left alone, so an edit made meanwhile is never recorded as part of this write.
+pub fn set_setting_print(
+    dir: &Path,
+    key: &str,
+    value: &str,
+    expected: Option<&str>,
+) -> Result<String, String> {
+    if ![MODE_KEY, EXCHANGE_KEY, SERVICES_KEY].contains(&key) {
         return Err(format!("{} is not a setting of this file", shown(key)));
     }
     editable(dir)?;
@@ -1940,6 +2227,9 @@ pub fn set_setting(dir: &Path, key: &str, value: &str) -> Result<(), String> {
     let print = old
         .as_deref()
         .map_or_else(|| "missing".to_string(), fingerprint);
+    if expected.is_some_and(|e| e != print) {
+        return Err("the file changed while setup was saving; run skykeep-mcp setup again".into());
+    }
     let text = match &old {
         Some(bytes) => {
             String::from_utf8(bytes.clone()).map_err(|_| "the file is not UTF-8 text")?
@@ -1950,16 +2240,23 @@ pub fn set_setting(dir: &Path, key: &str, value: &str) -> Result<(), String> {
     let mut want = parse_settings(&text)?;
     match key {
         MODE_KEY => want.mode = Some(value.to_string()),
+        SERVICES_KEY => want.services = Some(services_value(value)?),
         _ => want.exchange = Some(value.to_string()),
     }
-    let new = with_setting(&text, key, &written(value));
+    // A list is written as it is; it never needs quotes.
+    let value = if key == SERVICES_KEY {
+        value.to_string()
+    } else {
+        written(value)
+    };
+    let new = with_setting(&text, key, &value);
     match parse_settings(&new) {
         Ok(got) if got == want && new.len() as u64 <= MAX_FILE_BYTES => {}
         Ok(_) => return Err("the file's layout can't be edited safely".into()),
         Err(problem) => {
             return Err(format!(
                 "{} can't be written there: {}",
-                shown(value),
+                shown(&value),
                 shown_problem(&problem)
             ))
         }
@@ -1975,7 +2272,7 @@ pub fn set_setting(dir: &Path, key: &str, value: &str) -> Result<(), String> {
         return Err("the file changed while it was being edited; run the command again".into());
     }
     write_atomic(dir, FILE_NAME, new.as_bytes())?;
-    Ok(())
+    Ok(fingerprint(new.as_bytes()))
 }
 
 fn append_log(dir: &Path, entry: Value) -> Result<(), &'static str> {

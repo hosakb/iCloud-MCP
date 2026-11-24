@@ -143,9 +143,43 @@ fn plain_error(error: &str) -> Value {
         "approval_cancelled" => "The request was cancelled before the approval card was answered, so nothing ran.",
         "not_signed_in" => "Not signed in to iCloud yet, so there is nothing to read.",
         "approval_timeout" => "Nobody answered the approval card within 3 minutes, so nothing ran. A session where nobody can answer, such as a scheduled job, can't run actions that need approval. Ask again while someone can answer the card.",
-        _ => return value,
+        SYNC_OFF => "Notes and Reminders are both switched off for this server in permissions.yaml (services:), so sync has nothing to refresh or send, and nothing ran.",
+        e => match switched_off_service(e) {
+            Some(name) => return switched_off_value(value, name),
+            None => return value,
+        },
     };
     value["message"] = json!(message);
+    value
+}
+
+/// The error for `sync` while Notes and Reminders are both switched off.
+const SYNC_OFF: &str = "sync_switched_off";
+
+/// The error for a call to a tool whose service the `services:` line switches off.
+fn switched_off(tool: &str) -> &'static str {
+    match permissions::service_of(tool) {
+        Some("notes") => "notes_switched_off",
+        Some("reminders") => "reminders_switched_off",
+        Some("contacts") => "contacts_switched_off",
+        Some("calendar") => "calendar_switched_off",
+        Some("photos") => "photos_switched_off",
+        Some("drive") => "drive_switched_off",
+        _ => SYNC_OFF,
+    }
+}
+
+/// The service's name for people, for a [`switched_off`] code.
+fn switched_off_service(error: &str) -> Option<&'static str> {
+    let service = error.strip_suffix("_switched_off")?;
+    permissions::SERVICES
+        .iter()
+        .find(|(s, _)| *s == service)
+        .map(|(_, name)| *name)
+}
+
+fn switched_off_value(mut value: Value, name: &str) -> Value {
+    value["message"] = json!(format!("{name} is switched off for this server in permissions.yaml (services:), so this did not run and nothing from {name} was read."));
     value
 }
 
@@ -195,6 +229,10 @@ fn gate_for(
     name: &str,
     args: &Value,
 ) -> Result<(Gate, Option<permissions::Effect>), &'static str> {
+    // A switched-off service is refused before any rule, mode or card, deletions included.
+    if !active.tool_on(name) {
+        return Err(switched_off(name));
+    }
     let require_all = library
         .state("mcp.require_write_approval")
         .map_err(|_| "library_unavailable")?
@@ -447,6 +485,12 @@ fn error_value(error: &'static str, dir: &Path, params: &Value) -> Value {
 /// result carries as `instructions` and the terminal approval prints. `args` are the call's
 /// arguments (`Value::Null` when there are none).
 pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
+    if let Some(name) =
+        switched_off_service(error).or((error == SYNC_OFF).then_some("Notes or Reminders"))
+    {
+        let word = name.split(' ').next().unwrap_or(name).to_ascii_lowercase();
+        return Some(format!("To switch {name} on, add {word} to the services: line in {} or run {} in your own terminal, then restart the MCP client so it lists the tools again. Changes that were waiting to be sent were set aside; ask for them again. Data cached before it was switched off stays in this folder, and nothing reads it while the service is off; to remove it, set up a fresh folder with skykeep-mcp setup --state-dir NEW_FOLDER and delete this one.", dir.join(permissions::FILE_NAME).display(), status::with_dir("skykeep-mcp setup", dir)));
+    }
     if let Some(text) = photos_write::next_step(error, dir, args) {
         return Some(text);
     }
@@ -1948,6 +1992,34 @@ impl Server {
         drive_write::run(&dir, &seam, op, true).await
     }
 
+    /// The services on now, read without recording anything, for the tool list and the
+    /// server instructions. While another process holds the folder, the records and the file
+    /// are read without the lock, so a busy folder never makes a service look off, and a
+    /// broken or missing file keeps the services in force. `None` when nothing can say: then
+    /// no service is called off here, and every call is still checked when it runs.
+    fn services_now(&mut self) -> Option<Vec<&'static str>> {
+        match state::PrivateState::open(&self.dir) {
+            Ok(held) => {
+                let library = self.ready(&held).ok()?;
+                let stored = stored_mode(library, &held.path).ok().flatten();
+                permissions::peek(library, &held.path, stored.as_deref())
+                    .ok()
+                    .map(|a| a.services)
+            }
+            // Only busy: the folder passed its checks, and another process holds it. The
+            // records are read through a read-only handle that creates and changes nothing
+            // and refuses links; the file alone when even that can't be opened.
+            Err("state_busy_retry") => quince_core::Library::open_read_only(&self.dir)
+                .ok()
+                .and_then(|library| permissions::peek(&library, &self.dir, None).ok())
+                .map(|a| a.services)
+                .or_else(|| permissions::services_in_file(&self.dir)),
+            // Any other folder problem (a link, a shared file): the library is never opened,
+            // only the file, which its own reader refuses as a link or a shared file.
+            Err(_) => permissions::services_in_file(&self.dir),
+        }
+    }
+
     pub async fn refresh(&mut self) -> Result<Value, &'static str> {
         self.call("sync", json!({})).await
     }
@@ -2070,12 +2142,27 @@ impl Server {
                 if version != PROTOCOL_2025_03_26 {
                     server_info["title"] = json!(SERVER_TITLE);
                 }
+                let mut instructions = SERVER_INSTRUCTIONS.to_string();
+                let off: Vec<&str> = match self.services_now() {
+                    Some(on) => permissions::SERVICES
+                        .iter()
+                        .map(|(s, _)| *s)
+                        .filter(|s| !on.contains(s))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                if !off.is_empty() {
+                    instructions.push_str(&format!(" Switched off in this folder: {}. Their tools are not offered and are refused.", permissions::service_names(&off)));
+                }
                 Ok(
-                    json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":server_info,"instructions":SERVER_INSTRUCTIONS}),
+                    json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":server_info,"instructions":instructions}),
                 )
             }
             Some("ping") => Ok(json!({})),
-            Some("tools/list") if self.initialized => Ok(json!({"tools":tools()})),
+            Some("tools/list") if self.initialized => {
+                let on = self.services_now();
+                Ok(json!({"tools":listed_tools(on.as_deref())}))
+            }
             Some("tools/call") if self.initialized => {
                 if bounded_value(&request["params"], MAX_ARGUMENT_BYTES).is_err() {
                     return Some(tool_reply(id, Err("operation_too_large")));
@@ -2338,6 +2425,8 @@ impl Server {
         let configured = policy(library, &dir)?;
         let stored = stored_mode(library, &dir)?;
         let active = permissions::load(library, &dir, stored.as_deref())?;
+        // Queued changes of a switched-off service never wait to be sent later.
+        sync::set_aside_switched_off(library, &active.services)?;
         let configured = match configured {
             None if adopt_file_mode(library, &dir, &active)? => policy(library, &dir)?,
             configured => configured,
@@ -2631,6 +2720,11 @@ impl Server {
                     .map_err(|_| "library_unavailable")?;
                 let mut services = Vec::new();
                 for service in ["notes", "reminders"] {
+                    // Switched off: only that, no ids, kinds, reasons or sync times.
+                    if !active.service_on(service) {
+                        services.push(json!({"service":service,"switched_off":true}));
+                        continue;
+                    }
                     let h = health.iter().find(|h| h.service == service);
                     let mine: Vec<_> = refused.iter().filter(|r| r.service == service).collect();
                     let pending = library
@@ -2640,7 +2734,7 @@ impl Server {
                     let pending_recent = sync::pending_view(library, &dir, service)?;
                     // Upstream error text may hold HTTP bodies; report only that one exists.
                     services.push(
-                        json!({"service":service,"last_synced_at":h.and_then(|h| h.last_synced_at),
+                        json!({"service":service,"switched_off":false,"last_synced_at":h.and_then(|h| h.last_synced_at),
                         "last_error":h.is_some_and(|h| h.last_error.is_some()),"pending":pending,
                         // Why each waits, as a fixed code, oldest first.
                         "pending_recent":pending_recent,
@@ -2650,7 +2744,13 @@ impl Server {
                         "refused_recent":mine[mine.len().saturating_sub(20)..].iter().map(|r| sync::refused_view(r)).collect::<Vec<_>>()}),
                     );
                 }
-                Ok(json!({"source":"local_cache","services":services,"remote_verified":false}))
+                let mut reply =
+                    json!({"source":"local_cache","services":services,"remote_verified":false});
+                let off = active.services_off();
+                if !off.is_empty() {
+                    reply["switched_off"] = json!(off);
+                }
+                Ok(reply)
             }
             "auth_status" => {
                 let _: Empty = serde_json::from_value(args).map_err(|_| "invalid_arguments")?;
@@ -3600,6 +3700,27 @@ const SERVER_TITLE: &str =
     "iCloud-MCP: Apple iCloud Notes, Reminders, Contacts, Calendar, Photos & iCloud Drive";
 const SERVER_INSTRUCTIONS: &str = "iCloud-MCP reads and changes the user's Apple iCloud Notes and Apple Reminders through a local synced cache, reads the user's Apple iCloud Contacts and changes one card at a time with contacts_write, reads Apple iCloud Calendar and changes its events with calendar_write, reads Apple iCloud Photos metadata and changes it with photos_write (upload from the exchange folder, favorite, title and caption, rating, keywords, date, new and renamed albums, move to Recently Deleted), and reads and changes Apple iCloud Drive: folder listings and file details from the cache, and drive_write to create folders, rename, move, trash, delete for good, upload from and download into the exchange folder the user set up in their terminal. Reads return cached data. Contacts refresh only through contacts_refresh, Calendar only through calendar_refresh, Photos only through photos_refresh, and Drive one folder at a time through drive_refresh. Photos tools show the personal library's photo details, never the pictures, places or faces; the Photos tools other than photos_write are read-only. Drive paths start with / and use the names Apple shows. Calendar dates are YYYY-MM-DD; pass the user's IANA time zone to calendar_events. Changes follow the configured approval mode. Notes and Reminders changes are queued until sync sends them; a Drive, Contacts, Calendar or Photos change runs once it is allowed and its reply says what Apple confirmed. calendar_write needs the etag from calendar_get, an offset or IANA zone for every time, and scope for a repeating event. Sign-in happens only in the user's own terminal; never ask for Apple passwords or codes.";
 
+/// The tools offered to the client: those of services that are on (all of them when nothing
+/// can say, see [`Server::services_now`]), with `sync` described for what it refreshes.
+fn listed_tools(services: Option<&[&str]>) -> Vec<Value> {
+    let on = |tool: &str| services.is_none_or(|s| permissions::tool_on(s, tool));
+    let mut tools: Vec<Value> = tools()
+        .into_iter()
+        .filter(|t| on(t["name"].as_str().unwrap_or_default()))
+        .collect();
+    let refreshes = match services.map(|s| (s.contains(&"notes"), s.contains(&"reminders"))) {
+        Some((true, false)) => Some("Apple iCloud Notes"),
+        Some((false, true)) => Some("Apple Reminders"),
+        _ => None,
+    };
+    if let (Some(what), Some(sync)) = (refreshes, tools.iter_mut().find(|t| t["name"] == "sync")) {
+        sync["description"] = json!(format!("Refresh {what} and send its approved queued changes. Queued/sent is not field-level remote verification. Never opens a login prompt."));
+    }
+    tools
+}
+
+/// Every tool, whether its service is on or not: rule names in the permissions file come from
+/// this list, so a rule for a switched-off service stays valid.
 pub(crate) fn tools() -> Vec<Value> {
     // (name, description, parent property, parent required)
     let lists = [
