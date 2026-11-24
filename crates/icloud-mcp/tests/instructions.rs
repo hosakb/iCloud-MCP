@@ -420,7 +420,7 @@ fn the_errors_from_issue_91_say_what_to_do_next() {
     // A second name may be anywhere; the line never tells the AI app to copy past the guard.
     let hard_link = line("local_hard_link_refused");
     assert!(!hard_link.contains("cp "), "{hard_link}");
-    assert!(hard_link.contains("not the AI app"), "{hard_link}");
+    assert!(hard_link.contains("not by the AI app"), "{hard_link}");
     // These come back on a live call too, where nothing was queued.
     for code in [
         "preview_too_large",
@@ -431,6 +431,18 @@ fn the_errors_from_issue_91_say_what_to_do_next() {
         assert!(text.contains("nothing was queued"), "{code}: {text}");
         assert!(text.contains("icloud-mcp quarantine"), "{code}: {text}");
         assert!(text.contains("read the list first"), "{code}: {text}");
+    }
+    // An older waiting change can fail a new write: nothing is queued or set aside then.
+    for code in ["payload_too_large", "template_too_large", "unknown_service"] {
+        let text = line(code);
+        assert!(
+            text.contains("nothing was queued or set aside by this call"),
+            "{code}: {text}"
+        );
+        assert!(text.contains("icloud-mcp quarantine"), "{code}: {text}");
+        assert!(text.contains("read the list first"), "{code}: {text}");
+        assert!(!text.contains("smaller change"), "{code}: {text}");
+        assert!(!text.contains("It was set aside"), "{code}: {text}");
     }
     let path = line("invalid_path");
     assert!(path.contains("255 bytes"), "{path}");

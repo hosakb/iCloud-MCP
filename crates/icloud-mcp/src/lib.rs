@@ -553,8 +553,10 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
 /// give instead, or where to look. Codes shared by several tools get one sentence that fits each.
 fn fix_step(error: &str, dir: &Path) -> Option<String> {
     let quarantine = status::with_dir("icloud-mcp quarantine", dir);
-    let set_aside = |what: &str| {
-        format!("{what} It was set aside and never sent. Ask for a smaller change again; to clear the set-aside one, run {quarantine} in your own terminal.")
+    // Codes for a change already waiting in the queue. A new write checks every waiting
+    // change and is undone when one fails; a sync sets that change aside.
+    let waiting = |what: &str| {
+        format!("{what} If a tool call returned this, nothing was queued or set aside by this call: an older change waiting in the queue has this problem and stops new writes. If sync returned it, that change was set aside and never sent. Either way, run {quarantine} in your own terminal to see it. That command lists every set-aside change and can delete any of them, so read the list first.")
     };
     // Codes a live call returns too, where nothing was queued.
     let queued_or_live = |what: &str| {
@@ -629,7 +631,7 @@ fn fix_step(error: &str, dir: &Path) -> Option<String> {
         "invalid_local_path" => format!("{local}. Each name must not be empty, longer than 255 bytes, or hold a control or hidden character. Rename the file or fix the path and ask again."),
         "local_path_too_long" => format!("{local}, at most 1024 bytes. Use a shorter path or file name."),
         "local_path_too_deep" => format!("{local}, at most 8 names deep. Move the file higher up in the exchange folder."),
-        "local_hard_link_refused" => "That file has a second name (a hard link), which could be anywhere on this computer, even outside the exchange folder, so it is refused. Ask the person to check first what the file is. Only if they really meant to share it, they put a copy of it into the exchange folder themselves, not the AI app, and then ask again with that copy.".into(),
+        "local_hard_link_refused" => "That file has a second name (a hard link), which could be anywhere on this computer, even outside the exchange folder, so it is refused. Ask the person to check first what the file is. If they really meant to share it, a copy can go into the exchange folder, put there by the person and not by the AI app. Then ask again with that copy.".into(),
         "local_not_a_regular_file" => "Only plain files can be uploaded, not folders, devices or pipes. Give the local path of a file.".into(),
         "local_file_unavailable" => "The file or a folder on that local path could not be opened or read. Check that it exists in the exchange folder and that you can read it, then ask again.".into(),
         "local_file_changed_while_read" => "The file changed while it was read, so nothing was sent. Wait until nothing is writing to it, then ask again.".into(),
@@ -639,11 +641,11 @@ fn fix_step(error: &str, dir: &Path) -> Option<String> {
         "frame_too_large" => "The message was larger than 64 KB, so the connection was closed. Send smaller requests.".into(),
         "invalid_utf8" => "The message was not valid UTF-8 text. Send it as UTF-8.".into(),
         "invalid_tool" => "The request names no tool iCloud-MCP can run. Ask for the change again with a tool from tools/list.".into(),
-        "payload_too_large" => set_aside("This queued change is larger than 256 KB, too large to send."),
+        "payload_too_large" => waiting("A queued change is larger than 256 KB, too large to send."),
         "preview_too_large" => queued_or_live("The change is too large to show for approval."),
         "invalid_preview" => queued_or_live("The change could not be shown for approval."),
-        "template_too_large" => set_aside("The note template Apple sent is too large to use for a new note."),
-        "unknown_service" => set_aside("This queued change belongs to no service iCloud-MCP sends."),
+        "template_too_large" => waiting("A queued new note needs the note template Apple sent, and that template is too large to use."),
+        "unknown_service" => waiting("A queued change belongs to no service iCloud-MCP sends."),
         _ => return None,
     })
 }
