@@ -31,7 +31,7 @@ allow = [
 confidence-threshold = 0.9
 # Preserve the inherited allow-list even when a license is currently unused.
 unused-allowed-license = "allow"
-# Skykeep's own crates are not published to crates.io.
+# This workspace's own crates are not published to crates.io.
 private = { ignore = true }
 
 [bans]

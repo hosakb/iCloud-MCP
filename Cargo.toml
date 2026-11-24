@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-default-members = ["crates/skykeep-mcp"]
-members = ["crates/skykeep-mcp", "crates/quince-auth", "crates/quince-core", "crates/quince-icloud", "crates/quince-sync"]
+default-members = ["crates/icloud-mcp"]
+members = ["crates/icloud-mcp", "crates/quince-auth", "crates/quince-core", "crates/quince-icloud", "crates/quince-sync"]
 
 [workspace.package]
 edition = "2021"

@@ -1,12 +1,12 @@
 # Architecture
 
-The workspace has one executable, `skykeep-mcp` (the iCloud-MCP server), and four engine crates from upstream Skykeep. The server speaks newline-delimited JSON-RPC over stdio. Stdout carries protocol messages only; there is no HTTP listener. JSON-RPC batches are not supported.
+The workspace has one executable, `icloud-mcp` (the iCloud-MCP server), and four engine crates from upstream Skykeep. The server speaks newline-delimited JSON-RPC over stdio. Stdout carries protocol messages only; there is no HTTP listener. JSON-RPC batches are not supported.
 
 ## Crates
 
 | Crate | Responsibility | Local dependencies |
 |---|---|---|
-| `skykeep-mcp` | MCP tools, private state, account binding, terminal helpers and Notes/Reminders scheduling | all four engine crates |
+| `icloud-mcp` | MCP tools, private state, account binding, terminal helpers and Notes/Reminders scheduling | all four engine crates |
 | `quince-auth` | SRP sign-in, two-factor routes, HTTP clients, sessions and keyring access | none |
 | `quince-core` | SQLite library, schema, search and durable outbox | none |
 | `quince-icloud` | Apple service requests, parsing and encoding | `quince-core` |
@@ -26,7 +26,7 @@ Several processes can share a state directory but operations take turns on its l
 
 Login, logout, approval and policy changes are terminal helpers, not MCP tools. Login accepts secrets only from a controlling terminal with echo disabled. The server stores session and trust tokens in the Linux Secret Service keyring and never stores the account password. A one-way account tag binds a library to one account. Cookies are sealed using a key held in the keyring.
 
-The server does not import a desktop session. It uses the `skykeep-mcp` keyring service, with an entry per state directory. The file `src-tauri/tauri.conf.json` remains only as an identifier record: unchanged `quince-auth` source embeds it at compile time for its inherited default service. Its identifier is unchanged; it contains no desktop build or packaging configuration.
+The server does not import a desktop session. It uses the keyring service `skykeep-mcp`, the name the unchanged upstream `quince-auth` sets, with an entry per state directory. The file `src-tauri/tauri.conf.json` remains only as an identifier record: unchanged `quince-auth` source embeds it at compile time for its inherited default service. Its identifier is unchanged; it contains no desktop build or packaging configuration.
 
 Destructive writes require a terminal approval tied to the requested operation. Optional require-all policy extends that to routine writes. This boundary assumes the client can use MCP tools only. An agent with shell access as the state owner can bypass it. See the [README](README.md#write-approval) and [security policy](SECURITY.md).
 
