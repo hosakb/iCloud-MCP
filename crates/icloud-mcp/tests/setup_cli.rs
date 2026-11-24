@@ -99,10 +99,17 @@ fn the_server_refuses_a_missing_folder_without_creating_it() {
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
     let text = String::from_utf8(out.stderr).unwrap();
-    assert!(text.contains("does not exist"), "{text}");
     assert!(
         text.contains(&format!(
-            "icloud-mcp setup --state-dir {}",
+            "could not use the folder {} because it does not exist",
+            missing.display()
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("server"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Next step: run icloud-mcp setup --state-dir {}",
             missing.display()
         )),
         "{text}"
@@ -137,10 +144,17 @@ fn terminal_commands_refuse_a_missing_folder_without_creating_it() {
             .unwrap();
         assert_eq!(out.status.code(), Some(1), "{command:?}");
         let text = String::from_utf8(out.stderr).unwrap();
-        assert!(text.contains("does not exist"), "{command:?}: {text}");
         assert!(
             text.contains(&format!(
-                "icloud-mcp setup --state-dir {}",
+                "could not use the folder {} because it does not exist",
+                missing.display()
+            )),
+            "{command:?}: {text}"
+        );
+        assert!(!text.contains("server"), "{command:?}: {text}");
+        assert!(
+            text.contains(&format!(
+                "Next step: run icloud-mcp setup --state-dir {}",
                 missing.display()
             )),
             "{command:?}: {text}"
