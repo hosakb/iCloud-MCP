@@ -354,10 +354,12 @@ impl Library {
     }
 
     /// A read-only handle on the library under `dir` while another handle has it open, for
-    /// reading without the folder's lock. It never creates a file, never changes the table
-    /// layout or any row, and never waits for a writer. The library and its `-wal` and `-shm`
-    /// files must already be regular files of this user (no links); otherwise it is refused,
-    /// since opening a WAL library without them would create them.
+    /// reading without the folder's lock. It never changes the table layout or any row, and
+    /// never waits for a writer. The library and its `-wal` and `-shm` files must already be
+    /// regular files of this user (no links); otherwise it is refused, since opening a WAL
+    /// library without them would create them. The check runs before the open: if the other
+    /// handle closes the library in between, SQLite may create a new `-shm` in the same
+    /// folder.
     pub fn open_read_only(dir: &Path) -> Result<Self> {
         use rusqlite::OpenFlags;
         use std::os::unix::fs::MetadataExt;

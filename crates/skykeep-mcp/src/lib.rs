@@ -2715,6 +2715,11 @@ impl Server {
                     .map_err(|_| "library_unavailable")?;
                 let mut services = Vec::new();
                 for service in ["notes", "reminders"] {
+                    // Switched off: only that, no ids, kinds, reasons or sync times.
+                    if !active.service_on(service) {
+                        services.push(json!({"service":service,"switched_off":true}));
+                        continue;
+                    }
                     let h = health.iter().find(|h| h.service == service);
                     let mine: Vec<_> = refused.iter().filter(|r| r.service == service).collect();
                     let pending = library
@@ -2724,7 +2729,7 @@ impl Server {
                     let pending_recent = sync::pending_view(library, &dir, service)?;
                     // Upstream error text may hold HTTP bodies; report only that one exists.
                     services.push(
-                        json!({"service":service,"switched_off":!active.service_on(service),"last_synced_at":h.and_then(|h| h.last_synced_at),
+                        json!({"service":service,"switched_off":false,"last_synced_at":h.and_then(|h| h.last_synced_at),
                         "last_error":h.is_some_and(|h| h.last_error.is_some()),"pending":pending,
                         // Why each waits, as a fixed code, oldest first.
                         "pending_recent":pending_recent,

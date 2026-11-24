@@ -545,7 +545,8 @@ async fn sync_pass(
     // back.
     let mut waiting_before = Vec::new();
     for service in ["notes", "reminders"] {
-        // Switched off in permissions.yaml: nothing is read, and its queued changes wait.
+        // Switched off in permissions.yaml: nothing is read. Its queued changes were set
+        // aside in refresh_gate and are never sent.
         if !on.contains(&service) {
             services.push(json!({"service":service,"outcome":"switched_off","sent":false}));
             continue;

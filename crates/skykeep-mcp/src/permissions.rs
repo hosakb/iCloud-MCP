@@ -2126,11 +2126,18 @@ pub fn editable(dir: &Path) -> Result<(), String> {
 /// written whole and private. A missing file becomes a short one; a file with a mistake is
 /// left alone. Returns why nothing was written.
 pub fn set_setting(dir: &Path, key: &str, value: &str) -> Result<(), String> {
-    set_setting_print(dir, key, value).map(|_| ())
+    set_setting_print(dir, key, value, None).map(|_| ())
 }
 
-/// [`set_setting`], returning the fingerprint of the file it wrote.
-pub fn set_setting_print(dir: &Path, key: &str, value: &str) -> Result<String, String> {
+/// [`set_setting`], returning the fingerprint of the file it wrote. With `expected`, the
+/// fingerprint of the file as last loaded ([`Active::fingerprint`]), a file changed since then
+/// is left alone, so an edit made meanwhile is never recorded as part of this write.
+pub fn set_setting_print(
+    dir: &Path,
+    key: &str,
+    value: &str,
+    expected: Option<&str>,
+) -> Result<String, String> {
     if ![MODE_KEY, EXCHANGE_KEY, SERVICES_KEY].contains(&key) {
         return Err(format!("{} is not a setting of this file", shown(key)));
     }
@@ -2139,6 +2146,9 @@ pub fn set_setting_print(dir: &Path, key: &str, value: &str) -> Result<String, S
     let print = old
         .as_deref()
         .map_or_else(|| "missing".to_string(), fingerprint);
+    if expected.is_some_and(|e| e != print) {
+        return Err("the file changed while setup was saving; run skykeep-mcp setup again".into());
+    }
     let text = match &old {
         Some(bytes) => {
             String::from_utf8(bytes.clone()).map_err(|_| "the file is not UTF-8 text")?

@@ -1131,12 +1131,14 @@ fn step_services(console: &mut dyn Console, dir: &Path) -> Result<(), &'static s
     let held = PrivateState::open(dir)?;
     // Whatever the file says before setup writes is loaded as usual first, so a looser edit
     // made by someone else is still reported, and only setup's own line counts as chosen here.
-    {
+    // The write is refused when the file changed after that load, so such an edit is never
+    // recorded as setup's own.
+    let loaded = {
         let mut library = crate::setup(&held.path)?;
         let stored = crate::stored_mode(&library, &held.path).ok().flatten();
-        permissions::load(&mut library, &held.path, stored.as_deref())?;
-    }
-    match permissions::set_setting_print(&held.path, SERVICES_KEY, &value) {
+        permissions::load(&mut library, &held.path, stored.as_deref())?.fingerprint
+    };
+    match permissions::set_setting_print(&held.path, SERVICES_KEY, &value, Some(&loaded)) {
         Ok(print) => {
             // Recorded now as the person's own choice, so the check below raises no notice.
             let mut library = crate::setup(&held.path)?;

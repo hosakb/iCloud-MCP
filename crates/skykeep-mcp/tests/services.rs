@@ -457,15 +457,30 @@ async fn queued_changes_of_a_switched_off_service_are_set_aside_and_never_sent_l
         .find(|s| s["service"] == "reminders")
         .unwrap()
         .clone();
+    // While off, sync_status says only that: no ids, kinds, reasons or sync times.
+    assert_eq!(
+        reminders,
+        json!({"service":"reminders","switched_off":true}),
+        "{value}"
+    );
+    assert!(f.library.outbox_pending("reminders").unwrap().is_empty());
+    // Switched on again, the change stays set aside: it needs a new request, and its count
+    // and reason show now.
+    write_file(&dir, "version: 1\n");
+    let (value, _) = result(&mut f, 3, "sync_status", json!({})).await;
+    let reminders = value["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["service"] == "reminders")
+        .unwrap()
+        .clone();
     assert_eq!(reminders["pending"], 0, "{value}");
     assert_eq!(reminders["refused"], 1, "{value}");
     assert_eq!(
         reminders["refused_recent"][0]["reason"], "mcp_quarantine:service_switched_off",
         "{value}"
     );
-    // Switched on again, the change stays set aside: it needs a new request.
-    write_file(&dir, "version: 1\n");
-    result(&mut f, 3, "sync_status", json!({})).await;
     assert!(f.library.outbox_pending("reminders").unwrap().is_empty());
 }
 
@@ -628,4 +643,31 @@ fn the_read_only_open_creates_nothing_and_changes_no_table() {
     assert_eq!(names(dir.path()), files);
     assert_eq!(std::fs::read(dir.path().join("library.db")).unwrap(), db);
     drop(writer);
+}
+
+#[tokio::test]
+async fn an_edit_between_setups_load_and_its_write_is_refused_and_still_reported() {
+    let mut f = folder(Some("writes_only")).await;
+    let dir = f.path();
+    write_file(&dir, "version: 1\n");
+    f.server.handle(call(1, "reminders_lists", json!({}))).await;
+    permissions::show(&dir, true).unwrap();
+    // Setup loads the file as it is, then someone loosens it before setup writes.
+    let active = permissions::load(&mut f.library, &dir, Some("writes_only")).unwrap();
+    write_file(&dir, "version: 1\napproval_mode: yolo\n");
+    let error = permissions::set_setting_print(
+        &dir,
+        permissions::SERVICES_KEY,
+        "[reminders]",
+        Some(&active.fingerprint),
+    )
+    .unwrap_err();
+    assert!(error.contains("changed"), "{error}");
+    let text = std::fs::read_to_string(dir.join(permissions::FILE_NAME)).unwrap();
+    assert_eq!(text, "version: 1\napproval_mode: yolo\n", "nothing written");
+    let lines = permissions::status(&f.library, &dir, Some("writes_only"));
+    assert!(
+        lines.iter().any(|(t, _)| t.contains("became looser")),
+        "{lines:?}"
+    );
 }
