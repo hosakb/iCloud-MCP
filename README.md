@@ -22,6 +22,48 @@ This fork contains the MCP server and its four engine crates, not the upstream d
 
 Edit `crates/icloud-mcp/docs/architecture.html` and re-export `crates/icloud-mcp/docs/architecture.webp` whenever a route changes.
 
+## Install a release (Linux beta)
+
+The release is a beta for Linux on x86-64 only. On macOS, use Hermes' own Apple skills instead (see "Other apps"). The programs are built offline from a tagged commit. Nobody has audited them.
+
+1. On the [releases page](https://github.com/hosakb/iCloud-MCP/releases), download the program file and the file of the same name ending in `.sha256` into one folder.
+2. In that folder, check the file and install it. Replace `FILE` with the name of the program file:
+
+   ```sh
+   sha256sum -c FILE.sha256
+   chmod +x FILE
+   mkdir -p ~/.local/bin
+   mv FILE ~/.local/bin/icloud-mcp
+   icloud-mcp --version
+   ```
+
+   Go on only when `sha256sum` says `OK`.
+3. Run `icloud-mcp setup` in a terminal window you opened yourself. You type your password and the code there, never in a chat. "Get started" below explains each step.
+4. Add the server to your MCP client. Setup prints these lines with your folder filled in; here `DIR` is that folder.
+
+   Hermes: add this to `config.yaml` (if it already has `mcp_servers:`, add only the `icloud` part under it), then type `/reload-mcp` in Hermes:
+
+   ```yaml
+   mcp_servers:
+     icloud:
+       command: icloud-mcp
+       args:
+         - "--state-dir"
+         - DIR
+       enabled: true
+       sampling:
+         enabled: false
+   ```
+
+   Claude Code and Codex: run one of these in a terminal:
+
+   ```sh
+   claude mcp add --scope user icloud -- icloud-mcp --state-dir DIR
+   codex mcp add icloud -- icloud-mcp --state-dir DIR
+   ```
+
+If you used the program under its old name `skykeep-mcp`, read the note on the old folder in step 1 of "Get started".
+
 ## Build
 
 Install the Rust version pinned in [rust-toolchain.toml](rust-toolchain.toml); [rustup.rs](https://rustup.rs) picks it up. Linux also needs a C build toolchain, `pkg-config` and the D-Bus development headers for the Secret Service client: on Debian or Ubuntu `sudo apt install build-essential pkg-config libdbus-1-dev`, on Fedora `sudo dnf install gcc pkgconf-pkg-config dbus-devel`, on Arch `sudo pacman -S base-devel pkgconf dbus`.

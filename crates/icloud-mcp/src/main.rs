@@ -13,6 +13,11 @@ async fn main() {
     }
     let mut all: Vec<_> = std::env::args_os().skip(1).collect();
     let first = all.first().and_then(|c| c.to_str()).map(str::to_string);
+    // The version alone, as the MCP client also sees it in the server info.
+    if all.len() == 1 && matches!(first.as_deref(), Some("--version" | "-V")) {
+        println!("icloud-mcp {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     // Help after any command, too: `login --help` must not try to sign in. A command's own
     // help for `COMMAND --help` and `help COMMAND`, the full list otherwise.
     let help = all.iter().any(|a| a == "--help" || a == "-h");
@@ -101,6 +106,7 @@ More commands (each needs --state-dir FOLDER):
                           Writes exchange_folder: in permissions.yaml, which you can also edit
   icloud-mcp --state-dir FOLDER
                           run the MCP server on stdin and stdout (your MCP client starts this)
+  icloud-mcp --version   print the version
 
 FOLDER defaults to ~/.local/share/icloud-mcp for setup, status, unlock and exchange.
 If that folder does not exist but ~/.local/share/skykeep-mcp does (the folder from the
