@@ -1298,6 +1298,51 @@ async fn a_save_apple_already_holds_is_not_set_aside_when_tried_again() {
     }
 }
 
+/// Issue 92 with issue 74: a save sent once whose reply was lost still waits. A second save
+/// from the same read is refused, the first is kept, and the retry is not set aside.
+#[tokio::test]
+async fn a_lost_reply_save_is_kept_and_retried_after_a_second_save_is_refused() {
+    let (dir, mut server, mut library) = family().await;
+    let saved = write(
+        &mut server,
+        2,
+        "notes_write",
+        json!({"action":"save","guid":"note","body":"NOTE\nbody","base_etag":"n1"}),
+    )
+    .await;
+    assert_eq!(saved["isError"], false, "{saved}");
+    let sent = library.outbox_take("notes").unwrap().unwrap();
+    assert_eq!(sent.tries, 1);
+    let second = write(
+        &mut server,
+        3,
+        "notes_write",
+        json!({"action":"save","guid":"note","body":"NOTE\nbody two","base_etag":"n1"}),
+    )
+    .await;
+    assert_eq!(second["isError"], true, "{second}");
+    assert!(
+        second.to_string().contains("save_already_queued"),
+        "{second}"
+    );
+    let pending = library.outbox_pending("notes").unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, sent.id);
+    let remote = remote_with_note("NOTE\nbody", None).await;
+    let result = icloud_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+        .await
+        .unwrap();
+    assert_eq!(mcp_refusals(&library), Vec::<String>::new(), "{result}");
+    assert!(
+        library.outbox_pending("notes").unwrap().is_empty(),
+        "{result}"
+    );
+    assert!(
+        modified(&remote.received_requests().await.unwrap()).is_empty(),
+        "nothing written again"
+    );
+}
+
 /// Review round 2: the same formatting cut into other runs, as Apple may send it back, is
 /// not a change.
 #[tokio::test]

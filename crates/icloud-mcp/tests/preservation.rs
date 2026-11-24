@@ -154,7 +154,9 @@ async fn note_saves_that_add_up_to_a_table_move_are_refused() {
     // would take it out and type a new one.
     let first = call(&mut server, "notes_write", save("ab\u{FFFC}ab")).await;
     assert_eq!(first["status"], "queued", "{first}");
-    let second = call(&mut server, "notes_write", save("\u{FFFC}ab")).await;
+    let etag = call(&mut server, "notes_get", json!({"guid":"note"})).await["item"]["etag"].clone();
+    let again = json!({"action":"save","guid":"note","base_etag":etag,"body":"\u{FFFC}ab"});
+    let second = call(&mut server, "notes_write", again).await;
     assert_eq!(second["error"], "unsupported_attachment_move", "{second}");
     let pending = library.outbox_pending("notes").unwrap();
     assert_eq!(pending.len(), 1);
@@ -304,8 +306,10 @@ async fn note_saves_queued_from_one_read_merge_into_one_send() {
         call(&mut server, "notes_write", save(&first)).await["status"],
         "queued"
     );
+    let etag = call(&mut server, "notes_get", json!({"guid":"note"})).await["item"]["etag"].clone();
+    let again = json!({"action":"save","guid":"note","base_etag":etag,"body":second});
     assert_eq!(
-        call(&mut server, "notes_write", save(&second)).await["status"],
+        call(&mut server, "notes_write", again).await["status"],
         "queued"
     );
     let pending = library.outbox_pending("notes").unwrap();
@@ -317,6 +321,65 @@ async fn note_saves_queued_from_one_read_merge_into_one_send() {
     let payload: Value = serde_json::from_str(&pending[0].payload).unwrap();
     assert_eq!(payload["base"], RICH);
     assert_eq!(payload["body"], second);
+}
+
+/// Issue 92: two saves typed over one read, before a sync. The second is refused with a
+/// next step, and the first stays queued as it was.
+#[tokio::test]
+async fn a_second_save_from_the_same_read_is_refused_and_the_first_kept() {
+    let (_dir, mut server, mut library) = setup();
+    rich_note(&mut library);
+    let first = RICH.replace("Pack the bag", "Pack the red bag");
+    let second = RICH.replace("Book the train", "Book the late train");
+    assert_eq!(
+        call(&mut server, "notes_write", save(&first)).await["status"],
+        "queued"
+    );
+    let refused = call(&mut server, "notes_write", save(&second)).await;
+    assert_eq!(refused["error"], "save_already_queued", "{refused}");
+    let step = refused["instructions"].as_str().unwrap();
+    assert!(
+        step.contains("notes_get") && step.contains("sync"),
+        "{step}"
+    );
+    let pending = library.outbox_pending("notes").unwrap();
+    assert_eq!(pending.len(), 1);
+    let payload: Value = serde_json::from_str(&pending[0].payload).unwrap();
+    assert_eq!(payload["body"], first);
+    assert_eq!(payload["base"], RICH);
+    let shown = call(&mut server, "notes_get", json!({"guid":"note"})).await;
+    assert_eq!(shown["item"]["body"], first, "{shown}");
+}
+
+/// Issue 92: text-only saves in a row, each with the etag from a fresh notes_get, all go
+/// through; an etag from before the latest save is refused.
+#[tokio::test]
+async fn text_only_saves_in_a_row_with_fresh_etags_are_queued() {
+    let (_dir, mut server, mut library) = setup();
+    rich_note(&mut library);
+    let bodies = [
+        RICH.replace("Pack the bag", "Pack the red bag"),
+        RICH.replace("Pack the bag", "Pack the blue bag"),
+        RICH.replace("Pack the bag", "Pack the green bag"),
+    ];
+    let mut seen = Vec::new();
+    for body in &bodies {
+        let etag =
+            call(&mut server, "notes_get", json!({"guid":"note"})).await["item"]["etag"].clone();
+        assert!(!seen.contains(&etag), "a new etag after each save: {etag}");
+        seen.push(etag.clone());
+        let args = json!({"action":"save","guid":"note","base_etag":etag,"body":body});
+        let result = call(&mut server, "notes_write", args).await;
+        assert_eq!(result["status"], "queued", "{result}");
+    }
+    let stale = json!({"action":"save","guid":"note","base_etag":seen[1],"body":RICH});
+    let refused = call(&mut server, "notes_write", stale).await;
+    assert_eq!(refused["error"], "save_already_queued", "{refused}");
+    let pending = library.outbox_pending("notes").unwrap();
+    assert_eq!(pending.len(), 1);
+    let payload: Value = serde_json::from_str(&pending[0].payload).unwrap();
+    assert_eq!(payload["body"], bodies[2]);
+    assert_eq!(payload["base"], RICH);
 }
 
 #[tokio::test]

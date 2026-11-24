@@ -408,11 +408,17 @@ async fn coalesced_payload_is_reauthorized_and_policy_changes_quarantine_it() {
     let guid = result["guid"].as_str().unwrap();
     let mut original = None;
     for body in ["second", "final exact body"] {
+        let read = server
+            .handle(operation(4, "notes_get", json!({"guid":guid})))
+            .await
+            .unwrap();
+        let read: serde_json::Value =
+            serde_json::from_str(read["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         let reply = server
             .handle(operation(
                 3,
                 "notes_write",
-                json!({"action":"save","guid":guid,"body":body}),
+                json!({"action":"save","guid":guid,"body":body,"base_etag":read["item"]["etag"]}),
             ))
             .await
             .unwrap();

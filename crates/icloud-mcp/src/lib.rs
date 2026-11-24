@@ -521,6 +521,7 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
         "not_found" => Some("Nothing with that ID or path is in the local copy. Take the ID from a list or search reply. Right after a create, the item is only in iCloud until the next sync (Notes and Reminders) or refresh (calendar_refresh, contacts_refresh, photos_refresh, or drive_refresh on its folder): run that first, then read it again.".to_string()),
         "already_initialized" => Some("The server is already initialized in this connection. Go on with tools/list or tools/call.".to_string()),
         sync::ITEM_CHANGED => Some(sync::ITEM_CHANGED_STEP.to_string()),
+        "save_already_queued" => Some("Another save of this note is queued and not sent yet, so this save was refused and the queued one kept. Read the note again with notes_get, or run sync first, then save with the base_etag it shows now.".to_string()),
         "conflict" => Some("The item changed since you read it, so nothing was queued. Read it again with notes_get or reminders_get, then ask again with its current base_etag.".to_string()),
         "mutation_refused" => Some(format!("The change could not be saved to the local queue, so nothing was queued. In your own terminal, run {} to check this folder, then try again.", status::with_dir("icloud-mcp status", dir))),
         "drive_read_failed_nothing_sent" => Some("Apple's answer about the item could not be read, so nothing was sent. Try again in a moment; if it keeps failing, run drive_refresh on the folder.".to_string()),
@@ -2830,6 +2831,7 @@ impl Server {
                     .note(&args.guid)
                     .map_err(|_| "library_unavailable")?
                     .ok_or("not_found")?;
+                item.etag = note_etag(library, &item)?;
                 item.body = library
                     .note_body(&args.guid)
                     .map_err(|_| "library_unavailable")?;
@@ -3211,6 +3213,61 @@ fn require_folder(library: &Library, folder: Option<&str>) -> Result<(), &'stati
     }
 }
 
+/// The etag notes_get shows and a note write is checked against. While a save waits to be
+/// sent, the note is no longer what Apple's etag stands for, so the etag gets a mark of that
+/// save: a second save typed over the read before it is refused, not laid over the first.
+fn note_etag(
+    library: &Library,
+    note: &quince_core::notes::Note,
+) -> Result<Option<String>, &'static str> {
+    let waiting = library
+        .outbox_waiting("notes", &note.guid, "save")
+        .map_err(|_| "library_unavailable")?;
+    let Some(last) = waiting.last() else {
+        return Ok(note.etag.clone());
+    };
+    // FNV-1a: the same mark for the same waiting save in every build.
+    let mark = last
+        .payload
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+    Ok(Some(format!(
+        "{}~q{:016x}",
+        note.etag.as_deref().unwrap_or_default(),
+        mark
+    )))
+}
+
+/// Whether `base_etag` is the note's etag. A save must name the etag shown now; a move, pin
+/// or delete does not replace the text, so Apple's etag still does for them.
+fn same_note_etag(
+    library: &Library,
+    note: &quince_core::notes::Note,
+    base_etag: Option<&String>,
+    save: bool,
+) -> Result<(), &'static str> {
+    let shown = note_etag(library, note)?;
+    if base_etag == shown.as_ref() {
+        return Ok(());
+    }
+    // Apple's etag, or one shown while an earlier save waited: read before the latest save.
+    let raw = note.etag.as_deref().unwrap_or_default();
+    let before_a_save = |tag: &String| {
+        tag.strip_prefix(raw)
+            .is_some_and(|rest| rest.starts_with("~q"))
+    };
+    if base_etag == note.etag.as_ref() || base_etag.is_some_and(before_a_save) {
+        return if save {
+            Err("save_already_queued")
+        } else {
+            Ok(())
+        };
+    }
+    Err("conflict")
+}
+
 fn enqueue_note(library: &mut Library, args: NoteWrite) -> Result<Value, &'static str> {
     match args {
         NoteWrite::Move {
@@ -3222,9 +3279,7 @@ fn enqueue_note(library: &mut Library, args: NoteWrite) -> Result<Value, &'stati
                 .note(&guid)
                 .map_err(|_| "library_unavailable")?
                 .ok_or("not_found")?;
-            if note.etag != base_etag {
-                return Err("conflict");
-            }
+            same_note_etag(library, &note, base_etag.as_ref(), false)?;
             if note.locked || !note.editable {
                 return Err("read_only_note");
             }
@@ -3242,9 +3297,7 @@ fn enqueue_note(library: &mut Library, args: NoteWrite) -> Result<Value, &'stati
                 .note(&guid)
                 .map_err(|_| "library_unavailable")?
                 .ok_or("not_found")?;
-            if note.etag != base_etag {
-                return Err("conflict");
-            }
+            same_note_etag(library, &note, base_etag.as_ref(), false)?;
             if note.locked || !note.editable {
                 return Err("read_only_note");
             }
@@ -3262,9 +3315,7 @@ fn enqueue_note(library: &mut Library, args: NoteWrite) -> Result<Value, &'stati
                 .note(&guid)
                 .map_err(|_| "library_unavailable")?
                 .ok_or("not_found")?;
-            if note.etag != base_etag {
-                return Err("conflict");
-            }
+            same_note_etag(library, &note, base_etag.as_ref(), true)?;
             if note.locked || !note.editable {
                 return Err("read_only_note");
             }
@@ -3305,9 +3356,7 @@ fn enqueue_note(library: &mut Library, args: NoteWrite) -> Result<Value, &'stati
                 .note(&guid)
                 .map_err(|_| "library_unavailable")?
                 .ok_or("not_found")?;
-            if note.etag != base_etag {
-                return Err("conflict");
-            }
+            same_note_etag(library, &note, base_etag.as_ref(), false)?;
             if note.locked || !note.editable {
                 return Err("read_only_note");
             }
