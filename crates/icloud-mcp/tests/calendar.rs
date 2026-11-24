@@ -783,6 +783,53 @@ async fn reads_report_cache_freshness_and_coverage_honestly() {
 }
 
 #[tokio::test]
+async fn get_and_events_agree_on_whether_the_last_refresh_read_the_day() {
+    let remote = apple().await;
+    answer(&remote, apple_body()).await;
+    let (dir, mut server) = bound_with_unrelated_state(Some("writes_only"));
+    init(&mut server, false).await;
+    refresh(
+        dir.path(),
+        &remote.uri(),
+        json!({"from":"2026-10-01","to":"2026-12-01"}),
+    )
+    .await
+    .unwrap();
+    let day = events(&mut server, "2026-10-05", "2026-10-06", "UTC").await;
+    assert_eq!(guids(&day), ["A-1", "F-1"]);
+    assert_eq!(day["coverage"]["range_within_last_refresh"], true);
+    for guid in ["A-1", "F-1"] {
+        let got = ok(&mut server, "calendar_get", json!({"guid":guid})).await;
+        assert_eq!(got["coverage"]["range_within_last_refresh"], true, "{guid}");
+    }
+    // A later refresh of other days no longer covers that day, in either tool.
+    refresh(
+        dir.path(),
+        &remote.uri(),
+        json!({"from":"2027-01-01","to":"2027-02-01"}),
+    )
+    .await
+    .unwrap();
+    let day = events(&mut server, "2026-10-05", "2026-10-06", "UTC").await;
+    assert_eq!(day["coverage"]["range_within_last_refresh"], false);
+    let got = ok(&mut server, "calendar_get", json!({"guid":"A-1"})).await;
+    assert_eq!(got["coverage"]["range_within_last_refresh"], false);
+    // A trip that starts before the window and runs into a covered day: both say covered.
+    refresh(
+        dir.path(),
+        &remote.uri(),
+        json!({"from":"2026-10-12","to":"2026-11-01"}),
+    )
+    .await
+    .unwrap();
+    let day = events(&mut server, "2026-10-12", "2026-10-13", "UTC").await;
+    assert_eq!(guids(&day), ["A-3"]);
+    assert_eq!(day["coverage"]["range_within_last_refresh"], true);
+    let got = ok(&mut server, "calendar_get", json!({"guid":"A-3"})).await;
+    assert_eq!(got["coverage"]["range_within_last_refresh"], true);
+}
+
+#[tokio::test]
 async fn writes_only_and_yolo_read_calendar_without_a_prompt() {
     for mode in ["writes_only", "yolo"] {
         let (_dir, mut server) = seeded(Some(mode));

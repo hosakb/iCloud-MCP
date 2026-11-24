@@ -1506,6 +1506,7 @@ impl Server {
         calendar::validate(name, &params["arguments"])?;
         photos::validate(name, &params["arguments"])?;
         drive::validate(name, &params["arguments"])?;
+        validate_cache_read(name, &params["arguments"])?;
         if name == photos_write::TOOL {
             photos_write::validate(&params["arguments"])?;
         }
@@ -3157,9 +3158,37 @@ impl From<Page> for List {
     }
 }
 
+/// A Notes or Reminders page size. As the schema says: 1 to 1000, refused outside it like
+/// every other service's limit.
+fn cache_limit(limit: Option<usize>) -> Result<usize, &'static str> {
+    match limit {
+        None => Ok(100),
+        Some(n) if (1..=1000).contains(&n) => Ok(n),
+        Some(_) => Err("invalid_arguments"),
+    }
+}
+
+/// Checks a Notes or Reminders read's limit before any approval card. Arguments that don't
+/// parse are left to the tool, which refuses them with its own reason.
+fn validate_cache_read(name: &str, args: &Value) -> Result<(), &'static str> {
+    let limit = match name {
+        "notes_list" | "reminders_list" => serde_json::from_value::<List>(args.clone())
+            .ok()
+            .and_then(|a| a.limit),
+        "notes_search" | "reminders_search" => serde_json::from_value::<Search>(args.clone())
+            .ok()
+            .and_then(|a| a.limit),
+        "notes_folders" | "reminders_lists" => serde_json::from_value::<Page>(args.clone())
+            .ok()
+            .and_then(|a| a.limit),
+        _ => None,
+    };
+    cache_limit(limit).map(|_| ())
+}
+
 fn page<T: serde::Serialize>(items: Vec<T>, args: List) -> Result<Value, &'static str> {
     let total = items.len();
-    let limit = args.limit.unwrap_or(100).clamp(1, 1000);
+    let limit = cache_limit(args.limit)?;
     let items: Vec<_> = items.into_iter().skip(args.offset).take(limit).collect();
     let next = args.offset.saturating_add(items.len());
     Ok(
@@ -3768,7 +3797,7 @@ pub(crate) fn tools() -> Vec<Value> {
         ("notes_search", "Apple iCloud Notes"),
         ("reminders_search", "Apple Reminders"),
     ] {
-        tools.push(json!({"name":name,"description":format!("Search the user's {kind} in the local cache index."),"inputSchema":{"type":"object","properties":{"query":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}},"required":["query"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
+        tools.push(json!({"name":name,"description":format!("Search the user's {kind} in the local cache index.{}", if name == "reminders_search" { " Finds open reminders only, not completed ones; reminders_list shows a list's completed reminders too." } else { "" }),"inputSchema":{"type":"object","properties":{"query":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}},"required":["query"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     }
     tools.push(json!({"name":"notes_write","description":"Queue a change to the user's Apple iCloud Notes (create, save, move, pin, delete). Follows the approval mode; a delete, a move into Recently Deleted or a save that empties a note always asks the user on the approval card. Queued is not remote-verified. An etag can change once more after a create or a sync, so read the note again with notes_get just before a change.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","save","move","pin","delete"]},"body":{"type":"string"},"pinned":{"type":"boolean"},"runs":{"type":["array","null"],"items":{"type":"object"}},"folder_guid":{"type":["string","null"]},"guid":{"type":"string"},"base_etag":{"type":["string","null"],"description":"Needed for move, save, pin and delete: the etag from notes_get. A missing or older etag returns conflict."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
     tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). A create can also repeat daily and alert at or before its due time. Deletions always ask the user on the approval card. Queued is not CloudKit-accepted; sync reports accepted writes. No field-level remote verification. Only edit takes base_etag; delete and tick take no base_etag. An etag can change once more after a create or a sync, so read the reminder again with reminders_get just before an edit.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."},"base_etag":{"type":["string","null"],"description":"Edit only: the etag from reminders_get. A newer cached copy returns conflict."},"repeat":{"type":"object","description":"Create only. Repeats daily from due_at, until the end of the given day or for ever. Needs due_at.","properties":{"frequency":{"enum":["daily"]},"until":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"YYYY-MM-DD, the last day it repeats. Read in timezone for a timed due_at, in UTC for an all-day one."}},"required":["frequency"],"additionalProperties":false},"due_time_alert":{"type":"boolean","description":"Create only. Alert at due_at. Needs a timed (not all-day) due_at."},"early_alert":{"type":"object","description":"Create only. Alert this long before due_at. Needs a timed due_at, and an early alert set on one of the user's reminders from an Apple device and then a sync, so the account id it carries is in the cache.","properties":{"amount":{"type":"integer","minimum":1,"maximum":10000},"unit":{"enum":["minutes","hours","days","weeks","months"]}},"required":["amount","unit"],"additionalProperties":false},"timezone":{"type":"string","maxLength":64,"description":"Create only. IANA zone the timed due_at and its alerts are kept in, such as Europe/Berlin. Default: this computer's zone, or UTC if it has no IANA name."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));

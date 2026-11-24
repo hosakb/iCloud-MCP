@@ -244,6 +244,7 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
             "regional_login_retry_required",
             "security_key_sign_in_unsupported",
             "sign_in_wait_protects_account",
+            "state_directory_missing",
             "state_directory_required",
             "storage_already_chosen",
             "terminal_unavailable",

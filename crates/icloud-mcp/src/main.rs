@@ -363,6 +363,14 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
     if args.next().is_some() {
         return Err("unexpected_argument");
     }
+    // Only setup creates the folder; a mistyped path must not become a new, empty one.
+    match std::fs::symlink_metadata(&dir) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err("state_directory_missing")
+        }
+        Err(_) => return Err("state_unavailable"),
+    }
     if command != "serve" {
         // An agent-launched PTY can carry keystrokes through model-visible transcripts.
         if terminal::agent_marked(|name| std::env::var_os(name)) {

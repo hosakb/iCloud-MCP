@@ -70,6 +70,63 @@ async fn invalid_arguments_names_an_unknown_field_and_a_wrong_type() {
     assert!(instructions(&reply).contains("limit"), "{reply}");
 }
 
+/// A limit outside the schema's 1..=1000 is refused, as in the other services, not
+/// quietly raised to one or lowered to the most.
+#[tokio::test]
+async fn notes_and_reminders_refuse_a_limit_outside_the_schema() {
+    let dir = private_dir();
+    let mut s = server(dir.path(), true).await;
+    for limit in [0, 1001] {
+        for (name, mut args) in [
+            ("notes_list", json!({})),
+            ("notes_search", json!({"query":"synthetic"})),
+            ("reminders_list", json!({"parent":"list"})),
+            ("reminders_search", json!({"query":"synthetic"})),
+            ("notes_folders", json!({})),
+            ("reminders_lists", json!({})),
+        ] {
+            args["limit"] = json!(limit);
+            let (reply, failed) = call(&mut s, name, args).await;
+            assert!(failed, "{name} {limit}: {reply}");
+            assert_eq!(reply["error"], "invalid_arguments", "{name} {limit}");
+            assert!(instructions(&reply).contains("limit"), "{name}: {reply}");
+        }
+    }
+}
+
+/// In reads_and_writes mode a bad Notes or Reminders limit is refused before the read card,
+/// as Contacts, Calendar, Photos and Drive do: nobody is asked to approve a call that fails.
+#[tokio::test]
+async fn a_bad_notes_or_reminders_limit_is_refused_before_the_card() {
+    let dir = private_dir();
+    let mut s = Server::open(dir.path()).unwrap();
+    s.set_policy("reads_and_writes").unwrap();
+    s.handle(json!({"id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{"form":{}}}}}))
+        .await
+        .unwrap();
+    for (name, args) in [
+        ("notes_list", json!({"limit":0})),
+        ("notes_search", json!({"query":"synthetic","limit":0})),
+        ("notes_folders", json!({"limit":1001})),
+        ("reminders_list", json!({"parent":"list","limit":0})),
+        (
+            "reminders_search",
+            json!({"query":"synthetic","limit":1001}),
+        ),
+        ("reminders_lists", json!({"limit":0})),
+    ] {
+        let reply = s
+            .handle(json!({"id":1,"method":"tools/call","params":{"name":name,"arguments":args}}))
+            .await
+            .unwrap();
+        assert_ne!(reply["method"], "elicitation/create", "{name}: {reply}");
+        assert_eq!(reply["result"]["isError"], true, "{name}: {reply}");
+        let text: Value =
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text["error"], "invalid_arguments", "{name}: {text}");
+    }
+}
+
 #[tokio::test]
 async fn reminders_delete_and_tick_say_they_take_no_base_etag() {
     let dir = private_dir();
