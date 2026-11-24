@@ -416,3 +416,54 @@ async fn reminder_list_discovery_reports_pin_dates() {
     assert_eq!(item("plain")["pinnedAt"], Value::Null);
     assert!(items.iter().all(|i| i.get("reminderOrder").is_none()));
 }
+
+/// reminders_search finds open reminders only, and its description says so and names the
+/// tool that lists completed ones.
+#[tokio::test]
+async fn reminders_search_says_it_skips_completed_reminders() {
+    use quince_core::reminders::{Reminder, ReminderList};
+    let (_dir, mut server, mut library) = setup();
+    library
+        .put_reminder_lists(&[ReminderList {
+            guid: "list".into(),
+            title: "Synthetic".into(),
+            enabled: true,
+            ..Default::default()
+        }])
+        .unwrap();
+    let reminder = |guid: &str, done: bool| Reminder {
+        guid: guid.into(),
+        list_guid: "list".into(),
+        title: format!("Synthetic errand {guid}"),
+        completed_at: done.then_some(1),
+        ..Default::default()
+    };
+    library
+        .put_reminders(&[reminder("open", false), reminder("done", true)])
+        .unwrap();
+    let found = call(&mut server, "reminders_search", json!({"query":"errand"})).await;
+    let guids: Vec<_> = found["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["guid"].as_str().unwrap())
+        .collect();
+    assert_eq!(guids, ["open"], "{found}");
+    let listed = call(&mut server, "reminders_list", json!({"parent":"list"})).await;
+    assert_eq!(listed["total"], 2, "{listed}");
+    let tools = server
+        .handle(json!({"id":3,"method":"tools/list"}))
+        .await
+        .unwrap();
+    let description = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "reminders_search")
+        .unwrap()["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(description.contains("completed"), "{description}");
+    assert!(description.contains("reminders_list"), "{description}");
+}

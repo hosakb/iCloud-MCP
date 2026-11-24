@@ -453,16 +453,13 @@ fn cache_state(library: &Library) -> Result<Value, &'static str> {
     }))
 }
 
-fn coverage(library: &Library, span: Option<&Span>) -> Value {
+/// Whether the last refresh read `[lo, hi)`, in the cache's seconds (see [`Window::covers`]).
+fn coverage(library: &Library, read: (i64, i64)) -> Value {
     let window = stored_window(library);
-    let within = match (window, span) {
-        (Some(w), Some(span)) => {
-            let (lo, hi) = span.widest();
-            let (a, b) = w.covers();
-            a <= lo && hi <= b
-        }
-        _ => false,
-    };
+    let within = window.is_some_and(|w| {
+        let (a, b) = w.covers();
+        a <= read.0 && read.1 <= b
+    });
     json!({
         "last_refresh_window": window.map(Window::view),
         "range_within_last_refresh": within,
@@ -747,7 +744,7 @@ pub(crate) fn events(library: &mut Library, args: Value) -> Result<Value, &'stat
     kept.sort_by(|(a, x), (b, y)| a.cmp(b).then_with(|| x.guid.cmp(&y.guid)));
     let all: Vec<Event> = kept.into_iter().map(|(_, e)| e).collect();
     let cache = cache_state(library)?;
-    let coverage = coverage(library, Some(&span));
+    let coverage = coverage(library, span.widest());
     let range = json!({"from":day_text(span.from_day),"to":day_text(span.to_day),"to_is_exclusive":true,"timezone":span.zone_name,"calendar_guid":args.calendar_guid});
     paged(
         &all,
@@ -916,7 +913,12 @@ pub(crate) fn get(library: &mut Library, args: Value) -> Result<Value, &'static 
         );
     }
     let cache = cache_state(library)?;
-    let coverage = coverage(library, None);
+    // The event's start is what a refresh judges it by, so the one second there is the
+    // range: an event on a covered day reads as covered, as calendar_events says of the day.
+    let coverage = coverage(
+        library,
+        (event.starts_at, event.starts_at.saturating_add(1)),
+    );
     for level in EVENT_LEVELS {
         let mut cut_any = false;
         let shown = match level {

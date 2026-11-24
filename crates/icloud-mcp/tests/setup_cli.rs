@@ -83,6 +83,34 @@ fn status_reports_a_missing_folder_and_exits_non_zero_without_creating_it() {
     assert!(!missing.exists());
 }
 
+/// The server never creates the folder it is started with: setup does that. A mistyped
+/// --state-dir in an AI app's config is refused with the setup command, not set up empty.
+#[test]
+fn the_server_refuses_a_missing_folder_without_creating_it() {
+    let parent = private_dir();
+    let missing = parent.path().join("not-there");
+    let out = program()
+        .arg("--state-dir")
+        .arg(&missing)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    let text = String::from_utf8(out.stderr).unwrap();
+    assert!(text.contains("does not exist"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "icloud-mcp setup --state-dir {}",
+            missing.display()
+        )),
+        "{text}"
+    );
+    assert!(!missing.exists());
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+}
+
 #[test]
 fn status_on_a_fresh_folder_lists_each_problem_with_a_next_step() {
     let dir = private_dir();

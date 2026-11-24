@@ -321,6 +321,7 @@ pub fn sentence(code: &str, dir: &std::path::Path) -> Option<String> {
         "interactive_terminal_required" | "terminal_unavailable" => "This command needs a real terminal. Open a terminal window and run it there, not through a pipe or another program.".to_string(),
         "foreground_terminal_required" => "This command must run in the foreground of your terminal. Run it again without & at the end.".to_string(),
         "state_directory_required" => "--state-dir needs a folder after it, for example: --state-dir ~/.local/share/icloud-mcp.".to_string(),
+        "state_directory_missing" => with("This folder does not exist, so the server did not start and created nothing. Check the --state-dir path, or run icloud-mcp setup to create and set up the folder."),
         "policy_mode_required" => "Name the approval mode after the folder: reads_and_writes, writes_only or yolo.".to_string(),
         "invalid_policy_mode" => "The approval mode must be reads_and_writes, writes_only or yolo. Nothing was changed.".to_string(),
         "policy_change_cancelled" => "Nothing was changed, because the answer was not confirm.".to_string(),

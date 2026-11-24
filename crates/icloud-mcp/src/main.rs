@@ -536,6 +536,10 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
         eprintln!("Signed in. The MCP server will reopen this session on its next sync request.");
         return Ok(());
     }
+    // Only setup creates the folder; a mistyped path must not become a new, empty one.
+    if std::fs::symlink_metadata(&dir).is_err() {
+        return Err("state_directory_missing");
+    }
     let mut server = Server::open(&dir)?;
     let mut input = BufReader::new(tokio::io::stdin());
     let mut frame = Vec::new();

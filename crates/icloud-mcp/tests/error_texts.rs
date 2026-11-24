@@ -70,6 +70,28 @@ async fn invalid_arguments_names_an_unknown_field_and_a_wrong_type() {
     assert!(instructions(&reply).contains("limit"), "{reply}");
 }
 
+/// A limit outside the schema's 1..=1000 is refused, as in the other services, not
+/// quietly raised to one or lowered to the most.
+#[tokio::test]
+async fn notes_and_reminders_refuse_a_limit_outside_the_schema() {
+    let dir = private_dir();
+    let mut s = server(dir.path(), true).await;
+    for limit in [0, 1001] {
+        for (name, mut args) in [
+            ("notes_list", json!({})),
+            ("notes_search", json!({"query":"synthetic"})),
+            ("reminders_list", json!({"parent":"list"})),
+            ("reminders_search", json!({"query":"synthetic"})),
+        ] {
+            args["limit"] = json!(limit);
+            let (reply, failed) = call(&mut s, name, args).await;
+            assert!(failed, "{name} {limit}: {reply}");
+            assert_eq!(reply["error"], "invalid_arguments", "{name} {limit}");
+            assert!(instructions(&reply).contains("limit"), "{name}: {reply}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn reminders_delete_and_tick_say_they_take_no_base_etag() {
     let dir = private_dir();
