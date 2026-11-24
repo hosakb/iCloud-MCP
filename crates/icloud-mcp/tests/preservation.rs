@@ -371,8 +371,8 @@ async fn text_only_saves_in_a_row_with_fresh_etags_are_queued() {
         let args = json!({"action":"save","guid":"note","base_etag":etag,"body":body});
         let result = call(&mut server, "notes_write", args).await;
         assert_eq!(result["status"], "queued", "{result}");
-        let now = call(&mut server, "notes_get", json!({"guid":"note"})).await["item"]["etag"]
-            .clone();
+        let now =
+            call(&mut server, "notes_get", json!({"guid":"note"})).await["item"]["etag"].clone();
         assert_eq!(result["etag"], now, "the save reply gives the new etag");
     }
     let stale = json!({"action":"save","guid":"note","base_etag":seen[1],"body":RICH});
@@ -405,7 +405,8 @@ async fn move_pin_and_delete_refuse_a_made_up_marked_etag() {
         }
     }
     assert_eq!(library.outbox_count().unwrap(), 1);
-    let shown = call(&mut server, "notes_get", json!({"guid":"note"})).await["item"]["etag"].clone();
+    let shown =
+        call(&mut server, "notes_get", json!({"guid":"note"})).await["item"]["etag"].clone();
     for etag in [json!("etag-1"), shown] {
         let pinned = call(
             &mut server,

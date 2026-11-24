@@ -1368,7 +1368,10 @@ async fn a_save_from_the_original_etag_is_refused_after_the_first_was_sent() {
     // Sent: the sender leaves the old etag on the note and takes the row off the queue.
     let first = library.outbox_take("notes").unwrap().unwrap();
     library.outbox_done(first.id).unwrap();
-    assert_eq!(library.note("note").unwrap().unwrap().etag.as_deref(), Some("n1"));
+    assert_eq!(
+        library.note("note").unwrap().unwrap().etag.as_deref(),
+        Some("n1")
+    );
     let second = write(
         &mut server,
         3,
@@ -1377,7 +1380,10 @@ async fn a_save_from_the_original_etag_is_refused_after_the_first_was_sent() {
     )
     .await;
     assert_eq!(second["isError"], true, "{second}");
-    assert!(second.to_string().contains("save_already_queued"), "{second}");
+    assert!(
+        second.to_string().contains("save_already_queued"),
+        "{second}"
+    );
     assert!(library.outbox_pending("notes").unwrap().is_empty());
     let etag = shown_etag(&mut server).await;
     assert_ne!(etag, json!("n1"));
