@@ -34,12 +34,8 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "The call's arguments are wrong, and the code says which. The AI app fixes its call.",
+        "contacts_write's argument codes: the line names the field, so it is made from the call's arguments (tests/contacts_write.rs checks it there).",
         &[
-            "all_day_cannot_have_timed_alert",
-            "all_day_requires_due_at",
-            "calendar_guid_required",
-            "calendar_guid_too_long",
             "contact_create_needs_only_fields",
             "contact_delete_needs_only_guid_and_etag",
             "contact_entry_must_be_label_and_value",
@@ -47,85 +43,8 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
             "contact_invalid_action",
             "contact_invalid_guid_or_etag",
             "contact_is_company_must_be_true_or_false",
-            "contact_too_large",
             "contact_unknown_field",
             "contact_update_needs_guid_etag_and_fields",
-            "due_time_alert_requires_due_at",
-            "early_alert_requires_due_at",
-            "event_too_large",
-            "frame_too_large",
-            "guid_required",
-            "invalid_arguments_move_changes_only_the_calendar",
-            "invalid_date",
-            "invalid_early_alert",
-            "invalid_id",
-            "invalid_local_path",
-            "invalid_name",
-            "invalid_patch",
-            "invalid_path",
-            "invalid_preview",
-            "invalid_range",
-            "invalid_repeat_end",
-            "invalid_tool",
-            "invalid_utf8",
-            "item_too_large",
-            "local_path_too_deep",
-            "local_path_too_long",
-            "operation_too_large",
-            "page_too_large",
-            "path_too_deep",
-            "path_too_long",
-            "payload_too_large",
-            "photo_too_large",
-            "preview_too_large",
-            "query_required",
-            "query_too_long",
-            "repeat_end_before_due",
-            "repeat_requires_due_at",
-            "runs_do_not_match_body",
-            "template_too_large",
-            "timezone_requires_timed_due_at",
-            "title_required",
-            "unexpected_argument",
-            "unknown_service",
-        ],
-    ),
-    (
-        "The item can't be used or changed this way, and the code says why. The step is to pick another item or action.",
-        &[
-            "absolute_local_path_refused",
-            "album_is_folder",
-            "app_library_cannot_be_changed",
-            "cannot_move_a_folder_into_itself",
-            "destination_not_found",
-            "drive_ambiguous_path_cache_kept",
-            "drive_file_over_exchange_limit",
-            "drive_folder_in_trash_cache_kept",
-            "drive_folder_left_cache_cache_kept",
-            "drive_folder_not_found_cache_kept",
-            "drive_not_a_folder_cache_kept",
-            "drive_path_not_found_cache_kept",
-            "folder_not_found",
-            "folder_not_writable",
-            "list_unavailable_or_read_only",
-            "local_file_changed_while_read",
-            "local_file_unavailable",
-            "local_hard_link_refused",
-            "local_not_a_regular_file",
-            "local_path_traversal_refused",
-            "local_write_failed",
-            "lossy_markdown_overwrite",
-            "not_a_file",
-            "not_a_folder",
-            "parent_not_found",
-            "read_only_note",
-            "repeating_reminder_needs_due_date",
-            "root_has_no_details",
-            "top_folder_cannot_be_changed",
-            "trash_not_supported",
-            "unsupported_attachment_insertion",
-            "unsupported_attachment_move",
-            "unsupported_attachment_removal",
         ],
     ),
     (
@@ -248,6 +167,7 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
             "storage_already_chosen",
             "terminal_unavailable",
             "too_many_code_requests_try_later",
+            "unexpected_argument",
             "use_policy_command",
             "user_owned_terminal_required",
         ],
@@ -462,4 +382,38 @@ fn every_error_code_has_instructions_or_is_listed_as_needing_none() {
         .filter(|c| !once.insert(**c))
         .collect();
     assert!(twice.is_empty(), "listed twice: {twice:?}");
+}
+
+/// The tool errors issue #91 found without a next step. Each now says what to do.
+const ISSUE_91: &[&str] = &[
+    "folder_not_found",
+    "list_unavailable_or_read_only",
+    "repeat_requires_due_at",
+    "title_required",
+    "invalid_date",
+    "query_required",
+    "absolute_local_path_refused",
+    "local_path_traversal_refused",
+    "local_hard_link_refused",
+    "invalid_name",
+    "destination_not_found",
+    "invalid_path",
+    "root_has_no_details",
+];
+
+#[test]
+fn the_errors_from_issue_91_say_what_to_do_next() {
+    let dir = tempfile::tempdir().unwrap();
+    let bare: Vec<&&str> = ISSUE_91
+        .iter()
+        .filter(|code| {
+            icloud_mcp::next_step(code, dir.path(), &Value::Null)
+                .is_none_or(|text| text.trim().len() < 20)
+        })
+        .collect();
+    assert!(bare.is_empty(), "give these an instructions line: {bare:?}");
+    for code in ISSUE_91 {
+        let text = icloud_mcp::next_step(code, dir.path(), &Value::Null).unwrap();
+        assert!(!text.to_lowercase().contains("skykeep"), "{code}: {text}");
+    }
 }

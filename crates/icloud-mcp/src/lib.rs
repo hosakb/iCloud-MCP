@@ -545,8 +545,103 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
                     |folder| format!("A folder inside the exchange folder can be changed by other users. Make it yours alone in your own terminal with: chmod 700 {} and try again.", status::quoted(&folder)),
                 ),
         ),
-        other => calendar_write::next_step(other, args),
+        other => calendar_write::next_step(other, args).or_else(|| fix_step(other, dir)),
     }
+}
+
+/// The next step for a refused argument or an item that can't be used this way: what to
+/// give instead, or where to look. Codes shared by several tools get one sentence that fits each.
+fn fix_step(error: &str, dir: &Path) -> Option<String> {
+    let quarantine = status::with_dir("icloud-mcp quarantine", dir);
+    let set_aside = |what: &str| {
+        format!("{what} It was set aside and never sent. Ask for a smaller change again; to clear the set-aside one, run {quarantine} in your own terminal.")
+    };
+    let local = "local is a path inside the exchange folder, such as photos/a.jpg";
+    Some(match error {
+        // Notes.
+        "folder_not_found" => "No notes folder with that folder_guid is in the local copy. Run notes_folders and take a folder's guid from there (run sync first if the folder is new), or leave folder_guid out to use the default folder.".into(),
+        "folder_not_writable" => "A note can't be created in Recently Deleted. Pick another folder with notes_folders, or leave folder_guid out to use the default folder.".into(),
+        "read_only_note" => "This note is locked, or Apple marks it as not editable, so it can't be changed here. Change it in Apple Notes.".into(),
+        "lossy_markdown_overwrite" => "The new body looks like the note's Markdown copy, and saving it would replace the note's formatting with Markdown symbols. Edit the plain body that notes_get returns, and send that instead.".into(),
+        "runs_do_not_match_body" => "The formatting runs don't fit the body that was sent. Leave runs out to keep the note's own formatting, or send runs that cover the new body exactly.".into(),
+        "unsupported_attachment_insertion" => "The body has an attachment mark (the character U+FFFC) that the note does not have. Attachments can't be added here; take that mark out, or add the attachment in Apple Notes.".into(),
+        "unsupported_attachment_removal" => "The body has fewer attachment marks (the character U+FFFC) than the note. Attachments can't be removed here; keep every mark, or remove the attachment in Apple Notes.".into(),
+        "unsupported_attachment_move" => "The edit takes out or moves an attachment mark (the character U+FFFC). Keep each mark where it is and change only the text around it, or move the attachment in Apple Notes.".into(),
+        // Reminders.
+        "list_unavailable_or_read_only" => "No reminder list with that list_guid is in the local copy, or it can't take new reminders. Run reminders_lists and take a list's guid from there (run sync first if the list is new), then ask again.".into(),
+        "repeat_requires_due_at" => "A repeating reminder needs a due date. Give due_at with repeat, or leave repeat out.".into(),
+        "repeat_end_before_due" => "The repeat's until date is before the due date. Give a later until, or leave until out so the repeat does not end.".into(),
+        "invalid_repeat_end" => "The repeat's until could not be read. Give it as a date, YYYY-MM-DD, such as 2026-12-31.".into(),
+        "repeating_reminder_needs_due_date" => "A repeating reminder must keep a due date. Give due_at a new date instead of null, or end the repeat in Apple Reminders.".into(),
+        "all_day_requires_due_at" => "all_day changes only with a due date. Give due_at as well, such as 2026-03-29 for an all-day reminder.".into(),
+        "all_day_cannot_have_timed_alert" => "An all-day reminder has no time to alert at. Leave out due_time_alert and early_alert, or give due_at a time and leave all_day out.".into(),
+        "due_time_alert_requires_due_at" => "due_time_alert rings at the due time, so it needs due_at. Give due_at with a time, or leave due_time_alert out.".into(),
+        "early_alert_requires_due_at" => "early_alert rings before the due time, so it needs due_at. Give due_at with a time, or leave early_alert out.".into(),
+        "invalid_early_alert" => format!("early_alert's amount must be from 1 to {MOST_EARLY_ALERT}. Ask again with an amount in that range."),
+        "timezone_requires_timed_due_at" => "timezone is only for a reminder due at a time. Give due_at with a time and leave all_day out, or leave timezone out.".into(),
+        "invalid_patch" => format!("patch is an object that names at least one field to change, out of {}. Ask again with such a patch.", preserve::REMINDER_FIELDS.join(", ")),
+        // Reminders and Calendar.
+        "title_required" => "A title is needed and it can't be blank. Give a title and ask again.".into(),
+        "guid_required" => "This action needs the guid of the item to change. Take it from a list, search or get reply, then ask again.".into(),
+        // Calendar.
+        "invalid_date" => "A date could not be read. Give it as YYYY-MM-DD, such as 2026-03-29, with a day that month has and a year from 1970 to 2200.".into(),
+        "invalid_range" => "to must be a later day than from. Ask again with a later to.".into(),
+        "calendar_guid_required" => "This action needs calendar_guid, the calendar to put the event in. Run calendar_calendars and pick one whose read_only is false.".into(),
+        "calendar_guid_too_long" => "The event's calendar guid is too long to show here. Look at the event in Apple Calendar instead.".into(),
+        "invalid_arguments_move_changes_only_the_calendar" => "move changes only the calendar. Give guid, etag, calendar_guid and, for a repeating event, scope; make other changes with update.".into(),
+        // Searches and pages.
+        "query_required" => "Give a query that is not blank: the words to look for. To see everything instead, use the matching list tool, such as contacts_list.".into(),
+        "query_too_long" => "The query is longer than 256 bytes. Shorten it and ask again.".into(),
+        "page_too_large" => "One page of the reply would be too large. Ask again with a smaller limit.".into(),
+        "event_too_large" => "This event is too large to show here, even cut short. Look at it in Apple Calendar instead.".into(),
+        "photo_too_large" => "This photo's details are too large to show here, even cut short. Look at it in Apple Photos instead.".into(),
+        "item_too_large" => "This item's details are too large to show here, even cut short. Look at it with drive_list on its folder, or in iCloud Drive on icloud.com.".into(),
+        "album_is_folder" => "That album is a folder of albums. Run photos_albums and pick an album inside it.".into(),
+        // iCloud Drive paths, ids and names.
+        "invalid_path" => "A path in iCloud Drive starts with /, such as /Documents/Taxes. Each name between the slashes must not be empty, . or .., or hold a control character. Give the path that way, or use the id from drive_list.".into(),
+        "path_too_long" => "The path is longer than 1024 bytes. Use the item's id from drive_list or drive_search instead.".into(),
+        "path_too_deep" => "The path has more than 32 folders. Use the item's id from drive_list or drive_search instead.".into(),
+        "invalid_id" => "That id can't be right: it is empty, longer than 512 bytes or holds a control character. Take the id from drive_list or drive_search as it is.".into(),
+        "invalid_name" => "That name can't be used in iCloud Drive. A name must not be empty, longer than 255 bytes, start with a dot, start or end with a space, or hold /, a colon, a control character or a hidden character. Pick another name and ask again.".into(),
+        "root_has_no_details" => "The top folder, /, has no details of its own. To see what is in it, run drive_list with path /. To read one item, give drive_get that item's path or id.".into(),
+        "not_a_folder" => "That is a file, not a folder. Give a folder's path or id; drive_list shows which items are folders.".into(),
+        "not_a_file" => "Only files can be downloaded, and that is a folder. Run drive_list on it and download the files inside one by one.".into(),
+        "trash_not_supported" => "Recently Deleted in iCloud Drive can't be read or changed here. Use iCloud Drive on icloud.com or a Mac for it.".into(),
+        "top_folder_cannot_be_changed" => "The top folder of iCloud Drive can't be renamed, moved or deleted. Give an item inside it instead.".into(),
+        "app_library_cannot_be_changed" => "That is an app's own folder in iCloud Drive, which can't be renamed, moved or deleted here. Pick another item, or change it in that app.".into(),
+        "cannot_move_a_folder_into_itself" => "A folder can't move into itself or into a folder inside it. Pick a destination outside it.".into(),
+        "parent_not_found" => "The folder to put the item in is not in the local copy of iCloud Drive. Run drive_refresh on that folder or on its parent, check it with drive_list, then ask again.".into(),
+        "destination_not_found" => "The folder to move into is not in the local copy of iCloud Drive. Run drive_refresh on that folder or on its parent, check it with drive_list, then ask again with destination_path or destination_id.".into(),
+        "drive_file_over_exchange_limit" => format!("The file is larger than the exchange folder's size limit, so nothing was kept. To raise the limit, run in your own terminal: {}", status::with_dir("icloud-mcp exchange --max-mb N", dir)),
+        "drive_path_not_found_cache_kept" => "iCloud Drive has nothing on that path, and the local copy was kept as it was. Check the path with drive_list on its parent folder, or run drive_refresh with path /.".into(),
+        "drive_folder_not_found_cache_kept" => "Apple no longer has that folder; it may have been moved or deleted. The local copy was kept as it was. Run drive_refresh on its parent folder or on /.".into(),
+        "drive_folder_left_cache_cache_kept" => "The folder left the local copy while the refresh ran, and the local copy was kept as it was. Run drive_refresh on its parent folder, then try again.".into(),
+        "drive_folder_in_trash_cache_kept" => "That folder is in Recently Deleted now, and the local copy was kept as it was. Run drive_refresh on its parent folder to bring the local copy up to date.".into(),
+        "drive_not_a_folder_cache_kept" => "In iCloud Drive that path is a file, not a folder, and the local copy was kept as it was. Run drive_refresh on the folder that holds it.".into(),
+        "drive_ambiguous_path_cache_kept" => "Two items on that path have the same name, and the local copy was kept as it was. Run drive_refresh with the folder's id from drive_list instead of its path.".into(),
+        // Local files in the exchange folder (drive_write and photos_write).
+        "absolute_local_path_refused" => format!("{local}, not one that starts with / or ~. Put the file in the exchange folder and give its path from there."),
+        "local_path_traversal_refused" => format!("{local}; . and .. are refused as names. Give the path from the exchange folder down, without them."),
+        "invalid_local_path" => format!("{local}. Each name must not be empty, longer than 255 bytes, or hold a control or hidden character. Rename the file or fix the path and ask again."),
+        "local_path_too_long" => format!("{local}, at most 1024 bytes. Use a shorter path or file name."),
+        "local_path_too_deep" => format!("{local}, at most 8 names deep. Move the file higher up in the exchange folder."),
+        "local_hard_link_refused" => "That file has a second name (a hard link), which could be outside the exchange folder, so it is refused. Put a copy of it in the exchange folder (cp makes a new file) and ask again with that copy.".into(),
+        "local_not_a_regular_file" => "Only plain files can be uploaded, not folders, devices or pipes. Give the local path of a file.".into(),
+        "local_file_unavailable" => "The file or a folder on that local path could not be opened or read. Check that it exists in the exchange folder and that you can read it, then ask again.".into(),
+        "local_file_changed_while_read" => "The file changed while it was read, so nothing was sent. Wait until nothing is writing to it, then ask again.".into(),
+        "local_write_failed" => "The file could not be written to the exchange folder, so nothing was kept. Check that the disk has room and that you can write to the folder, then ask again.".into(),
+        // The call itself, and queued changes that can't be sent.
+        "operation_too_large" => "The arguments are too large or too deeply nested. Send a smaller change, or split it into several calls.".into(),
+        "frame_too_large" => "The message was larger than 64 KB, so the connection was closed. Send smaller requests.".into(),
+        "invalid_utf8" => "The message was not valid UTF-8 text. Send it as UTF-8.".into(),
+        "invalid_tool" => "The request names no tool iCloud-MCP can run. Ask for the change again with a tool from tools/list.".into(),
+        "payload_too_large" => set_aside("This queued change is larger than 256 KB, too large to send."),
+        "preview_too_large" => set_aside("The change is too large to show for approval."),
+        "invalid_preview" => set_aside("The change could not be shown for approval."),
+        "template_too_large" => set_aside("The note template Apple sent is too large to use for a new note."),
+        "unknown_service" => set_aside("This queued change belongs to no service iCloud-MCP sends."),
+        _ => return None,
+    })
 }
 
 /// The next step when the sign-in does not offer `service`.

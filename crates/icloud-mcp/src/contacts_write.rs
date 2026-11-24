@@ -1048,6 +1048,7 @@ pub(crate) fn next_step(error: &str, args: &Value) -> Option<String> {
         TOO_LARGE => "The address book or one of its cards is larger than this tool reads, so nothing was sent. Make the change on an Apple device or on icloud.com.",
         UNREADABLE => "Apple's copy of this card could not be read as a contact, so nothing was sent. Make the change on an Apple device or on icloud.com.",
         CREATE_REFUSED => "Apple refused the new card because its address book changed while the card was being sent, so nothing was made. Try the create again.",
+        "contact_too_large" => "This card is too large to show here, even cut short. Look at it in Apple Contacts instead.",
         OUT_OF_DATE => "This request is out of date: the card in the local cache changed since it was asked, so it can't be approved. Nothing was sent. Ask for the change again.",
         _ => return None,
     }
