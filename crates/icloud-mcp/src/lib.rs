@@ -556,6 +556,10 @@ fn fix_step(error: &str, dir: &Path) -> Option<String> {
     let set_aside = |what: &str| {
         format!("{what} It was set aside and never sent. Ask for a smaller change again; to clear the set-aside one, run {quarantine} in your own terminal.")
     };
+    // Codes a live call returns too, where nothing was queued.
+    let queued_or_live = |what: &str| {
+        format!("{what} On a tool call, nothing was queued: ask for a smaller change. If it came from a change already queued, that change was set aside and never sent; to see it, run {quarantine} in your own terminal. Quarantine can delete other set-aside changes too, so read the list first.")
+    };
     let local = "local is a path inside the exchange folder, such as photos/a.jpg";
     Some(match error {
         // Notes.
@@ -598,7 +602,7 @@ fn fix_step(error: &str, dir: &Path) -> Option<String> {
         "item_too_large" => "This item's details are too large to show here, even cut short. Look at it with drive_list on its folder, or in iCloud Drive on icloud.com.".into(),
         "album_is_folder" => "That album is a folder of albums. Run photos_albums and pick an album inside it.".into(),
         // iCloud Drive paths, ids and names.
-        "invalid_path" => "A path in iCloud Drive starts with /, such as /Documents/Taxes. Each name between the slashes must not be empty, . or .., or hold a control character. Give the path that way, or use the id from drive_list.".into(),
+        "invalid_path" => "A path in iCloud Drive starts with /, such as /Documents/Taxes. Each name between the slashes must not be empty, . or .., longer than 255 bytes, or hold a control character. Give the path that way, or use the id from drive_list.".into(),
         "path_too_long" => "The path is longer than 1024 bytes. Use the item's id from drive_list or drive_search instead.".into(),
         "path_too_deep" => "The path has more than 32 folders. Use the item's id from drive_list or drive_search instead.".into(),
         "invalid_id" => "That id can't be right: it is empty, longer than 512 bytes or holds a control character. Take the id from drive_list or drive_search as it is.".into(),
@@ -625,19 +629,19 @@ fn fix_step(error: &str, dir: &Path) -> Option<String> {
         "invalid_local_path" => format!("{local}. Each name must not be empty, longer than 255 bytes, or hold a control or hidden character. Rename the file or fix the path and ask again."),
         "local_path_too_long" => format!("{local}, at most 1024 bytes. Use a shorter path or file name."),
         "local_path_too_deep" => format!("{local}, at most 8 names deep. Move the file higher up in the exchange folder."),
-        "local_hard_link_refused" => "That file has a second name (a hard link), which could be outside the exchange folder, so it is refused. Put a copy of it in the exchange folder (cp makes a new file) and ask again with that copy.".into(),
+        "local_hard_link_refused" => "That file has a second name (a hard link), which could be anywhere on this computer, even outside the exchange folder, so it is refused. Ask the person to check first what the file is. Only if they really meant to share it, they put a copy of it into the exchange folder themselves, not the AI app, and then ask again with that copy.".into(),
         "local_not_a_regular_file" => "Only plain files can be uploaded, not folders, devices or pipes. Give the local path of a file.".into(),
         "local_file_unavailable" => "The file or a folder on that local path could not be opened or read. Check that it exists in the exchange folder and that you can read it, then ask again.".into(),
         "local_file_changed_while_read" => "The file changed while it was read, so nothing was sent. Wait until nothing is writing to it, then ask again.".into(),
         "local_write_failed" => "The file could not be written to the exchange folder, so nothing was kept. Check that the disk has room and that you can write to the folder, then ask again.".into(),
         // The call itself, and queued changes that can't be sent.
-        "operation_too_large" => "The arguments are too large or too deeply nested. Send a smaller change, or split it into several calls.".into(),
+        "operation_too_large" => queued_or_live("The arguments are too large or too deeply nested."),
         "frame_too_large" => "The message was larger than 64 KB, so the connection was closed. Send smaller requests.".into(),
         "invalid_utf8" => "The message was not valid UTF-8 text. Send it as UTF-8.".into(),
         "invalid_tool" => "The request names no tool iCloud-MCP can run. Ask for the change again with a tool from tools/list.".into(),
         "payload_too_large" => set_aside("This queued change is larger than 256 KB, too large to send."),
-        "preview_too_large" => set_aside("The change is too large to show for approval."),
-        "invalid_preview" => set_aside("The change could not be shown for approval."),
+        "preview_too_large" => queued_or_live("The change is too large to show for approval."),
+        "invalid_preview" => queued_or_live("The change could not be shown for approval."),
         "template_too_large" => set_aside("The note template Apple sent is too large to use for a new note."),
         "unknown_service" => set_aside("This queued change belongs to no service iCloud-MCP sends."),
         _ => return None,
