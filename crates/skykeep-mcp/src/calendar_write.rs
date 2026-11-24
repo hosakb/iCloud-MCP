@@ -282,6 +282,13 @@ fn parse_when(text: &str, all_day: bool) -> Option<When> {
     }
 }
 
+/// The deserializer's reason the arguments don't fit, for an error's instructions.
+pub(crate) fn serde_reason(args: &Value) -> Option<String> {
+    serde_json::from_value::<CalendarWrite>(args.clone())
+        .err()
+        .map(|e| e.to_string().replace('`', ""))
+}
+
 /// Checks the arguments before any approval prompt, cache or network use.
 pub(crate) fn validate(args: &Value) -> Result<CalendarWrite, &'static str> {
     if !args["action"]
@@ -869,8 +876,8 @@ pub(crate) fn preview(
     };
     value["invitations"] = json!(match (op.action, invitations) {
         (Action::Create, _) => "calendar_write adds no attendees. If the calendar is shared, its members see the new event; the cache does not say whether it is shared.".to_string(),
-        (_, true) => format!("Skykeep reads the event's attendees from Apple just before the change. If other people are invited, Apple emails each of them {what}, because permissions.yaml sets {INVITATIONS_RULE}: allow. Members of a shared calendar see the change too."),
-        (_, false) => format!("Skykeep reads the event's attendees from Apple just before the change. If other people are invited, the change is refused before anything is sent, because permissions.yaml does not set {INVITATIONS_RULE}: allow. Members of a shared calendar see the change."),
+        (_, true) => format!("iCloud-MCP reads the event's attendees from Apple just before the change. If other people are invited, Apple emails each of them {what}, because permissions.yaml sets {INVITATIONS_RULE}: allow. Members of a shared calendar see the change too."),
+        (_, false) => format!("iCloud-MCP reads the event's attendees from Apple just before the change. If other people are invited, the change is refused before anything is sent, because permissions.yaml does not set {INVITATIONS_RULE}: allow. Members of a shared calendar see the change."),
     });
     value["effect"] = json!(match (op.action, op.scope) {
         (Action::Create, _) => "adds one new event",
@@ -881,10 +888,10 @@ pub(crate) fn preview(
         (Action::Update, None) => "changes the event; fields not given stay as they are",
         (Action::Move, _) => "moves the event, as it is, into the other calendar",
         (Action::Delete, Some(Repeat::WholeSeries)) =>
-            "deletes every occurrence of the series, past and future; Skykeep cannot undo it",
+            "deletes every occurrence of the series, past and future; iCloud-MCP cannot undo it",
         (Action::Delete, Some(Repeat::ThisOccurrence)) =>
-            "deletes this one occurrence; the rest of the series stays; Skykeep cannot undo it",
-        (Action::Delete, None) => "deletes the event; Skykeep cannot undo it",
+            "deletes this one occurrence; the rest of the series stays; iCloud-MCP cannot undo it",
+        (Action::Delete, None) => "deletes the event; iCloud-MCP cannot undo it",
     });
     Ok(value)
 }

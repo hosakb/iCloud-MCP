@@ -84,7 +84,7 @@ pub enum Error {
     StaleCursor,
     /// A file's bytes stopped going to Apple part way, or Apple had them all and never
     /// answered (see [`upload`]): the line went. Nothing was filed; it is sent again.
-    #[error("The connection to iCloud stopped part way through sending. Nothing was saved there — Skykeep sends it again.")]
+    #[error("The connection to iCloud stopped part way through sending. Nothing was saved there — iCloud-MCP sends it again.")]
     Stalled,
     #[error(transparent)]
     Storage(#[from] quince_core::Error),
@@ -100,7 +100,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 fn busy_words(wait: Option<std::time::Duration>) -> String {
     match wait.map(|w| w.as_secs().div_ceil(60)) {
         Some(minutes) if minutes > 1 => format!(
-            "iCloud asked Skykeep to wait about {minutes} minutes before asking again. Nothing was changed — Skykeep tries again then."
+            "iCloud asked iCloud-MCP to wait about {minutes} minutes before asking again. Nothing was changed — iCloud-MCP tries again then."
         ),
         _ => "iCloud is busy right now. Nothing was changed — try again in a minute.".into(),
     }
@@ -108,7 +108,7 @@ fn busy_words(wait: Option<std::time::Duration>) -> String {
 
 /// What [`Error::NeedsDeviceApproval`] says to the person.
 pub const APPROVAL_WORDS: &str =
-    "Approve Skykeep on your iPhone, iPad or Mac to open this. Advanced Data Protection keeps it end-to-end encrypted.";
+    "Approve iCloud-MCP on your iPhone, iPad or Mac to open this. Advanced Data Protection keeps it end-to-end encrypted.";
 
 /// Whether Apple turned a request down only because Advanced Data Protection is keeping the
 /// service's keys from this session — the two answers it gives, measured on an account with

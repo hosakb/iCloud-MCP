@@ -22,7 +22,7 @@ use std::path::{Component, Path, PathBuf};
 /// Where the folder and its limit are kept, in the private directory's state.
 pub(crate) const KEY: &str = "mcp.drive.exchange";
 /// The folder's name in the home folder, unless the person names another.
-pub const DEFAULT_NAME: &str = "Skykeep-Exchange";
+pub const DEFAULT_NAME: &str = "iCloud-MCP-Exchange";
 /// The size limit unless the person sets another: 100 MB.
 pub const DEFAULT_MAX_BYTES: u64 = 100 * 1024 * 1024;
 /// The largest limit the terminal accepts, in MB.
@@ -48,7 +48,7 @@ pub struct Exchange {
     pub from_file: bool,
 }
 
-/// The home folder's `Skykeep-Exchange`.
+/// The home folder's `iCloud-MCP-Exchange`.
 pub fn default_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
     Some(PathBuf::from(home).join(DEFAULT_NAME))
@@ -427,17 +427,29 @@ pub fn explain(code: &str, path: Option<&Path>, dir: &Path) -> String {
         }
         "exchange_folder_writable_by_others" => format!("Other users can change {folder}. Make it yours alone with: chmod 700 {folder} and run the same command again."),
         "exchange_folder_not_yours" => format!("{folder} belongs to another user. Pick a folder of your own with: skykeep-mcp exchange --state-dir {state} --path DIR"),
-        "exchange_folder_path_unsafe" => match path.and_then(|p| std::fs::canonicalize(p).ok()) {
-            Some(real) => format!("{folder} is a symbolic link. Use the real folder it points to: skykeep-mcp exchange --state-dir {state} --path {}", crate::status::quoted(&real)),
-            None => format!("{folder} is a symbolic link or names no folder. Give a real folder, for example: skykeep-mcp exchange --state-dir {state} --path ~/{DEFAULT_NAME}"),
-        },
+        "exchange_folder_path_unsafe" => {
+            let example = format!("skykeep-mcp exchange --state-dir {state} --path ~/{DEFAULT_NAME}");
+            let text = path.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+            // `Path` drops a trailing `.`, so the text is read as typed.
+            let dots = [".", ".."].contains(&text.as_str()) || text.ends_with("/.") || text.ends_with("/..");
+            let real = path
+                .filter(|_| !dots)
+                .and_then(|p| Some((std::path::absolute(p).ok()?, std::fs::canonicalize(p).ok()?)))
+                .filter(|(given, real)| given != real)
+                .map(|(_, real)| real);
+            match real {
+                Some(real) => format!("{folder} is a symbolic link. Use the real folder it points to: skykeep-mcp exchange --state-dir {state} --path {}", crate::status::quoted(&real)),
+                None if dots => format!("{folder} ends in . or .., so it does not name the folder itself. Give the folder's own name, for example: {example}"),
+                None => format!("{folder} can't be the exchange folder: it is not a folder of your own. Give one, for example: {example}"),
+            }
+        }
         "home_folder_unknown_give_path" => format!("Your home folder is not known here. Name the folder with: skykeep-mcp exchange --state-dir {state} --path DIR"),
         "exchange_folder_unavailable" => format!("{folder} could not be created or opened. Check that it is a folder you can open, or pick another with: skykeep-mcp exchange --state-dir {state} --path DIR"),
         "invalid_exchange_setting" => format!("The saved exchange setting is unreadable. Set it again with: skykeep-mcp exchange --state-dir {state} --path DIR"),
-        "exchange_path_required" => "--path needs a folder after it, for example: --path ~/Skykeep-Exchange".to_string(),
+        "exchange_path_required" => format!("--path needs a folder after it, for example: --path ~/{DEFAULT_NAME}"),
         "exchange_folder_system_folder" | "exchange_folder_hidden_or_credentials" | "exchange_folder_private_state" | "exchange_folder_is_a_link" | "exchange_folder_not_a_folder" | "exchange_folder_home_unknown" => format!("{folder} {}. Pick a private folder of your own, for example: skykeep-mcp exchange --state-dir {state} --path ~/{DEFAULT_NAME}", problem(code)),
         "permissions_file_unusable" => format!("permissions.yaml in {state} can't be edited, so nothing was changed. Run skykeep-mcp permissions show --state-dir {state} to see what to fix, then run the same command again."),
-        "state_busy_retry" => "Another Skykeep command is using the private folder. Run the same command again in a moment.".to_string(),
+        "state_busy_retry" => "Another iCloud-MCP command is using the private folder. Run the same command again in a moment.".to_string(),
         other => format!("The exchange folder was not set up ({other}). Run skykeep-mcp status --state-dir {state} to check the private folder."),
     }
 }

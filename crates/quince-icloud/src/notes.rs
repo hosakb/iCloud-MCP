@@ -132,7 +132,7 @@ fn note_from_record(record: &Value) -> Option<Note> {
 /// Said when a write would leave a note's attachments unsound (see
 /// [`crate::ckdocument::attachments_sound_in_base64`]): nothing is sent.
 const ATTACHMENTS_UNSOUND: &str =
-    "Skykeep didn’t save this: it would have left a table or attachment in this note referenced twice, which Notes on iPhone can’t open. Nothing was changed.";
+    "iCloud-MCP didn’t save this: it would have left a table or attachment in this note referenced twice, which Notes on iPhone can’t open. Nothing was changed.";
 
 pub async fn sync_cloudkit(
     http: &reqwest::Client,
@@ -205,7 +205,8 @@ const MOST_INLINE: usize = 700 * 1024;
 fn fits_inline(document: &str) -> Result<()> {
     if document.len() > MOST_INLINE {
         return Err(Error::Protocol(
-            "This note is longer than Skykeep can save to iCloud yet. Nothing was changed.".into(),
+            "This note is longer than iCloud-MCP can save to iCloud yet. Nothing was changed."
+                .into(),
         ));
     }
     Ok(())
@@ -618,7 +619,7 @@ pub async fn edit_rich_cloudkit_from(
         // — and the merge kept only what was typed here.
         let theirs = crate::ckdocument::stored_text_from_base64(encoded).ok_or_else(|| {
             Error::Refused(
-                "Skykeep couldn't read this note's text as Apple holds it, so nothing was saved."
+                "iCloud-MCP couldn't read this note's text as Apple holds it, so nothing was saved."
                     .into(),
             )
         })?;
@@ -756,7 +757,7 @@ fn rewrite_for_save(
     }
     .ok_or_else(|| {
         Error::Refused(
-            "Skykeep can’t safely save changes to this note yet, so nothing was changed. Editing it on an Apple device is safe."
+            "iCloud-MCP can’t safely save changes to this note yet, so nothing was changed. Editing it on an Apple device is safe."
                 .into(),
         )
     })?;
@@ -3603,7 +3604,7 @@ pub async fn add_table_line_cloudkit(
         .await?
         .ok_or_else(|| {
             Error::Refused(format!(
-                "A {} can’t be added to this table here: it holds something Skykeep can’t rewrite exactly.",
+                "A {} can’t be added to this table here: it holds something iCloud-MCP can’t rewrite exactly.",
                 if column { "column" } else { "row" }
             ))
         })?;
@@ -3643,7 +3644,7 @@ pub async fn remove_table_line_cloudkit(
         .await?
         .ok_or_else(|| {
             Error::Refused(format!(
-                "That {} can’t be deleted here: a table keeps at least one, or it holds something Skykeep can’t rewrite exactly.",
+                "That {} can’t be deleted here: a table keeps at least one, or it holds something iCloud-MCP can’t rewrite exactly.",
                 if column { "column" } else { "row" }
             ))
         })?;
@@ -3704,7 +3705,7 @@ pub async fn set_table_cell_cloudkit(
         })
         .await?
         .ok_or_else(|| {
-            Error::Refused("That cell can’t be changed here: this table holds something Skykeep can’t rewrite exactly.".into())
+            Error::Refused("That cell can’t be changed here: this table holds something iCloud-MCP can’t rewrite exactly.".into())
         })?;
     // Apple's answer to the write does not carry the table back (measured), so what it now
     // holds is read from it.

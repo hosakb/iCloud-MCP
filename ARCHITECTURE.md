@@ -1,6 +1,6 @@
 # Architecture
 
-The workspace has one executable, `skykeep-mcp`, and four Skykeep engine crates. The server speaks newline-delimited JSON-RPC over stdio. Stdout carries protocol messages only; there is no HTTP listener. JSON-RPC batches are not supported.
+The workspace has one executable, `skykeep-mcp` (the iCloud-MCP server), and four engine crates from upstream Skykeep. The server speaks newline-delimited JSON-RPC over stdio. Stdout carries protocol messages only; there is no HTTP listener. JSON-RPC batches are not supported.
 
 ## Crates
 
