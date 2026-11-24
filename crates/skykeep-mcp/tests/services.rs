@@ -542,3 +542,90 @@ async fn deleting_and_breaking_the_file_in_either_order_keeps_the_same_services(
         );
     }
 }
+
+/// Every entry in `dir` with its bytes, to see that nothing was created or changed.
+fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            let bytes = std::fs::read(e.path()).unwrap_or_default();
+            (e.file_name().to_string_lossy().into_owned(), bytes)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn a_library_swapped_for_a_link_is_never_opened_for_the_tool_list() {
+    for busy in [false, true] {
+        let mut f = folder(Some("yolo")).await;
+        let dir = f.path();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("elsewhere.db");
+        std::fs::write(&target, b"").unwrap();
+        let held = busy.then(|| skykeep_mcp::state::PrivateState::open(&dir).unwrap());
+        for name in ["library.db", "library.db-wal", "library.db-shm"] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        std::os::unix::fs::symlink(&target, dir.join("library.db")).unwrap();
+        f.server
+            .handle(json!({"id":9,"method":"tools/list"}))
+            .await
+            .unwrap();
+        f.server.handle(json!({"id":0,"method":"initialize"})).await;
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"",
+            "busy: {busy}: the file behind the link stays untouched"
+        );
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+        drop(held);
+    }
+}
+
+#[test]
+fn the_read_only_open_creates_nothing_and_changes_no_table() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    // No library yet: refused, and none is made.
+    assert!(quince_core::Library::open_read_only(dir.path()).is_err());
+    assert_eq!(snapshot(dir.path()), Vec::new());
+    // An empty file in its place is not given the table layout.
+    std::fs::write(dir.path().join("library.db"), b"").unwrap();
+    let before = snapshot(dir.path());
+    if let Ok(library) = quince_core::Library::open_read_only(dir.path()) {
+        assert!(library.state("account").is_err());
+    }
+    assert_eq!(snapshot(dir.path()), before);
+    // A real library, closed: no side files to read through, so it is refused and none is
+    // made.
+    std::fs::remove_file(dir.path().join("library.db")).unwrap();
+    {
+        let mut library = quince_core::Library::open(dir.path()).unwrap();
+        library.set_state("account", "synthetic-account").unwrap();
+    }
+    let before = snapshot(dir.path());
+    assert!(quince_core::Library::open_read_only(dir.path()).is_err());
+    assert_eq!(snapshot(dir.path()), before);
+    // Open in another handle, as while the folder is busy: it reads, can't write, and the
+    // library file and the set of files stay as they were.
+    let mut writer = quince_core::Library::open(dir.path()).unwrap();
+    writer.set_state("account", "synthetic-account").unwrap();
+    let names = |d: &Path| -> Vec<String> { snapshot(d).into_iter().map(|(n, _)| n).collect() };
+    let (files, db) = (
+        names(dir.path()),
+        std::fs::read(dir.path().join("library.db")).unwrap(),
+    );
+    let mut reader = quince_core::Library::open_read_only(dir.path()).unwrap();
+    assert_eq!(
+        reader.state("account").unwrap().as_deref(),
+        Some("synthetic-account")
+    );
+    assert!(reader.set_state("account", "other").is_err());
+    drop(reader);
+    assert_eq!(names(dir.path()), files);
+    assert_eq!(std::fs::read(dir.path().join("library.db")).unwrap(), db);
+    drop(writer);
+}

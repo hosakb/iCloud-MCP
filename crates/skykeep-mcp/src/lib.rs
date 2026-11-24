@@ -1939,15 +1939,17 @@ impl Server {
                     .ok()
                     .map(|a| a.services)
             }
-            // The records are read without the folder's lock, as `status` does; only the
-            // file when even they can't be read.
-            // A folder not set up yet gets no library from here: it would not be private.
-            Err(_) => Some(())
-                .filter(|()| self.dir.join("library.db").is_file())
-                .and_then(|()| quince_core::Library::open(&self.dir).ok())
+            // Only busy: the folder passed its checks, and another process holds it. The
+            // records are read through a read-only handle that creates and changes nothing
+            // and refuses links; the file alone when even that can't be opened.
+            Err("state_busy_retry") => quince_core::Library::open_read_only(&self.dir)
+                .ok()
                 .and_then(|library| permissions::peek(&library, &self.dir, None).ok())
                 .map(|a| a.services)
                 .or_else(|| permissions::services_in_file(&self.dir)),
+            // Any other folder problem (a link, a shared file): the library is never opened,
+            // only the file, which its own reader refuses as a link or a shared file.
+            Err(_) => permissions::services_in_file(&self.dir),
         }
     }
 
