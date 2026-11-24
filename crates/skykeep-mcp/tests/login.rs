@@ -599,3 +599,57 @@ async fn choosing_devices_again_requests_a_fresh_device_code() {
     let twice = device_pushes(&["1", "b", "1", "123456"]).await;
     assert_eq!(twice, once + 1, "a second push for the second choice");
 }
+
+/// `skykeep-mcp login` binds the account the same way setup does, and a new sign-in clears
+/// an earlier failed check, so auth_status no longer says "not signed in".
+#[tokio::test]
+async fn a_new_sign_in_clears_an_earlier_failed_check() {
+    use std::os::unix::fs::PermissionsExt;
+    // As the program itself runs: new files private to this user.
+    unsafe {
+        libc::umask(0o077);
+    }
+    let server = MockServer::start().await;
+    mock_auth(&server).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut mcp = skykeep_mcp::Server::open(dir.path()).unwrap();
+    quince_core::Library::open(dir.path())
+        .unwrap()
+        .set_state("account", &quince_sync::queue::account_tag("1234567890"))
+        .unwrap();
+    skykeep_mcp::note_session_check(
+        &skykeep_mcp::state::PrivateState::open(dir.path()).unwrap(),
+        Err("login_required"),
+    );
+    let auth = |reply: serde_json::Value| -> serde_json::Value {
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+    mcp.handle(json!({"id":0,"method":"initialize"})).await;
+    let request =
+        json!({"id":1,"method":"tools/call","params":{"name":"auth_status","arguments":{}}});
+    let before = auth(mcp.handle(request.clone()).await.unwrap());
+    assert_eq!(before["status"], "login_required", "{before}");
+
+    let mut client = Client::with(
+        dir.path(),
+        Endpoints::at(&server.uri()),
+        Store::file(dir.path()).unwrap().without_passwords(),
+    )
+    .unwrap();
+    let mut inputs = [
+        "fixture@example.invalid",
+        "SYNTHETIC-PASSWORD",
+        "1",
+        "123456",
+    ]
+    .into_iter();
+    authenticate(&mut client, &mut |_| {
+        Ok(Zeroizing::new(inputs.next().unwrap().to_string()))
+    })
+    .await
+    .unwrap();
+    skykeep_mcp::login::bind_account(dir.path(), &mut client).unwrap();
+    let after = auth(mcp.handle(request).await.unwrap());
+    assert_eq!(after["status"], "session_unverified", "{after}");
+}

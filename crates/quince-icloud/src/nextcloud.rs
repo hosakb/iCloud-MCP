@@ -66,7 +66,7 @@ pub fn normalise_address(raw: &str) -> Result<Url> {
     }
     if !safe_for_a_password(&url) {
         return Err(Error::Refused(
-            "Skykeep only sends a password over an encrypted connection. Use an https:// address."
+            "iCloud-MCP only sends a password over an encrypted connection. Use an https:// address."
                 .into(),
         ));
     }

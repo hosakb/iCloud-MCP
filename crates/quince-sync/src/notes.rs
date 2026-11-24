@@ -447,7 +447,7 @@ pub async fn send(
             n::pin_cloudkit(http, root, params, &note, x.pinned).await
         }
         other => Err(Error::Refused(format!(
-            "Skykeep does not know how to send “{other}”."
+            "iCloud-MCP does not know how to send “{other}”."
         ))),
     }
 }

@@ -1,6 +1,8 @@
 # iCloud-MCP
 
-iCloud-MCP is a local MCP server for Apple Notes, Reminders, Contacts, Calendar, Photos and iCloud Drive. It is a fork of [Skykeep](https://github.com/YashwanthKamireddi/Skykeep) and runs on its Rust engine. The command is `skykeep-mcp`. It speaks newline-delimited JSON-RPC over stdio, keeps its own private library directory and has no network listener. Reads come from a private local SQLite cache.
+iCloud-MCP is an MCP server for Apple iCloud Notes, Reminders, Contacts, Calendar, Photos and Drive. It is a fork of [Skykeep](https://github.com/YashwanthKamireddi/Skykeep) and runs on its Rust engine. The command is `skykeep-mcp`.
+
+It runs on your own computer, speaks newline-delimited JSON-RPC over stdio, keeps its own private library directory and has no network listener. Reads come from a private local SQLite cache.
 
 - Notes and Reminders can be read and changed. Changes wait in a local queue until `sync` sends them. A new reminder can repeat daily and alert at its due time or before it.
 - Contacts can be read and changed with `contacts_write`, one card per call. Deletions always need your approval.
@@ -38,7 +40,7 @@ mkdir -p ~/.local/bin
 install -m 755 target/release/skykeep-mcp ~/.local/bin/
 ```
 
-If your terminal then says it can't find `skykeep-mcp`, type `~/.local/bin/skykeep-mcp` wherever this guide says `skykeep-mcp`. `skykeep-mcp --help` lists every command.
+If your terminal then says it can't find `skykeep-mcp`, type `~/.local/bin/skykeep-mcp` wherever this guide says `skykeep-mcp`. `skykeep-mcp --help` lists every command, and `skykeep-mcp COMMAND --help` explains one of them.
 
 You need a terminal window that you open yourself. Don't run these commands through an AI assistant or chat: what you type there can end up in a transcript.
 
@@ -64,7 +66,7 @@ You need a terminal window that you open yourself. Don't run these commands thro
 
       Every choice asks on iCloud-MCP's approval card in the MCP client. Hermes, Claude Code and Codex offer the card when they connect. In a client without the card, a request that needs approval is refused with `approval_requires_form_client`, and nothing runs. A client that offers the card but connects with an MCP protocol version older than `2025-06-18` gets `approval_requires_newer_protocol`. A session where nobody answers, such as a scheduled job, gets `approval_timeout` after 3 minutes. In both cases nothing runs. Choice 4 keeps a folder's earlier `require-approval` setting: then every change asks on the card, and setup and status say so. Once a folder has had choice 1, 2 or 3, it can't go back to 4; set up a new folder instead. You can change the mode later with an `approval_mode:` line in `permissions.yaml` (see "Settings in the permissions file"). A line there wins over the choice made here, and setup changes that line to match when you choose again.
    After step 4, setup offers to write a starter permissions file. In it every deletion asks on the card. Press Enter to skip it.
-   5. **Check.** Setup checks everything it set up and prints what to paste into your MCP client's settings, all under the server name `icloud`: a JSON line for most clients, a `config.yaml` block for Hermes, and one command each for Claude Code and Codex.
+   5. **Check.** Setup checks everything it set up and prints what to paste into your MCP client's settings, all under the server name `icloud`: a JSON line for most clients, a `config.yaml` block for Hermes, and one command each for Claude Code and Codex. If your client had rules for the old name `skykeep`, such as tools it may call without asking, they don't apply to `icloud`; set them again there.
 
    Claude Code and Codex add the server with one command each, and setup prints both with your folder filled in. Replace `DIR` with the folder setup used:
 
@@ -117,7 +119,7 @@ For the code you pick a number from a short list: one sends the code to your App
 
 What is kept afterwards:
 
-- The session and trust tokens, in the storage chosen above. With the system keyring they are under the service name `skykeep-mcp`, one entry per folder. The server never imports a session from the Skykeep desktop app.
+- The session and trust tokens, in the storage chosen above. With the system keyring they are under the service name `skykeep-mcp`, one entry per folder. The server never imports a session from the upstream Skykeep desktop app.
 - A one-way account tag in the library, so a folder can't be reused for another Apple Account. Use a new folder for a different account.
 
 The folder must be owned by you, mode `0700`, and contain no symlinks or files readable by others. The one exception is `permissions.yaml`: a shared or linked copy doesn't stop the folder, and iCloud-MCP treats that file as unusable (see "Permissions file"). The server and the helper commands take an exclusive lock on it for each operation. If a command meets a request in progress it stops with `state_busy_retry`; run it again. A running server picks up the new session on its next request, without a restart.
@@ -130,13 +132,21 @@ The folder must be owned by you, mode `0700`, and contain no symlinks or files r
 skykeep-mcp --state-dir ~/.local/share/skykeep-mcp
 ```
 
-Configure your MCP client to start that command. Stdout carries protocol messages only. JSON-RPC batches are not supported and get an `Invalid Request` error. Several clients can share one directory: operations take turns on the lock, and a server that starts while another holds it still answers `initialize`, then returns `state_busy_retry` from each tool call until the lock is free. Setup prints the exact line to paste. The server never opens a keyring unlock dialog or a sign-in prompt; if the keyring is locked or the session has expired, tools return `login_required` with instructions, and with a protected file that is not unlocked they return `locked: run skykeep-mcp unlock in a terminal`. `auth_status` names the folder in that command, and says which other problem a protected file has, such as a damaged file or a blocked kernel key storage. While running it refreshes Notes and Reminders every five minutes; a failed pass waits for the next interval rather than retrying.
+Configure your MCP client to start that command. Stdout carries protocol messages only. JSON-RPC batches are not supported and get an `Invalid Request` error. Several clients can share one directory: operations take turns on the lock, and a server that starts while another holds it still answers `initialize`, then returns `state_busy_retry` from each tool call until the lock is free. Setup prints the exact line to paste. The server never opens a keyring unlock dialog or a sign-in prompt. If the keyring is locked, tools return `login_required_unlock_secure_storage`, and if the session has expired, `login_required`, each with instructions. With a protected file that is not unlocked they return `locked: run skykeep-mcp unlock in a terminal`. `auth_status` names the folder in that command, and says which other problem a protected file has, such as a damaged file or a blocked kernel key storage. While running it refreshes Notes and Reminders every five minutes; a failed pass waits for the next interval rather than retrying.
+
+Before the first sign-in, read tools answer `not_signed_in` instead of an empty list. Every error reply carries an `error` code, and where there is something to do, `instructions` with the next step: for `invalid_arguments` they name the field that is missing, unknown or of the wrong type.
+
+### Other apps
+
+Hermes ships Apple skills of its own (`apple-notes`, `apple-reminders`, `findmy`, `imessage`; see the [Hermes skills catalog](https://hermes-agent.nousresearch.com/docs/reference/skills-catalog)). They run only on macOS and drive the Mac apps. iCloud-MCP runs on Linux and talks to iCloud itself, including Calendar, Contacts, Photos and Drive.
+
+iCloud-MCP is a standard MCP server over stdio, so any MCP client can start it, not only Hermes; Claude Code and Codex, for example, start it, list its tools and run reads. Approval cards need a client that shows MCP form elicitation, as Hermes does. A client without them can't approve deletions or other changes that need a person: they are refused, and nothing runs.
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `auth_status` | Whether the folder is bound to an account, whether the protected file is locked, and how to sign in. Takes no arguments and never accepts secrets. |
+| `auth_status` | Whether the folder is signed in, and how to sign in. `signed_in` holds only as of the last sync or refresh that used the sign-in (`checked_at`); it may have changed since. `session_unverified` means none has used it yet. `login_required` with a `reason` means the last one could not use it; without a `reason` it means this folder was never signed in. `locked` means the keyring or the protected file is locked, `storage_problem` that the protected file is missing, damaged or can't be opened here, and `signed_out` that `skykeep-mcp logout` ran. Takes no arguments and never accepts secrets. |
 | `sync` | Refreshes Notes and Reminders, then sends queued changes. Nothing is sent when the refresh fails. `left_queue_this_sync` lists each write that left the queue, with outcome `cloudkit_accepted` or `finished_unconfirmed` (see Reminders below). `pending_recent` lists up to 20 writes still waiting, oldest first, each with a reason code (see "Why a change waits" below). |
 | `sync_status` | Last refresh per service, whether the last pass failed, counts of pending and refused changes, and per service `pending_recent` (why each waiting change waits, as of the last `sync`) and `refused_recent`. No network access. |
 | `notes_list`, `notes_folders`, `notes_search`, `notes_get` | Read the local cache. `notes_get` returns the plain text and the native formatting runs. |
@@ -202,7 +212,7 @@ Uploads read from, and downloads write into, one local folder. Name it with an `
 skykeep-mcp exchange --state-dir ~/.local/share/skykeep-mcp
 ```
 
-Like `setup`, `status` and `unlock`, it uses `~/.local/share/skykeep-mcp` when `--state-dir` is left out, and its flags can come in any order. A symbolic link among the folders above it (such as `/home` pointing to `/var/home`) is followed once, here, and the real path is kept; the exchange folder itself must not be a link. It creates `~/Skykeep-Exchange` (mode `0700`) if needed, writes its full path into the `exchange_folder:` line of `permissions.yaml` and prints the folder and the size limit. `--path DIR` picks another folder (its parent must exist); without it, the command keeps the folder the file names. `--max-mb N` changes the limit, 100 MB by default; the limit is set only here, not in the file. No MCP argument can name the folder or change the limit. Until a folder is named, `upload` and `download` are refused.
+Like `setup`, `status` and `unlock`, it uses `~/.local/share/skykeep-mcp` when `--state-dir` is left out, and its flags can come in any order. A symbolic link among the folders above it (such as `/home` pointing to `/var/home`) is followed once, here, and the real path is kept; the exchange folder itself must not be a link. It creates `~/iCloud-MCP-Exchange` (mode `0700`) if needed, writes its full path into the `exchange_folder:` line of `permissions.yaml` and prints the folder and the size limit. `--path DIR` picks another folder (its parent must exist); without it, the command keeps the folder the file names. `--max-mb N` changes the limit, 100 MB by default; the limit is set only here, not in the file. No MCP argument can name the folder or change the limit. Until a folder is named, `upload` and `download` are refused.
 
 The folder is checked before every upload and download. It must exist and be a folder of yours that no one else can change. It can't be a symbolic link, a system folder such as `/etc` or `/usr`, your home folder or a folder above it, or a folder inside a hidden folder (a name that starts with a dot, such as `.ssh`, `.gnupg` or `.aws`) or a folder whose name has "credential" or "keyring" in it. It also can't be iCloud-MCP's own folder, a folder inside it, or a folder that holds it. A folder that fails is refused with what is wrong and what to change; iCloud-MCP never falls back to another folder, such as the one `skykeep-mcp exchange` set up earlier. `status` shows the folder in use and says where it comes from.
 
@@ -320,7 +330,7 @@ Two settings can stand next to the rules, each on its own line without indentati
 ```yaml
 version: 1
 approval_mode: writes_only            # reads_and_writes, writes_only or yolo
-exchange_folder: ~/Skykeep-Exchange   # a full path, or one that starts with ~/
+exchange_folder: ~/iCloud-MCP-Exchange   # a full path, or one that starts with ~/
 rules:
   notes_write.delete:
     ask: client
@@ -345,130 +355,32 @@ Passwords, verification codes and the passphrase never go in the file. A line th
 
 ### Approval modes in detail
 
-Setup's choices 1 to 3 are the policy modes `reads_and_writes`, `writes_only` and
-`yolo` (the table is under "Get started"). They control reads, Notes, Reminders and
-Calendar, Drive, Contacts and Photos changes, and sync. Every deletion (Notes, Reminders,
-Contacts and Calendar deletes, Drive trash and delete forever, Photos moves to Recently
-Deleted) and every large Drive folder move or rename is always asked; see "Drive changes",
-"Contacts changes", "Calendar changes" and "Photos changes". A folder with no policy
-(choice 4) runs reads and routine changes without asking and asks on the card before every
-deletion and large Drive folder move or rename, like choice 3. The difference is that
-`skykeep-mcp require-approval` can make every change ask there.
+Setup's choices 1 to 3 are the approval modes `reads_and_writes`, `writes_only` and `yolo` (the table is under "Get started"). They decide whether reads, sync and changes in each service ask first. Every deletion is always asked: Notes, Reminders, Contacts and Calendar deletes, Drive trash and delete forever, and Photos moves to Recently Deleted. So is every move or rename of a large Drive folder; see "Drive changes", "Contacts changes", "Calendar changes" and "Photos changes". A folder with no mode (choice 4) runs reads and routine changes without asking and asks on the card before every deletion and large Drive folder move or rename, like choice 3. The difference is that `skykeep-mcp require-approval` can make every change ask there.
 
-The human-only command is `skykeep-mcp policy --state-dir DIR MODE`, where MODE is
-`reads_and_writes`, `writes_only`, or `yolo`. It requires a user-owned terminal,
-literal `confirm`, persists a fresh revision bound to the account and directory
-device/inode, writes `approval_mode: MODE` into `permissions.yaml`, and prints the saved
-record. It refuses before asking anything when the file has a mistake. It is never exposed as an MCP tool.
-Account changes or copied policies fail closed until the human explicitly migrates
-again. Existing terminal policy commands cannot override an activated new policy.
-No migration back to legacy is provided. In each mode that asks, every approval is
-a one-shot form in the MCP client.
+**Changing the mode.** Only a person can change it, with `skykeep-mcp policy --state-dir DIR MODE` in a terminal they opened themselves, where MODE is `reads_and_writes`, `writes_only` or `yolo`. The command asks you to type `confirm`, saves the mode for this Apple Account and this exact folder, writes `approval_mode: MODE` into `permissions.yaml` and says which mode it saved. It refuses before asking anything when the file has a mistake. No MCP tool can change the mode. A mode saved for another account, or in a folder that was copied or moved, stops working until a person chooses it again. Older terminal approvals can't override a newly saved mode, and a folder can't go back to having no mode.
 
-Clients that connect with protocol `2025-06-18` or newer and advertise
-`elicitation: {}` or `form: {}` receive standard `elicitation/create` with one
-required choice, `decision`. The server answers `initialize` with the version the
-client asked for, or `2025-11-25` for a newer one; an older version gets
-`2025-03-26` and no card. For `2025-06-18` the card lists the choices as `enum`
-with `enumNames` and has no `mode`. The card shows the call's name and arguments
-but leaves out its `_meta`, and escapes markup characters, non-ASCII characters and
-any underscore that is not inside a word. Only `accept` with exactly
-`content: {"decision": "approve"}`, or `"always_allow"` where the card offers it,
-authorizes execution. Unsupported versions, URL-only,
-absent, malformed and unknown-only capabilities fail closed when consent is needed.
-Terminal requests exist only for actions a rule sets to `ask: terminal`.
+**The approval card.** In each mode that asks, every approval is one card in the MCP client. A client gets the card when it connects with protocol `2025-06-18` or newer and says it can show forms (`elicitation: {}` or `form: {}`). The server answers with the version the client asked for, or `2025-11-25` for a newer one; an older version gets `2025-03-26` and no card. For `2025-06-18` the card lists the choices as `enum` with `enumNames` and has no `mode`. The card shows the tool and its arguments but leaves out the call's `_meta`. It escapes markup characters, control and non-ASCII characters, and any underscore that is not inside a word. The card has one required choice. Only "Approve this time", or "Always allow this action" where the card offers it, lets the action run. A client that can't show the card, connects with a protocol version older than `2025-06-18` or offers only links gets a refusal whenever approval is needed. Approval in the terminal (`skykeep-mcp approve`) exists only for actions a rule sets to `ask: terminal`.
 
-Consent is an in-memory continuation: the stdio loop resumes receiving messages
-while the human decides, without retaining the directory lock. One consent can be
-pending per connection; ping/status remain available. The originating RPC, complete
-arguments, account, policy revision and directory identity are retained privately;
-execution revalidates them under the operation lock. IDs use a UUID server namespace;
-only response envelopes can complete consent. Decline, cancel, malformed replies,
-policy changes, timeout (180 seconds), disconnect and replay cannot enqueue. No
-durable consent record is written. EOF drops the pending continuation. Cancellation
-after enqueue cannot roll back an already committed operation.
+**While a card is open.** The server keeps answering other messages while the person decides, and does not hold the folder's lock. One card can be open per connection; `ping`, `auth_status` and `sync_status` still answer. The server keeps the request, its full arguments, the account, the mode and the folder in memory only, and checks all of them again under the lock before the action runs. Only the client's answer to that card can approve it. A declined, cancelled or malformed answer, a change of mode, 180 seconds without an answer, a dropped connection or a repeated answer runs nothing. Nothing about an open card is written to disk, and closing the connection drops it. Cancelling after the change was queued can't undo it.
 
-The complete create/read-request JSON is sent without truncation, with markup and
-non-ASCII characters escaped as inert Unicode sequences. Existing-item mutations
-show the cached item, body/runs or reminder details, affected subtasks, containers,
-and prior queued operations. Execution checks that snapshot again under lock.
-In `reads_and_writes`, a first consent authorizes reading this preview; a second
-consent authorizes the mutation. A stale policy cannot authorize preview reads.
-Frames are limited to 64 KiB before parsing, arguments to 32 KiB before cloning,
-and escaped previews to 128 KiB before expansion. Parsed values also have depth
-and node limits. Oversized operations are rejected, never silently truncated. The owner
-must verify that the client exposes the entire preview before approving; source or
-SDK tests do not establish UI rendering. Forms request only approval, never secrets.
+**What the card shows.** It shows the whole request without cutting it short, with markup and non-ASCII characters escaped so they can't pose as the card's own text. For a change to an existing item it also shows the cached item, its text or reminder details, affected subtasks, its folder or list, and changes already queued for it; the server checks that copy again before running. In `reads_and_writes`, a first card allows reading that preview and a second card allows the change. Messages are limited to 64 KiB, arguments to 32 KiB and the escaped preview to 128 KiB, and deeply nested values are refused; anything larger is refused, never cut short. Whether the client shows the whole preview is up to the client, so check that before approving. A card only ever asks for approval, never for a password or code.
 
-Migration atomically marks existing pending writes refused with the reason
-`mcp_policy_migration_quarantine` and invalidates their grants. It also blocks old
-terminal proposals. It runs however large a legacy queue is. Every new enqueue
-records the exact native payload and policy revision in the same transaction.
-Coalescing requires previously authorized input and replaces the resulting payload
-grant. Tries can change during retry; operation bytes cannot. Changing policy
-quarantines even previously approved pending writes.
+**What happens to waiting changes when the mode changes.** Saving a mode sets aside every Notes and Reminders change still waiting to be sent, including ones approved before, with the reason `mcp_policy_migration_quarantine`, and older terminal requests can no longer be approved. This works however many changes are waiting. Each new queued change is stored together with the exact data it sends and the mode it was approved under. Two queued changes to the same item can be merged only when both were approved, and the merged change gets a new approval record.
 
-A grant binds only the cached rows the native sender reads for that operation:
-the item itself, a note's body for `save` (runs come from the payload), the subtasks for a reminder
-edit that moves lists, and the notes template for a note `create`. Lists, folders
-and other items are not bound, so refreshing them does not stale a grant. When an
-approved write changes the cached rows of another queued write (a subtask edit
-under a parent's list move, or a parent move that rewrites its subtasks), that
-write is re-bound in the same transaction, but only if its grant was current just
-before. An approved deletion that removes an item, or its subtasks, refuses older
-writes to those items with `superseded_by_approved_deletion`. A changed payload
-on another record is never re-authorized.
+**What an approval covers.** An approval covers only the cached data the sender uses for that change: the item itself, a note's text for `save`, the subtasks of a reminder that moves to another list, and the notes template for a new note. Refreshing other lists, folders or items doesn't make it stale. When an approved change rewrites the cached data of another queued change (a subtask under a parent that moves lists, for example), that change keeps its approval only if it was current just before. An approved deletion refuses older queued changes to the same items with `superseded_by_approved_deletion`. A changed request is never approved again on its own.
 
-Before session validation, sync checks read permission and the policy binding. In
-`reads_and_writes`, startup/timer refresh is refused without issuing a form;
-only an originating `sync` call can request one-shot refresh consent. The other
-modes permit background refresh. A queued write whose grant is missing, stale,
-oversized (including a bound item that grew past the serializer limit) or whose
-item is gone is refused alone with the reason `mcp_quarantine:<code>` and is never
-sent; the rest of the queue continues. The cache still shows a quarantined write as
-if it were on its way, so after its drain the same sync re-reads that service in
-full. A full pass replays only waiting writes, which drops the quarantined change
-from the cache. If that pass fails, the next sync that reaches the drain tries
-again. Until it succeeds, reads can still show the unsent change.
-Native sends recheck exact payload, account, policy, directory and the bound cached
-rows after refresh, before entering the writer, and refuse that write if they
-changed. A sync has a 60-second async deadline. At most 128 waiting writes are
-admitted. Timeout after a send begins means delivery may be uncertain; the
-original durable record remains for retry. These safeguards can refuse delivery
-after a concurrent remote edit of the same item. Apple-side conflict/merge
-behavior remains native engine behavior; local acceptance is not field-level
-remote verification.
+**What sync checks.** Before it uses the sign-in, sync checks that reading is allowed and that the saved mode still belongs to this account and folder. In `reads_and_writes`, the automatic refresh at startup and every five minutes doesn't run; only a `sync` call can ask for it on the card. The other modes refresh in the background. A queued change whose approval is missing, out of date, too large, or whose item is gone is set aside alone with the reason `mcp_quarantine:<code>` and never sent; the rest of the queue goes on. Because the cache still shows a set-aside change as if it were on its way, the same sync then reads that service again in full; until that works, reads can still show the unsent change. Right before sending, the server checks again that the change, account, mode, folder and cached item are what was approved, and refuses the change if anything differs. A sync stops after 60 seconds, and at most 128 waiting changes are taken in. If time runs out after sending began, the change may or may not have arrived; it stays queued to be sent again. These checks can refuse a change when someone edited the same item elsewhere at the same time. How Apple merges conflicting edits is up to Apple; a change accepted here is not checked field by field at Apple.
 
-The `sync` reply reports `queued` (waiting writes only), `refused` (all kept
-refused writes) and `refused_this_sync` with each write this sync refused or
-quarantined. `sync_status` reports per service the refused count and the 20 newest
-as `refused_recent`. Both show id, service, kind, record and a reason code, never
-payloads; engine and Apple reasons appear only as `refused_by_sync_engine`. A
-sync that fails after its local gate does not list its quarantines; `sync_status`
-does.
+**Reporting refused changes.** The `sync` reply reports `queued` (waiting changes only), `refused` (all refused changes kept) and `refused_this_sync`, each change this sync refused or set aside. `sync_status` reports, per service, how many were refused and the 20 newest as `refused_recent`. Both show the id, service, kind, item and a reason code, never the content; reasons from Apple or the sync engine appear only as `refused_by_sync_engine`. A sync that fails after its local check doesn't list the changes it set aside; `sync_status` does.
 
-Refused writes stay in the private directory and `sync_status` counts them. They
-do not count toward the 128 waiting writes. Up to 1024 refused writes are kept;
-after that new writes fail with `quarantine_full_retire_in_terminal`. The
-human-only `skykeep-mcp quarantine --state-dir DIR` lists them in a user-owned
-terminal (id, service, kind, record, reason; no payloads) and deletes exactly the
-listed rows after the literal answer `retire`. Retired writes are never sent. No
-MCP tool can resend, release or retire a refused write.
+Refused changes stay in the private folder and `sync_status` counts them. They don't count toward the 128 waiting changes. Up to 1024 are kept; after that, new changes fail with `quarantine_full_retire_in_terminal`. The person-only command `skykeep-mcp quarantine --state-dir DIR` lists them in a terminal you opened yourself (id, service, kind, item and reason, never the content) and deletes exactly those rows after you type `retire`. Retired changes are never sent. No MCP tool can send again, release or delete a refused change.
 
-Hermes 0.23.3 sends `initialize` with protocol `2025-11-25` and
-`elicitation: {form: {}, url: {}}`, so the server shows it the approval card. How
-each Hermes surface renders the three choices, and whether it returns the chosen
-value, was not tested here; a card answered without a choice counts as Deny. Claude
-Code 2.1.325 connects with protocol `2025-11-25` and Codex 0.169.0 with `2025-06-18`;
-both offer form elicitation, so both get the card. The interactive card in these two
-apps was not tested here. OpenClaw
-runtime interoperability is untested.
+Hermes 0.23.3 connects with protocol `2025-11-25` and says it can show forms and links (`elicitation: {form: {}, url: {}}`), so the server shows it the approval card. How each Hermes screen shows the three choices, and whether it sends the chosen one back, was not tested here; a card answered without a choice counts as Deny. Claude Code 2.1.325 connects with protocol `2025-11-25` and Codex 0.169.0 with `2025-06-18`; both say they can show forms, so both get the card. The interactive card in these two apps was not tested here. OpenClaw has not been tested.
 
 References: [MCP elicitation](https://modelcontextprotocol.io/specification/2025-11-25/client/elicitation),
 [MCP tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools),
 [Hermes configuration](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference).
-Client UI is client-owned. A same-user executable can forge consent or edit state;
-MCP-only approvals cannot defend against that authority.
+How the card looks is up to the client. A program running as your own user can fake an approval or edit the folder; approvals through MCP can't protect against that.
 
 ## Development
 

@@ -67,7 +67,7 @@ pub enum Outcome {
     Quit,
 }
 
-const NO_SECURE_STORAGE: &str = "Setup can't find a safe place on this computer to keep your sign-in. If you are inside Docker or a similar container, run Skykeep directly on the computer. On a desktop, log in to the desktop session first, then run skykeep-mcp setup again.";
+const NO_SECURE_STORAGE: &str = "Setup can't find a safe place on this computer to keep your sign-in. If you are inside Docker or a similar container, run iCloud-MCP directly on the computer. On a desktop, log in to the desktop session first, then run skykeep-mcp setup again.";
 const UNKNOWN_KEYRING: &str = "Setup can't tell whether your system keyring is unlocked. Log in to your desktop session, then run skykeep-mcp setup again.";
 const LOCKED_KEYRING: &str = "Your system keyring is locked. Unlock it (log in to your desktop session), then run skykeep-mcp setup again.";
 
@@ -78,7 +78,7 @@ pub fn default_dir() -> Option<PathBuf> {
 }
 
 /// A sentence for each error code the steps below can stop with. Codes never carry secrets.
-pub fn plain(code: &'static str) -> &'static str {
+pub fn plain(code: &str) -> &str {
     match code {
         "credentials_rejected" => "Apple didn't accept that Apple Account or password. Run skykeep-mcp setup again to retry.",
         "code_incorrect_or_expired" => "The verification code was wrong or expired three times. Run skykeep-mcp setup again to get a new code.",
@@ -89,7 +89,7 @@ pub fn plain(code: &'static str) -> &'static str {
         "secure_storage_unavailable" => "The sign-in could not be saved in the chosen storage. Run skykeep-mcp status to see why.",
         "regional_login_retry_required" => "Apple asked to sign in again. Run skykeep-mcp setup again.",
         "account_mismatch_use_new_state_directory" => "This folder belongs to a different Apple Account. Run setup again and choose a new folder for this account.",
-        "security_key_sign_in_unsupported" => "This account signs in with a security key, which skykeep-mcp can't use yet.",
+        "security_key_sign_in_unsupported" => "This account signs in with a security key, which iCloud-MCP can't use yet.",
         "too_many_code_requests_try_later" => "Setup already asked Apple for several codes. Wait a while, then run skykeep-mcp setup again.",
         "input_cancelled" => "Setup stopped. Run skykeep-mcp setup again to continue where you left off.",
         "input_timeout" => "Setup waited three minutes without an answer and stopped. Run skykeep-mcp setup again to continue.",
@@ -192,7 +192,7 @@ fn prepare(path: &Path) -> Result<PathBuf, &'static str> {
 }
 
 fn step_folder(console: &mut dyn Console, suggested: &Path) -> Result<PathBuf, &'static str> {
-    console.say("\nStep 1 of 5: Folder\nSkykeep keeps its private data in one folder: its cache, its settings and the choice of where your sign-in is kept.")?;
+    console.say("\nStep 1 of 5: Folder\niCloud-MCP keeps its private data in one folder: its cache, its settings and the choice of where your sign-in is kept.")?;
     loop {
         let answer = console.ask(&format!(
             "Folder: {}\nPress Enter to use it, or type another folder: ",
@@ -213,7 +213,7 @@ fn step_folder(console: &mut dyn Console, suggested: &Path) -> Result<PathBuf, &
             .filter(|h| !h.is_empty())
             .and_then(|h| PathBuf::from(h).canonicalize().ok());
         if home.is_some_and(|h| path.canonicalize().is_ok_and(|p| p == h)) {
-            console.say("Skykeep needs a folder of its own, not your home folder. Press Enter for the suggested folder, or type for example ~/.local/share/skykeep-mcp.")?;
+            console.say("iCloud-MCP needs a folder of its own, not your home folder. Press Enter for the suggested folder, or type for example ~/.local/share/skykeep-mcp.")?;
             continue;
         }
         if !path.exists() {
@@ -388,7 +388,7 @@ pub async fn run(
 }
 
 async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcome, &'static str> {
-    c.say("Skykeep setup: five short steps. You can stop at any time with Ctrl-C and run setup again later; it continues where it stopped.")?;
+    c.say("iCloud-MCP setup: five short steps. You can stop at any time with Ctrl-C and run setup again later; it continues where it stopped.")?;
     let suggested = options
         .state_dir
         .clone()
@@ -470,7 +470,7 @@ async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcom
         "args": ["--state-dir", folder],
     });
     c.say(&format!(
-        "\nMost MCP clients: add this line to the list of servers in the client's settings:\n\"icloud\": {config}\n\nHermes: add this to config.yaml (if it already has mcp_servers:, add only the icloud part under it):\nmcp_servers:\n  icloud:\n    command: {}\n    args:\n      - \"--state-dir\"\n      - {}\n    enabled: true\n    sampling:\n      enabled: false\n\nClaude Code and Codex: run one of these in a terminal:\nclaude mcp add --scope user icloud -- {launch}\ncodex mcp add icloud -- {launch}",
+        "\nMost MCP clients: add this line to the list of servers in the client's settings:\n\"icloud\": {config}\n\nHermes: add this to config.yaml (if it already has mcp_servers:, add only the icloud part under it):\nmcp_servers:\n  icloud:\n    command: {}\n    args:\n      - \"--state-dir\"\n      - {}\n    enabled: true\n    sampling:\n      enabled: false\n\nClaude Code and Codex: run one of these in a terminal:\nclaude mcp add --scope user icloud -- {launch}\ncodex mcp add icloud -- {launch}\n\nThe server's name in the client is now icloud. Rules the client keeps for the old name skykeep, such as tools it may call without asking, don't apply to icloud: set them again there.",
         yaml(&command),
         yaml(&folder),
     ))?;
@@ -545,7 +545,7 @@ fn step_storage(console: &mut dyn Console, env: &Env, dir: &Path) -> Result<bool
                         let _ = old.clear();
                     }
                     let _ = std::fs::remove_file(dir.join("cookies.json"));
-                    console.say("Setup could not reach the system keyring, so an older sign-in may stay there under the name skykeep-mcp. Nothing of it is used from now on.")?;
+                    console.say("Setup could not reach the system keyring, so an older sign-in may stay there under the service name \"skykeep-mcp\". Nothing of it is used from now on.")?;
                     storage::set_kind(dir, Kind::ProtectedFile)?;
                     new_protected(console, env, dir)?;
                     Ok(true)
@@ -623,7 +623,7 @@ fn step_storage(console: &mut dyn Console, env: &Env, dir: &Path) -> Result<bool
                 (KeyringState::Ready, true) => {
                     let n = choose(
                         console,
-                        "  1. My computer's password store (the system keyring). Recommended.\n  2. A protected file in the Skykeep folder, opened with a passphrase you choose. After each restart you run skykeep-mcp unlock once.\nChoose 1 or 2 (Enter picks 1): ",
+                        "  1. My computer's password store (the system keyring). Recommended.\n  2. A protected file in the iCloud-MCP folder, opened with a passphrase you choose. After each restart you run skykeep-mcp unlock once.\nChoose 1 or 2 (Enter picks 1): ",
                         2,
                         Some(1),
                     )?;
@@ -699,7 +699,7 @@ pub fn weak_passphrase(passphrase: &str) -> Option<String> {
 /// Asks for a new passphrase twice and creates the protected file with it.
 fn new_protected(console: &mut dyn Console, env: &Env, dir: &Path) -> Result<(), &'static str> {
     console.say(&format!(
-        "Choose a passphrase for the protected file: at least {} characters. Nothing is shown as you type. Skykeep can't recover it; if you lose it, run skykeep-mcp setup again and start over.",
+        "Choose a passphrase for the protected file: at least {} characters. Nothing is shown as you type. iCloud-MCP can't recover it; if you lose it, run skykeep-mcp setup again and start over.",
         storage::MIN_PASSPHRASE
     ))?;
     for _ in 0..3 {
@@ -751,7 +751,7 @@ pub fn unlock(
     };
     if !dir.exists() {
         return Err(c.scope(&format!(
-            "No Skykeep folder at {}. Run skykeep-mcp setup first.",
+            "No iCloud-MCP folder at {}. Run skykeep-mcp setup first.",
             dir.display()
         )));
     }
@@ -766,7 +766,7 @@ fn unlock_in(
     hours: Option<u32>,
 ) -> Result<(), &'static str> {
     if !dir.exists() {
-        return Err("No Skykeep folder there yet. Run skykeep-mcp setup first.");
+        return Err("No iCloud-MCP folder there yet. Run skykeep-mcp setup first.");
     }
     let held = PrivateState::open(dir).map_err(|code| match code {
         "state_busy_retry" => {
@@ -1061,7 +1061,7 @@ fn offer_permissions(console: &mut dyn Console, dir: &Path) -> Result<(), &'stat
     let n = choose(
         console,
         &format!(
-            "\nOptional: a permissions file says, for each tool and action, whether Skykeep runs it, asks you first or refuses it. Setup can write a starter file to {}. In it, every deletion asks on the approval card in your MCP client, and it lists every name you can use. Skykeep uses the file as soon as it exists, and you can change it later.\n{STARTER_CHOICE}",
+            "\nOptional: a permissions file says, for each tool and action, whether iCloud-MCP runs it, asks you first or refuses it. Setup can write a starter file to {}. In it, every deletion asks on the approval card in your MCP client, and it lists every name you can use. iCloud-MCP uses the file as soon as it exists, and you can change it later.\n{STARTER_CHOICE}",
             path.display()
         ),
         2,

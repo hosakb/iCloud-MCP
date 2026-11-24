@@ -202,7 +202,7 @@ pub fn check(env: &Env, dir: &Path) -> Report {
     let shown = dir.display().to_string();
     if !dir.exists() {
         report.fix(
-            format!("No Skykeep folder at {shown}."),
+            format!("No iCloud-MCP folder at {shown}."),
             "Run skykeep-mcp setup.",
         );
         return report;
@@ -271,7 +271,7 @@ pub fn check(env: &Env, dir: &Path) -> Report {
         Some(Err(_)) => {
             // The storage answered a moment ago; a failed read now is still a problem.
             report.fix(
-                "Skykeep couldn't read the saved sign-in from its storage.",
+                "iCloud-MCP couldn't read the saved sign-in from its storage.",
                 "Run skykeep-mcp status again in a moment. If it keeps failing, run skykeep-mcp setup.",
             );
             None
@@ -423,7 +423,7 @@ fn storage_lines(env: &Env, dir: &Path, report: &mut Report) -> Option<quince_au
                         if env.holder.available() {
                             "Log in to your desktop session so the keyring starts, or run skykeep-mcp setup to use a protected file instead."
                         } else {
-                            "Log in to your desktop session so the keyring starts. If you are inside Docker or a similar container, run Skykeep directly on the computer."
+                            "Log in to your desktop session so the keyring starts. If you are inside Docker or a similar container, run iCloud-MCP directly on the computer."
                         },
                     );
                     None
