@@ -1061,8 +1061,9 @@ fn offer_permissions(console: &mut dyn Console, dir: &Path) -> Result<(), &'stat
     let n = choose(
         console,
         &format!(
-            "\nOptional: a permissions file says, for each tool and action, whether iCloud-MCP runs it, asks you first or refuses it. Setup can write a starter file to {}. In it, every deletion asks on the approval card in your MCP client, and it lists every name you can use. iCloud-MCP uses the file as soon as it exists, and you can change it later.\n{STARTER_CHOICE}",
-            path.display()
+            "\nOptional: a permissions file says, for each tool and action, whether iCloud-MCP runs it, asks you first or refuses it. Setup can write a starter file to {}. In it, every deletion asks on the approval card in your MCP client, and it lists every name you can use. iCloud-MCP uses the file as soon as it exists, and you can change it later. Once this file exists, only its {}: line names the exchange folder for Drive and Photos; a folder set up earlier with skykeep-mcp exchange is written into it if it still passes the checks.\n{STARTER_CHOICE}",
+            path.display(),
+            crate::permissions::EXCHANGE_KEY
         ),
         2,
         Some(2),

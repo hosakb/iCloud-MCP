@@ -476,6 +476,7 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
         "unknown_tool" => Some("No tool has that name. Call tools/list to see the tools this server has, then use one of those names.".to_string()),
         "not_found" => Some("Nothing with that ID or path is in the local copy. Take the ID from a list or search reply. Right after a create, the item is only in iCloud until the next sync (Notes and Reminders) or refresh (calendar_refresh, contacts_refresh, photos_refresh, or drive_refresh on its folder): run that first, then read it again.".to_string()),
         "already_initialized" => Some("The server is already initialized in this connection. Go on with tools/list or tools/call.".to_string()),
+        sync::ITEM_CHANGED => Some(sync::ITEM_CHANGED_STEP.to_string()),
         "conflict" => Some("The item changed since you read it, so nothing was queued. Read it again with notes_get or reminders_get, then ask again with its current base_etag.".to_string()),
         "mutation_refused" => Some(format!("The change could not be saved to the local queue, so nothing was queued. In your own terminal, run {} to check this folder, then try again.", status::with_dir("skykeep-mcp status", dir))),
         "drive_read_failed_nothing_sent" => Some("Apple's answer about the item could not be read, so nothing was sent. Try again in a moment; if it keeps failing, run drive_refresh on the folder.".to_string()),
@@ -1745,8 +1746,12 @@ impl Server {
         Ok(refused
             .iter()
             .map(|r| {
-                json!({"id":r.change.id,"service":plain(&r.change.service, 40),"kind":plain(&r.change.kind, 40),
-                    "record":plain(&r.change.record, 200),"reason":plain(&r.reason, 160),"refused_at":r.refused_at})
+                let mut row = json!({"id":r.change.id,"service":plain(&r.change.service, 40),"kind":plain(&r.change.kind, 40),
+                    "record":plain(&r.change.record, 200),"reason":plain(&r.reason, 160),"refused_at":r.refused_at});
+                if r.reason.strip_prefix("mcp_quarantine:") == Some(sync::ITEM_CHANGED) {
+                    row["next_step"] = json!(sync::ITEM_CHANGED_STEP);
+                }
+                row
             })
             .collect())
     }

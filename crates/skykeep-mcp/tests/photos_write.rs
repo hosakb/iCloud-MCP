@@ -926,6 +926,27 @@ async fn an_upload_without_an_exchange_folder_is_refused() {
         .contains("skykeep-mcp exchange"));
 }
 
+/// Issue 75: an exchange_folder line the file can't use refuses the upload with the file to
+/// fix; the folder set up before is not used.
+#[tokio::test]
+async fn an_upload_with_a_broken_exchange_line_is_refused() {
+    let mut f = fixture(Some("yolo")).await;
+    jpeg(&f.exchange.join("IMG_0001.JPG"), 4096);
+    rules(f.dir.path(), "exchange_folder: rel/ex\n");
+    let reply = call(
+        &mut f.server,
+        json!({"action":"upload","local":"IMG_0001.JPG"}),
+    )
+    .await;
+    let value = text(&reply);
+    assert_eq!(value["error"], "exchange_folder_file_unusable", "{reply}");
+    assert!(value["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("permissions.yaml"));
+    assert!(asked(&f.remote).await.is_empty());
+}
+
 #[tokio::test]
 async fn a_move_to_recently_deleted_always_asks_and_never_offers_always_allow() {
     // Under writes_only: the card, without Always allow, even with an allow rule.

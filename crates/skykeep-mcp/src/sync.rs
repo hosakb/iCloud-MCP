@@ -62,7 +62,10 @@ fn send_context(
                 .note(&p.record)
                 .map_err(|_| "library_unavailable")?
                 .ok_or("not_found")?;
-            // `Note.runs` never serializes; the sender takes runs from the payload.
+            // `Note.runs` never serializes; the sender takes runs from the payload. A save is
+            // also checked against Apple's own copy just before it is sent
+            // ([`note_changed_on_icloud`]): each sync lays a waiting save over the copy it
+            // reads, so the cache can't show a change on iCloud to the saved note.
             if kind == "save" {
                 item.body = library
                     .note_body(&p.record)
@@ -96,14 +99,120 @@ fn send_context(
     }
 }
 
+/// The container and zone Apple keeps notes in, as the native sender names them.
+const NOTES_CONTAINER: &str = "com.apple.notes";
+const NOTES_ZONE: &str = "Notes";
+
+/// Whether Apple's copy of a note moved on since a waiting save was typed: the note is gone,
+/// its text is not the text the save was typed over, or, for a save that sets formatting
+/// of its own, Apple's formatting is not the formatting it was typed over (compared as
+/// `quince_icloud::notes::same_formatting` does, so the same formatting cut into other runs
+/// is no change). Apple already holding the save's own text, and its own formatting when it
+/// sets any, is no change either: a send that landed but whose reply was lost. A text-only
+/// save writes its text into Apple's current document and keeps
+/// Apple's formatting, so its formatting is not compared; nor is formatting the save was
+/// typed over that does not describe its text (the cache can keep the runs of an earlier
+/// text). Read just before the send, after the sync's own read, so a change between that
+/// read and this check is caught too. An answer that can't be read is left to the sender,
+/// which refuses it itself.
+/// `client` reads the notes container ([`NOTES_CONTAINER`]).
+async fn note_changed_on_icloud(
+    client: quince_icloud::cloudkit::ZoneClient<'_>,
+    p: &quince_core::outbox::Pending,
+) -> Result<bool, quince_icloud::Error> {
+    use quince_icloud::ckdocument as doc;
+    let Ok(save) = serde_json::from_str::<quince_sync::notes::NoteSave>(&p.payload) else {
+        return Ok(false);
+    };
+    let Some(current) = client.lookup_record(NOTES_ZONE, &p.record).await? else {
+        return Ok(true);
+    };
+    let Some(encoded) = current
+        .pointer("/fields/TextDataEncrypted/value")
+        .and_then(Value::as_str)
+    else {
+        return Ok(false);
+    };
+    let encoded = doc::with_apple_line_breaks_in_base64(encoded);
+    let (Some(theirs), Some(base)) = (doc::stored_text_from_base64(&encoded), save.base) else {
+        return Ok(false);
+    };
+    // Apple already holds this save (a send that landed, its reply lost): no change on
+    // iCloud. The sender then finds nothing to write and finishes quietly.
+    let saved = doc::apple_line_breaks(&save.body);
+    let holds_formatting = match &save.runs {
+        None => true,
+        Some(runs) => quince_icloud::notes::same_formatting(
+            &saved,
+            &doc::runs_with_apple_line_breaks(&save.body, runs.clone()),
+            &doc::runs_from_base64(&encoded),
+        ),
+    };
+    if saved == theirs && holds_formatting {
+        return Ok(false);
+    }
+    let typed_over = doc::apple_line_breaks(&base);
+    if typed_over != theirs {
+        return Ok(true);
+    }
+    if let (Some(_), Some(base_runs)) = (save.runs, save.base_runs) {
+        let base_runs = doc::runs_with_apple_line_breaks(&base, base_runs);
+        if quince_icloud::notes::canonical_runs(&typed_over, &base_runs).is_some()
+            && !quince_icloud::notes::same_formatting(
+                &typed_over,
+                &base_runs,
+                &doc::runs_from_base64(&encoded),
+            )
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn bounded_context(context: Value) -> Result<Value, &'static str> {
     crate::bounded_value(&context, crate::MAX_ARGUMENT_BYTES)?;
-    Ok(context)
+    Ok(without_version_stamps(context))
 }
+
+/// A context without the etag and modified time of its items. Apple gives a note or reminder
+/// a new etag (and time) when it next reads it back, even one just made, with nothing else
+/// changed, so neither is compared. What is compared is the item as the cache showed it when
+/// the write was queued and as it shows it after this sync's read from Apple. The senders
+/// then write with an etag: some send the cached one, and CloudKit refuses the write if
+/// Apple's record changed since that read; others look the record up first and write over
+/// what Apple holds then. A change made on another device between this sync's read and the
+/// send is not caught here, except for a note save, which is checked against Apple's copy
+/// just before it is sent ([`note_changed_on_icloud`]).
+fn without_version_stamps(mut context: Value) -> Value {
+    fn strip(item: &mut Value) {
+        if let Some(item) = item.as_object_mut() {
+            item.remove("etag");
+            item.remove("modifiedAt");
+        }
+    }
+    if let Some(context) = context.as_object_mut() {
+        if let Some(item) = context.get_mut("item") {
+            strip(item);
+        }
+        if let Some(children) = context.get_mut("children").and_then(Value::as_array_mut) {
+            children.iter_mut().for_each(strip);
+        }
+    }
+    context
+}
+
+/// The item a queued write is bound to changed on iCloud (or was deleted there) after the
+/// write was queued, so the write is never sent.
+pub(crate) const ITEM_CHANGED: &str = "item_changed_on_icloud_since_queued";
+
+/// The next step after [`ITEM_CHANGED`].
+/// It names [`MAX_REFUSED`]; a test holds the two together.
+pub(crate) const ITEM_CHANGED_STEP: &str = "The note or reminder changed on iCloud after this change was queued, or was deleted there, so the change was not sent. If it still exists, read it again with notes_get or reminders_get and ask again. If it was deleted there is nothing to redo. The set-aside change stays in the list, and counts toward the limit of 1024 set-aside changes, until you retire it with skykeep-mcp quarantine in your own terminal.";
 
 /// Grant failures that belong to one queued write. Anything else (an unreadable library,
 /// a changed policy, account or directory) still stops the whole pass.
-const QUARANTINABLE: [&str; 12] = [
+const QUARANTINABLE: [&str; 13] = [
     "payload_too_large",
     "preview_too_large",
     "invalid_preview",
@@ -111,6 +220,7 @@ const QUARANTINABLE: [&str; 12] = [
     "authorization_too_large",
     "invalid_authorization",
     "write_authorization_stale",
+    ITEM_CHANGED,
     "write_mode_stricter",
     "not_found",
     "operation_too_large",
@@ -285,7 +395,11 @@ fn shown_reason(reason: &str) -> &str {
 
 /// A refused write as MCP may show it: identifiers and a reason code, never the payload.
 pub(crate) fn refused_view(r: &quince_core::outbox::RefusedBrief) -> Value {
-    json!({"id":r.id,"service":r.service,"kind":r.kind,"record":r.record,"reason":shown_reason(&r.reason)})
+    let mut view = json!({"id":r.id,"service":r.service,"kind":r.kind,"record":r.record,"reason":shown_reason(&r.reason)});
+    if r.reason.strip_prefix("mcp_quarantine:") == Some(ITEM_CHANGED) {
+        view["instructions"] = json!(ITEM_CHANGED_STEP);
+    }
+    view
 }
 
 fn refused_ids(dir: &Path) -> Result<Vec<i64>, &'static str> {
@@ -367,9 +481,32 @@ fn authorization_check(
     if !(fields == 3 || (fields == 4 && grant["mode"].is_string()))
         || grant["policy"] != binding.policy
         || grant["pending"] != pending_value(p)
-        || (context && grant["context"] != send_context(library, p)?)
     {
         return Err("write_authorization_stale");
+    }
+    // The item itself changed, or is gone, since the write was queued. A grant recorded
+    // before the etag and time were left out is compared without them too. A create's
+    // context holds no item; a change there is a stale grant.
+    if context {
+        let mut queued = without_version_stamps(grant["context"].clone());
+        let mut now = match send_context(library, p) {
+            Err("not_found") => return Err(ITEM_CHANGED),
+            now => now?,
+        };
+        // A cached formatting value, recorded by a build before the note save was checked
+        // against Apple's copy, means nothing now: Apple's copy is compared instead.
+        for context in [&mut queued, &mut now] {
+            if let Some(context) = context.as_object_mut() {
+                context.remove("runs");
+            }
+        }
+        if queued != now {
+            return Err(if queued.get("item").is_some() {
+                ITEM_CHANGED
+            } else {
+                "write_authorization_stale"
+            });
+        }
     }
     // Queued under a looser mode than the one in force now: never sent.
     let queued = grant["mode"].as_str().unwrap_or(&stored.mode).to_string();
@@ -529,20 +666,46 @@ async fn sync_pass(
                 let http = &ctx.http;
                 let params = ctx.params.clone();
                 async move {
-                    if configured {
-                        let mut library = data.lock().await;
-                        if let Err(reason) = authorized(&library, dir, &p) {
+                    // The drain refuses a row set aside here; its grant is emptied as before
+                    // the pass, so it can never be sent under this grant again.
+                    let set_aside = |reason: &str| {
+                        let reason = format!("mcp_quarantine:{reason}");
+                        let id = p.id;
+                        async move {
+                            let mut library = data.lock().await;
+                            let _ = library.set_state(&format!("mcp.authorization.{id}"), "");
                             let _ = library.set_state(&reread_key(service), "1");
-                            return Err(quince_icloud::Error::Refused(format!(
-                                "mcp_quarantine:{reason}"
-                            )));
+                            quince_icloud::Error::Refused(reason)
+                        }
+                    };
+                    if configured {
+                        let refused = authorized(&*data.lock().await, dir, &p).err();
+                        if let Some(reason) = refused {
+                            return Err(set_aside(reason).await);
                         }
                     }
                     let (id, tries) = (p.id, p.tries);
-                    let sent = if service == "notes" {
-                        quince_sync::notes::send(data, http, root, params, p).await
+                    // A note save is also checked against Apple's copy, read now.
+                    let checked = if configured && service == "notes" && p.kind == "save" {
+                        let client = quince_icloud::cloudkit::ZoneClient::new(
+                            http,
+                            root,
+                            NOTES_CONTAINER,
+                            params.clone(),
+                        );
+                        note_changed_on_icloud(client, &p).await
                     } else {
-                        quince_sync::reminders::send(data, http, root, params, p).await
+                        Ok(false)
+                    };
+                    let sent = match checked {
+                        Ok(true) => return Err(set_aside(ITEM_CHANGED).await),
+                        Err(e) => Err(e),
+                        Ok(false) if service == "notes" => {
+                            quince_sync::notes::send(data, http, root, params, p).await
+                        }
+                        Ok(false) => {
+                            quince_sync::reminders::send(data, http, root, params, p).await
+                        }
                     };
                     // Kept queued (the queue's own rule): note why, as a code, for the reply.
                     if let Err(e) = &sent {
