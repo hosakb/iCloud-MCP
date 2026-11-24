@@ -237,6 +237,19 @@ fn unlock_rejects_bad_hours_and_older_commands_keep_their_usage() {
 }
 
 #[test]
+fn version_prints_the_release_version_and_exits_zero() {
+    for flag in ["--version", "-V"] {
+        let out = program().arg(flag).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{flag}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            "icloud-mcp 0.1.0-beta.1\n"
+        );
+        assert!(out.stderr.is_empty(), "{flag}");
+    }
+}
+
+#[test]
 fn help_lists_every_command_and_exits_zero() {
     for args in [vec!["--help"], vec!["-h"], vec!["help"]] {
         let out = program().args(&args).output().unwrap();
