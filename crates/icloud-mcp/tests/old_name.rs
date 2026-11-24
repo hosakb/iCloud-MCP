@@ -17,6 +17,8 @@ const ALLOWED: &[&str] = &[
     ".local/share/skykeep-mcp",
     // Partial downloads the program left under its old name, still cleaned up.
     ".skykeep-download-",
+    // The kernel key name of an unlock under the old name, only ever forgotten.
+    "skykeep-mcp:{}:{}",
     // Inputs of stored fingerprints: changing them would make saved approvals stale.
     "skykeep-calendar-notes:",
     "skykeep-permissions:",
@@ -364,7 +366,8 @@ fn the_architecture_diagram_says_icloud_mcp() {
 }
 
 /// The README, the docs and the workflow name the old name only where they credit the
-/// upstream project, for the old folder, or for the keyring service the upstream engine sets.
+/// upstream project, for the old folder, for the old command, or for the keyring service the
+/// upstream engine sets.
 #[test]
 fn the_docs_name_the_old_name_only_for_upstream_and_the_old_folder() {
     let root = crate_dir().join("../..");
@@ -388,6 +391,8 @@ fn the_docs_name_the_old_name_only_for_upstream_and_the_old_folder() {
     let mut stray = Vec::new();
     for doc in &docs {
         let text = std::fs::read_to_string(doc).unwrap();
+        // The README tells people who still run the old command to switch.
+        let text = text.replace("old `skykeep-mcp` command", "");
         for line in text.lines().filter(|line| holds_old_name(line)) {
             let credit = ["fork", "upstream", "Upstream", "Yashwanth Kamireddi"]
                 .iter()

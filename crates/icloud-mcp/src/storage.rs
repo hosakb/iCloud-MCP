@@ -138,6 +138,14 @@ pub fn key_name(dir: &Path) -> Result<String, &'static str> {
     Ok(format!("icloud-mcp:{}:{}", meta.dev(), meta.ino()))
 }
 
+/// The key name `dir` had under the program's old name. Only ever forgotten, never read, so
+/// a key left by an unlock under the old name doesn't stay until the next restart.
+fn old_key_name(dir: &Path) -> Result<String, &'static str> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(dir).map_err(|_| "state_unavailable")?;
+    Ok(format!("skykeep-mcp:{}:{}", meta.dev(), meta.ino()))
+}
+
 /// The names and values the file holds, cleared from memory when dropped.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
@@ -354,7 +362,7 @@ pub fn remove_protected(env: &Env, dir: &Path) -> Result<(), &'static str> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err("state_unavailable"),
     }
-    if let Ok(name) = key_name(dir) {
+    for name in [key_name(dir), old_key_name(dir)].into_iter().flatten() {
         let _ = env.holder.forget(&name);
     }
     Ok(())
@@ -437,4 +445,36 @@ pub fn protected_problem(dir: &Path) -> Option<Closed> {
         return None;
     }
     protected_state(env(), dir).err()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keyhold::MemoryHolder;
+
+    /// Removing the protected file forgets the folder's key under the new and the old name,
+    /// and no other key. Synthetic folder and keys only.
+    #[test]
+    fn removing_the_protected_file_forgets_the_key_under_both_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = MemoryHolder::default();
+        let new = key_name(dir.path()).unwrap();
+        let old = old_key_name(dir.path()).unwrap();
+        assert!(new.starts_with("icloud-mcp:"));
+        assert_ne!(new, old);
+        let other = "icloud-mcp:0:0-synthetic-other";
+        for name in [new.as_str(), old.as_str(), other] {
+            holder.put(name, &[7; 32], None).unwrap();
+        }
+        std::fs::write(dir.path().join(PROTECTED_FILE), b"synthetic").unwrap();
+        let env = Env {
+            keyring: Box::new(|_| Err(std::io::Error::other("no keyring in this test"))),
+            holder: Box::new(holder),
+        };
+        remove_protected(&env, dir.path()).unwrap();
+        assert!(!dir.path().join(PROTECTED_FILE).exists());
+        assert_eq!(env.holder.get(&new), Ok(None));
+        assert_eq!(env.holder.get(&old), Ok(None));
+        assert!(env.holder.get(other).unwrap().is_some());
+    }
 }
