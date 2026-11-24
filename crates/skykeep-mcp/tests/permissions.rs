@@ -401,7 +401,11 @@ async fn ask_client_shows_the_card_where_forms_exist_and_says_what_to_do_where_n
     assert_eq!(result["error"], "approval_requires_form_client");
     assert!(result.get("request_id").is_none(), "{result}");
     let message = result["message"].as_str().unwrap();
-    for said in ["approval card", "nothing ran", "Hermes"] {
+    for said in [
+        "approval card",
+        "nothing ran",
+        "Hermes, Claude Code or Codex",
+    ] {
         assert!(message.contains(said), "{message}");
     }
     // Nothing sends the person to the terminal by default.

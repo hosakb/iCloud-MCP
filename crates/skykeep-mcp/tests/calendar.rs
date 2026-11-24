@@ -810,7 +810,9 @@ async fn reads_and_writes_binds_each_calendar_read_to_one_approval() {
     let form = call(&mut server, 3, "calendar_get", json!({"guid":"F-1"})).await;
     assert_eq!(form["method"], "elicitation/create", "{form}");
     let message = form["params"]["message"].as_str().unwrap();
-    assert!(message.contains("calendar\\u005fget"), "{message}");
+    assert!(message.contains("calendar_get"), "{message}");
+    // An underscore inside a word is no longer escaped on the card.
+    assert!(!message.contains("calendar\\u005fget"), "{message}");
     assert!(!message.contains("Gym"), "no content before approval");
     assert_eq!(
         text(&call(&mut server, 4, "calendar_calendars", json!({})).await)["error"],
@@ -862,7 +864,7 @@ async fn refresh_prompt_names_calendar_only_and_sends_nothing() {
     .await;
     assert_eq!(form["method"], "elicitation/create", "{form}");
     let message = form["params"]["message"].as_str().unwrap();
-    assert!(message.contains("calendar\\u005frefresh"), "{message}");
+    assert!(message.contains("calendar_refresh"), "{message}");
     assert!(
         message.contains("\"services\": \\u005b\n      \"calendar\"\n    \\u005d"),
         "{message}"
@@ -1621,10 +1623,7 @@ async fn a_default_refresh_is_approved_for_the_dates_it_shows() {
     let message = form["params"]["message"].as_str().unwrap();
     // The operation carries the resolved dates, shown beside the days Apple is asked.
     assert!(message.matches("\"from\": \"20").count() >= 2, "{message}");
-    assert!(
-        message.contains("asked\\u005fapple\\u005fdays"),
-        "{message}"
-    );
+    assert!(message.contains("asked_apple_days"), "{message}");
 }
 
 #[tokio::test]

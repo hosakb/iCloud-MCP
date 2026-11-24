@@ -1192,7 +1192,9 @@ async fn reads_and_writes_binds_each_drive_read_to_one_approval() {
     let form = call(&mut server, 3, "drive_list", json!({"path":"/Documents"})).await;
     assert_eq!(form["method"], "elicitation/create", "{form}");
     let message = form["params"]["message"].as_str().unwrap();
-    assert!(message.contains("drive\\u005flist"), "{message}");
+    assert!(message.contains("drive_list"), "{message}");
+    // An underscore inside a word is no longer escaped on the card.
+    assert!(!message.contains("drive\\u005flist"), "{message}");
     assert!(!message.contains("Scan"), "no content before approval");
     assert_eq!(
         text(&call(&mut server, 4, "drive_search", json!({"query":"scan"})).await)["error"],
@@ -1226,7 +1228,7 @@ async fn reads_and_writes_binds_each_drive_read_to_one_approval() {
     .await;
     assert_eq!(form["method"], "elicitation/create", "{form}");
     let message = form["params"]["message"].as_str().unwrap();
-    assert!(message.contains("drive\\u005frefresh"), "{message}");
+    assert!(message.contains("drive_refresh"), "{message}");
     assert!(
         message.contains("\"services\": \\u005b\n      \"drive\"\n    \\u005d"),
         "{message}"

@@ -173,6 +173,7 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
             "approval_required",
             "approval_required_or_stale",
             "approval_requires_form_client",
+            "approval_requires_newer_protocol",
             "approval_stale_calendar_changed_ask_again",
             "approval_stale_drive_changed_ask_again",
             "approval_timeout",

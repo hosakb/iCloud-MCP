@@ -351,6 +351,20 @@ fn next_free(dir: &Path) -> PathBuf {
     dir.with_file_name("skykeep-mcp-new")
 }
 
+/// One shell word: as it is when it holds only safe characters, else in single quotes.
+fn shell(text: &str) -> String {
+    let safe = !text.is_empty()
+        && !text.starts_with('~')
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+:=@,~".contains(c));
+    if safe {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', r"'\''"))
+    }
+}
+
 /// A YAML scalar: JSON's double-quoted string is valid YAML.
 fn yaml(text: &str) -> String {
     serde_json::to_string(text).unwrap_or_default()
@@ -451,12 +465,13 @@ async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcom
     c.say(report.render().trim_end())?;
     let command = options.command.to_string_lossy();
     let folder = dir.to_string_lossy();
+    let launch = format!("{} --state-dir {}", shell(&command), shell(&folder));
     let config = serde_json::json!({
         "command": command,
         "args": ["--state-dir", folder],
     });
     c.say(&format!(
-        "\nMost MCP clients: add this line to the list of servers in the client's settings:\n\"icloud\": {config}\n\nHermes: add this to config.yaml (if it already has mcp_servers:, add only the icloud part under it):\nmcp_servers:\n  icloud:\n    command: {}\n    args:\n      - \"--state-dir\"\n      - {}\n    enabled: true\n    sampling:\n      enabled: false\n\nThe server's name in the client is now icloud. Rules the client keeps for the old name skykeep, such as tools it may call without asking, don't apply to icloud: set them again there.",
+        "\nMost MCP clients: add this line to the list of servers in the client's settings:\n\"icloud\": {config}\n\nHermes: add this to config.yaml (if it already has mcp_servers:, add only the icloud part under it):\nmcp_servers:\n  icloud:\n    command: {}\n    args:\n      - \"--state-dir\"\n      - {}\n    enabled: true\n    sampling:\n      enabled: false\n\nClaude Code and Codex: run one of these in a terminal:\nclaude mcp add --scope user icloud -- {launch}\ncodex mcp add icloud -- {launch}\n\nThe server's name in the client is now icloud. Rules the client keeps for the old name skykeep, such as tools it may call without asking, don't apply to icloud: set them again there.",
         yaml(&command),
         yaml(&folder),
     ))?;
@@ -848,7 +863,7 @@ async fn step_sign_in(
 }
 
 /// What every approval mode needs from the MCP client, as setup says it.
-const CARD_NOTE: &str = "The client must be able to show iCloud-MCP's approval card; Hermes shows it. In a client without the card, or a session where nobody answers it, such as a scheduled job, actions that need approval are refused and nothing runs.";
+const CARD_NOTE: &str = "The client must be able to show iCloud-MCP's approval card; Hermes, Claude Code and Codex show it in their interactive apps. In a client without the card, or a session where nobody answers it, such as a scheduled job, actions that need approval are refused and nothing runs.";
 
 /// Step 4. Runs after the sign-in: a policy saved before sign-in is bound to no account.
 fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str> {
@@ -1138,5 +1153,20 @@ fn step_services(console: &mut dyn Console, dir: &Path) -> Result<(), &'static s
         Err(reason) => console.say(&format!(
             "permissions.yaml could not be changed ({reason}), so the services stay as they were. Fix the file, then run skykeep-mcp setup again."
         )),
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    #[test]
+    fn a_path_with_spaces_or_quotes_stays_one_shell_word() {
+        assert_eq!(
+            super::shell("/opt/skykeep/skykeep-mcp"),
+            "/opt/skykeep/skykeep-mcp"
+        );
+        assert_eq!(super::shell("/home/a b/x"), "'/home/a b/x'");
+        assert_eq!(super::shell("/home/it's"), r"'/home/it'\''s'");
+        assert_eq!(super::shell("~/x"), "'~/x'");
+        assert_eq!(super::shell("/a;rm -rf x"), "'/a;rm -rf x'");
     }
 }
