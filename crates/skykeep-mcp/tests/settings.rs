@@ -88,11 +88,11 @@ async fn asks(f: &mut Folder, id: i64, name: &str, args: Value) -> bool {
 #[test]
 fn the_file_takes_an_approval_mode_and_an_exchange_folder_and_nothing_secret() {
     let parsed = permissions::parse_settings(
-        "version: 1\napproval_mode: yolo   # comment\nexchange_folder: ~/Skykeep-Exchange\nrules:\n  notes_list: deny\n",
+        "version: 1\napproval_mode: yolo   # comment\nexchange_folder: ~/iCloud-MCP-Exchange\nrules:\n  notes_list: deny\n",
     )
     .unwrap();
     assert_eq!(parsed.mode.as_deref(), Some("yolo"));
-    assert_eq!(parsed.exchange.as_deref(), Some("~/Skykeep-Exchange"));
+    assert_eq!(parsed.exchange.as_deref(), Some("~/iCloud-MCP-Exchange"));
     assert_eq!(parsed.rules.len(), 1);
     let quoted = permissions::parse_settings("exchange_folder: \"/srv/a b\"\n").unwrap();
     assert_eq!(quoted.exchange.as_deref(), Some("/srv/a b"));

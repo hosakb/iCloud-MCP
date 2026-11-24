@@ -248,15 +248,18 @@ pub fn bind_account(dir: &std::path::Path, client: &mut Client) -> Result<(), &'
     let dsid = client.session().dsid.as_deref().ok_or("login_incomplete")?;
     let mut library = quince_core::Library::open(dir).map_err(|_| "library_unavailable")?;
     match crate::account::binding(&library, dsid)? {
-        crate::account::Binding::Same => Ok(()),
+        crate::account::Binding::Same => {}
         crate::account::Binding::Unbound(tag) => library
             .set_state(quince_sync::queue::ACCOUNT_KEY, &tag)
-            .map_err(|_| "library_unavailable"),
+            .map_err(|_| "library_unavailable")?,
         crate::account::Binding::Other => {
             let _ = client.sign_out();
-            Err("account_mismatch_use_new_state_directory")
+            return Err("account_mismatch_use_new_state_directory");
         }
     }
+    // A new sign-in: an earlier failed check or sign-out no longer speaks for it.
+    crate::forget_session_check(&mut library);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -406,7 +406,7 @@ pub async fn send(
             }
         }
         other => Err(Error::Refused(format!(
-            "Skykeep does not know how to send “{other}”."
+            "iCloud-MCP does not know how to send “{other}”."
         ))),
     }
 }

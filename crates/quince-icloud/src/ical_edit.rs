@@ -783,7 +783,7 @@ pub fn new_event(uid: &str, c: &Change<'_>, now: i64, here: &TimeZone) -> Result
     }
     let mut cal = Part::new("VCALENDAR");
     cal.add("VERSION:2.0".into());
-    cal.add("PRODID:-//Skykeep//Calendar//EN".into());
+    cal.add("PRODID:-//iCloud-MCP//Calendar//EN".into());
     cal.add("CALSCALE:GREGORIAN".into());
     cal.nodes.push(Node::Part(v));
     let mut doc = Doc {

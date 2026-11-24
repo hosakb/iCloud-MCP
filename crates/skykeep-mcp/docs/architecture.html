@@ -19,12 +19,11 @@
   }
   .dot { position:absolute; border-radius:50%; opacity:.5; }
   .container { margin:0 auto; position:relative; z-index:2; }
-  .header-row { display:flex; align-items:center; gap:.7rem; }
+  .header-row { display:flex; align-items:center; gap:.7rem; margin-bottom:1.2rem; }
   .emoji { height:1.9rem; }
   h1 { font-size:1.9rem; font-weight:800;
        background:linear-gradient(90deg,var(--sky),var(--sand),var(--orange),var(--teal));
        -webkit-background-clip:text; background-clip:text; color:transparent; }
-  .subtitle { color:var(--muted); font-size:1rem; margin:.1rem 0 1.2rem 0; font-weight:600; }
   .diagram-container {
     background:rgba(16,42,48,.55); border-radius:1.6rem; border:2px solid rgba(234,179,8,.3);
     padding:1.2rem;
@@ -42,7 +41,6 @@
       <img class="emoji" src="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f6f0.svg" alt="">
       <h1>iCloud-MCP</h1>
     </div>
-    <p class="subtitle">What runs on main today, and where each request goes</p>
 
     <div class="diagram-container">
       <svg viewBox="0 0 1260 620">
@@ -92,8 +90,8 @@
         <!-- ===== Arrows between left column and server ===== -->
         <text x="368" y="142" fill="#38bdf8" font-size="11" font-weight="700" text-anchor="middle">tool call</text>
         <line x1="320" y1="150" x2="416" y2="150" stroke="#38bdf8" stroke-width="3" stroke-linecap="round" marker-end="url(#a-sky)"/>
-        <text x="368" y="236" fill="#38bdf8" font-size="11" font-weight="700" text-anchor="middle">approval</text>
-        <text x="368" y="249" fill="#38bdf8" font-size="11" font-weight="700" text-anchor="middle">card</text>
+        <text x="368" y="234" fill="#38bdf8" font-size="11" font-weight="700" text-anchor="middle">result</text>
+        <text x="368" y="248" fill="#bfe3df" font-size="9.5" text-anchor="middle">or an approval card</text>
         <line x1="416" y1="258" x2="320" y2="258" stroke="#38bdf8" stroke-width="3" stroke-linecap="round" marker-end="url(#a-sky)"/>
         <text x="368" y="478" fill="#eab308" font-size="11" font-weight="700" text-anchor="middle">upload</text>
         <text x="368" y="514" fill="#eab308" font-size="11" font-weight="700" text-anchor="middle">download</text>
@@ -106,13 +104,14 @@
           <text x="630" y="46" fill="#eab308" font-size="16" font-weight="700" text-anchor="middle">iCloud-MCP server</text>
 
           <!-- Permissions file -->
-          <rect x="380" y="60" width="500" height="86" rx="16" fill="#2a2a1c" stroke="#eab308" stroke-width="2"/>
+          <rect x="380" y="60" width="500" height="98" rx="16" fill="#2a2a1c" stroke="#eab308" stroke-width="2"/>
           <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f512.svg" x="394" y="72" width="18" height="18"/>
           <text x="420" y="86" fill="white" font-size="14" font-weight="700">Permissions file</text>
           <text x="545" y="86" fill="#fcd34d" font-size="12" font-weight="600">rules · approval mode · exchange folder · services</text>
-          <text x="394" y="104" fill="#bfe3df" font-size="11">Read at every tool call, so an edit counts at the next call.</text>
-          <text x="394" y="119" fill="#bfe3df" font-size="11">Actions without a rule follow the file's approval_mode, or else the mode chosen in setup.</text>
-          <text x="394" y="134" fill="#bfe3df" font-size="11">Deletions always need a person, and so does moving or renaming a large Drive folder.</text>
+          <text x="396" y="104" fill="#fcd34d" font-size="11">•</text><text x="408" y="104" fill="#bfe3df" font-size="11">Read at every tool call; an edit counts from the next call</text>
+          <text x="396" y="119" fill="#fcd34d" font-size="11">•</text><text x="408" y="119" fill="#bfe3df" font-size="11">Actions without a rule follow approval_mode, else the mode from setup</text>
+          <text x="396" y="134" fill="#fcd34d" font-size="11">•</text><text x="408" y="134" fill="#bfe3df" font-size="11">Every deletion asks a person, in every mode</text>
+          <text x="396" y="149" fill="#fcd34d" font-size="11">•</text><text x="408" y="149" fill="#bfe3df" font-size="11">So does renaming or moving a Drive folder with 20+ items or an unknown count</text>
 
           <rect x="380" y="170" width="500" height="50" rx="14" fill="#0e4a3a" stroke="#2dd4bf" stroke-width="2"/>
           <image href="https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/svg/1f4dd.svg" x="392" y="185" width="20" height="20"/>

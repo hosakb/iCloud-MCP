@@ -95,14 +95,14 @@ fn login_requires_a_controlling_terminal_and_never_reads_pipe() {
             .unwrap();
         assert!(!output.status.success());
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("interactive_terminal_required"),
+            String::from_utf8_lossy(&output.stderr).contains("needs a real terminal"),
             "{command}: {:?}",
             output.stderr
         );
     }
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("interactive_terminal_required"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("needs a real terminal"));
 }
 
 #[test]
@@ -117,7 +117,7 @@ fn agent_marked_process_cannot_open_a_secret_prompt() {
         .unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("user_owned_terminal_required"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("AI agent's terminal"));
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     let policy = Command::new(env!("CARGO_BIN_EXE_skykeep-mcp"))
         .args(["policy", "--state-dir"])
@@ -128,7 +128,7 @@ fn agent_marked_process_cannot_open_a_secret_prompt() {
         .output()
         .unwrap();
     assert!(!policy.status.success());
-    assert!(String::from_utf8_lossy(&policy.stderr).contains("user_owned_terminal_required"));
+    assert!(String::from_utf8_lossy(&policy.stderr).contains("AI agent's terminal"));
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
@@ -188,8 +188,8 @@ fn stdio_initializes_lists_and_reads_without_stdout_diagnostics() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(read["source"], "local_cache");
-    assert_eq!(read["items"], json!([]));
+    // A folder without a sign-in says so instead of an empty list.
+    assert_eq!(read["error"], "not_signed_in", "{read}");
 }
 
 /// Spawning tests share this binary only with other spawning tests: a forked child briefly

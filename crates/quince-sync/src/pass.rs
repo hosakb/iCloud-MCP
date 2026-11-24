@@ -50,7 +50,7 @@ pub const FULL_SYNC_EVERY: i64 = 24 * 60 * 60;
 pub const MOST_ITEMS: usize = 500;
 
 /// What a waiting service says.
-pub const PAUSED_WORDS: &str = "Syncs when you approve Skykeep on your iPhone, iPad or Mac.";
+pub const PAUSED_WORDS: &str = "Syncs when you approve iCloud-MCP on your iPhone, iPad or Mac.";
 
 /// Said while Apple prepares the library: calm, and true.
 pub const PREPARING_WORDS: &str =
@@ -280,7 +280,7 @@ pub fn failed_by_panic(service: &'static str, panic: &(dyn std::any::Any + Send)
         service,
         Outcome::Failed,
         Some(format!(
-            "Skykeep couldn’t read something in {label} ({what}). The other apps carried on."
+            "iCloud-MCP couldn’t read something in {label} ({what}). The other apps carried on."
         )),
     )
 }

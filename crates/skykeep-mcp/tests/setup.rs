@@ -473,8 +473,9 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client
         "{screen}"
     );
     assert!(
-        screen
-            .contains("The client must be able to show Skykeep's approval card; Hermes shows it."),
+        screen.contains(
+            "The client must be able to show iCloud-MCP's approval card; Hermes shows it."
+        ),
         "{screen}"
     );
     assert!(screen.contains("such as a scheduled job"), "{screen}");
@@ -488,15 +489,19 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client
         "{screen}"
     );
     let line = format!(
-        "\"skykeep\": {{\"args\":[\"--state-dir\",\"{}\"],\"command\":\"/opt/skykeep/skykeep-mcp\"}}",
+        "\"icloud\": {{\"args\":[\"--state-dir\",\"{}\"],\"command\":\"/opt/skykeep/skykeep-mcp\"}}",
         dir.display()
     );
     assert!(screen.contains(&line), "{screen}");
     let hermes = format!(
-        "mcp_servers:\n  skykeep:\n    command: \"/opt/skykeep/skykeep-mcp\"\n    args:\n      - \"--state-dir\"\n      - \"{}\"\n    enabled: true\n    sampling:\n      enabled: false",
+        "mcp_servers:\n  icloud:\n    command: \"/opt/skykeep/skykeep-mcp\"\n    args:\n      - \"--state-dir\"\n      - \"{}\"\n    enabled: true\n    sampling:\n      enabled: false",
         dir.display()
     );
     assert!(screen.contains(&hermes), "{screen}");
+    assert!(
+        screen.contains("Rules the client keeps for the old name skykeep, such as tools it may call without asking, don't apply to icloud"),
+        "{screen}"
+    );
     assert!(
         screen.contains("Setup is complete. The client must be able to show"),
         "{screen}"
@@ -565,11 +570,21 @@ async fn signing_in_again_on_request_keeps_the_account_and_refuses_another() {
     let server = apple().await;
     let (_parent, dir) = folder();
     first_run_with_keyring(&dir, &server).await;
+    // A sync had found the sign-in expired; signing in again clears that.
+    skykeep_mcp::note_session_check(
+        &skykeep_mcp::state::PrivateState::open(&dir).unwrap(),
+        Err("login_required"),
+    );
+    assert_eq!(tool(&dir, "auth_status").await["status"], "login_required");
     let mut answers = vec![Ask(""), Ask("2")];
     answers.extend(sign_in_answers());
     answers.push(Ask(""));
     let script = ready(answers, &dir, &server).await;
     assert!(script.screen.contains("Type your Apple Account"));
+    assert_eq!(
+        tool(&dir, "auth_status").await["status"],
+        "session_unverified"
+    );
 
     let mut script = Script::new(vec![
         Ask(""),
@@ -1119,7 +1134,7 @@ async fn with_no_secure_storage_at_all_setup_stops_in_plain_words_and_writes_not
     let report = skykeep_mcp::status::check(storage::env(), &dir).render();
     holder().blocked.store(false, Ordering::SeqCst);
     assert!(
-        refused.starts_with("Setup can't find a safe place on this computer to keep your sign-in. If you are inside Docker or a similar container, run Skykeep directly on the computer."),
+        refused.starts_with("Setup can't find a safe place on this computer to keep your sign-in. If you are inside Docker or a similar container, run iCloud-MCP directly on the computer."),
         "{refused}"
     );
     assert!(!report.contains("protected file instead"), "{report}");
@@ -1458,7 +1473,7 @@ async fn unlock_names_a_missing_folder() {
     let mut script = Script::new(vec![]);
     let refused = setup::unlock(&mut script, storage::env(), &dir, None).unwrap_err();
     assert!(
-        refused.starts_with(&format!("No Skykeep folder at {}.", dir.display())),
+        refused.starts_with(&format!("No iCloud-MCP folder at {}.", dir.display())),
         "{refused}"
     );
 }
