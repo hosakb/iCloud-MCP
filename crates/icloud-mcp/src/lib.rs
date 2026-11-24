@@ -521,7 +521,7 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
         "not_found" => Some("Nothing with that ID or path is in the local copy. Take the ID from a list or search reply. Right after a create, the item is only in iCloud until the next sync (Notes and Reminders) or refresh (calendar_refresh, contacts_refresh, photos_refresh, or drive_refresh on its folder): run that first, then read it again.".to_string()),
         "already_initialized" => Some("The server is already initialized in this connection. Go on with tools/list or tools/call.".to_string()),
         sync::ITEM_CHANGED => Some(sync::ITEM_CHANGED_STEP.to_string()),
-        "save_already_queued" => Some("Another save of this note is queued and not sent yet, so this save was refused and the queued one kept. Read the note again with notes_get, or run sync first, then save with the base_etag it shows now.".to_string()),
+        "save_already_queued" => Some("A save from this version of the note is already queued or was already sent, so this save was refused and nothing new was queued. Read the note again with notes_get (or run sync first), then save with the etag it shows now.".to_string()),
         "conflict" => Some("The item changed since you read it, so nothing was queued. Read it again with notes_get or reminders_get, then ask again with its current base_etag.".to_string()),
         "mutation_refused" => Some(format!("The change could not be saved to the local queue, so nothing was queued. In your own terminal, run {} to check this folder, then try again.", status::with_dir("icloud-mcp status", dir))),
         "drive_read_failed_nothing_sent" => Some("Apple's answer about the item could not be read, so nothing was sent. Try again in a moment; if it keeps failing, run drive_refresh on the folder.".to_string()),
@@ -3213,35 +3213,68 @@ fn require_folder(library: &Library, folder: Option<&str>) -> Result<(), &'stati
     }
 }
 
-/// The etag notes_get shows and a note write is checked against. While a save waits to be
-/// sent, the note is no longer what Apple's etag stands for, so the etag gets a mark of that
-/// save: a second save typed over the read before it is refused, not laid over the first.
+/// The state key that keeps, per note, the Apple etag its latest save was typed over and the
+/// mark of that save, until a read brings Apple's new etag.
+fn save_mark_key(guid: &str) -> String {
+    format!("mcp.notes.save_mark.{guid}")
+}
+
+/// A mark of one queued save's payload. FNV-1a: the same mark in every build.
+fn save_mark(payload: &str) -> String {
+    let hash = payload.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("{hash:016x}")
+}
+
+/// The etag notes_get shows and a note write is checked against. Once a save is queued, the
+/// note is no longer what Apple's etag stands for, so the etag gets a mark of that save. The
+/// mark stays after the save is sent, until a read stores Apple's new etag: a second save
+/// typed over the read before it is refused, not laid over the first.
 fn note_etag(
     library: &Library,
     note: &quince_core::notes::Note,
 ) -> Result<Option<String>, &'static str> {
+    let raw = note.etag.as_deref().unwrap_or_default();
+    let waiting = library
+        .outbox_waiting("notes", &note.guid, "save")
+        .map_err(|_| "library_unavailable")?;
+    if let Some(last) = waiting.last() {
+        return Ok(Some(format!("{raw}~q{}", save_mark(&last.payload))));
+    }
+    let kept = library
+        .state(&save_mark_key(&note.guid))
+        .map_err(|_| "library_unavailable")?
+        .and_then(|v| serde_json::from_str::<Value>(&v).ok());
+    Ok(match kept {
+        Some(kept) if kept["from"].as_str() == note.etag.as_deref() => {
+            let mark = kept["mark"].as_str().unwrap_or_default();
+            Some(format!("{raw}~q{mark}"))
+        }
+        _ => note.etag.clone(),
+    })
+}
+
+/// Keeps the mark of the save just queued for `note`, so the etag stays marked after the
+/// save is sent and before a read brings Apple's new etag.
+fn keep_save_mark(
+    library: &mut Library,
+    note: &quince_core::notes::Note,
+) -> Result<(), &'static str> {
     let waiting = library
         .outbox_waiting("notes", &note.guid, "save")
         .map_err(|_| "library_unavailable")?;
     let Some(last) = waiting.last() else {
-        return Ok(note.etag.clone());
+        return Ok(());
     };
-    // FNV-1a: the same mark for the same waiting save in every build.
-    let mark = last
-        .payload
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-        });
-    Ok(Some(format!(
-        "{}~q{:016x}",
-        note.etag.as_deref().unwrap_or_default(),
-        mark
-    )))
+    let kept = json!({"from": note.etag, "mark": save_mark(&last.payload)});
+    library
+        .set_state(&save_mark_key(&note.guid), &kept.to_string())
+        .map_err(|_| "library_unavailable")
 }
 
-/// Whether `base_etag` is the note's etag. A save must name the etag shown now; a move, pin
-/// or delete does not replace the text, so Apple's etag still does for them.
+/// Whether `base_etag` is the note's etag. A save must name the etag shown now. A move, pin
+/// or delete does not replace the text, so it takes that etag or Apple's own, nothing else.
 fn same_note_etag(
     library: &Library,
     note: &quince_core::notes::Note,
@@ -3252,18 +3285,21 @@ fn same_note_etag(
     if base_etag == shown.as_ref() {
         return Ok(());
     }
-    // Apple's etag, or one shown while an earlier save waited: read before the latest save.
+    if !save {
+        return if base_etag == note.etag.as_ref() {
+            Ok(())
+        } else {
+            Err("conflict")
+        };
+    }
+    // Apple's etag, or one shown after an earlier save: read before the latest save.
     let raw = note.etag.as_deref().unwrap_or_default();
     let before_a_save = |tag: &String| {
         tag.strip_prefix(raw)
             .is_some_and(|rest| rest.starts_with("~q"))
     };
     if base_etag == note.etag.as_ref() || base_etag.is_some_and(before_a_save) {
-        return if save {
-            Err("save_already_queued")
-        } else {
-            Ok(())
-        };
+        return Err("save_already_queued");
     }
     Err("conflict")
 }
@@ -3347,8 +3383,10 @@ fn enqueue_note(library: &mut Library, args: NoteWrite) -> Result<Value, &'stati
                 base_runs,
             )
             .map_err(|_| "write_refused")?;
+            keep_save_mark(library, &note)?;
+            let etag = note_etag(library, &note)?;
             Ok(
-                json!({"guid":guid,"status":"queued","remote_verified":false,"kept_attachments":kept_attachments,"formatting":formatting}),
+                json!({"guid":guid,"status":"queued","remote_verified":false,"kept_attachments":kept_attachments,"formatting":formatting,"etag":etag}),
             )
         }
         NoteWrite::Delete { guid, base_etag } => {
@@ -3819,7 +3857,7 @@ pub(crate) fn tools() -> Vec<Value> {
     ] {
         tools.push(json!({"name":name,"description":format!("Search the user's {kind} in the local cache index."),"inputSchema":{"type":"object","properties":{"query":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000}},"required":["query"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     }
-    tools.push(json!({"name":"notes_write","description":"Queue a change to the user's Apple iCloud Notes (create, save, move, pin, delete). Follows the approval mode; a delete, a move into Recently Deleted or a save that empties a note always asks the user on the approval card. Queued is not remote-verified. An etag can change once more after a create or a sync, so read the note again with notes_get just before a change.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","save","move","pin","delete"]},"body":{"type":"string"},"pinned":{"type":"boolean"},"runs":{"type":["array","null"],"items":{"type":"object"}},"folder_guid":{"type":["string","null"]},"guid":{"type":"string"},"base_etag":{"type":["string","null"],"description":"Needed for move, save, pin and delete: the etag from notes_get. A missing or older etag returns conflict."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
+    tools.push(json!({"name":"notes_write","description":"Queue a change to the user's Apple iCloud Notes (create, save, move, pin, delete). Follows the approval mode; a delete, a move into Recently Deleted or a save that empties a note always asks the user on the approval card. Queued is not remote-verified. An etag can change once more after a create or a sync, so read the note again with notes_get just before a change.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","save","move","pin","delete"]},"body":{"type":"string"},"pinned":{"type":"boolean"},"runs":{"type":["array","null"],"items":{"type":"object"}},"folder_guid":{"type":["string","null"]},"guid":{"type":"string"},"base_etag":{"type":["string","null"],"description":"Needed for move, save, pin and delete: the etag from notes_get. A missing or older etag returns conflict. The etag changes after each queued save, and the save reply gives the new one; a save with an etag read before another save returns save_already_queued."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
     tools.push(json!({"name":"reminders_write","description":"Queue a change to the user's Apple Reminders (create, edit, tick, delete). A create can also repeat daily and alert at or before its due time. Deletions always ask the user on the approval card. Queued is not CloudKit-accepted; sync reports accepted writes. No field-level remote verification. Only edit takes base_etag; delete and tick take no base_etag. An etag can change once more after a create or a sync, so read the reminder again with reminders_get just before an edit.","inputSchema":{"type":"object","properties":{"action":{"enum":["create","edit","tick","delete"]},"guid":{"type":"string"},"list_guid":{"type":"string"},"title":{"type":"string"},"due_at":{"type":["integer","null"]},"all_day":{"type":"boolean"},"flagged":{"type":"boolean"},"done":{"type":"boolean"},"patch":{"type":"object","description":"Supported fields: title, notes, due_at, all_day, flagged, completed, priority, list_guid, parent_guid. Absent leaves unchanged; null clears notes/due_at/parent_guid."},"base_etag":{"type":["string","null"],"description":"Edit only: the etag from reminders_get. A newer cached copy returns conflict."},"repeat":{"type":"object","description":"Create only. Repeats daily from due_at, until the end of the given day or for ever. Needs due_at.","properties":{"frequency":{"enum":["daily"]},"until":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"YYYY-MM-DD, the last day it repeats. Read in timezone for a timed due_at, in UTC for an all-day one."}},"required":["frequency"],"additionalProperties":false},"due_time_alert":{"type":"boolean","description":"Create only. Alert at due_at. Needs a timed (not all-day) due_at."},"early_alert":{"type":"object","description":"Create only. Alert this long before due_at. Needs a timed due_at, and an early alert set on one of the user's reminders from an Apple device and then a sync, so the account id it carries is in the cache.","properties":{"amount":{"type":"integer","minimum":1,"maximum":10000},"unit":{"enum":["minutes","hours","days","weeks","months"]}},"required":["amount","unit"],"additionalProperties":false},"timezone":{"type":"string","maxLength":64,"description":"Create only. IANA zone the timed due_at and its alerts are kept in, such as Europe/Berlin. Default: this computer's zone, or UTC if it has no IANA name."}},"required":["action"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true}}));
     tools.push(json!({"name":"reminders_get","description":"Read one cached Apple Reminders item and its supported details. Not a complete archive. An etag can change once more after a create or a sync, so read the item again just before a change.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     tools.push(json!({"name":"notes_get","description":"Read one cached Apple iCloud Notes note. Not a complete preservation archive. An etag can change once more after a create or a sync, so read the item again just before a change.","inputSchema":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));

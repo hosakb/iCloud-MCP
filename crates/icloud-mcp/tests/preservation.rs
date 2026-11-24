@@ -371,6 +371,9 @@ async fn text_only_saves_in_a_row_with_fresh_etags_are_queued() {
         let args = json!({"action":"save","guid":"note","base_etag":etag,"body":body});
         let result = call(&mut server, "notes_write", args).await;
         assert_eq!(result["status"], "queued", "{result}");
+        let now = call(&mut server, "notes_get", json!({"guid":"note"})).await["item"]["etag"]
+            .clone();
+        assert_eq!(result["etag"], now, "the save reply gives the new etag");
     }
     let stale = json!({"action":"save","guid":"note","base_etag":seen[1],"body":RICH});
     let refused = call(&mut server, "notes_write", stale).await;
@@ -380,6 +383,38 @@ async fn text_only_saves_in_a_row_with_fresh_etags_are_queued() {
     let payload: Value = serde_json::from_str(&pending[0].payload).unwrap();
     assert_eq!(payload["body"], bodies[2]);
     assert_eq!(payload["base"], RICH);
+}
+
+/// Issue 92, review round 1: while a save waits, move and pin take Apple's etag or the exact
+/// etag notes_get shows, and nothing else. Delete, which asks on the approval card, is in
+/// queue_recovery.
+#[tokio::test]
+async fn move_pin_and_delete_refuse_a_made_up_marked_etag() {
+    let (_dir, mut server, mut library) = setup();
+    rich_note(&mut library);
+    let first = RICH.replace("Pack the bag", "Pack the red bag");
+    let queued = call(&mut server, "notes_write", save(&first)).await;
+    assert_eq!(queued["status"], "queued", "{queued}");
+    for made_up in ["etag-1~q0000000000000000", "etag-1~q", "etag-1~qanything"] {
+        for args in [
+            json!({"action":"pin","guid":"note","pinned":true,"base_etag":made_up}),
+            json!({"action":"move","guid":"note","folder_guid":null,"base_etag":made_up}),
+        ] {
+            let refused = call(&mut server, "notes_write", args).await;
+            assert_eq!(refused["error"], "conflict", "{made_up}: {refused}");
+        }
+    }
+    assert_eq!(library.outbox_count().unwrap(), 1);
+    let shown = call(&mut server, "notes_get", json!({"guid":"note"})).await["item"]["etag"].clone();
+    for etag in [json!("etag-1"), shown] {
+        let pinned = call(
+            &mut server,
+            "notes_write",
+            json!({"action":"pin","guid":"note","pinned":true,"base_etag":etag}),
+        )
+        .await;
+        assert_eq!(pinned["status"], "queued", "{etag}: {pinned}");
+    }
 }
 
 #[tokio::test]
