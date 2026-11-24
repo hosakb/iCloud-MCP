@@ -530,7 +530,9 @@ async fn reads_and_writes_binds_each_contacts_read_to_one_approval() {
     let message = form["params"]["message"].as_str().unwrap();
     // The preview escapes markup characters such as `_` as inert JSON text.
     assert!(
-        message.contains("contacts\\u005fget") && message.contains("C-ADA"),
+        message.contains("contacts_get")
+            && !message.contains("contacts\\u005fget")
+            && message.contains("C-ADA"),
         "{message}"
     );
     assert!(!message.contains("Lovelace"), "no content before approval");
@@ -630,7 +632,7 @@ async fn refresh_prompt_names_contacts_only_and_sends_nothing() {
     let form = call(&mut server, 3, "contacts_refresh", json!({})).await;
     assert_eq!(form["method"], "elicitation/create", "{form}");
     let message = form["params"]["message"].as_str().unwrap();
-    assert!(message.contains("contacts\\u005frefresh"), "{message}");
+    assert!(message.contains("contacts_refresh"), "{message}");
     assert!(
         message.contains("\"services\": \\u005b\n      \"contacts\"\n    \\u005d"),
         "{message}"

@@ -267,7 +267,7 @@ async fn card(server: &mut Server, args: Value) -> Value {
     let mut form = call(server, args.clone()).await;
     while form["params"]["message"]
         .as_str()
-        .is_some_and(|m| m.contains("\"read\\u005fpreview\\u005fonly\": true"))
+        .is_some_and(|m| m.contains("\"read_preview_only\": true"))
     {
         form = server.handle(approve(&form)).await.unwrap();
     }
@@ -634,10 +634,7 @@ async fn move_of_a_small_folder_runs_and_a_large_one_asks_on_the_card_with_a_pre
     )
     .await;
     let message = form["params"]["message"].as_str().unwrap();
-    assert!(
-        message.contains("apple\\u005fitem\\u005fcount\": 500"),
-        "{message}"
-    );
+    assert!(message.contains("apple_item_count\": 500"), "{message}");
     assert!(message.contains(DOCS), "{message}");
     assert!(!message.contains("SYNTHETIC-TOKEN"));
     assert_eq!(writes(&f.remote).await, ["/moveItems"]);
@@ -712,11 +709,8 @@ async fn deletions_ask_on_the_card_under_every_mode() {
         for action in ["trash", "delete_forever"] {
             let form = asks_on_card(&mut f.server, json!({"action":action,"id":DOCS})).await;
             let message = form["params"]["message"].as_str().unwrap();
-            // The form's text escapes `_` as \u005f.
-            assert!(
-                message.contains("apple\\u005fitem\\u005fcount"),
-                "{mode:?}: {message}"
-            );
+            // An underscore inside a word stays as it is on the card.
+            assert!(message.contains("apple_item_count"), "{mode:?}: {message}");
             assert!(
                 message.contains(action.split('_').next().unwrap()),
                 "{message}"

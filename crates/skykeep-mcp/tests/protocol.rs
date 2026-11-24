@@ -1002,3 +1002,218 @@ async fn initialize_and_tools_name_apple_icloud_notes_and_reminders() {
         }
     }
 }
+
+/// Creates a note under yolo and returns its guid, so a deletion can follow.
+async fn yolo_note(server: &mut Server) -> String {
+    let reply = server
+        .handle(operation(
+            20,
+            "notes_write",
+            json!({"action":"create","body":"delete fixture"}),
+        ))
+        .await
+        .unwrap();
+    let created: serde_json::Value =
+        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    created["guid"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn cards_turn_on_from_protocol_2025_06_18_and_the_answer_names_the_asked_version() {
+    for (asked, answered, cards) in [
+        ("2024-11-05", "2025-03-26", false),
+        ("2025-03-26", "2025-03-26", false),
+        ("2025-06-18", "2025-06-18", true),
+        ("2025-11-25", "2025-11-25", true),
+        // A version newer than this server knows gets the newest one it supports.
+        ("2099-01-01", "2025-11-25", true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut server = Server::open(dir.path()).unwrap();
+        let init = server.handle(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":asked,"capabilities":{"elicitation":{}}}})).await.unwrap();
+        assert_eq!(init["result"]["protocolVersion"], answered, "{asked}");
+        assert_eq!(
+            init["result"]["serverInfo"]["title"].is_string(),
+            answered != "2025-03-26",
+            "{asked}: {init}"
+        );
+        let mut library = quince_core::Library::open(dir.path()).unwrap();
+        library.set_state("account", "synthetic").unwrap();
+        server.set_policy("yolo").unwrap();
+        let guid = yolo_note(&mut server).await;
+        let count = library.outbox_count().unwrap();
+        // A deletion asks a person on the card even under yolo, for every version.
+        let reply = server
+            .handle(operation(
+                3,
+                "notes_write",
+                json!({"action":"delete","guid":guid}),
+            ))
+            .await
+            .unwrap();
+        if !cards {
+            let error: serde_json::Value =
+                serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(
+                error["error"], "approval_requires_newer_protocol",
+                "{asked}"
+            );
+            let message = error["message"].as_str().unwrap();
+            assert!(message.contains("nothing ran"), "{message}");
+            assert!(message.contains("2025-06-18"), "{message}");
+            assert!(
+                message.contains("Update your MCP client, or use Hermes, Claude Code or Codex in their interactive apps."),
+                "{message}"
+            );
+            assert_eq!(library.outbox_count().unwrap(), count, "{asked}");
+            continue;
+        }
+        assert_eq!(reply["method"], "elicitation/create", "{asked}: {reply}");
+        let params = &reply["params"];
+        if answered == "2025-06-18" {
+            // 2025-06-18 has no `mode` and no titled `oneOf` choices; it lists `enum`.
+            assert!(params.get("mode").is_none(), "{params}");
+            let decision = &params["requestedSchema"]["properties"]["decision"];
+            assert_eq!(decision["enum"], json!(["approve", "deny"]), "{decision}");
+            assert!(decision.get("oneOf").is_none(), "{decision}");
+        } else {
+            assert_eq!(params["mode"], "form", "{params}");
+        }
+        assert_eq!(library.outbox_count().unwrap(), count, "{asked}");
+        let declined = server
+            .handle(json!({"jsonrpc":"2.0","id":reply["id"],"result":{"action":"decline"}}))
+            .await
+            .unwrap();
+        assert_eq!(declined["result"]["isError"], true, "{asked}: {declined}");
+        assert_eq!(library.outbox_count().unwrap(), count, "{asked}");
+        // Closed, cancelled, typed text or a missing choice: nothing runs.
+        for answer in [
+            json!({"action":"cancel"}),
+            json!({"action":"accept","content":{}}),
+            json!({"action":"accept","content":{"decision":"yes, delete it"}}),
+            json!({"action":"accept","content":{"decision":"always_allow"}}),
+        ] {
+            let card = server
+                .handle(operation(
+                    4,
+                    "notes_write",
+                    json!({"action":"delete","guid":guid}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(card["method"], "elicitation/create", "{asked}: {card}");
+            let reply = server
+                .handle(json!({"jsonrpc":"2.0","id":card["id"],"result":answer}))
+                .await
+                .unwrap();
+            assert_eq!(reply["result"]["isError"], true, "{asked}: {answer}");
+            assert_eq!(library.outbox_count().unwrap(), count, "{asked}: {answer}");
+        }
+        // No tool can answer a card while it is open.
+        let card = server
+            .handle(operation(
+                5,
+                "notes_write",
+                json!({"action":"delete","guid":guid}),
+            ))
+            .await
+            .unwrap();
+        let reply = server
+            .handle(operation(
+                6,
+                "notes_write",
+                json!({"action":"create","body":"approve"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reply["result"]["isError"], true, "{asked}: {reply}");
+        let reply = server
+            .handle(json!({"jsonrpc":"2.0","id":card["id"],"result":{"action":"accept","content":{"decision":"approve"}}}))
+            .await
+            .unwrap();
+        assert_eq!(reply["result"]["isError"], false, "{asked}: {reply}");
+        assert_eq!(library.outbox_count().unwrap(), count + 1, "{asked}");
+    }
+}
+
+#[tokio::test]
+async fn a_client_without_cards_is_told_which_clients_show_the_card() {
+    for version in ["2025-06-18", "2025-11-25"] {
+        let (_dir, mut server, library) = configured("writes_only", json!({}), version).await;
+        let reply = server
+            .handle(operation(
+                2,
+                "notes_write",
+                json!({"action":"create","body":"exact"}),
+            ))
+            .await
+            .unwrap();
+        let error: serde_json::Value =
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(error["error"], "approval_requires_form_client", "{version}");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("nothing ran"), "{message}");
+        assert!(
+            message.contains("Hermes, Claude Code or Codex in their interactive apps"),
+            "{message}"
+        );
+        assert_eq!(library.outbox_count().unwrap(), 0);
+    }
+}
+
+#[tokio::test]
+async fn the_card_leaves_out_client_meta_and_escapes_only_what_could_render() {
+    for version in ["2025-06-18", "2025-11-25"] {
+        let (_dir, mut server, _library) =
+            configured("writes_only", json!({"elicitation":{}}), version).await;
+        let mut request = operation(
+            2,
+            "notes_write",
+            json!({"action":"create","body":"Title\u{7f}bell\nsnake_case and _stress_ <b>x</b>"}),
+        );
+        request["params"]["_meta"] = json!({
+            "progressToken": "tok-77",
+            "codex/sandbox-policy": {"network_access": "disabled"},
+            "claudecode/toolUseId": "toolu_secret"
+        });
+        let card = server.handle(request).await.unwrap();
+        assert_eq!(card["method"], "elicitation/create", "{card}");
+        let message = card["params"]["message"].as_str().unwrap();
+        for absent in [
+            "_meta",
+            "\\u005fmeta",
+            "tok-77",
+            "sandbox",
+            "toolUseId",
+            "toolu",
+        ] {
+            assert!(!message.contains(absent), "{absent}: {message}");
+        }
+        // The exact operation and target stay on the card.
+        for present in [
+            "\"name\": \"notes_write\"",
+            "\"action\": \"create\"",
+            "snake_case",
+            "read_preview_only",
+            // An underscore at a word edge could start emphasis, so it stays escaped.
+            "\\u005fstress\\u005f",
+            "\\u003cb\\u003e",
+            // DEL is a control character and is escaped like the others.
+            "Title\\u007fbell",
+            // The text says what the JSON is: the tool and its arguments.
+            "shows the tool and its arguments",
+        ] {
+            assert!(message.contains(present), "{present}: {message}");
+        }
+        assert!(!message.contains('\u{7f}'), "{message}");
+        assert!(
+            !message.contains("exact record the approval is bound to"),
+            "{message}"
+        );
+    }
+}
