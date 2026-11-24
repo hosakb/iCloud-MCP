@@ -50,7 +50,7 @@ async fn folder(mode: Option<&str>) -> Folder {
         }])
         .unwrap();
     if let Some(mode) = mode {
-        server.set_policy(mode).unwrap();
+        retried(|| server.set_policy(mode));
     }
     server
         .handle(json!({"id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{"form":{}}}}}))
@@ -72,9 +72,40 @@ fn call(id: i64, name: &str, args: Value) -> Value {
     json!({"id":id,"method":"tools/call","params":{"name":name,"arguments":args}})
 }
 
+/// `f` again while it is `state_busy_retry`, for the calls that take the folder lock outside
+/// a tool call (see [`handle`]).
+fn retried<T>(mut f: impl FnMut() -> Result<T, &'static str>) -> T {
+    for _ in 0..500 {
+        match f() {
+            Err("state_busy_retry") => std::thread::sleep(std::time::Duration::from_millis(10)),
+            other => return other.unwrap(),
+        }
+    }
+    panic!("the private folder stayed busy");
+}
+
+/// The reply to a tool call, asked again while it is `state_busy_retry`, as a client does.
+/// A test here that starts a terminal command forks this process, and the child holds every
+/// open folder lock for a moment, until it runs the command. The lock itself is unchanged.
+async fn handle(server: &mut Server, request: Value) -> Value {
+    for _ in 0..500 {
+        let reply = server.handle(request.clone()).await.unwrap();
+        let busy = reply["result"]["isError"] == true
+            && reply["result"]["content"][0]["text"]
+                .as_str()
+                .and_then(|t| serde_json::from_str::<Value>(t).ok())
+                .is_some_and(|t| t["error"] == "state_busy_retry");
+        if !busy {
+            return reply;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the private folder stayed busy: {request}");
+}
+
 /// Whether the call stopped at an approval card; the card is closed again.
 async fn asks(f: &mut Folder, id: i64, name: &str, args: Value) -> bool {
-    let reply = f.server.handle(call(id, name, args)).await.unwrap();
+    let reply = handle(&mut f.server, call(id, name, args)).await;
     if reply["method"] == "elicitation/create" {
         f.server
             .handle(json!({"jsonrpc":"2.0","id":reply["id"],"result":{"action":"cancel"}}))
@@ -220,8 +251,8 @@ async fn looser_settings_are_listed_until_the_person_looks() {
     let mut f = folder(Some("writes_only")).await;
     let dir = f.path();
     write_file(&dir, "version: 1\n");
-    f.server.handle(call(1, "reminders_lists", json!({}))).await;
-    permissions::show(&dir, true).unwrap();
+    handle(&mut f.server, call(1, "reminders_lists", json!({}))).await;
+    retried(|| permissions::show(&dir, true));
     let exchange = private("xchg");
     let folder_path = exchange.path().canonicalize().unwrap();
     write_file(
@@ -231,7 +262,7 @@ async fn looser_settings_are_listed_until_the_person_looks() {
             folder_path.display()
         ),
     );
-    f.server.handle(call(2, "reminders_lists", json!({}))).await;
+    handle(&mut f.server, call(2, "reminders_lists", json!({}))).await;
     let lines = permissions::status(&f.library, &dir, Some("writes_only"));
     let notice = &lines
         .iter()
@@ -239,7 +270,7 @@ async fn looser_settings_are_listed_until_the_person_looks() {
         .expect("reported")
         .0;
     assert!(notice.contains("(and 1 earlier)"), "{notice}");
-    let shown = permissions::show(&dir, true).unwrap();
+    let shown = retried(|| permissions::show(&dir, true));
     assert!(
         shown.contains("looser: approval mode: writes_only before, now yolo"),
         "{shown}"
@@ -257,11 +288,11 @@ async fn looser_settings_are_listed_until_the_person_looks() {
     );
     // Stricter changes are listed, but no notice waits for them.
     write_file(&dir, "version: 1\napproval_mode: reads_and_writes\n");
-    f.server.handle(call(3, "reminders_lists", json!({}))).await;
+    handle(&mut f.server, call(3, "reminders_lists", json!({}))).await;
     assert!(permissions::status(&f.library, &dir, Some("writes_only"))
         .iter()
         .all(|(t, _)| !t.contains("became looser")));
-    let shown = permissions::show(&dir, true).unwrap();
+    let shown = retried(|| permissions::show(&dir, true));
     assert!(
         shown.contains("stricter: approval mode: yolo before, now reads_and_writes"),
         "{shown}"
@@ -384,7 +415,7 @@ async fn a_bad_folder_in_the_file_is_refused_and_never_falls_back_to_the_older_o
     assert!(step.contains(&gone.display().to_string()), "{step}");
     assert!(step.contains("exchange_folder"), "{step}");
     assert!(step.contains("permissions.yaml"), "{step}");
-    // A broken file keeps the last valid folder from the file, never the older one.
+    // A broken file uses no folder: not the last valid one from the file, not the older one.
     let new = private("xchg-new");
     let new_path = new.path().canonicalize().unwrap();
     write_file(
@@ -401,12 +432,120 @@ async fn a_bad_folder_in_the_file_is_refused_and_never_falls_back_to_the_older_o
         ),
     );
     assert_eq!(
-        skykeep_mcp::exchange::in_force(&library, &dir)
-            .unwrap()
-            .unwrap()
-            .path,
-        new_path
+        skykeep_mcp::exchange::in_force(&library, &dir).map(|e| e.map(|e| e.path)),
+        Err("exchange_folder_file_unusable")
     );
+}
+
+/// Issue 75: while permissions.yaml can't be used, for any reason, no exchange folder is in
+/// use, and the next step names the file and its mistake. A file without the line names no
+/// folder, even when one was set up in the terminal before.
+#[tokio::test]
+async fn a_broken_or_removed_exchange_line_leaves_no_exchange_folder() {
+    let f = folder(Some("writes_only")).await;
+    let dir = f.path();
+    let older = private("xchg-older");
+    let good = private("xchg-good");
+    let good_path = good.path().canonicalize().unwrap();
+    let mut library = quince_core::Library::open(&dir).unwrap();
+    skykeep_mcp::exchange::set_up(&mut library, Some(older.path().to_path_buf()), None).unwrap();
+    let good_file = format!("version: 1\nexchange_folder: {}\n", good_path.display());
+    write_file(&dir, &good_file);
+    permissions::load(&mut library, &dir, Some("writes_only")).unwrap();
+    let in_force = |library: &quince_core::Library| {
+        skykeep_mcp::exchange::in_force(library, &dir).map(|e| e.map(|e| e.path))
+    };
+    assert_eq!(in_force(&library), Ok(Some(good_path.clone())));
+    for (text, mistake) in [
+        (
+            "version: 1\nexchange_folder: rel/ex\n".to_string(),
+            "line 2",
+        ),
+        (format!("{good_file}bogus_key: 1\n"), "line 3"),
+    ] {
+        write_file(&dir, &text);
+        assert_eq!(
+            in_force(&library),
+            Err("exchange_folder_file_unusable"),
+            "{text}"
+        );
+        // Loading the broken file changes nothing about that.
+        permissions::load(&mut library, &dir, Some("writes_only")).unwrap();
+        assert_eq!(in_force(&library), Err("exchange_folder_file_unusable"));
+        let step =
+            skykeep_mcp::next_step("exchange_folder_file_unusable", &dir, &Value::Null).unwrap();
+        assert!(step.contains("permissions.yaml"), "{step}");
+        assert!(step.contains(mistake), "{step}");
+        assert!(
+            step.contains("Fix the mistake named above in that file, then try again."),
+            "{step}"
+        );
+        // In the terminal, status itself is the place that says what is wrong.
+        let lines = permissions::status(&library, &dir, Some("writes_only"));
+        let (line, fix) = lines
+            .iter()
+            .find(|(t, _)| t.starts_with("Exchange folder:"))
+            .unwrap();
+        let fix = fix.as_deref().unwrap_or_default();
+        assert!(fix.contains(mistake), "{line} {fix}");
+        assert!(!fix.contains("permissions show"), "{fix}");
+        assert!(!step.contains(&good_path.display().to_string()), "{step}");
+        write_file(&dir, &good_file);
+        permissions::load(&mut library, &dir, Some("writes_only")).unwrap();
+    }
+    // A file that can't be read at all.
+    let file = dir.join(permissions::FILE_NAME);
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    assert_eq!(in_force(&library), Err("exchange_folder_file_unusable"));
+    std::fs::remove_dir(&file).unwrap();
+    // The line taken out: no folder, not the one set up before, and the refusal and status
+    // say that folder is no longer used, with the command that writes it into the file.
+    write_file(&dir, "version: 1\n");
+    assert_eq!(
+        in_force(&library),
+        Err("exchange_folder_not_in_permissions_file")
+    );
+    permissions::load(&mut library, &dir, Some("writes_only")).unwrap();
+    assert_eq!(
+        in_force(&library),
+        Err("exchange_folder_not_in_permissions_file")
+    );
+    let older_path = older.path().canonicalize().unwrap().display().to_string();
+    let step = skykeep_mcp::next_step(
+        "exchange_folder_not_in_permissions_file",
+        &dir,
+        &Value::Null,
+    )
+    .unwrap();
+    assert!(step.contains(&older_path), "{step}");
+    assert!(step.contains("skykeep-mcp exchange"), "{step}");
+    assert!(step.contains("no exchange_folder: line"), "{step}");
+    // Short sentences: at most three, none over 30 words.
+    let sentences: Vec<&str> = step.split(". ").collect();
+    assert!(sentences.len() <= 3, "{step}");
+    assert!(
+        sentences.iter().all(|s| s.split_whitespace().count() <= 30),
+        "{step}"
+    );
+    let lines = permissions::status(&library, &dir, Some("writes_only"));
+    let (line, fix) = lines
+        .iter()
+        .find(|(t, _)| t.starts_with("Exchange folder:"))
+        .unwrap();
+    assert!(line.contains(&older_path), "{line}");
+    assert!(
+        fix.as_deref()
+            .unwrap_or_default()
+            .contains("skykeep-mcp exchange"),
+        "{fix:?}"
+    );
+    // With no folder set up before, a file without the line simply names none.
+    library.set_state("mcp.drive.exchange", "").unwrap();
+    assert_eq!(in_force(&library), Ok(None));
+    // A good file works again.
+    write_file(&dir, &good_file);
+    assert_eq!(in_force(&library), Ok(Some(good_path)));
 }
 
 #[test]
@@ -484,7 +623,7 @@ async fn status_says_where_each_setting_comes_from() {
             path.display()
         ),
     );
-    f.server.handle(call(1, "reminders_lists", json!({}))).await;
+    handle(&mut f.server, call(1, "reminders_lists", json!({}))).await;
     let lines = permissions::status(&f.library, &dir, Some("writes_only"));
     assert!(
         lines.iter().any(|(t, _)| t.contains(&format!(
@@ -583,10 +722,9 @@ fn policy_command(dir: &Path, mode: &str, answer: &str) -> (bool, String) {
 fn the_policy_command_writes_the_files_line_and_keeps_its_comments() {
     let state = private("state");
     let dir = state.path().canonicalize().unwrap();
-    Server::open(&dir)
-        .unwrap()
-        .set_policy("writes_only")
-        .unwrap();
+    let mut server = Server::open(&dir).unwrap();
+    retried(|| server.set_policy("writes_only"));
+    drop(server);
     write_file(
         &dir,
         "version: 1\napproval_mode: writes_only  # my choice\nrules:\n  notes_list: deny\n",
@@ -756,10 +894,10 @@ async fn a_mode_taken_from_the_file_stops_counting_when_its_line_is_removed() {
     assert!(!asks(&mut f, 1, "reminders_lists", json!({})).await);
     let create = json!({"action":"create","list_guid":"list","title":"Synthetic"});
     assert!(!asks(&mut f, 2, "reminders_write", create.clone()).await);
-    permissions::show(&dir, true).unwrap();
+    retried(|| permissions::show(&dir, true));
     write_file(&dir, "version: 1\n");
     assert!(asks(&mut f, 3, "reminders_write", create).await);
-    let shown = permissions::show(&dir, true).unwrap();
+    let shown = retried(|| permissions::show(&dir, true));
     assert!(
         shown.contains("stricter: approval mode: yolo before, now none"),
         "{shown}"
@@ -775,21 +913,156 @@ async fn taking_over_the_files_mode_says_where_set_aside_changes_are() {
     let create = json!({"action":"create","list_guid":"list","title":"Waiting"});
     assert!(!asks(&mut f, 1, "reminders_write", create).await);
     write_file(&dir, "version: 1\napproval_mode: writes_only\n");
-    let reply = f
-        .server
-        .handle(call(2, "reminders_lists", json!({})))
-        .await
-        .unwrap();
+    let reply = handle(&mut f.server, call(2, "reminders_lists", json!({}))).await;
     let body: Value =
         serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     let notice = body["set_aside"].as_str().unwrap_or_default();
     assert!(notice.contains("1 waiting change"), "{body}");
     assert!(notice.contains("skykeep-mcp quarantine"), "{body}");
     // Said once.
-    let reply = f
-        .server
-        .handle(call(3, "reminders_lists", json!({})))
-        .await
-        .unwrap();
+    let reply = handle(&mut f.server, call(3, "reminders_lists", json!({}))).await;
     assert!(!reply.to_string().contains("set_aside"), "{reply}");
+}
+
+/// Review round 1: a folder set up with `skykeep-mcp exchange` before the file existed is
+/// copied into the file as its exchange_folder: line when Skykeep writes the first file (setup's
+/// starter, the policy command, a rule saved from a card), and the copy is in the history.
+#[tokio::test]
+async fn an_earlier_exchange_folder_is_copied_into_the_first_file() {
+    for how in ["starter", "policy", "card"] {
+        let f = folder(Some("writes_only")).await;
+        let dir = f.path();
+        let older = private("xchg-older");
+        let older_path = older.path().canonicalize().unwrap();
+        let mut library = quince_core::Library::open(&dir).unwrap();
+        skykeep_mcp::exchange::set_up(&mut library, Some(older_path.clone()), None).unwrap();
+        // The server has loaded the folder without a file first, as before an upgrade.
+        permissions::load(&mut library, &dir, Some("writes_only")).unwrap();
+        match how {
+            "starter" => permissions::write_starter(&dir).unwrap(),
+            "policy" => permissions::set_setting(&dir, permissions::MODE_KEY, "yolo").unwrap(),
+            _ => permissions::save_allow(&dir, "notes_list", "missing").unwrap(),
+        }
+        assert_eq!(
+            permissions::setting_in_file(&dir, permissions::EXCHANGE_KEY).as_deref(),
+            Some(older_path.to_str().unwrap()),
+            "{how}"
+        );
+        permissions::load(&mut library, &dir, Some("writes_only")).unwrap();
+        assert_eq!(
+            skykeep_mcp::exchange::in_force(&library, &dir)
+                .unwrap()
+                .map(|e| e.path),
+            Some(older_path.clone()),
+            "{how}"
+        );
+        let shown = retried(|| permissions::show(&dir, true));
+        assert!(
+            shown.contains(&format!(
+                "the exchange folder set up with skykeep-mcp exchange, {}, was written into the file",
+                older_path.display()
+            )),
+            "{how}: {shown}"
+        );
+        assert!(!shown.contains("looser: exchange folder"), "{how}: {shown}");
+    }
+    // A folder that no longer passes the checks is not copied: one others can change, one
+    // replaced by a symbolic link, one inside a hidden or credentials folder, and one replaced
+    // by another folder of the same name.
+    let base = private("xchg-base");
+    let base_path = base.path().canonicalize().unwrap();
+    let elsewhere = private("xchg-elsewhere");
+    for case in ["shared", "link", ".ssh", "Credentials", "replaced"] {
+        let f = folder(Some("writes_only")).await;
+        let dir = f.path();
+        let earlier = match case {
+            ".ssh" | "Credentials" => base_path.join(case).join("in"),
+            other => base_path.join(other),
+        };
+        std::fs::create_dir_all(&earlier).unwrap();
+        std::fs::set_permissions(&earlier, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut library = quince_core::Library::open(&dir).unwrap();
+        skykeep_mcp::exchange::set_up(&mut library, Some(earlier.clone()), None).unwrap();
+        match case {
+            "shared" => {
+                std::fs::set_permissions(&earlier, std::fs::Permissions::from_mode(0o777)).unwrap()
+            }
+            "link" => {
+                std::fs::remove_dir(&earlier).unwrap();
+                std::os::unix::fs::symlink(elsewhere.path(), &earlier).unwrap();
+            }
+            "replaced" => {
+                // Moved aside, not removed, so the new folder can't reuse its inode.
+                std::fs::rename(&earlier, base_path.join("replaced-old")).unwrap();
+                std::fs::create_dir(&earlier).unwrap();
+                std::fs::set_permissions(&earlier, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            _ => {}
+        }
+        permissions::set_setting(&dir, permissions::MODE_KEY, "yolo").unwrap();
+        assert_eq!(
+            permissions::setting_in_file(&dir, permissions::EXCHANGE_KEY),
+            None,
+            "{case}"
+        );
+    }
+}
+
+/// Review round 2: once copied into the file, the folder is still held to the device and
+/// inode it was set up with: a folder made again at the same path is refused, never used.
+#[tokio::test]
+async fn a_copied_folder_replaced_at_the_same_path_is_refused() {
+    let f = folder(Some("writes_only")).await;
+    let dir = f.path();
+    let older = private("xchg-older");
+    let older_path = older.path().canonicalize().unwrap();
+    let mut library = quince_core::Library::open(&dir).unwrap();
+    skykeep_mcp::exchange::set_up(&mut library, Some(older_path.clone()), None).unwrap();
+    permissions::write_starter(&dir).unwrap();
+    permissions::load(&mut library, &dir, Some("writes_only")).unwrap();
+    let in_force = |library: &quince_core::Library| {
+        skykeep_mcp::exchange::in_force(library, &dir).map(|e| e.map(|e| e.path))
+    };
+    assert_eq!(in_force(&library), Ok(Some(older_path.clone())));
+    // Moved aside, not removed, so the new folder can't reuse its inode.
+    let aside = private("xchg-aside");
+    std::fs::rename(&older_path, aside.path().join("old")).unwrap();
+    std::fs::create_dir(&older_path).unwrap();
+    std::fs::set_permissions(&older_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        in_force(&library),
+        Err("exchange_folder_changed_run_skykeep_mcp_exchange")
+    );
+    // Set up again in the terminal, the new folder is the one held to.
+    skykeep_mcp::exchange::set_up(&mut library, Some(older_path.clone()), None).unwrap();
+    assert_eq!(in_force(&library), Ok(Some(older_path.clone())));
+    // Review round 3: a stored setting that can't be read can't be checked: refused, with
+    // the command that sets it up again.
+    library
+        .set_state("mcp.drive.exchange", "not a setting")
+        .unwrap();
+    assert_eq!(
+        in_force(&library),
+        Err("exchange_folder_unchecked_run_skykeep_mcp_exchange")
+    );
+    let step = skykeep_mcp::next_step(
+        "exchange_folder_unchecked_run_skykeep_mcp_exchange",
+        &dir,
+        &Value::Null,
+    )
+    .unwrap();
+    assert!(step.contains("skykeep-mcp exchange"), "{step}");
+    assert!(step.contains("can't be checked"), "{step}");
+}
+
+/// Review round 2: when the file's mistake can't be named (no library to read it from), the
+/// step does not point to a mistake "named above".
+#[test]
+fn an_unusable_file_without_a_named_mistake_says_fix_the_file() {
+    let state = private("state");
+    let dir = state.path().canonicalize().unwrap();
+    write_file(&dir, "version: 1\nexchange_folder: rel/ex\n");
+    let step = skykeep_mcp::next_step("exchange_folder_file_unusable", &dir, &Value::Null).unwrap();
+    assert!(step.contains("Fix the file, then try again."), "{step}");
+    assert!(!step.contains("named above"), "{step}");
 }

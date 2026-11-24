@@ -421,6 +421,13 @@ async fn setup_offers_a_starter_permissions_file_and_writes_it_only_when_asked()
         "{}",
         script.screen
     );
+    assert!(
+        script.screen.contains(
+            "Once this file exists, only its exchange_folder: line names the exchange folder"
+        ),
+        "{}",
+        script.screen
+    );
     let file = dir.join(skykeep_mcp::permissions::FILE_NAME);
     assert!(!file.exists(), "Enter skips");
 

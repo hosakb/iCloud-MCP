@@ -165,14 +165,28 @@ pub fn checked(written: &str, state_dir: &Path, max_bytes: u64) -> Result<Exchan
     })
 }
 
-/// The folder uploads and downloads use now, checked: the one `permissions.yaml` names (or
-/// its last valid one while the file can't be used), else the one `skykeep-mcp exchange` set
-/// up, else `None`. A folder that fails the checks is refused, never replaced by another.
+/// `permissions.yaml` can't be used, so no exchange folder is in use.
+pub const FILE_UNUSABLE: &str = "exchange_folder_file_unusable";
+/// The folder set up with `skykeep-mcp exchange` can't be read, so the file's folder can't be
+/// checked against it.
+pub const UNCHECKED: &str = "exchange_folder_unchecked_run_skykeep_mcp_exchange";
+/// `permissions.yaml` has no `exchange_folder:` line, but a folder was set up earlier with
+/// `skykeep-mcp exchange`; once the file exists only its line counts, so none is in use.
+pub const NOT_IN_FILE: &str = "exchange_folder_not_in_permissions_file";
+
+/// The folder uploads and downloads use now, checked: the one `permissions.yaml` names;
+/// with no file, the one `skykeep-mcp exchange` set up; else `None`. A file that can't be
+/// used refuses every transfer ([`FILE_UNUSABLE`]), and a usable file without the line names
+/// none: [`NOT_IN_FILE`] when a folder was set up earlier, so the person learns it is no
+/// longer used. A folder that fails the checks is refused, never replaced by another.
 pub fn in_force(
     library: &quince_core::Library,
     state_dir: &Path,
 ) -> Result<Option<Exchange>, &'static str> {
     let active = crate::permissions::peek(library, state_dir, None)?;
+    if active.problem.is_some() {
+        return Err(FILE_UNUSABLE);
+    }
     let stored = configured(library);
     let max_bytes = stored
         .as_ref()
@@ -182,7 +196,25 @@ pub fn in_force(
     if let Some(written) = &active.exchange {
         let mut exchange = checked(written, state_dir, max_bytes)?;
         exchange.from_file = true;
+        // The folder set up in the terminal, named in the file (as the copy into the first
+        // file does), is still held to the device and inode it was set up with.
+        // A stored setting that can't be read can't be compared: refused, never skipped.
+        match &stored {
+            Ok(Some(stored))
+                if stored.path == exchange.path && stored.identity != exchange.identity =>
+            {
+                return Err("exchange_folder_changed_run_skykeep_mcp_exchange");
+            }
+            Ok(_) => {}
+            Err(_) => return Err(UNCHECKED),
+        }
         return Ok(Some(exchange));
+    }
+    if active.file_names_exchange {
+        return match stored {
+            Ok(Some(_)) => Err(NOT_IN_FILE),
+            _ => Ok(None),
+        };
     }
     let Some(stored) = stored? else {
         return Ok(None);
@@ -222,6 +254,9 @@ pub fn problem(code: &str) -> &'static str {
             "is no longer the folder that was set up"
         }
         "exchange_folder_changed" => "changed while it was in use; try again",
+        FILE_UNUSABLE => "is not used while permissions.yaml can't be used",
+        NOT_IN_FILE => "is not named in permissions.yaml",
+        UNCHECKED => "can't be checked, because the folder set up with skykeep-mcp exchange can't be read",
         _ => "can't be opened",
     }
 }
@@ -249,6 +284,10 @@ pub fn fix(code: &str, dir: &Path, written: Option<&str>) -> String {
         "exchange_folder_writable_by_others" => {
             format!("Make it yours alone with: chmod 700 {folder} or {change}.")
         }
+        UNCHECKED => format!(
+            "In your own terminal, run {} to set the folder up again.",
+            crate::status::with_dir("skykeep-mcp exchange", dir)
+        ),
         _ => {
             let mut text = change;
             text[..1].make_ascii_uppercase();
@@ -271,6 +310,24 @@ pub fn next_step(code: &str, dir: &Path) -> String {
     if code == "exchange_folder_not_set_up_run_skykeep_mcp_exchange_in_a_terminal" {
         return fix(code, dir, None);
     }
+    if code == FILE_UNUSABLE {
+        return file_unusable_step(dir, false);
+    }
+    if code == NOT_IN_FILE {
+        let because = format!(
+            "{} has no {}: line, so nothing was uploaded or downloaded.",
+            crate::permissions::FILE_NAME,
+            crate::permissions::EXCHANGE_KEY
+        );
+        return match earlier_folder(dir) {
+            Some(path) => format!(
+                "{} was set up earlier with skykeep-mcp exchange. It is not used, because {because} {}",
+                crate::status::quoted(&path),
+                not_in_file_fix(dir)
+            ),
+            None => format!("{because} {}", not_in_file_fix(dir)),
+        };
+    }
     match &written {
         Some(w) => format!(
             "The exchange folder {} in {} {}, so nothing was uploaded or downloaded. {}",
@@ -285,6 +342,80 @@ pub fn next_step(code: &str, dir: &Path) -> String {
             fix(code, dir, None)
         ),
     }
+}
+
+/// What to do when `permissions.yaml` can't be used. `in_terminal` leaves out the pointer to
+/// `skykeep-mcp permissions show`, for the terminal commands that already say what is wrong.
+pub fn file_unusable_step(dir: &Path, in_terminal: bool) -> String {
+    let file = crate::status::quoted(&dir.join(crate::permissions::FILE_NAME));
+    // The file's mistake, read without making a library in a folder that has none.
+    let why = (dir.join("library.db").is_file())
+        .then(|| quince_core::Library::open(dir).ok())
+        .flatten()
+        .and_then(|l| crate::permissions::peek(&l, dir, None).ok())
+        .and_then(|a| a.problem)
+        .map(|p| {
+            format!(
+                " ({})",
+                p.chars()
+                    .filter(|c| !c.is_control())
+                    .take(300)
+                    .collect::<String>()
+            )
+        })
+        .unwrap_or_default();
+    let fix = if why.is_empty() {
+        "Fix the file, then try again."
+    } else {
+        "Fix the mistake named above in that file, then try again."
+    };
+    let mut text = format!("{file} can't be used{why}, so no exchange folder is in use and nothing is uploaded or downloaded. {fix}");
+    if !in_terminal {
+        text.push_str(&format!(
+            " In your own terminal, {} says what is wrong.",
+            crate::status::with_dir("skykeep-mcp permissions show", dir)
+        ));
+    }
+    text
+}
+
+/// The folder `skykeep-mcp exchange` set up, read without making a library.
+fn earlier_folder(dir: &Path) -> Option<PathBuf> {
+    let library = (dir.join("library.db").is_file())
+        .then(|| quince_core::Library::open(dir).ok())
+        .flatten()?;
+    configured(&library).ok()?.map(|e| e.path)
+}
+
+/// What [`NOT_IN_FILE`] means, in two short sentences naming the folder set up earlier.
+pub(crate) fn not_in_file(dir: &Path) -> Option<String> {
+    Some(format!(
+        "{} was set up earlier with skykeep-mcp exchange. It is not used, because {} has no {}: line.",
+        crate::status::quoted(&earlier_folder(dir)?),
+        crate::permissions::FILE_NAME,
+        crate::permissions::EXCHANGE_KEY
+    ))
+}
+
+/// The fix for [`NOT_IN_FILE`].
+pub(crate) fn not_in_file_fix(dir: &Path) -> String {
+    format!(
+        "To use it, run {} in your own terminal or add the line yourself.",
+        crate::status::with_dir("skykeep-mcp exchange", dir)
+    )
+}
+
+/// The folder `skykeep-mcp exchange` set up before `permissions.yaml` existed, as it would
+/// be written in the file, when it still passes every check and is still the folder that was
+/// set up. Copied into the first file Skykeep writes, so it is not lost.
+pub(crate) fn earlier_still_valid(dir: &Path) -> Option<String> {
+    let library = (dir.join("library.db").is_file())
+        .then(|| quince_core::Library::open(dir).ok())
+        .flatten()?;
+    let stored = configured(&library).ok()??;
+    let text = stored.path.to_str()?;
+    let now = checked(text, dir, stored.max_bytes).ok()?;
+    (now.identity == stored.identity && now.path == stored.path).then(|| text.to_string())
 }
 
 /// The folder as `skykeep-mcp exchange` stored it, `None` before it is.

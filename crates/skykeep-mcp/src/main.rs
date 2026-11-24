@@ -410,7 +410,13 @@ async fn run(all: Vec<std::ffi::OsString>) -> Result<(), &'static str> {
                 return Ok(());
             }
             for row in &rows {
-                writeln!(tty, "{row}").map_err(|_| "terminal_unavailable")?;
+                // The next step on a line of its own, not again inside the row.
+                let mut shown = row.clone();
+                let step = shown.as_object_mut().and_then(|r| r.remove("next_step"));
+                writeln!(tty, "{shown}").map_err(|_| "terminal_unavailable")?;
+                if let Some(step) = step.as_ref().and_then(|s| s.as_str()) {
+                    writeln!(tty, "  Next step: {step}").map_err(|_| "terminal_unavailable")?;
+                }
             }
             writeln!(tty, "These {} writes were refused or quarantined and will never be sent. Retiring deletes exactly these rows from {} for good.", rows.len(), dir.display()).map_err(|_| "terminal_unavailable")?;
             let answer = terminal::hidden(

@@ -568,7 +568,7 @@ async fn stale_write_is_quarantined_alone_and_never_sent() {
         .unwrap();
     assert_eq!(
         refused_reason(&library, "other").as_deref(),
-        Some("mcp_quarantine:write_authorization_stale")
+        Some("mcp_quarantine:item_changed_on_icloud_since_queued")
     );
     assert_eq!(library.outbox_pending("reminders").unwrap().len(), 0);
     let requests = remote.received_requests().await.unwrap();
@@ -807,7 +807,7 @@ async fn sync_reply_and_status_report_quarantined_writes() {
     assert_eq!(quarantined[0]["kind"], "edit");
     assert_eq!(
         quarantined[0]["reason"],
-        "mcp_quarantine:write_authorization_stale"
+        "mcp_quarantine:item_changed_on_icloud_since_queued"
     );
     assert!(!result.to_string().contains("QUEUED-TITLE"));
     use std::os::unix::fs::PermissionsExt;
@@ -834,7 +834,7 @@ async fn sync_reply_and_status_report_quarantined_writes() {
     );
     assert_eq!(
         reminders["refused_recent"][0]["reason"],
-        "mcp_quarantine:write_authorization_stale"
+        "mcp_quarantine:item_changed_on_icloud_since_queued"
     );
     assert!(!status.to_string().contains("QUEUED-TITLE"));
 }
@@ -901,4 +901,529 @@ async fn refused_reasons_are_plain_in_terminal_and_coded_in_status() {
     let text = status["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("refused_by_sync_engine"), "{text}");
     assert!(!text.contains("SYNTHETIC-UPSTREAM-TEXT"));
+}
+
+fn grant(library: &quince_core::Library, id: i64) -> Option<String> {
+    library.state(&format!("mcp.authorization.{id}")).unwrap()
+}
+
+/// A synthetic remote whose Reminders read brings "other" back with a new etag, in `list`.
+async fn remote_with_other_in(list: &str) -> MockServer {
+    let remote = remote().await;
+    let record = json!({"recordName":"other","recordType":"Reminder","recordChangeTag":"apple-2",
+        "fields":{"List":{"type":"REFERENCE","value":{"recordName":list}},
+        "TitleDocument":{"type":"ENCRYPTED_BYTES","value":quince_icloud::ckdocument::text_to_base64("other")}}});
+    Mock::given(method("POST"))
+        .and(path_regex(".*/com.apple.reminders/.*/changes/zone$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"zones":[{"records":[record],"syncToken":"next","moreComing":false}]}),
+        ))
+        .with_priority(1)
+        .mount(&remote)
+        .await;
+    remote
+}
+
+/// Issue 74: Apple gives a new etag and time to a note or reminder at the next read, even
+/// one just made. A write queued before that read still goes to the sender, which checks
+/// the etag itself.
+#[tokio::test]
+async fn a_new_etag_and_time_from_apple_do_not_stale_a_queued_write() {
+    let (dir, mut server, mut library) = family().await;
+    let created = write(
+        &mut server,
+        2,
+        "reminders_write",
+        json!({"action":"create","list_guid":"list","title":"fresh"}),
+    )
+    .await;
+    let created: Value =
+        serde_json::from_str(created["content"][0]["text"].as_str().unwrap()).unwrap();
+    let fresh = created["guid"].as_str().unwrap().to_string();
+    approved(
+        &mut server,
+        3,
+        json!({"action":"tick","guid":fresh,"done":true}),
+    )
+    .await;
+    let pinned = write(
+        &mut server,
+        4,
+        "notes_write",
+        json!({"action":"pin","guid":"note","pinned":true,"base_etag":"n1"}),
+    )
+    .await;
+    assert_eq!(pinned["isError"], false, "{pinned}");
+    // What the next read from Apple brings: new etags and a new time, nothing else.
+    let mut reminder = library.reminder(&fresh).unwrap().unwrap();
+    reminder.etag = Some("apple-1".into());
+    library.put_reminders(&[reminder]).unwrap();
+    let mut note = library.note("note").unwrap().unwrap();
+    note.etag = Some("n2".into());
+    note.modified_at = Some(1_700_000_000);
+    library.put_notes(&[note]).unwrap();
+    for service in ["notes", "reminders"] {
+        for p in library.outbox_pending(service).unwrap() {
+            assert_eq!(
+                skykeep_mcp::sync::authorized(&library, dir.path(), &p),
+                Ok(()),
+                "{p:?}"
+            );
+        }
+    }
+    let remote = remote().await;
+    let result =
+        skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+            .await
+            .unwrap();
+    assert_eq!(mcp_refusals(&library), Vec::<String>::new(), "{result}");
+    let requests = remote.received_requests().await.unwrap();
+    assert!(handed_to_sender(&requests, &fresh));
+    assert!(handed_to_sender(&requests, "note"));
+}
+
+/// Issue 74: the same, with the new etag arriving in the sync's own read from Apple, just
+/// before the queued edit is checked and sent.
+#[tokio::test]
+async fn an_etag_changed_by_the_sync_read_still_sends_the_edit() {
+    let (dir, mut server, library) = family().await;
+    approved(
+        &mut server,
+        2,
+        json!({"action":"edit","guid":"other","patch":{"title":"approved"}}),
+    )
+    .await;
+    let remote = remote_with_other_in("list").await;
+    let result =
+        skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+            .await
+            .unwrap();
+    assert_eq!(mcp_refusals(&library), Vec::<String>::new(), "{result}");
+    assert!(handed_to_sender(
+        &remote.received_requests().await.unwrap(),
+        "other"
+    ));
+}
+
+/// Issue 74: an item really changed on iCloud in the sync's own read is refused with a
+/// reason and a next step, its grant is emptied, and it never reaches the sender.
+#[tokio::test]
+async fn an_item_moved_on_icloud_in_the_sync_read_is_refused_and_its_grant_emptied() {
+    let (dir, mut server, library) = family().await;
+    approved(
+        &mut server,
+        2,
+        json!({"action":"edit","guid":"other","patch":{"title":"approved"}}),
+    )
+    .await;
+    let id = pending_for(&library, "other").id;
+    let remote = remote_with_other_in("list2").await;
+    let result =
+        skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+            .await
+            .unwrap();
+    assert_eq!(
+        refused_reason(&library, "other").as_deref(),
+        Some("mcp_quarantine:item_changed_on_icloud_since_queued"),
+        "{result}"
+    );
+    assert_eq!(grant(&library, id).as_deref(), Some(""));
+    let refused = &result["refused_this_sync"][0];
+    assert_eq!(refused["record"], "other", "{result}");
+    let step = refused["instructions"].as_str().unwrap_or_default();
+    assert!(step.contains("after this change was queued"), "{result}");
+    assert!(step.contains("reminders_get"), "{result}");
+    assert!(step.contains("nothing to redo"), "{result}");
+    assert!(!modified(&remote.received_requests().await.unwrap())
+        .iter()
+        .any(|b| b.contains("approved")));
+}
+
+/// Issue 74: a body changed or an item deleted on iCloud before the sync is refused the
+/// same way, each write alone.
+#[tokio::test]
+async fn a_body_changed_or_item_deleted_on_icloud_is_refused_with_a_reason() {
+    let (dir, mut server, mut library) = family().await;
+    let saved = write(
+        &mut server,
+        2,
+        "notes_write",
+        json!({"action":"save","guid":"note","body":"note\nbody edited","base_etag":"n1"}),
+    )
+    .await;
+    assert_eq!(saved["isError"], false, "{saved}");
+    approved(
+        &mut server,
+        3,
+        json!({"action":"tick","guid":"child","done":true}),
+    )
+    .await;
+    let note_id = library.outbox_pending("notes").unwrap()[0].id;
+    let child_id = pending_for(&library, "child").id;
+    library
+        .set_note_text("note", "note\nchanged on a phone", "note", Some("changed"))
+        .unwrap();
+    library
+        .forget_reminders(&["child".to_string()], &[])
+        .unwrap();
+    let remote = remote().await;
+    let result =
+        skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+            .await
+            .unwrap();
+    for (id, reason) in library
+        .outbox_refused()
+        .unwrap()
+        .iter()
+        .map(|r| (r.change.id, &r.reason))
+    {
+        assert!([note_id, child_id].contains(&id), "{result}");
+        assert_eq!(
+            reason, "mcp_quarantine:item_changed_on_icloud_since_queued",
+            "{result}"
+        );
+        assert_eq!(grant(&library, id).as_deref(), Some(""));
+    }
+    assert_eq!(library.outbox_refused().unwrap().len(), 2, "{result}");
+    let requests = remote.received_requests().await.unwrap();
+    assert!(!handed_to_sender(&requests, "note"));
+    assert!(!handed_to_sender(&requests, "child"));
+    // The terminal's quarantine list gives the same next step under each row.
+    use std::os::unix::fs::PermissionsExt;
+    for file in std::fs::read_dir(dir.path()).unwrap() {
+        let file = file.unwrap();
+        if file.file_type().unwrap().is_file() {
+            std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    let rows = server.quarantined().unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let step = row["next_step"].as_str().unwrap_or_default();
+        assert!(step.contains("nothing to redo"), "{row}");
+        // It stays until a person retires it, and counts toward the limit.
+        assert!(step.contains("skykeep-mcp quarantine"), "{row}");
+        assert!(
+            step.contains(&skykeep_mcp::sync::MAX_REFUSED.to_string()),
+            "{row}"
+        );
+    }
+}
+
+/// Review round 1: a change on iCloud to a field the queued write does not set (the title,
+/// the due date) still sets a queued tick aside.
+#[tokio::test]
+async fn a_title_or_due_date_changed_on_icloud_refuses_a_queued_tick() {
+    let (dir, mut server, mut library) = family().await;
+    for (id, guid) in [(2, "other"), (3, "parent")] {
+        approved(
+            &mut server,
+            id,
+            json!({"action":"tick","guid":guid,"done":true}),
+        )
+        .await;
+    }
+    let mut other = library.reminder("other").unwrap().unwrap();
+    other.title = "renamed on a phone".into();
+    library.put_reminder_local(&other).unwrap();
+    let mut parent = library.reminder("parent").unwrap().unwrap();
+    parent.due_at = Some(1_800_000_000);
+    library.put_reminder_local(&parent).unwrap();
+    let remote = remote().await;
+    let result =
+        skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+            .await
+            .unwrap();
+    for guid in ["other", "parent"] {
+        assert_eq!(
+            refused_reason(&library, guid).as_deref(),
+            Some("mcp_quarantine:item_changed_on_icloud_since_queued"),
+            "{guid}: {result}"
+        );
+    }
+}
+
+/// A save of `body` on the family note that carries its formatting, `runs`; it must queue.
+async fn save_with_runs(server: &mut skykeep_mcp::Server, id: i64, body: &str, runs: Value) {
+    let saved = write(
+        server,
+        id,
+        "notes_write",
+        json!({"action":"save","guid":"note","body":body,"runs":runs,"base_etag":"n1"}),
+    )
+    .await;
+    assert_eq!(saved["isError"], false, "{saved}");
+}
+
+/// A synthetic remote whose Notes read and lookup both give the family note as Apple holds
+/// it now: `text`, set with `runs` when given, titled by its first line.
+async fn remote_with_note(text: &str, runs: Option<Value>) -> MockServer {
+    use quince_icloud::ckdocument as doc;
+    let remote = remote().await;
+    let mut encoded = doc::text_to_base64(text);
+    if let Some(runs) = runs {
+        let runs: Vec<doc::Run> = serde_json::from_value(runs).unwrap();
+        encoded = doc::replace_rich_in_base64(&encoded, text, &runs).unwrap();
+    }
+    let record = json!({"recordName":"note","recordType":"Note","recordChangeTag":"n2","fields":{
+        "TitleEncrypted":{"type":"ENCRYPTED_BYTES","value":doc::bare_text_to_base64(text.lines().next().unwrap_or_default())},
+        "SnippetEncrypted":{"type":"ENCRYPTED_BYTES","value":doc::bare_text_to_base64("body")},
+        "TextDataEncrypted":{"type":"ENCRYPTED_BYTES","value":encoded},
+        "Deleted":{"type":"INT64","value":0}}});
+    Mock::given(method("POST"))
+        .and(path_regex(".*/com.apple.notes/.*/changes/zone$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"zones":[{"records":[record.clone()],"syncToken":"next","moreComing":false}]}),
+        ))
+        .with_priority(1)
+        .mount(&remote)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/com.apple.notes/.*/records/lookup$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"records":[record]})))
+        .with_priority(1)
+        .mount(&remote)
+        .await;
+    remote
+}
+
+/// Review round 3: the note's text changed on a phone after a save was queued. The sync's
+/// read stores Apple's copy and lays the waiting save over it again, so the cache can't show
+/// the change; before the save is sent, Apple's copy is compared with the text the save was
+/// typed over, and the save is set aside.
+#[tokio::test]
+async fn a_note_text_changed_on_icloud_sets_a_queued_save_aside() {
+    let (dir, mut server, library) = family().await;
+    let saved = write(
+        &mut server,
+        2,
+        "notes_write",
+        json!({"action":"save","guid":"note","body":"NOTE\nbody","base_etag":"n1"}),
+    )
+    .await;
+    assert_eq!(saved["isError"], false, "{saved}");
+    let id = library.outbox_pending("notes").unwrap()[0].id;
+    let remote = remote_with_note("note\nbody\nadded on a phone", None).await;
+    let result =
+        skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+            .await
+            .unwrap();
+    assert_eq!(
+        library.outbox_refused().unwrap()[0].reason,
+        "mcp_quarantine:item_changed_on_icloud_since_queued",
+        "{result}"
+    );
+    assert_eq!(grant(&library, id).as_deref(), Some(""));
+    assert!(
+        modified(&remote.received_requests().await.unwrap()).is_empty(),
+        "nothing was written to Apple"
+    );
+}
+
+/// Review round 3: a line styled on iCloud after a save that restyles it was queued. The
+/// save carries its own formatting, so Apple's formatting is compared with the formatting
+/// the save was typed over, and the save is set aside rather than overwrite it.
+#[tokio::test]
+async fn a_line_styled_on_icloud_sets_aside_a_save_that_restyles_it() {
+    let (dir, mut server, mut library) = family().await;
+    library
+        .set_note_runs("note", &json!([{"length":9}]).to_string())
+        .unwrap();
+    save_with_runs(&mut server, 2, "note\nbody!", json!([{"length":10}])).await;
+    let remote = remote_with_note(
+        "note\nbody",
+        Some(json!([{"length":5},{"length":4,"bold":true}])),
+    )
+    .await;
+    let result =
+        skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+            .await
+            .unwrap();
+    assert_eq!(
+        library.outbox_refused().unwrap()[0].reason,
+        "mcp_quarantine:item_changed_on_icloud_since_queued",
+        "{result}"
+    );
+    assert!(modified(&remote.received_requests().await.unwrap()).is_empty());
+}
+
+/// Review round 3: the same save over a copy unchanged on iCloud is sent.
+#[tokio::test]
+async fn a_save_over_an_unchanged_copy_on_icloud_is_sent() {
+    let (dir, mut server, mut library) = family().await;
+    library
+        .set_note_runs("note", &json!([{"length":9}]).to_string())
+        .unwrap();
+    save_with_runs(&mut server, 2, "note\nbody!", json!([{"length":10}])).await;
+    let remote = remote_with_note("note\nbody", Some(json!([{"length":5},{"length":4}]))).await;
+    let result =
+        skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+            .await
+            .unwrap();
+    assert_eq!(mcp_refusals(&library), Vec::<String>::new(), "{result}");
+    assert!(!modified(&remote.received_requests().await.unwrap()).is_empty());
+}
+
+/// Final check: a save Apple already took, whose reply was lost, is tried again. Apple now
+/// holds the save's own text (and its own formatting, when it sets any), not the text it was
+/// typed over. That is no change on iCloud: it is not set aside, and the sender finishes
+/// without writing again.
+#[tokio::test]
+async fn a_save_apple_already_holds_is_not_set_aside_when_tried_again() {
+    for formatted in [false, true] {
+        let (dir, mut server, mut library) = family().await;
+        library
+            .set_note_runs("note", &json!([{"length":9}]).to_string())
+            .unwrap();
+        let remote = if formatted {
+            save_with_runs(&mut server, 2, "note\nbody!", json!([{"length":10}])).await;
+            remote_with_note("note\nbody!", Some(json!([{"length":4},{"length":6}]))).await
+        } else {
+            let saved = write(
+                &mut server,
+                2,
+                "notes_write",
+                json!({"action":"save","guid":"note","body":"NOTE\nbody","base_etag":"n1"}),
+            )
+            .await;
+            assert_eq!(saved["isError"], false, "{saved}");
+            remote_with_note("NOTE\nbody", None).await
+        };
+        let result =
+            skykeep_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+                .await
+                .unwrap();
+        assert_eq!(
+            mcp_refusals(&library),
+            Vec::<String>::new(),
+            "{formatted}: {result}"
+        );
+        assert!(
+            library.outbox_pending("notes").unwrap().is_empty(),
+            "{formatted}: {result}"
+        );
+        assert!(
+            modified(&remote.received_requests().await.unwrap()).is_empty(),
+            "{formatted}: nothing written again"
+        );
+    }
+}
+
+/// Review round 2: the same formatting cut into other runs, as Apple may send it back, is
+/// not a change.
+#[tokio::test]
+async fn the_same_formatting_in_other_runs_does_not_set_a_save_aside() {
+    let (dir, mut server, mut library) = family().await;
+    library
+        .set_note_runs("note", &json!([{"length":9}]).to_string())
+        .unwrap();
+    save_with_runs(&mut server, 2, "note\nbody edited", json!([{"length":16}])).await;
+    library
+        .set_note_runs(
+            "note",
+            &json!([{"length":5},{"length":4},{"length":7}]).to_string(),
+        )
+        .unwrap();
+    let p = library.outbox_pending("notes").unwrap().remove(0);
+    assert_eq!(
+        skykeep_mcp::sync::authorized(&library, dir.path(), &p),
+        Ok(())
+    );
+}
+
+/// Review round 2: two text-only saves in a row. The first was sent and the cache still has
+/// the formatting from before it; the next read brings Apple's formatting for the sent text,
+/// with the second save laid over it again. Nothing changed on iCloud, so it is not set aside.
+#[tokio::test]
+async fn a_second_text_only_save_after_a_sent_one_is_not_set_aside() {
+    let (dir, mut server, mut library) = family().await;
+    library
+        .set_note_runs("note", &json!([{"length":9}]).to_string())
+        .unwrap();
+    for (id, body) in [(2, "note\nbody one"), (3, "note\nbody two!")] {
+        let saved = write(
+            &mut server,
+            id,
+            "notes_write",
+            json!({"action":"save","guid":"note","body":body,"base_etag":"n1"}),
+        )
+        .await;
+        assert_eq!(saved["isError"], false, "{saved}");
+        if id == 2 {
+            // Sent: it leaves the queue, and the cache keeps its formatting as it was.
+            let first = library.outbox_pending("notes").unwrap().remove(0);
+            library.outbox_done(first.id).unwrap();
+        }
+    }
+    // The next read: Apple's copy of the first save, in its own runs, and the second save
+    // laid over it as the pass replays it.
+    library
+        .set_note_runs("note", &json!([{"length":5},{"length":8}]).to_string())
+        .unwrap();
+    let mut note = library.note("note").unwrap().unwrap();
+    note.etag = Some("n2".into());
+    library.put_notes(&[note]).unwrap();
+    let p = library.outbox_pending("notes").unwrap().remove(0);
+    assert_eq!(
+        skykeep_mcp::sync::authorized(&library, dir.path(), &p),
+        Ok(())
+    );
+}
+
+/// Review rounds 2 and 3: a save's grant holds no cached formatting; one recorded with it
+/// (by a build before round 3) or without it is checked the same way, so neither is set
+/// aside for a formatting value that no longer means anything here.
+#[tokio::test]
+async fn a_save_grant_with_or_without_a_formatting_value_is_still_sent() {
+    let (dir, mut server, mut library) = family().await;
+    library
+        .set_note_runs("note", &json!([{"length":9}]).to_string())
+        .unwrap();
+    save_with_runs(&mut server, 2, "note\nbody edited", json!([{"length":16}])).await;
+    let p = library.outbox_pending("notes").unwrap().remove(0);
+    let key = format!("mcp.authorization.{}", p.id);
+    let mut grant: Value = serde_json::from_str(&library.state(&key).unwrap().unwrap()).unwrap();
+    assert!(grant["context"].get("runs").is_none(), "{grant}");
+    assert_eq!(
+        skykeep_mcp::sync::authorized(&library, dir.path(), &p),
+        Ok(())
+    );
+    grant["context"]["runs"] = json!("a formatting value from an earlier build");
+    library.set_state(&key, &grant.to_string()).unwrap();
+    assert_eq!(
+        skykeep_mcp::sync::authorized(&library, dir.path(), &p),
+        Ok(())
+    );
+}
+
+/// Review round 3: a text-only save that undoes an earlier one, back to the text's earlier
+/// length, is not tied to the formatting the cache kept from before; it is not set aside.
+#[tokio::test]
+async fn a_text_only_undo_to_the_earlier_length_is_not_set_aside() {
+    let (dir, mut server, mut library) = family().await;
+    library
+        .set_note_runs("note", &json!([{"length":9}]).to_string())
+        .unwrap();
+    for (id, body) in [(2, "note\nbody one"), (3, "note\nbody")] {
+        let saved = write(
+            &mut server,
+            id,
+            "notes_write",
+            json!({"action":"save","guid":"note","body":body,"base_etag":"n1"}),
+        )
+        .await;
+        assert_eq!(saved["isError"], false, "{saved}");
+        if id == 2 {
+            let first = library.outbox_pending("notes").unwrap().remove(0);
+            library.outbox_done(first.id).unwrap();
+        }
+    }
+    library
+        .set_note_runs("note", &json!([{"length":5},{"length":8}]).to_string())
+        .unwrap();
+    let p = library.outbox_pending("notes").unwrap().remove(0);
+    assert_eq!(
+        skykeep_mcp::sync::authorized(&library, dir.path(), &p),
+        Ok(())
+    );
 }
