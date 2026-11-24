@@ -1822,7 +1822,7 @@ async fn a_refused_final_delete_says_the_item_is_in_recently_deleted_and_what_to
         &Value::Null
     )
     .unwrap()
-    .contains("skykeep-mcp login --state-dir /state"));
+    .contains("skykeep-mcp setup --state-dir /state"));
 }
 
 /// The approval form path carries the next step in the error result too.
@@ -2077,10 +2077,10 @@ fn the_exchange_command_defaults_its_state_folder() {
     let status = child.wait().unwrap();
     let said = String::from_utf8_lossy(&said);
     assert!(status.success(), "{said}");
-    let exchange = home.path().join("Skykeep-Exchange");
+    let exchange = home.path().join("iCloud-MCP-Exchange");
     let real = std::fs::canonicalize(home.path())
         .unwrap()
-        .join("Skykeep-Exchange");
+        .join("iCloud-MCP-Exchange");
     assert!(
         said.contains(&format!("Drive exchange folder: {}", real.display())),
         "{said}"

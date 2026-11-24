@@ -478,6 +478,10 @@ async fn get_returns_the_cached_card_and_says_what_is_not_kept() {
 async fn reads_say_when_the_cache_was_never_refreshed_or_last_failed() {
     let dir = private_dir();
     let mut server = Server::open(dir.path()).unwrap();
+    quince_core::Library::open(dir.path())
+        .unwrap()
+        .set_state("account", "synthetic-account")
+        .unwrap();
     init(&mut server, false).await;
     let empty = ok(&mut server, "contacts_list", json!({})).await;
     assert_eq!(empty["items"], json!([]));

@@ -23,9 +23,7 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
             "early_alert_account_unavailable_set_one_on_an_apple_device_then_sync",
             "folder_not_in_cache_use_path",
             "invalid_arguments_use_move_for_another_calendar",
-            "login_required_complete_account_setup",
             "login_required_or_network_unavailable",
-            "login_required_unlock_secure_storage",
             "logout_pending_unlock_keyring_and_retry",
             "not_found_at_apple_run_calendar_refresh",
             "not_found_at_apple_run_drive_refresh",
@@ -57,7 +55,6 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
             "event_too_large",
             "frame_too_large",
             "guid_required",
-            "invalid_arguments",
             "invalid_arguments_move_changes_only_the_calendar",
             "invalid_date",
             "invalid_early_alert",
@@ -76,7 +73,6 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
             "local_path_too_long",
             "operation_too_large",
             "page_too_large",
-            "parent_required",
             "path_too_deep",
             "path_too_long",
             "payload_too_large",
@@ -92,7 +88,6 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
             "title_required",
             "unexpected_argument",
             "unknown_service",
-            "unknown_tool",
         ],
     ),
     (
@@ -122,7 +117,6 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
             "lossy_markdown_overwrite",
             "not_a_file",
             "not_a_folder",
-            "not_found",
             "parent_not_found",
             "read_only_note",
             "repeating_reminder_needs_due_date",
@@ -222,10 +216,9 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "Only terminal commands return these, and the terminal prints its own sentence for each.",
+        "Only terminal commands return these, and the terminal prints its own sentence for each (checked below).",
         &[
             "account_locked_visit_account_website",
-            "already_initialized",
             "apple_answer_unreadable",
             "auth_cooldown_try_later",
             "authentication_unavailable",
@@ -268,6 +261,7 @@ const NOT_CODES: &[&str] = &[
     "app_library",
     "approval_mode",
     "approve",
+    "asset_points_at_another_master",
     "calendar",
     "checked",
     "cloudkit_accepted",
@@ -287,6 +281,7 @@ const NOT_CODES: &[&str] = &[
     "finished_unconfirmed",
     "folder",
     "full",
+    "hidden_or_in_recently_deleted",
     "image",
     "into",
     "jpg",
@@ -298,7 +293,10 @@ const NOT_CODES: &[&str] = &[
     "meaning",
     "mp4",
     "none",
+    "not_in_local_cache",
+    "not_shown_by_apple_yet",
     "nothing",
+    "number",
     "order",
     "other",
     "outcome",
@@ -309,6 +307,7 @@ const NOT_CODES: &[&str] = &[
     "policy",
     "priority",
     "quarantine",
+    "queued",
     "reads",
     "reads_and_writes",
     "refresh",
@@ -431,6 +430,15 @@ fn every_error_code_has_instructions_or_is_listed_as_needing_none() {
         missing.is_empty(),
         "give these an instructions line, or list them in NEEDS_NONE or NOT_CODES: {missing:#?}"
     );
+    // The terminal group's reason holds: each has its own sentence there.
+    let terminal = NEEDS_NONE.last().unwrap();
+    assert!(terminal.0.starts_with("Only terminal commands"));
+    let bare: Vec<&&str> = terminal
+        .1
+        .iter()
+        .filter(|code| skykeep_mcp::terminal::sentence(code, dir.path()).is_none())
+        .collect();
+    assert!(bare.is_empty(), "give these a terminal sentence: {bare:?}");
     let stale: Vec<&&str> = listed
         .iter()
         .chain(NOT_CODES)

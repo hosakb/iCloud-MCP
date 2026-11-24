@@ -37,7 +37,7 @@ pub enum Error {
     /// The library was last opened by a newer Skykeep, whose schema this one does not know:
     /// written to by this one, its tables and triggers could break for both.
     #[error(
-        "this library was made by a newer version of Skykeep (library version {found}; this \
+        "this library was made by a newer version of iCloud-MCP (library version {found}; this \
          version knows up to {known}). Install the newer version again to open it"
     )]
     Newer { found: u32, known: u32 },
@@ -706,7 +706,7 @@ mod tests {
             matches!(err, Error::Newer { found, .. } if found == newer),
             "{err}"
         );
-        assert!(err.to_string().contains("newer version of Skykeep"));
+        assert!(err.to_string().contains("newer version of iCloud-MCP"));
         let still: u32 = Connection::open(dir.path().join("library.db"))
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
