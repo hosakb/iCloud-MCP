@@ -26,7 +26,7 @@ Edit `crates/icloud-mcp/docs/architecture.html` and re-export `crates/icloud-mcp
 
 The release is a beta for Linux on x86-64 only. On macOS, use Hermes' own Apple skills instead (see "Other apps"). The program is built offline from a tagged commit by the project owner. Nobody has audited it.
 
-1. On the [releases page](https://github.com/hosakb/iCloud-MCP/releases), download the program file, named like `icloud-mcp-0.1.0-beta.1-linux-x86_64` (the release page lists the exact name), and the file of the same name ending in `.sha256`. Keep both in one folder under the names they were downloaded with.
+1. On the [releases page](https://github.com/hosakb/iCloud-MCP/releases), download the program file and the file of the same name ending in `.sha256`. The names in this guide, such as `icloud-mcp-0.1.0-beta.1-linux-x86_64`, are examples; the names on the release page are the real ones. Keep both in one folder under the names they were downloaded with.
 2. In that folder, check the download. Replace `FILE` with the name of the program file:
 
    ```sh
@@ -82,7 +82,7 @@ The binary is `target/release/icloud-mcp`. The workspace's default member is thi
 
 ## Get started
 
-Install the program where your terminal finds programs:
+If you installed a release, skip the next block; you already have the program. Otherwise install the program you built where your terminal finds programs:
 
 ```sh
 mkdir -p ~/.local/bin
@@ -120,9 +120,9 @@ You need a terminal window that you open yourself. Don't run these commands thro
    5. **Services.** Which of Notes, Reminders, Contacts, Calendar, Photos and Drive the assistant may use. Setup lists them with numbers and whether each is on; type the numbers of the services to have on (such as `1 4`), `none`, or press Enter to keep them as they are. The choice is stored as the `services:` line in `permissions.yaml` (see "Settings in the permissions file"); with every service on and no line, nothing is written. Apple gives one sign-in for the whole account, so this is a limit inside iCloud-MCP, not at Apple: someone with the sign-in file could still reach the other services outside this server.
    6. **Check.** Setup checks everything it set up and prints what to paste into your MCP client's settings, all under the server name `icloud`: a JSON line for most clients, a `config.yaml` block for Hermes, and one command each for Claude Code and Codex. If your client had rules for an older server name, such as tools it may call without asking, they don't apply to `icloud`; set them again there.
 
-   Claude Code and Codex add the server with one command each, and setup prints both with the program's full path and your folder filled in. Step 5 of "Install a release" shows what they look like.
+   For the Claude Code and Codex commands, see step 5 of "Install a release".
 
-   Answer approval cards in the interactive app. `claude -p` and `codex exec` may close cards by themselves, and a closed card counts as Deny, so use the interactive app for deletions and other actions that need approval. Codex also has its own setting, `default_tools_approval_mode`, for whether Codex asks you before it calls a tool. It goes under `[mcp_servers.<name>]` in Codex's `config.toml`, so `[mcp_servers.icloud]` for the command above. That setting is separate from iCloud-MCP's card: whatever it says, every action that needs approval still asks on the card.
+   Answer approval cards in the interactive app. `claude -p` and `codex exec` may close cards by themselves, and a closed card counts as Deny, so use the interactive app for deletions and other actions that need approval. Codex also has its own setting, `default_tools_approval_mode`, for whether Codex asks you before it calls a tool. It goes under `[mcp_servers.<name>]` in Codex's `config.toml`, so `[mcp_servers.icloud]` for the command in step 5. That setting is separate from iCloud-MCP's card: whatever it says, every action that needs approval still asks on the card.
 
    You can run `setup` again at any time. It checks the saved sign-in with Apple, then asks whether to keep the setup, sign in again in the same folder (same Apple Account), switch to another Apple Account, or quit. If Apple no longer accepts the saved sign-in, setup says so and goes straight to signing in again. A folder belongs to one Apple Account, so switching sets up a new folder for the other account and leaves the first one as it is. If setup stopped part way, the next run continues with the first step that is not done.
 
