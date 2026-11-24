@@ -422,7 +422,11 @@ fn the_errors_from_issue_91_say_what_to_do_next() {
     assert!(!hard_link.contains("cp "), "{hard_link}");
     assert!(hard_link.contains("not the AI app"), "{hard_link}");
     // These come back on a live call too, where nothing was queued.
-    for code in ["preview_too_large", "invalid_preview", "operation_too_large"] {
+    for code in [
+        "preview_too_large",
+        "invalid_preview",
+        "operation_too_large",
+    ] {
         let text = line(code);
         assert!(text.contains("nothing was queued"), "{code}: {text}");
         assert!(text.contains("icloud-mcp quarantine"), "{code}: {text}");
