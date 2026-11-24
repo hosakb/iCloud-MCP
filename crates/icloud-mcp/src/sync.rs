@@ -690,6 +690,11 @@ async fn sync_pass(
         }
         let lock = Mutex::new(());
         let before = pass::run(service, &ctx, &data, &lock).await;
+        // Issue 92: the read is in; a save waiting to go moves its mark to the etag read now,
+        // so a save from before it is still refused after it is sent.
+        if service == "notes" && matches!(before.outcome, pass::Outcome::Ok) {
+            crate::settle_save_marks(&mut *data.lock().await)?;
+        }
         // Each sync says afresh why its queue stopped, if it did.
         let noted = if matches!(before.outcome, pass::Outcome::Ok) {
             String::new()
@@ -800,7 +805,10 @@ async fn sync_pass(
         // Raw upstream error details can contain HTTP bodies. Expose only typed outcomes.
         services.push(json!({"service":service,"outcome":after.outcome,"sent":sent,"last_synced_at":after.last_synced_at}));
     }
-    let library = data.lock().await;
+    let mut library = data.lock().await;
+    if on.contains(&"notes") {
+        crate::settle_save_marks(&mut library)?;
+    }
     let refused = library
         .outbox_refused_brief()
         .map_err(|_| "library_unavailable")?;

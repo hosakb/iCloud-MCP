@@ -1298,6 +1298,161 @@ async fn a_save_apple_already_holds_is_not_set_aside_when_tried_again() {
     }
 }
 
+/// Issue 92 with issue 74: a save sent once whose reply was lost still waits. A second save
+/// from the same read is refused, the first is kept, and the retry is not set aside.
+#[tokio::test]
+async fn a_lost_reply_save_is_kept_and_retried_after_a_second_save_is_refused() {
+    let (dir, mut server, mut library) = family().await;
+    let saved = write(
+        &mut server,
+        2,
+        "notes_write",
+        json!({"action":"save","guid":"note","body":"NOTE\nbody","base_etag":"n1"}),
+    )
+    .await;
+    assert_eq!(saved["isError"], false, "{saved}");
+    let sent = library.outbox_take("notes").unwrap().unwrap();
+    assert_eq!(sent.tries, 1);
+    let second = write(
+        &mut server,
+        3,
+        "notes_write",
+        json!({"action":"save","guid":"note","body":"NOTE\nbody two","base_etag":"n1"}),
+    )
+    .await;
+    assert_eq!(second["isError"], true, "{second}");
+    assert!(
+        second.to_string().contains("save_already_queued"),
+        "{second}"
+    );
+    let pending = library.outbox_pending("notes").unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, sent.id);
+    let remote = remote_with_note("NOTE\nbody", None).await;
+    let result = icloud_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+        .await
+        .unwrap();
+    assert_eq!(mcp_refusals(&library), Vec::<String>::new(), "{result}");
+    assert!(
+        library.outbox_pending("notes").unwrap().is_empty(),
+        "{result}"
+    );
+    assert!(
+        modified(&remote.received_requests().await.unwrap()).is_empty(),
+        "nothing written again"
+    );
+    // Both reads of this sync gave n2, the read before the send and the one after it, so
+    // nothing shows n2 came after the save: the mark moves to n2 and stays until a read
+    // brings a newer etag.
+    assert_eq!(
+        library
+            .state("mcp.notes.save_mark.note")
+            .unwrap()
+            .as_deref(),
+        Some(r#"{"from":"n2"}"#)
+    );
+    assert_ne!(shown_etag(&mut server).await, json!("n2"));
+}
+
+/// The etag notes_get shows for the family note now.
+async fn shown_etag(server: &mut icloud_mcp::Server) -> Value {
+    let read = write(server, 90, "notes_get", json!({"guid":"note"})).await;
+    let read: Value = serde_json::from_str(read["content"][0]["text"].as_str().unwrap()).unwrap();
+    read["item"]["etag"].clone()
+}
+
+/// Issue 92, review round 1: the first save is sent, but no read has brought Apple's new
+/// etag yet (the read failed, or Apple's feed does not carry our write back yet). A second
+/// save from the original etag is still refused; one from the etag shown now goes through,
+/// and once a read stores Apple's new etag, that etag is shown again as it is.
+#[tokio::test]
+async fn a_save_from_the_original_etag_is_refused_after_the_first_was_sent() {
+    let (_dir, mut server, mut library) = family().await;
+    let saved = write(
+        &mut server,
+        2,
+        "notes_write",
+        json!({"action":"save","guid":"note","body":"note\nbody one","base_etag":"n1"}),
+    )
+    .await;
+    assert_eq!(saved["isError"], false, "{saved}");
+    // Sent: the sender leaves the old etag on the note and takes the row off the queue.
+    let first = library.outbox_take("notes").unwrap().unwrap();
+    library.outbox_done(first.id).unwrap();
+    assert_eq!(
+        library.note("note").unwrap().unwrap().etag.as_deref(),
+        Some("n1")
+    );
+    // The read after the send brings the OLD etag back: Apple's feed does not carry our
+    // write yet.
+    let note = library.note("note").unwrap().unwrap();
+    assert_eq!(note.etag.as_deref(), Some("n1"));
+    library.put_notes(&[note]).unwrap();
+    let second = write(
+        &mut server,
+        3,
+        "notes_write",
+        json!({"action":"save","guid":"note","body":"note\nbody two","base_etag":"n1"}),
+    )
+    .await;
+    assert_eq!(second["isError"], true, "{second}");
+    assert!(
+        second.to_string().contains("save_already_queued"),
+        "{second}"
+    );
+    assert!(library.outbox_pending("notes").unwrap().is_empty());
+    let etag = shown_etag(&mut server).await;
+    assert_ne!(etag, json!("n1"));
+    let third = write(
+        &mut server,
+        4,
+        "notes_write",
+        json!({"action":"save","guid":"note","body":"note\nbody three","base_etag":etag}),
+    )
+    .await;
+    assert_eq!(third["isError"], false, "{third}");
+    let first = library.outbox_take("notes").unwrap().unwrap();
+    library.outbox_done(first.id).unwrap();
+    let mut note = library.note("note").unwrap().unwrap();
+    note.etag = Some("n2".into());
+    library.put_notes(&[note]).unwrap();
+    assert_eq!(shown_etag(&mut server).await, json!("n2"));
+}
+
+/// Issue 92, review round 1: while a save waits, a delete with a made-up marked etag is
+/// refused; one with the etag notes_get shows is queued.
+#[tokio::test]
+async fn a_delete_with_a_made_up_marked_etag_is_refused() {
+    let (_dir, mut server, library) = family().await;
+    let saved = write(
+        &mut server,
+        2,
+        "notes_write",
+        json!({"action":"save","guid":"note","body":"note\nbody one","base_etag":"n1"}),
+    )
+    .await;
+    assert_eq!(saved["isError"], false, "{saved}");
+    let refused = write(
+        &mut server,
+        3,
+        "notes_write",
+        json!({"action":"delete","guid":"note","base_etag":"n1~qanything"}),
+    )
+    .await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert!(refused.to_string().contains("conflict"), "{refused}");
+    assert_eq!(library.outbox_pending("notes").unwrap().len(), 1);
+    let etag = shown_etag(&mut server).await;
+    let deleted = write(
+        &mut server,
+        4,
+        "notes_write",
+        json!({"action":"delete","guid":"note","base_etag":etag}),
+    )
+    .await;
+    assert_eq!(deleted["isError"], false, "{deleted}");
+}
+
 /// Review round 2: the same formatting cut into other runs, as Apple may send it back, is
 /// not a change.
 #[tokio::test]
@@ -1330,11 +1485,12 @@ async fn a_second_text_only_save_after_a_sent_one_is_not_set_aside() {
         .set_note_runs("note", &json!([{"length":9}]).to_string())
         .unwrap();
     for (id, body) in [(2, "note\nbody one"), (3, "note\nbody two!")] {
+        let etag = shown_etag(&mut server).await;
         let saved = write(
             &mut server,
             id,
             "notes_write",
-            json!({"action":"save","guid":"note","body":body,"base_etag":"n1"}),
+            json!({"action":"save","guid":"note","body":body,"base_etag":etag}),
         )
         .await;
         assert_eq!(saved["isError"], false, "{saved}");
@@ -1394,11 +1550,12 @@ async fn a_text_only_undo_to_the_earlier_length_is_not_set_aside() {
         .set_note_runs("note", &json!([{"length":9}]).to_string())
         .unwrap();
     for (id, body) in [(2, "note\nbody one"), (3, "note\nbody")] {
+        let etag = shown_etag(&mut server).await;
         let saved = write(
             &mut server,
             id,
             "notes_write",
-            json!({"action":"save","guid":"note","body":body,"base_etag":"n1"}),
+            json!({"action":"save","guid":"note","body":body,"base_etag":etag}),
         )
         .await;
         assert_eq!(saved["isError"], false, "{saved}");

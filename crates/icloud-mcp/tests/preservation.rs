@@ -154,7 +154,9 @@ async fn note_saves_that_add_up_to_a_table_move_are_refused() {
     // would take it out and type a new one.
     let first = call(&mut server, "notes_write", save("ab\u{FFFC}ab")).await;
     assert_eq!(first["status"], "queued", "{first}");
-    let second = call(&mut server, "notes_write", save("\u{FFFC}ab")).await;
+    let etag = call(&mut server, "notes_get", json!({"guid":"note"})).await["item"]["etag"].clone();
+    let again = json!({"action":"save","guid":"note","base_etag":etag,"body":"\u{FFFC}ab"});
+    let second = call(&mut server, "notes_write", again).await;
     assert_eq!(second["error"], "unsupported_attachment_move", "{second}");
     let pending = library.outbox_pending("notes").unwrap();
     assert_eq!(pending.len(), 1);
@@ -304,8 +306,10 @@ async fn note_saves_queued_from_one_read_merge_into_one_send() {
         call(&mut server, "notes_write", save(&first)).await["status"],
         "queued"
     );
+    let etag = call(&mut server, "notes_get", json!({"guid":"note"})).await["item"]["etag"].clone();
+    let again = json!({"action":"save","guid":"note","base_etag":etag,"body":second});
     assert_eq!(
-        call(&mut server, "notes_write", save(&second)).await["status"],
+        call(&mut server, "notes_write", again).await["status"],
         "queued"
     );
     let pending = library.outbox_pending("notes").unwrap();
@@ -317,6 +321,182 @@ async fn note_saves_queued_from_one_read_merge_into_one_send() {
     let payload: Value = serde_json::from_str(&pending[0].payload).unwrap();
     assert_eq!(payload["base"], RICH);
     assert_eq!(payload["body"], second);
+}
+
+/// Issue 92: two saves typed over one read, before a sync. The second is refused with a
+/// next step, and the first stays queued as it was.
+#[tokio::test]
+async fn a_second_save_from_the_same_read_is_refused_and_the_first_kept() {
+    let (_dir, mut server, mut library) = setup();
+    rich_note(&mut library);
+    let first = RICH.replace("Pack the bag", "Pack the red bag");
+    let second = RICH.replace("Book the train", "Book the late train");
+    assert_eq!(
+        call(&mut server, "notes_write", save(&first)).await["status"],
+        "queued"
+    );
+    let refused = call(&mut server, "notes_write", save(&second)).await;
+    assert_eq!(refused["error"], "save_already_queued", "{refused}");
+    let step = refused["instructions"].as_str().unwrap();
+    assert!(
+        step.contains("notes_get") && step.contains("sync"),
+        "{step}"
+    );
+    let pending = library.outbox_pending("notes").unwrap();
+    assert_eq!(pending.len(), 1);
+    let payload: Value = serde_json::from_str(&pending[0].payload).unwrap();
+    assert_eq!(payload["body"], first);
+    assert_eq!(payload["base"], RICH);
+    let shown = call(&mut server, "notes_get", json!({"guid":"note"})).await;
+    assert_eq!(shown["item"]["body"], first, "{shown}");
+}
+
+/// Issue 92: text-only saves in a row, each with the etag from a fresh notes_get, all go
+/// through; an etag from before the latest save is refused.
+#[tokio::test]
+async fn text_only_saves_in_a_row_with_fresh_etags_are_queued() {
+    let (_dir, mut server, mut library) = setup();
+    rich_note(&mut library);
+    let bodies = [
+        RICH.replace("Pack the bag", "Pack the red bag"),
+        RICH.replace("Pack the bag", "Pack the blue bag"),
+        RICH.replace("Pack the bag", "Pack the green bag"),
+    ];
+    let mut seen = Vec::new();
+    for body in &bodies {
+        let etag =
+            call(&mut server, "notes_get", json!({"guid":"note"})).await["item"]["etag"].clone();
+        assert!(!seen.contains(&etag), "a new etag after each save: {etag}");
+        seen.push(etag.clone());
+        let args = json!({"action":"save","guid":"note","base_etag":etag,"body":body});
+        let result = call(&mut server, "notes_write", args).await;
+        assert_eq!(result["status"], "queued", "{result}");
+        let now =
+            call(&mut server, "notes_get", json!({"guid":"note"})).await["item"]["etag"].clone();
+        assert_eq!(result["etag"], now, "the save reply gives the new etag");
+    }
+    let stale = json!({"action":"save","guid":"note","base_etag":seen[1],"body":RICH});
+    let refused = call(&mut server, "notes_write", stale).await;
+    assert_eq!(refused["error"], "save_already_queued", "{refused}");
+    let pending = library.outbox_pending("notes").unwrap();
+    assert_eq!(pending.len(), 1);
+    let payload: Value = serde_json::from_str(&pending[0].payload).unwrap();
+    assert_eq!(payload["body"], bodies[2]);
+    assert_eq!(payload["base"], RICH);
+}
+
+/// Issue 92, review round 1: while a save waits, move and pin take Apple's etag or the exact
+/// etag notes_get shows, and nothing else. Delete, which asks on the approval card, is in
+/// queue_recovery.
+#[tokio::test]
+async fn move_pin_and_delete_refuse_a_made_up_marked_etag() {
+    let (_dir, mut server, mut library) = setup();
+    rich_note(&mut library);
+    let first = RICH.replace("Pack the bag", "Pack the red bag");
+    let queued = call(&mut server, "notes_write", save(&first)).await;
+    assert_eq!(queued["status"], "queued", "{queued}");
+    for made_up in ["etag-1~q0000000000000000", "etag-1~q", "etag-1~qanything"] {
+        for args in [
+            json!({"action":"pin","guid":"note","pinned":true,"base_etag":made_up}),
+            json!({"action":"move","guid":"note","folder_guid":null,"base_etag":made_up}),
+        ] {
+            let refused = call(&mut server, "notes_write", args).await;
+            assert_eq!(refused["error"], "conflict", "{made_up}: {refused}");
+        }
+    }
+    assert_eq!(library.outbox_count().unwrap(), 1);
+    let shown =
+        call(&mut server, "notes_get", json!({"guid":"note"})).await["item"]["etag"].clone();
+    for etag in [json!("etag-1"), shown] {
+        let pinned = call(
+            &mut server,
+            "notes_write",
+            json!({"action":"pin","guid":"note","pinned":true,"base_etag":etag}),
+        )
+        .await;
+        assert_eq!(pinned["status"], "queued", "{etag}: {pinned}");
+    }
+}
+
+/// Issue 92, review round 2: a save undone back to Apple's text takes the queued save back.
+/// The etag changes again, so a reader from before the undo is refused, as is one with
+/// Apple's etag; the etag the undo returned is taken.
+#[tokio::test]
+async fn an_undone_save_changes_the_etag_again() {
+    let (_dir, mut server, mut library) = setup();
+    rich_note(&mut library);
+    let first = RICH.replace("Pack the bag", "Pack the red bag");
+    let queued = call(&mut server, "notes_write", save(&first)).await;
+    assert_eq!(queued["status"], "queued", "{queued}");
+    let after_first = queued["etag"].clone();
+    let undo = json!({"action":"save","guid":"note","base_etag":after_first,"body":RICH});
+    let undone = call(&mut server, "notes_write", undo).await;
+    assert_eq!(undone["status"], "queued", "{undone}");
+    assert_eq!(
+        library.outbox_count().unwrap(),
+        0,
+        "the queued save is taken back"
+    );
+    let after_undo = undone["etag"].clone();
+    assert_ne!(after_undo, after_first);
+    for stale in [after_first, json!("etag-1")] {
+        let args = json!({"action":"save","guid":"note","base_etag":stale,"body":first});
+        let refused = call(&mut server, "notes_write", args).await;
+        assert_eq!(
+            refused["error"], "save_already_queued",
+            "{stale}: {refused}"
+        );
+    }
+    assert_eq!(library.outbox_count().unwrap(), 0);
+    let args = json!({"action":"save","guid":"note","base_etag":after_undo,"body":first});
+    assert_eq!(
+        call(&mut server, "notes_write", args).await["status"],
+        "queued"
+    );
+}
+
+/// Issue 92, review round 2: a save mark with no queued row (the mark is written with the
+/// row in one transaction, but a save may also have been sent or set aside since) still
+/// refuses Apple's etag.
+#[tokio::test]
+async fn a_save_mark_without_a_queued_row_still_refuses_the_old_etag() {
+    let (_dir, mut server, mut library) = setup();
+    rich_note(&mut library);
+    library
+        .set_state("mcp.notes.save_mark.note", r#"{"from":"etag-1"}"#)
+        .unwrap();
+    let shown =
+        call(&mut server, "notes_get", json!({"guid":"note"})).await["item"]["etag"].clone();
+    assert_ne!(shown, json!("etag-1"));
+    let refused = call(&mut server, "notes_write", save("Trip\nedited")).await;
+    assert_eq!(refused["error"], "save_already_queued", "{refused}");
+    assert_eq!(library.outbox_count().unwrap(), 0);
+}
+
+/// Issue 92, review round 2: a note with no Apple etag yet (made here, not synced) takes a
+/// first save with no base_etag; a second save with none gets save_already_queued.
+#[tokio::test]
+async fn a_second_save_without_an_etag_on_a_new_note_is_already_queued() {
+    let (_dir, mut server, library) = setup();
+    let made = call(
+        &mut server,
+        "notes_write",
+        json!({"action":"create","body":"New\none"}),
+    )
+    .await;
+    let guid = made["guid"].clone();
+    let first = json!({"action":"save","guid":guid,"body":"New\ntwo"});
+    let queued = call(&mut server, "notes_write", first).await;
+    assert_eq!(queued["status"], "queued", "{queued}");
+    let again = json!({"action":"save","guid":guid,"body":"New\nthree"});
+    let refused = call(&mut server, "notes_write", again).await;
+    assert_eq!(refused["error"], "save_already_queued", "{refused}");
+    let next = json!({"action":"save","guid":guid,"body":"New\nthree","base_etag":queued["etag"]});
+    assert_eq!(
+        call(&mut server, "notes_write", next).await["status"],
+        "queued"
+    );
+    assert!(library.outbox_count().unwrap() >= 2);
 }
 
 #[tokio::test]
