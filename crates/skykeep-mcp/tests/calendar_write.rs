@@ -790,11 +790,8 @@ async fn the_preview_says_who_would_be_told_and_what_changes() {
     .await;
     assert_eq!(form["method"], "elicitation/create", "{form}");
     let message = form["params"]["message"].as_str().unwrap();
-    // The card's text escapes `_` and `.` stays.
-    assert!(
-        message.contains("send\\u005finvitations: allow"),
-        "{message}"
-    );
+    // The card keeps `_` inside a word and `.` as they are.
+    assert!(message.contains("send_invitations: allow"), "{message}");
     assert!(message.contains("Planning v2"), "{message}");
     // A change that is not a delete may be always allowed.
     assert_eq!(choices(&form), ["approve", "deny", "always_allow"]);
@@ -1594,8 +1591,8 @@ async fn the_create_card_names_a_planned_event_not_an_existing_one() {
     )
     .await;
     let message = form["params"]["message"].as_str().unwrap();
-    assert!(message.contains("planned\\u005fevent"), "{message}");
-    assert!(!message.contains("existing\\u005fitem"), "{message}");
+    assert!(message.contains("planned_event"), "{message}");
+    assert!(!message.contains("existing_item"), "{message}");
 }
 
 #[tokio::test]

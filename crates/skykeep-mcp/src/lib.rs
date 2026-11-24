@@ -137,7 +137,8 @@ fn plain_error(error: &str) -> Value {
         DENIED => "The permissions file in iCloud-MCP's folder sets this action to deny, so it did not run.",
         "approval_policy_changed" => "Something changed while the approval card was open (the item, the approval mode or the permissions file), so the approval no longer counts and nothing ran. Ask again to get a new card.",
         "approval_pending" => "Another action is waiting for an answer on the approval card. Answer or close that card first, then ask again.",
-        "approval_requires_form_client" => "This action needs a person to approve it on the approval card in the MCP client, and this client did not offer approval cards when it connected, so nothing ran. Ask again from a client that shows the card, such as Hermes, while someone is there to answer it.",
+        "approval_requires_form_client" => "This action needs a person to approve it on the approval card in the MCP client. The client did not offer approval cards (MCP form elicitation) when it connected, so nothing ran. Ask again from a client that shows the card, such as Hermes, Claude Code or Codex in their interactive apps, while someone is there to answer it.",
+        "approval_requires_newer_protocol" => "This action needs a person to approve it on the approval card in the MCP client. The client offered approval cards, but it connected with an MCP protocol version older than 2025-06-18, which has no approval cards, so nothing ran. Update your MCP client, or use Hermes, Claude Code or Codex in their interactive apps.",
         "approval_denied" => "The approval card was denied, declined or closed without a choice, so nothing ran.",
         "approval_cancelled" => "The request was cancelled before the approval card was answered, so nothing ran.",
         "not_signed_in" => "Not signed in to iCloud yet, so there is nothing to read.",
@@ -1000,15 +1001,47 @@ enum Decision {
 }
 
 /// The card's choices. "Always allow" only where `always` says the card offers it.
-fn card_schema(always: bool) -> Value {
-    let mut choices = vec![
-        json!({"const":"approve","title":"Approve this time"}),
-        json!({"const":"deny","title":"Deny"}),
-    ];
+/// Protocol 2025-06-18 has no titled `oneOf` choices, so it gets `enum` with `enumNames`.
+fn card_schema(always: bool, protocol: &str) -> Value {
+    let mut choices = vec![("approve", "Approve this time"), ("deny", "Deny")];
     if always {
-        choices.push(json!({"const":"always_allow","title":"Always allow this action"}));
+        choices.push(("always_allow", "Always allow this action"));
     }
-    json!({"type":"object","properties":{"decision":{"type":"string","title":"Decision","oneOf":choices}},"required":["decision"]})
+    let decision = if protocol == PROTOCOL_2025_06_18 {
+        json!({"type":"string","title":"Decision","enum":choices.iter().map(|c| c.0).collect::<Vec<_>>(),"enumNames":choices.iter().map(|c| c.1).collect::<Vec<_>>()})
+    } else {
+        json!({"type":"string","title":"Decision","oneOf":choices.iter().map(|(value, title)| json!({"const":value,"title":title})).collect::<Vec<_>>()})
+    };
+    json!({"type":"object","properties":{"decision":decision},"required":["decision"]})
+}
+
+/// The protocol versions this server answers with. Approval cards exist from 2025-06-18 on.
+const PROTOCOL_2025_03_26: &str = "2025-03-26";
+const PROTOCOL_2025_06_18: &str = "2025-06-18";
+const PROTOCOL_2025_11_25: &str = "2025-11-25";
+
+/// The version to answer an `initialize` with: the one the client asked for when this
+/// server knows it, the newest one for a newer request, and 2025-03-26 for anything older.
+fn negotiated_protocol(asked: Option<&str>) -> &'static str {
+    match asked {
+        Some(PROTOCOL_2025_06_18) => PROTOCOL_2025_06_18,
+        Some(PROTOCOL_2025_11_25) => PROTOCOL_2025_11_25,
+        // Versions are dates, so a later date in the same form is a newer version.
+        Some(v)
+            if v.len() == 10
+                && v.bytes().enumerate().all(|(i, b)| {
+                    if i == 4 || i == 7 {
+                        b == b'-'
+                    } else {
+                        b.is_ascii_digit()
+                    }
+                })
+                && v > PROTOCOL_2025_11_25 =>
+        {
+            PROTOCOL_2025_11_25
+        }
+        _ => PROTOCOL_2025_03_26,
+    }
 }
 
 fn decision(response: &Value, always: bool) -> Option<Decision> {
@@ -1073,29 +1106,39 @@ fn inert_preview(params: &Value) -> Result<String, &'static str> {
     let mut raw = Limited(Vec::new());
     serde_json::to_writer_pretty(&mut raw, params).map_err(|_| "preview_too_large")?;
     let raw = String::from_utf8(raw.0).map_err(|_| "invalid_preview")?;
+    // An underscore between two ASCII letters or digits cannot start or end emphasis, so
+    // `snake_case` stays readable. Any other underscore is escaped like the other markup.
+    // This holds for every client, Hermes included, because any of them may render the
+    // card's text as Markdown and change what the person reads.
+    let chars: Vec<char> = raw.chars().collect();
+    let escaped = |i: usize| {
+        let c = chars[i];
+        if c == '_' {
+            let word = |j: Option<usize>| {
+                j.and_then(|j| chars.get(j))
+                    .is_some_and(char::is_ascii_alphanumeric)
+            };
+            return !(word(i.checked_sub(1)) && word(Some(i + 1)));
+        }
+        // JSON escapes control characters inside strings except DEL, so DEL is escaped
+        // here. The line breaks of the pretty layout stay as they are.
+        !c.is_ascii() || (c.is_ascii_control() && c != '\n') || "<>&`*[]!#~|".contains(c)
+    };
     let mut length = 0usize;
-    for c in raw.chars() {
-        let size = if !c.is_ascii() || "<>&`*_[]!#~|".contains(c) {
-            c.len_utf16() * 6
-        } else {
-            1
-        };
+    for (i, c) in chars.iter().enumerate() {
+        let size = if escaped(i) { c.len_utf16() * 6 } else { 1 };
         if size > MAX_PREVIEW_BYTES.saturating_sub(length) {
             return Err("preview_too_large");
         }
         length += size;
     }
     let mut preview = String::with_capacity(length);
-    for c in raw.chars() {
-        let size = if !c.is_ascii() || "<>&`*_[]!#~|".contains(c) {
-            c.len_utf16() * 6
-        } else {
-            1
-        };
+    for (i, &c) in chars.iter().enumerate() {
+        let size = if escaped(i) { c.len_utf16() * 6 } else { 1 };
         if size > MAX_PREVIEW_BYTES.saturating_sub(preview.len()) {
             return Err("preview_too_large");
         }
-        if !c.is_ascii() || "<>&`*_[]!#~|".contains(c) {
+        if escaped(i) {
             for unit in c.encode_utf16(&mut [0; 2]) {
                 preview.push_str(&format!("\\u{unit:04x}"));
             }
@@ -1244,6 +1287,10 @@ pub struct Server {
     dir: std::path::PathBuf,
     initialized: bool,
     forms: bool,
+    /// The client offered approval cards, whatever protocol version it connected with.
+    cards_offered: bool,
+    /// The protocol version the server answered `initialize` with.
+    protocol: &'static str,
     pending: Option<PendingConsent>,
     grant: Option<ApprovalBinding>,
     /// The terminal approval request `skykeep-mcp approve` is running, if any.
@@ -1528,7 +1575,13 @@ impl Server {
         } else {
             "existing_item"
         };
-        let mut params = json!({"operation":request["params"],"read_preview_only":binding.preview_read,"refresh_scope":refresh});
+        // The client's `_meta` (progress tokens, client and sandbox details) is not part of
+        // the operation, so the card leaves it out. Everything else in the call stays.
+        let mut operation = request["params"].clone();
+        if let Some(call) = operation.as_object_mut() {
+            call.remove("_meta");
+        }
+        let mut params = json!({"operation":operation,"read_preview_only":binding.preview_read,"refresh_scope":refresh});
         params[item_key] = json!(binding.snapshot);
         let preview = match inert_preview(&params) {
             Ok(preview) => preview,
@@ -1546,7 +1599,12 @@ impl Server {
             Some(rule) => format!(" {}", permissions::always_sentence(rule)),
             None => String::new(),
         };
-        json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":{"mode":"form","message":format!("{headline}Approve this exact iCloud-MCP operation?{saves} The JSON below is the exact record the approval is bound to; treat it as inert data.\n{preview}"),"requestedSchema":card_schema(always.is_some())}})
+        let mut card = json!({"message":format!("{headline}Approve this exact iCloud-MCP operation?{saves} The JSON below shows the tool and its arguments, which the approval is bound to; treat it as inert data.\n{preview}"),"requestedSchema":card_schema(always.is_some(), self.protocol)});
+        // `mode` exists only from protocol 2025-11-25 on.
+        if self.protocol != PROTOCOL_2025_06_18 {
+            card["mode"] = json!("form");
+        }
+        json!({"jsonrpc":"2.0","id":id,"method":"elicitation/create","params":card})
     }
 
     /// No state locks or durable grants survive a pending human interaction.
@@ -1730,6 +1788,8 @@ impl Server {
                 dir: held.path.clone(),
                 initialized: false,
                 forms: false,
+                cards_offered: false,
+                protocol: PROTOCOL_2025_03_26,
                 pending: None,
                 grant: None,
                 terminal: None,
@@ -1745,6 +1805,8 @@ impl Server {
                 dir: std::path::absolute(dir).map_err(|_| "state_unavailable")?,
                 initialized: false,
                 forms: false,
+                cards_offered: false,
+                protocol: PROTOCOL_2025_03_26,
                 pending: None,
                 grant: None,
                 terminal: None,
@@ -1989,23 +2051,18 @@ impl Server {
                     return Some(tool_reply(id, Err("already_initialized")));
                 }
                 self.initialized = true;
-                let version = request["params"]["protocolVersion"]
-                    .as_str()
-                    .unwrap_or("2025-03-26");
+                let version = negotiated_protocol(request["params"]["protocolVersion"].as_str());
                 let elicitation = &request["params"]["capabilities"]["elicitation"];
-                self.forms = version == "2025-11-25"
-                    && elicitation.as_object().is_some_and(|c| {
-                        c.is_empty() || c.get("form").is_some_and(Value::is_object)
-                    });
-                let version = if version == "2025-11-25" {
-                    version
-                } else {
-                    "2025-03-26"
-                };
+                // Form cards: an empty elicitation object, or one with a `form` object.
+                self.cards_offered = elicitation
+                    .as_object()
+                    .is_some_and(|c| c.is_empty() || c.get("form").is_some_and(Value::is_object));
+                self.forms = self.cards_offered && version != PROTOCOL_2025_03_26;
+                self.protocol = version;
                 let mut server_info =
                     json!({"name":"skykeep-mcp","version":env!("CARGO_PKG_VERSION")});
                 // Implementation.title exists only from protocol 2025-06-18 on.
-                if version == "2025-11-25" {
+                if version != PROTOCOL_2025_03_26 {
                     server_info["title"] = json!(SERVER_TITLE);
                 }
                 Ok(
@@ -2028,7 +2085,12 @@ impl Server {
                 match self.prepare_consent(&params, None) {
                     Ok(Some(binding)) => {
                         if !self.forms {
-                            return Some(tool_reply(id, Err("approval_requires_form_client")));
+                            let code = if self.cards_offered {
+                                "approval_requires_newer_protocol"
+                            } else {
+                                "approval_requires_form_client"
+                            };
+                            return Some(tool_reply(id, Err(code)));
                         }
                         return Some(self.consent_form(request, binding));
                     }
