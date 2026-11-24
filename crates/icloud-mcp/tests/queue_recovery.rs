@@ -1341,6 +1341,14 @@ async fn a_lost_reply_save_is_kept_and_retried_after_a_second_save_is_refused() 
         modified(&remote.received_requests().await.unwrap()).is_empty(),
         "nothing written again"
     );
+    // Both reads of this sync gave n2, the read before the send and the one after it, so
+    // nothing shows n2 came after the save: the mark moves to n2 and stays until a read
+    // brings a newer etag.
+    assert_eq!(
+        library.state("mcp.notes.save_mark.note").unwrap().as_deref(),
+        Some(r#"{"from":"n2"}"#)
+    );
+    assert_ne!(shown_etag(&mut server).await, json!("n2"));
 }
 
 /// The etag notes_get shows for the family note now.
@@ -1372,6 +1380,11 @@ async fn a_save_from_the_original_etag_is_refused_after_the_first_was_sent() {
         library.note("note").unwrap().unwrap().etag.as_deref(),
         Some("n1")
     );
+    // The read after the send brings the OLD etag back: Apple's feed does not carry our
+    // write yet.
+    let note = library.note("note").unwrap().unwrap();
+    assert_eq!(note.etag.as_deref(), Some("n1"));
+    library.put_notes(&[note]).unwrap();
     let second = write(
         &mut server,
         3,
