@@ -937,6 +937,7 @@ async fn a_change_refused_over_another_devices_edit_is_reported_as_a_conflict() 
     }
     assert_eq!(shown, 2, "{text}");
     assert!(!text.contains("refused_by_sync_engine"), "{text}");
+    assert!(!text.to_lowercase().contains("skykeep"), "{text}");
     use std::os::unix::fs::PermissionsExt;
     for file in std::fs::read_dir(dir.path()).unwrap() {
         let file = file.unwrap();
@@ -944,12 +945,15 @@ async fn a_change_refused_over_another_devices_edit_is_reported_as_a_conflict() 
             std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
         }
     }
-    for row in server.quarantined().unwrap() {
+    let rows = server.quarantined().unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for row in rows {
         assert_eq!(
             row["next_step"],
             icloud_mcp::sync::CHANGED_ELSEWHERE_STEP,
             "{row}"
         );
+        assert!(!row.to_string().to_lowercase().contains("skykeep"), "{row}");
     }
 }
 
