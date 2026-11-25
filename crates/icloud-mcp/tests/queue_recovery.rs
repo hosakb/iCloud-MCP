@@ -1420,8 +1420,9 @@ async fn a_save_from_the_original_etag_is_refused_after_the_first_was_sent() {
 }
 
 /// Issue 100: in the beta live test one note save was set aside once as
-/// write_authorization_stale. A save made after an earlier save was sent and confirmed gets
-/// its own grant and is sent; it is not set aside for any reason.
+/// write_authorization_stale. Here a first save is sent by one sync and leaves the queue. A
+/// second save, made after that from the etag shown then, passes the send check and is sent
+/// by the next sync. Neither sync sets anything aside.
 #[tokio::test]
 async fn a_save_after_one_sent_and_confirmed_is_not_set_aside() {
     let (dir, mut server, library) = family().await;
