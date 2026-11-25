@@ -523,6 +523,7 @@ pub fn next_step(error: &str, dir: &Path, args: &Value) -> Option<String> {
         "early_alert_account_unavailable_set_one_on_an_apple_device_then_sync" => Some("icloud-mcp can add an early alert only after it has seen one that Apple made, and no reminder in the local copy has one yet. Nothing was queued. On an iPhone, iPad or Mac, add an early alert to any reminder in Apple Reminders, run sync here, then ask again. Or ask again without early_alert.".to_string()),
         "already_initialized" => Some("The server is already initialized in this connection. Go on with tools/list or tools/call.".to_string()),
         sync::ITEM_CHANGED => Some(sync::ITEM_CHANGED_STEP.to_string()),
+        sync::CHANGED_ELSEWHERE => Some(sync::CHANGED_ELSEWHERE_STEP.to_string()),
         "save_already_queued" => Some("This save was typed over a version of the note from before another save (or the undo of one), so it was refused and nothing new was queued. That other save may still wait, may have been sent, or may have been set aside. Read the note again with notes_get (or run sync first), then save with the etag it shows now.".to_string()),
         "conflict" => Some("The item changed since you read it, so nothing was queued. Read it again with notes_get or reminders_get, then ask again with its current base_etag.".to_string()),
         "mutation_refused" => Some(format!("The change could not be saved to the local queue, so nothing was queued. In your own terminal, run {} to check this folder, then try again.", status::with_dir("icloud-mcp status", dir))),
@@ -1949,8 +1950,8 @@ impl Server {
             .map(|r| {
                 let mut row = json!({"id":r.change.id,"service":plain(&r.change.service, 40),"kind":plain(&r.change.kind, 40),
                     "record":plain(&r.change.record, 200),"reason":plain(&r.reason, 160),"refused_at":r.refused_at});
-                if r.reason.strip_prefix("mcp_quarantine:") == Some(sync::ITEM_CHANGED) {
-                    row["next_step"] = json!(sync::ITEM_CHANGED_STEP);
+                if let Some(step) = sync::refused_step(&r.reason) {
+                    row["next_step"] = json!(step);
                 }
                 row
             })
