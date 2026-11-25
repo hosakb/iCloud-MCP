@@ -400,6 +400,18 @@ A line in the file wins. `icloud-mcp policy`, `icloud-mcp exchange` and the serv
 
 Passwords, verification codes and the passphrase never go in the file. A line that looks like one (`password:`, `passphrase:`, `code:`, `token:` and similar) makes the file unusable, and the message does not repeat it. `setup`, `login`, `logout` and `unlock` stay terminal-only, and `approve` is only for actions set to `ask: terminal`.
 
+## What an edit keeps
+
+An edit changes only what it names. The rest of the item stays as Apple holds it.
+
+| Item | Safe to edit | Kept, never changed | Refused |
+|---|---|---|---|
+| Note | Text and formatting of an unlocked note | Tables, pictures and other attachments, where they stand | Locked or read-only notes, adding, removing or moving an attachment, a Markdown copy saved over the original |
+| Reminder | The fields in `patch`: title, notes, due date, all-day, flag, done, priority, list and parent | Repeat, alerts and every other field | A field outside that list |
+| Contact | Names, company, birthday, notes, work details, emails, phones and web addresses | Postal addresses, photos and contact lists | A list or notes on a card shown cut short |
+
+If the item changed on another device after you read it, the edit is refused as a conflict and never written over the other change. A queued note or reminder change refused this way shows as `item_changed_on_icloud_since_queued` or `changed_on_another_device_not_sent`, a contact as `contact_changed_conflict`. Read the item again and make the change again.
+
 ## Limitations
 
 - Notes with structures the engine can't round-trip are refused rather than flattened. Markdown export is not a lossless copy of a note.

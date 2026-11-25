@@ -381,6 +381,32 @@ fn oldest_first(mut first: Vec<Value>, second: Vec<Value>) -> Vec<Value> {
     first
 }
 
+/// The sync engine refused a queued note or reminder change at send time because the item
+/// changed or was deleted on another device: nothing was written over Apple's copy.
+pub const CHANGED_ELSEWHERE: &str = "changed_on_another_device_not_sent";
+
+/// The next step after [`CHANGED_ELSEWHERE`].
+pub const CHANGED_ELSEWHERE_STEP: &str = "The note or reminder changed or was deleted on another device while this change waited, so it was not sent and iCloud keeps the other device's version. If the item still exists, run sync, read it again with notes_get or reminders_get and make the change again. If it was deleted there is nothing to redo. The refused change stays in the list until you retire it with icloud-mcp quarantine in your own terminal.";
+
+/// The engine's own words for a send refused over a change on another device. Fixed texts
+/// from quince-icloud and quince-sync; a test checks each one is still in their source.
+const CHANGED_ELSEWHERE_TEXTS: [&str; 7] = [
+    "This note was changed on another device while you were writing, in the same place. Nothing was saved; your text is still here.",
+    "This note keeps changing on another device, so nothing was saved yet; your text is still here.",
+    "This note was deleted on another device, so the edit wasn\u{2019}t saved.",
+    "This note was deleted on another device, so it wasn\u{2019}t moved.",
+    "This note was recovered on another device, so it was kept.",
+    "This reminder was deleted on another device, so the change wasn\u{2019}t saved.",
+    "Apple no longer has that note.",
+];
+
+/// Whether an engine refusal says the item changed or went on another device: one of
+/// [`CHANGED_ELSEWHERE_TEXTS`], or a conflict still there after the last try.
+fn changed_elsewhere(reason: &str) -> bool {
+    CHANGED_ELSEWHERE_TEXTS.contains(&reason)
+        || reason == quince_icloud::Error::Conflict.to_string()
+}
+
 /// Our own refusal codes are shown; engine and Apple reasons can hold HTTP text.
 fn shown_reason(reason: &str) -> &str {
     if reason.starts_with("mcp_quarantine:")
@@ -388,16 +414,29 @@ fn shown_reason(reason: &str) -> &str {
         || reason == "superseded_by_approved_deletion"
     {
         reason
+    } else if changed_elsewhere(reason) {
+        CHANGED_ELSEWHERE
     } else {
         "refused_by_sync_engine"
+    }
+}
+
+/// The next step for a refused write's stored reason, when it has one.
+pub(crate) fn refused_step(reason: &str) -> Option<&'static str> {
+    if reason.strip_prefix("mcp_quarantine:") == Some(ITEM_CHANGED) {
+        Some(ITEM_CHANGED_STEP)
+    } else if changed_elsewhere(reason) {
+        Some(CHANGED_ELSEWHERE_STEP)
+    } else {
+        None
     }
 }
 
 /// A refused write as MCP may show it: identifiers and a reason code, never the payload.
 pub(crate) fn refused_view(r: &quince_core::outbox::RefusedBrief) -> Value {
     let mut view = json!({"id":r.id,"service":r.service,"kind":r.kind,"record":r.record,"reason":shown_reason(&r.reason)});
-    if r.reason.strip_prefix("mcp_quarantine:") == Some(ITEM_CHANGED) {
-        view["instructions"] = json!(ITEM_CHANGED_STEP);
+    if let Some(step) = refused_step(&r.reason) {
+        view["instructions"] = json!(step);
     }
     view
 }
@@ -908,6 +947,48 @@ mod tests {
             .contains("change 42"));
         assert!(waiting_step("waiting_behind_change_x", dir).is_none());
         assert!(waiting_step("waiting_unknown", dir).is_none());
+    }
+
+    /// A send the engine refused because the item changed or went on another device is shown
+    /// as that conflict with a next step, never as an unexplained engine refusal.
+    #[test]
+    fn a_change_refused_over_another_devices_edit_is_a_conflict_with_a_next_step() {
+        let brief = |reason: &str| quince_core::outbox::RefusedBrief {
+            id: 7,
+            service: "notes".into(),
+            record: "note".into(),
+            kind: "save".into(),
+            reason: reason.into(),
+        };
+        let conflict = quince_icloud::Error::Conflict.to_string();
+        for reason in CHANGED_ELSEWHERE_TEXTS
+            .iter()
+            .copied()
+            .chain([conflict.as_str()])
+        {
+            let view = refused_view(&brief(reason));
+            assert_eq!(view["reason"], CHANGED_ELSEWHERE, "{reason}");
+            assert_eq!(view["instructions"], CHANGED_ELSEWHERE_STEP, "{reason}");
+        }
+        let other = refused_view(&brief("iCloud sent back something unexpected: synthetic"));
+        assert_eq!(other["reason"], "refused_by_sync_engine");
+        assert!(other.get("instructions").is_none());
+        assert!(CHANGED_ELSEWHERE_STEP.contains("icloud-mcp quarantine"));
+        assert!(!CHANGED_ELSEWHERE_STEP.to_lowercase().contains("skykeep"));
+    }
+
+    /// The engine still says each of these words, so a reworded refusal there fails here
+    /// instead of quietly falling back to `refused_by_sync_engine`.
+    #[test]
+    fn the_engine_still_says_each_changed_elsewhere_text() {
+        let sources = [
+            include_str!("../../quince-icloud/src/notes.rs"),
+            include_str!("../../quince-sync/src/notes.rs"),
+            include_str!("../../quince-sync/src/reminders.rs"),
+        ];
+        for text in CHANGED_ELSEWHERE_TEXTS {
+            assert!(sources.iter().any(|s| s.contains(text)), "{text}");
+        }
     }
 
     /// The list across Notes and Reminders is the oldest changes, whichever service.

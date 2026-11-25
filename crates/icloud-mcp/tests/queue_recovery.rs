@@ -900,6 +900,59 @@ async fn refused_reasons_are_plain_in_terminal_and_coded_in_status() {
     assert!(!text.contains("SYNTHETIC-UPSTREAM-TEXT"));
 }
 
+/// Ticket #4: a note or reminder change the engine refused because the item changed or went on
+/// another device is reported as that conflict, with a next step, in status and the terminal.
+#[tokio::test]
+async fn a_change_refused_over_another_devices_edit_is_reported_as_a_conflict() {
+    let (dir, mut server, mut library) = family().await;
+    let note = library
+        .outbox_append("notes", "note", "save", "{}")
+        .unwrap();
+    library
+        .outbox_refuse(
+            note,
+            "This note was changed on another device while you were writing, in the same place. Nothing was saved; your text is still here.",
+        )
+        .unwrap();
+    let reminder = library
+        .outbox_append("reminders", "other", "edit", "{}")
+        .unwrap();
+    library
+        .outbox_refuse(reminder, &quince_icloud::Error::Conflict.to_string())
+        .unwrap();
+    let status = write(&mut server, 9, "sync_status", json!({})).await;
+    let text = status["content"][0]["text"].as_str().unwrap();
+    let body: Value = serde_json::from_str(text).unwrap();
+    let mut shown = 0;
+    for service in body["services"].as_array().unwrap() {
+        for row in service["refused_recent"].as_array().unwrap_or(&Vec::new()) {
+            assert_eq!(row["reason"], icloud_mcp::sync::CHANGED_ELSEWHERE, "{row}");
+            assert_eq!(
+                row["instructions"],
+                icloud_mcp::sync::CHANGED_ELSEWHERE_STEP,
+                "{row}"
+            );
+            shown += 1;
+        }
+    }
+    assert_eq!(shown, 2, "{text}");
+    assert!(!text.contains("refused_by_sync_engine"), "{text}");
+    use std::os::unix::fs::PermissionsExt;
+    for file in std::fs::read_dir(dir.path()).unwrap() {
+        let file = file.unwrap();
+        if file.file_type().unwrap().is_file() {
+            std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+    for row in server.quarantined().unwrap() {
+        assert_eq!(
+            row["next_step"],
+            icloud_mcp::sync::CHANGED_ELSEWHERE_STEP,
+            "{row}"
+        );
+    }
+}
+
 fn grant(library: &quince_core::Library, id: i64) -> Option<String> {
     library.state(&format!("mcp.authorization.{id}")).unwrap()
 }
