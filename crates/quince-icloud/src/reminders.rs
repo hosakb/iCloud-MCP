@@ -1725,13 +1725,22 @@ pub struct ReminderEdit {
     pub list_guid: Option<String>,
     /// Nest under another reminder, or `Some(None)` to bring it back out to the top level.
     pub parent_guid: Option<Option<String>>,
-    /// The IANA zone a timed date is kept in when the reminder has none yet; `None` is this
-    /// computer's zone. Not an edit on its own: it only goes with a due date.
+    /// The IANA zone a timed date is kept in. `None` keeps the zone Apple already has, or
+    /// uses this computer's zone when Apple has none. Not an edit on its own: it only goes
+    /// with a timed due date.
     #[serde(default)]
     pub timezone: Option<String>,
 }
 
 impl ReminderEdit {
+    /// A timed date with no zone given: the zone to write, if any, depends on the record as
+    /// Apple holds it at send time, so that record is read first.
+    fn needs_apple_zone(&self) -> bool {
+        matches!(self.due_at, Some(Some(_)))
+            && !self.all_day.unwrap_or(false)
+            && self.timezone.is_none()
+    }
+
     fn is_empty(&self) -> bool {
         self.title.is_none()
             && self.notes.is_none()
@@ -1755,9 +1764,10 @@ pub async fn edit_cloudkit(
     reminder: &Reminder,
     edit: &ReminderEdit,
 ) -> Result<()> {
-    // A title or notes edit is built from the document as it stood: if another device wrote
-    // first it is built again from theirs, never resent over it.
-    if edit.title.is_some() || edit.notes.is_some() {
+    // A title or notes edit is built from the document as it stood, and a timed date with no
+    // zone given from the zone Apple held: if another device wrote first it is built again
+    // from theirs, never resent over it.
+    if edit.title.is_some() || edit.notes.is_some() || edit.needs_apple_zone() {
         match edit_once(
             http,
             ckdatabasews_root,
@@ -1798,6 +1808,12 @@ async fn edit_once(
             return Err(Error::Protocol("a reminder needs a title".into()));
         }
     }
+    // A zone Apple's devices could not read is never written to the record.
+    if let Some(zone) = &edit.timezone {
+        if jiff::tz::TimeZone::get(zone).is_err() {
+            return Err(Error::Protocol(format!("unknown time zone {zone:?}")));
+        }
+    }
 
     let client = ZoneClient::new(http, ckdatabasews_root, CONTAINER, params.clone());
     let mut fields = serde_json::Map::new();
@@ -1807,7 +1823,7 @@ async fn edit_once(
     // threw all of that away every time — the same mistake that stopped edited notes from
     // ever reaching a phone. Rewriting in place keeps it, and only falls back to a new
     // document when there is genuinely nothing to rewrite.
-    let current = if edit.title.is_some() || edit.notes.is_some() {
+    let current = if edit.title.is_some() || edit.notes.is_some() || edit.needs_apple_zone() {
         client.lookup_record(ZONE, &reminder.guid).await?
     } else {
         None
@@ -1864,19 +1880,33 @@ async fn edit_once(
             "AllDay".into(),
             serde_json::json!({ "type": "NUMBER_INT64", "value": i64::from(all_day) }),
         );
-        // A reminder already kept in a zone keeps it, as the phone does when its time is
-        // changed: the field is left out, so Apple's copy stays exactly as it was.
-        if due.is_some() && !all_day && reminder.timezone.is_none() {
-            let zone = edit.timezone.clone().unwrap_or_else(|| {
-                jiff::tz::TimeZone::system()
-                    .iana_name()
-                    .unwrap_or("UTC")
-                    .to_string()
-            });
-            fields.insert(
-                "TimeZone".into(),
-                serde_json::json!({ "type": "STRING", "value": zone }),
-            );
+        // A zone given is written. Without one, a reminder Apple already keeps in a zone
+        // keeps it, as the phone does when its time is changed: the field is left out, so
+        // Apple's copy stays exactly as it was. Decided from the record just read, not the
+        // cached copy, which may hold a zone another device has changed since.
+        if due.is_some() && !all_day {
+            let zone = match &edit.timezone {
+                Some(zone) => Some(zone.clone()),
+                None => {
+                    let apple_has_zone = current
+                        .as_ref()
+                        .and_then(|rec| rec.pointer("/fields/TimeZone/value"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|z| !z.is_empty());
+                    (!apple_has_zone).then(|| {
+                        jiff::tz::TimeZone::system()
+                            .iana_name()
+                            .unwrap_or("UTC")
+                            .to_string()
+                    })
+                }
+            };
+            if let Some(zone) = zone {
+                fields.insert(
+                    "TimeZone".into(),
+                    serde_json::json!({ "type": "STRING", "value": zone }),
+                );
+            }
         }
         fields.insert(
             "DueDate".into(),
@@ -6270,6 +6300,208 @@ mod parity_write_tests {
         let mut sent = keys(fields);
         sent.retain(|k| k != "ResolutionTokenMap");
         assert_eq!(sent, ["AllDay", "DueDate", "LastModifiedDate"]);
+    }
+
+    /// The phone's record with its zone set to `zone`, or taken away for `None`.
+    fn record_in(zone: Option<&str>, tag: &str) -> Value {
+        let mut record = phone_record();
+        record["recordChangeTag"] = json!(tag);
+        let fields = record["fields"].as_object_mut().unwrap();
+        match zone {
+            Some(z) => {
+                fields.insert("TimeZone".into(), json!({ "type": "STRING", "value": z }));
+            }
+            None => {
+                fields.remove("TimeZone");
+            }
+        }
+        record
+    }
+
+    /// Apple answering every lookup with the phone's record in `zone`.
+    async fn phone_in(zone: Option<&str>) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/records/lookup$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "records": [record_in(zone, "jfv")] })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/records/modify$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "records": [{ "recordName": GUID }] })),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn edit_on(server: &MockServer, reminder: &Reminder, edit: &ReminderEdit) -> Result<()> {
+        edit_cloudkit(
+            &reqwest::Client::new(),
+            &server.uri(),
+            vec![],
+            reminder,
+            edit,
+        )
+        .await
+    }
+
+    fn new_time() -> ReminderEdit {
+        ReminderEdit {
+            due_at: Some(Some(1_792_684_800)),
+            ..Default::default()
+        }
+    }
+
+    /// #12: the cache still says New York, but the phone has moved the reminder to Tokyo since.
+    /// The zone is read from Apple's record at send time, so Tokyo stays.
+    #[tokio::test]
+    async fn a_zone_changed_on_the_phone_is_kept_over_the_cached_one() {
+        let server = phone_in(Some("Asia/Tokyo")).await;
+        edit_on(&server, &reminder(), &new_time()).await.unwrap();
+        let ops = operations(&server).await;
+        assert_eq!(ops.len(), 1);
+        let fields = &ops[0]["record"]["fields"];
+        assert_eq!(fields["DueDate"]["value"], 1_792_684_800_000_i64);
+        assert!(fields.get("TimeZone").is_none(), "Tokyo stays: {fields}");
+    }
+
+    /// #12: the phone changes the zone between the read and the write. The write is refused
+    /// as a conflict, and the next try decides again from the record read then.
+    #[tokio::test]
+    async fn a_retry_after_a_conflict_decides_the_zone_again() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/records/lookup$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "records": [record_in(None, "first")] })),
+            )
+            .up_to_n_times(2)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/records/lookup$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "records": [record_in(Some("Asia/Tokyo"), "second")] })),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/records/modify$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "records": [{
+                "recordName": GUID, "reason": "conflict", "serverErrorCode": "CONFLICT" }] })),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/records/modify$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "records": [{ "recordName": GUID }] })),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let mut cached = reminder();
+        cached.timezone = None;
+        edit_on(&server, &cached, &new_time()).await.unwrap();
+        let ops = operations(&server).await;
+        assert_eq!(ops.len(), 2, "one refused write, one written");
+        assert!(
+            ops[0]["record"]["fields"]["TimeZone"]["value"].is_string(),
+            "the first try saw no zone and gave one"
+        );
+        assert_eq!(ops[1]["record"]["recordChangeTag"], "second");
+        assert!(
+            ops[1]["record"]["fields"].get("TimeZone").is_none(),
+            "the retry saw Tokyo and left it"
+        );
+    }
+
+    /// A reminder Apple keeps with no zone gets this computer's zone with its time, even when
+    /// the cached copy still names one.
+    #[tokio::test]
+    async fn no_zone_at_apple_gets_the_default_zone() {
+        let server = phone_in(None).await;
+        edit_on(&server, &reminder(), &new_time()).await.unwrap();
+        let fields = &operations(&server).await[0]["record"]["fields"];
+        let default = jiff::tz::TimeZone::system()
+            .iana_name()
+            .unwrap_or("UTC")
+            .to_string();
+        assert_eq!(fields["TimeZone"]["value"], json!(default));
+        assert_eq!(fields["TimeZone"]["type"], "STRING");
+    }
+
+    /// A zone given with the time is written, whatever Apple had.
+    #[tokio::test]
+    async fn a_given_zone_is_written_over_apples() {
+        let server = phone_in(Some("Asia/Tokyo")).await;
+        let edit = ReminderEdit {
+            timezone: Some("Europe/Berlin".into()),
+            ..new_time()
+        };
+        edit_on(&server, &reminder(), &edit).await.unwrap();
+        let fields = &operations(&server).await[0]["record"]["fields"];
+        assert_eq!(fields["TimeZone"]["value"], "Europe/Berlin");
+        assert_eq!(fields["DueDate"]["value"], 1_792_684_800_000_i64);
+    }
+
+    /// A zone no device could read is refused before anything is sent.
+    #[tokio::test]
+    async fn an_unknown_zone_is_refused_before_anything_is_sent() {
+        let server = phone_in(Some("America/New_York")).await;
+        let edit = ReminderEdit {
+            timezone: Some("Mars/Olympus_Mons".into()),
+            ..new_time()
+        };
+        assert!(edit_on(&server, &reminder(), &edit).await.is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// An all-day date carries no zone, even one given, and needs no read of Apple's zone.
+    #[tokio::test]
+    async fn an_all_day_date_sends_no_zone() {
+        for given in [None, Some("Europe/Berlin".to_string())] {
+            let server = phone_in(None).await;
+            let edit = ReminderEdit {
+                due_at: Some(Some(1_792_627_200)),
+                all_day: Some(true),
+                timezone: given.clone(),
+                ..Default::default()
+            };
+            edit_on(&server, &reminder(), &edit).await.unwrap();
+            let fields = &operations(&server).await[0]["record"]["fields"];
+            assert_eq!(fields["AllDay"]["value"], 1);
+            assert!(fields.get("TimeZone").is_none(), "{given:?}: {fields}");
+        }
+    }
+
+    /// The same moment sent again keeps New York and the moment itself, to the millisecond.
+    #[tokio::test]
+    async fn an_unchanged_due_instant_keeps_its_zone_and_moment() {
+        let server = phone().await;
+        let edit = ReminderEdit {
+            due_at: Some(reminder().due_at),
+            ..Default::default()
+        };
+        edit_on(&server, &reminder(), &edit).await.unwrap();
+        let fields = &operations(&server).await[0]["record"]["fields"];
+        assert_eq!(fields["DueDate"]["value"], 1_792_681_200_000_i64);
+        assert_eq!(fields["AllDay"]["value"], 0);
+        assert!(fields.get("TimeZone").is_none());
     }
 
     #[tokio::test]
