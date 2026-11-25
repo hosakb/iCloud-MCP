@@ -552,6 +552,10 @@ async fn albums_are_created_and_renamed_and_a_taken_name_is_refused() {
     )
     .await;
     assert_eq!(done["outcome"], "done", "{done}");
+    // The reply names the album, not a photo (issue 100).
+    let checked = done["checked"].as_str().unwrap();
+    assert!(checked.contains("the album was not read back"), "{checked}");
+    assert!(!checked.contains("photo"), "{checked}");
     let sent = modified(&g.remote).await;
     assert_eq!(sent[0]["record"]["recordChangeTag"], ALBUM_TAG);
     let albums = quince_core::Library::open(g.dir.path())

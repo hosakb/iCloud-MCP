@@ -1419,6 +1419,75 @@ async fn a_save_from_the_original_etag_is_refused_after_the_first_was_sent() {
     assert_eq!(shown_etag(&mut server).await, json!("n2"));
 }
 
+/// Issue 100: in the beta live test one note save was set aside once as
+/// write_authorization_stale. Here a first save is sent by one sync and leaves the queue. A
+/// second save, made after that from the etag shown then, passes the send check and is sent
+/// by the next sync. Neither sync sets anything aside.
+#[tokio::test]
+async fn a_save_after_one_sent_and_confirmed_is_not_set_aside() {
+    let (dir, mut server, library) = family().await;
+    let first = write(
+        &mut server,
+        2,
+        "notes_write",
+        json!({"action":"save","guid":"note","body":"note\nbody one","base_etag":"n1"}),
+    )
+    .await;
+    assert_eq!(first["isError"], false, "{first}");
+    // Apple still holds the text the first save was typed over, so it is sent.
+    let remote = remote_with_note("note\nbody", None).await;
+    let result = icloud_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+        .await
+        .unwrap();
+    assert_eq!(mcp_refusals(&library), Vec::<String>::new(), "{result}");
+    assert!(
+        library.outbox_pending("notes").unwrap().is_empty(),
+        "{result}"
+    );
+    assert_eq!(
+        modified(&remote.received_requests().await.unwrap()).len(),
+        1
+    );
+    // The test's saved sign-in, private as setup leaves it, so the tools open the folder.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        dir.path().join("session.json"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    // The second save, from the etag and the text shown now.
+    let etag = shown_etag(&mut server).await;
+    let now = library.note_body("note").unwrap().unwrap();
+    let second = write(
+        &mut server,
+        3,
+        "notes_write",
+        json!({"action":"save","guid":"note","body":format!("{now}\ntwo"),"base_etag":etag}),
+    )
+    .await;
+    assert_eq!(second["isError"], false, "{second}");
+    let pending = library.outbox_pending("notes").unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        icloud_mcp::sync::authorized(&library, dir.path(), &pending[0]),
+        Ok(())
+    );
+    // Apple holds what the second save was typed over: it is sent, not set aside.
+    let remote = remote_with_note(&now, None).await;
+    let result = icloud_mcp::sync::with_client(dir.path(), saved_client(dir.path(), &remote.uri()))
+        .await
+        .unwrap();
+    assert_eq!(mcp_refusals(&library), Vec::<String>::new(), "{result}");
+    assert!(
+        library.outbox_pending("notes").unwrap().is_empty(),
+        "{result}"
+    );
+    assert_eq!(
+        modified(&remote.received_requests().await.unwrap()).len(),
+        1
+    );
+}
+
 /// Issue 92, review round 1: while a save waits, a delete with a made-up marked etag is
 /// refused; one with the etag notes_get shows is queued.
 #[tokio::test]

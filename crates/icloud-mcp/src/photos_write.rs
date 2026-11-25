@@ -988,16 +988,17 @@ impl Work<'_> {
         let params = || conn.client.service_params();
         let zc = ZoneClient::new(http, &conn.ck, apple::CONTAINER, params());
         let zone = apple::library_zone(&zc).await;
-        let done = |checked: bool, what: &str| {
+        let done_on = |checked: bool, what: &str, item: &str| {
             json!({
                 "outcome": if checked { "done" } else { "sent_not_confirmed" },
                 "checked": if checked {
-                    format!("Apple's answer to the change shows {what}; the photo was not read back")
+                    format!("Apple's answer to the change shows {what}; the {item} was not read back")
                 } else {
                     format!("Apple accepted the change, but its answer did not show {what}; run photos_refresh and look")
                 },
             })
         };
+        let done = |checked: bool, what: &str| done_on(checked, what, "photo");
         // The photo as it will be cached after the change.
         let mut after = self.photo.cloned();
         let shown_photo = |p: &Photo| json!({"id": p.id, "filename": p.filename.as_deref().map(|f| shown(f, SHOWN_CHARS))});
@@ -1212,7 +1213,7 @@ impl Work<'_> {
                 let checked = shows(&answer, "albumNameEnc", &json!(base64_text(name)));
                 album.name = name.clone();
                 album.change_tag = new_tag(&answer);
-                let mut value = done(checked, "the new name");
+                let mut value = done_on(checked, "the new name", "album");
                 value["album"] = show_album(&album);
                 Ok((value, Settled::Album(album)))
             }
