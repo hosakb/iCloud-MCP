@@ -470,7 +470,8 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client
     let script = first_run_with_keyring(&dir, &server).await;
     script.assert_no_secrets();
     let screen = &script.screen;
-    for step in 1..=6 {
+    assert!(screen.contains("Step 1: Folder"), "{screen}");
+    for step in 2..=6 {
         assert!(screen.contains(&format!("Step {step} of 6")), "{screen}");
     }
     assert!(screen.contains(&format!("Create {}? [Y/n]", dir.display())));
@@ -564,11 +565,19 @@ fn step_titles(screen: &str) -> Vec<&str> {
             "{title}:\n{screen}"
         );
     }
+    // Step 1 shows no total; every later title shows the same one.
+    let totals: std::collections::BTreeSet<&str> = titles
+        .iter()
+        .filter_map(|t| t.split_once(" of ").map(|(_, rest)| rest))
+        .filter_map(|rest| rest.split_once(':').map(|(n, _)| n))
+        .collect();
+    assert!(totals.len() <= 1, "the total changed:\n{screen}");
     titles
 }
 
 /// Every step has a numbered title after a blank line, and the total counts only the steps
-/// that run: a kept setup skips three, signing in again in a kept folder does not.
+/// that run: a kept setup skips three, signing in again in a kept folder does not. Step 1
+/// shows no total, since the folder chosen there decides it, and the total never changes.
 #[tokio::test]
 async fn every_step_has_a_numbered_title_and_the_total_counts_only_steps_that_run() {
     let _one = serial().await;
@@ -578,7 +587,7 @@ async fn every_step_has_a_numbered_title_and_the_total_counts_only_steps_that_ru
     assert_eq!(
         step_titles(&script.screen),
         [
-            "Step 1 of 6: Folder",
+            "Step 1: Folder",
             "Step 2 of 6: Where your sign-in is kept",
             "Step 3 of 6: Apple sign-in",
             "Step 4 of 6: Approval mode",
@@ -591,15 +600,10 @@ async fn every_step_has_a_numbered_title_and_the_total_counts_only_steps_that_ru
     assert_eq!(
         step_titles(&script.screen),
         [
-            "Step 1 of 3: Folder",
+            "Step 1: Folder",
             "Step 2 of 3: Services",
             "Step 3 of 3: Check"
         ]
-    );
-    assert!(
-        !script.screen.contains("steps for this folder"),
-        "{}",
-        script.screen
     );
     // Signing in again runs every step, and setup says the count changed.
     let mut answers = vec![Ask(""), Ask("2")];
@@ -610,20 +614,13 @@ async fn every_step_has_a_numbered_title_and_the_total_counts_only_steps_that_ru
     assert_eq!(
         step_titles(&script.screen),
         [
-            "Step 1 of 3: Folder",
+            "Step 1: Folder",
             "Step 2 of 6: Where your sign-in is kept",
             "Step 3 of 6: Apple sign-in",
             "Step 4 of 6: Approval mode",
             "Step 5 of 6: Services",
             "Step 6 of 6: Check",
         ]
-    );
-    assert!(
-        script
-            .screen
-            .contains("Setup has 6 steps for this folder.\n\nStep 2 of 6"),
-        "{}",
-        script.screen
     );
 }
 

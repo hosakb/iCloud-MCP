@@ -230,7 +230,11 @@ const FULL_STEPS: usize = 6;
 /// The steps when a folder is already set up and kept: folder, services, check.
 const KEPT_STEPS: usize = 3;
 
-/// The numbered step titles. Each starts a section after a blank line.
+/// The title of step 1. It shows no total: the folder chosen there decides it.
+const FOLDER_TITLE: &str = "\nStep 1: Folder";
+
+/// The numbered titles after step 1, each starting a section after a blank line. The total
+/// is fixed once the folder step is done, so it never changes while setup runs.
 struct Steps {
     done: usize,
     total: usize,
@@ -243,22 +247,8 @@ impl Steps {
     }
 }
 
-/// The step count a folder will likely need, read without changing anything: a folder that
-/// already chose where its sign-in is kept is likely set up and kept.
-fn likely_steps(dir: &Path) -> usize {
-    if dir.is_dir() && matches!(storage::kind(dir), Ok(Some(_))) {
-        KEPT_STEPS
-    } else {
-        FULL_STEPS
-    }
-}
-
-fn step_folder(
-    console: &mut dyn Console,
-    title: &str,
-    suggested: &Path,
-) -> Result<PathBuf, &'static str> {
-    console.say(&format!("{title}\niCloud-MCP keeps its private data in one folder: its cache, its settings and the choice of where your sign-in is kept."))?;
+fn step_folder(console: &mut dyn Console, suggested: &Path) -> Result<PathBuf, &'static str> {
+    console.say(&format!("{FOLDER_TITLE}\niCloud-MCP keeps its private data in one folder: its cache, its settings and the choice of where your sign-in is kept."))?;
     loop {
         let answer = console.ask(&format!(
             "Folder: {}\nPress Enter to use it, or type another folder: ",
@@ -460,11 +450,7 @@ async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcom
         .clone()
         .or_else(|| options.default_dir.clone())
         .ok_or("Setup can't find your home folder. Run it again with --state-dir FOLDER.")?;
-    let mut steps = Steps {
-        done: 0,
-        total: likely_steps(&suggested),
-    };
-    let mut dir = step_folder(c, &steps.title("Folder"), &suggested)?;
+    let mut dir = step_folder(c, &suggested)?;
     c.dir = Some(dir.clone());
     let mut again = false;
     let keep = loop {
@@ -515,22 +501,16 @@ async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcom
                     "A folder belongs to one Apple Account, so the other account gets a new folder. This folder stays as it is and stays signed in. To sign it out later, run: {}",
                     status::with_dir("icloud-mcp logout", &old)
                 ))?;
-                let next = next_free(&old);
-                steps = Steps {
-                    done: 0,
-                    total: likely_steps(&next),
-                };
-                dir = step_folder(c, &steps.title("Folder"), &next)?;
+                dir = step_folder(c, &next_free(&old))?;
                 c.dir = Some(dir.clone());
             }
             _ => return Ok(Outcome::Quit),
         }
     };
-    let total = if keep { KEPT_STEPS } else { FULL_STEPS };
-    if steps.total != total {
-        steps.total = total;
-        c.say(&format!("Setup has {total} steps for this folder."))?;
-    }
+    let mut steps = Steps {
+        done: 1,
+        total: if keep { KEPT_STEPS } else { FULL_STEPS },
+    };
     if !keep {
         c.say(&steps.title("Where your sign-in is kept"))?;
         if !step_storage(c, env, &dir)? {
