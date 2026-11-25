@@ -99,7 +99,7 @@ You need a terminal window that you open yourself. Don't run these commands thro
    icloud-mcp setup
    ```
 
-   It walks you through six steps and tells you what each one does:
+   It walks you through six steps, three when you keep a folder that is already set up, and tells you what each one does:
 
    1. **Folder.** Where iCloud-MCP keeps its private data. Press Enter to use the suggested folder, `~/.local/share/icloud-mcp`, or type another one as a full path starting with `/` or `~`. Setup asks before it creates a folder. With another folder, add `--state-dir FOLDER` to every command; setup and status print each command with it already filled in.
 

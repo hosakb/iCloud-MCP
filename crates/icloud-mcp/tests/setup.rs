@@ -470,7 +470,8 @@ async fn first_run_signs_in_then_binds_the_strictest_mode_and_prints_both_client
     let script = first_run_with_keyring(&dir, &server).await;
     script.assert_no_secrets();
     let screen = &script.screen;
-    for step in 1..=6 {
+    assert!(screen.contains("Step 1: Folder"), "{screen}");
+    for step in 2..=6 {
         assert!(screen.contains(&format!("Step {step} of 6")), "{screen}");
     }
     assert!(screen.contains(&format!("Create {}? [Y/n]", dir.display())));
@@ -553,6 +554,74 @@ async fn a_rerun_checks_the_sign_in_and_asks_keep_sign_in_again_switch_or_quit()
     let mut script = Script::new(vec![Ask(""), Ask("4")]);
     assert_eq!(run(&mut script, &dir, &server).await, Ok(Outcome::Quit));
     script.done();
+}
+
+/// The numbered step titles, in order. Each one must follow a blank line.
+fn step_titles(screen: &str) -> Vec<&str> {
+    let titles: Vec<&str> = screen.lines().filter(|l| l.starts_with("Step ")).collect();
+    for title in &titles {
+        assert!(
+            screen.contains(&format!("\n\n{title}\n")),
+            "{title}:\n{screen}"
+        );
+    }
+    // Step 1 shows no total; every later title shows the same one.
+    let totals: std::collections::BTreeSet<&str> = titles
+        .iter()
+        .filter_map(|t| t.split_once(" of ").map(|(_, rest)| rest))
+        .filter_map(|rest| rest.split_once(':').map(|(n, _)| n))
+        .collect();
+    assert!(totals.len() <= 1, "the total changed:\n{screen}");
+    titles
+}
+
+/// Every step has a numbered title after a blank line, and the total counts only the steps
+/// that run: a kept setup skips three, signing in again in a kept folder does not. Step 1
+/// shows no total, since the folder chosen there decides it, and the total never changes.
+#[tokio::test]
+async fn every_step_has_a_numbered_title_and_the_total_counts_only_steps_that_run() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    let script = first_run_with_keyring(&dir, &server).await;
+    assert_eq!(
+        step_titles(&script.screen),
+        [
+            "Step 1: Folder",
+            "Step 2 of 6: Where your sign-in is kept",
+            "Step 3 of 6: Apple sign-in",
+            "Step 4 of 6: Approval mode",
+            "Step 5 of 6: Services",
+            "Step 6 of 6: Check",
+        ]
+    );
+    // Kept: the sign-in, storage and approval steps don't run and aren't counted.
+    let script = ready(vec![Ask(""), Ask("")], &dir, &server).await;
+    assert_eq!(
+        step_titles(&script.screen),
+        [
+            "Step 1: Folder",
+            "Step 2 of 3: Services",
+            "Step 3 of 3: Check"
+        ]
+    );
+    // Signing in again runs every step, and setup says the count changed.
+    let mut answers = vec![Ask(""), Ask("2")];
+    answers.extend(sign_in_answers());
+    answers.push(Ask(""));
+    let script = ready(answers, &dir, &server).await;
+    script.assert_no_secrets();
+    assert_eq!(
+        step_titles(&script.screen),
+        [
+            "Step 1: Folder",
+            "Step 2 of 6: Where your sign-in is kept",
+            "Step 3 of 6: Apple sign-in",
+            "Step 4 of 6: Approval mode",
+            "Step 5 of 6: Services",
+            "Step 6 of 6: Check",
+        ]
+    );
 }
 
 /// Apple refused the saved sign-in: setup says so and signs in again in the same folder.
