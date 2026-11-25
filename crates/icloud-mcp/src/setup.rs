@@ -225,8 +225,40 @@ fn prepare(path: &Path) -> Result<PathBuf, &'static str> {
     Ok(held.path.clone())
 }
 
-fn step_folder(console: &mut dyn Console, suggested: &Path) -> Result<PathBuf, &'static str> {
-    console.say("\nStep 1 of 6: Folder\niCloud-MCP keeps its private data in one folder: its cache, its settings and the choice of where your sign-in is kept.")?;
+/// The steps of a full setup.
+const FULL_STEPS: usize = 6;
+/// The steps when a folder is already set up and kept: folder, services, check.
+const KEPT_STEPS: usize = 3;
+
+/// The numbered step titles. Each starts a section after a blank line.
+struct Steps {
+    done: usize,
+    total: usize,
+}
+
+impl Steps {
+    fn title(&mut self, name: &str) -> String {
+        self.done += 1;
+        format!("\nStep {} of {}: {name}", self.done, self.total)
+    }
+}
+
+/// The step count a folder will likely need, read without changing anything: a folder that
+/// already chose where its sign-in is kept is likely set up and kept.
+fn likely_steps(dir: &Path) -> usize {
+    if dir.is_dir() && matches!(storage::kind(dir), Ok(Some(_))) {
+        KEPT_STEPS
+    } else {
+        FULL_STEPS
+    }
+}
+
+fn step_folder(
+    console: &mut dyn Console,
+    title: &str,
+    suggested: &Path,
+) -> Result<PathBuf, &'static str> {
+    console.say(&format!("{title}\niCloud-MCP keeps its private data in one folder: its cache, its settings and the choice of where your sign-in is kept."))?;
     loop {
         let answer = console.ask(&format!(
             "Folder: {}\nPress Enter to use it, or type another folder: ",
@@ -422,13 +454,17 @@ pub async fn run(
 }
 
 async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcome, &'static str> {
-    c.say("iCloud-MCP setup: six short steps. You can stop at any time with Ctrl-C and run setup again later; it continues where it stopped.")?;
+    c.say("iCloud-MCP setup. You can stop at any time with Ctrl-C and run setup again later; it continues where it stopped.")?;
     let suggested = options
         .state_dir
         .clone()
         .or_else(|| options.default_dir.clone())
         .ok_or("Setup can't find your home folder. Run it again with --state-dir FOLDER.")?;
-    let mut dir = step_folder(c, &suggested)?;
+    let mut steps = Steps {
+        done: 0,
+        total: likely_steps(&suggested),
+    };
+    let mut dir = step_folder(c, &steps.title("Folder"), &suggested)?;
     c.dir = Some(dir.clone());
     let mut again = false;
     let keep = loop {
@@ -479,22 +515,36 @@ async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcom
                     "A folder belongs to one Apple Account, so the other account gets a new folder. This folder stays as it is and stays signed in. To sign it out later, run: {}",
                     status::with_dir("icloud-mcp logout", &old)
                 ))?;
-                dir = step_folder(c, &next_free(&old))?;
+                let next = next_free(&old);
+                steps = Steps {
+                    done: 0,
+                    total: likely_steps(&next),
+                };
+                dir = step_folder(c, &steps.title("Folder"), &next)?;
                 c.dir = Some(dir.clone());
             }
             _ => return Ok(Outcome::Quit),
         }
     };
+    let total = if keep { KEPT_STEPS } else { FULL_STEPS };
+    if steps.total != total {
+        steps.total = total;
+        c.say(&format!("Setup has {total} steps for this folder."))?;
+    }
     if !keep {
+        c.say(&steps.title("Where your sign-in is kept"))?;
         if !step_storage(c, env, &dir)? {
             return Ok(Outcome::Quit);
         }
+        c.say(&steps.title("Apple sign-in"))?;
         step_sign_in(c, env, &dir, &options.endpoints, again).await?;
+        c.say(&steps.title("Approval mode"))?;
         step_policy(c, &dir)?;
     }
     offer_permissions(c, &dir)?;
+    c.say(&steps.title("Services"))?;
     step_services(c, &dir)?;
-    c.say("\nStep 6 of 6: Check")?;
+    c.say(&steps.title("Check"))?;
     let report = status::check(env, &dir);
     c.say(report.render().trim_end())?;
     let command = options.command.to_string_lossy();
@@ -533,7 +583,7 @@ async fn flow(c: &mut Scoped<'_>, env: &Env, options: &Options) -> Result<Outcom
 
 /// Step 2. False when the person chose to quit.
 fn step_storage(console: &mut dyn Console, env: &Env, dir: &Path) -> Result<bool, &'static str> {
-    console.say("\nStep 2 of 6: Where your sign-in is kept\nYour Apple password is never stored. What is kept is the sign-in Apple hands back, so you don't have to type a code every time.")?;
+    console.say("Your Apple password is never stored. What is kept is the sign-in Apple hands back, so you don't have to type a code every time.")?;
     let held = PrivateState::open(dir)?;
     let dir = held.path.as_path();
     let chosen = storage::kind(dir)?;
@@ -843,7 +893,6 @@ async fn step_sign_in(
     endpoints: &Endpoints,
     again: bool,
 ) -> Result<(), &'static str> {
-    console.say("\nStep 3 of 6: Apple sign-in")?;
     let held = PrivateState::open(dir)?;
     let dir = held.path.as_path();
     let store = storage::open_store_in(env, dir)?;
@@ -901,7 +950,7 @@ const CARD_NOTE: &str = "The client must be able to show iCloud-MCP's approval c
 
 /// Step 4. Runs after the sign-in: a policy saved before sign-in is bound to no account.
 fn step_policy(console: &mut dyn Console, dir: &Path) -> Result<(), &'static str> {
-    console.say(&format!("\nStep 4 of 6: Approval mode\nThis decides when the assistant has to ask you before it acts. Every choice asks on the approval card in your MCP client. {CARD_NOTE} You can change it later with an {}: line in permissions.yaml in this folder; a line there wins over what you choose here, and setup keeps it in step.", crate::permissions::MODE_KEY))?;
+    console.say(&format!("This decides when the assistant has to ask you before it acts. Every choice asks on the approval card in your MCP client. {CARD_NOTE} You can change it later with an {}: line in permissions.yaml in this folder; a line there wins over what you choose here, and setup keeps it in step.", crate::permissions::MODE_KEY))?;
     let held = PrivateState::open(dir)?;
     let library = crate::setup(&held.path)?;
     if library
@@ -1128,7 +1177,7 @@ fn step_services(console: &mut dyn Console, dir: &Path) -> Result<(), &'static s
         let state = if active.service_on(key) { "on" } else { "off" };
         menu.push_str(&format!("\n  {}. {name} ({state})", n + 1));
     }
-    console.say(&format!("\nStep 5 of 6: Services\nChoose which iCloud services the assistant may use. A service you switch off has no tools in your MCP client, and nothing from it is read, cached or synced; data cached before stays in this folder, unread, until you set up a fresh folder and delete this one. Apple signs in the whole account, so this is a limit inside this server, not at Apple: someone with the sign-in could still reach every service. You can change it later with the {SERVICES_KEY}: line in permissions.yaml in this folder.{menu}"))?;
+    console.say(&format!("Choose which iCloud services the assistant may use. A service you switch off has no tools in your MCP client, and nothing from it is read, cached or synced; data cached before stays in this folder, unread, until you set up a fresh folder and delete this one. Apple signs in the whole account, so this is a limit inside this server, not at Apple: someone with the sign-in could still reach every service. You can change it later with the {SERVICES_KEY}: line in permissions.yaml in this folder.{menu}"))?;
     let chosen: Vec<&str> = loop {
         let answer = console.ask(SERVICES_CHOICE)?;
         let answer = answer.trim();

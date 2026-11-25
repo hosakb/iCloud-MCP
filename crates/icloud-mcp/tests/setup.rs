@@ -555,6 +555,78 @@ async fn a_rerun_checks_the_sign_in_and_asks_keep_sign_in_again_switch_or_quit()
     script.done();
 }
 
+/// The numbered step titles, in order. Each one must follow a blank line.
+fn step_titles(screen: &str) -> Vec<&str> {
+    let titles: Vec<&str> = screen.lines().filter(|l| l.starts_with("Step ")).collect();
+    for title in &titles {
+        assert!(
+            screen.contains(&format!("\n\n{title}\n")),
+            "{title}:\n{screen}"
+        );
+    }
+    titles
+}
+
+/// Every step has a numbered title after a blank line, and the total counts only the steps
+/// that run: a kept setup skips three, signing in again in a kept folder does not.
+#[tokio::test]
+async fn every_step_has_a_numbered_title_and_the_total_counts_only_steps_that_run() {
+    let _one = serial().await;
+    let server = apple().await;
+    let (_parent, dir) = folder();
+    let script = first_run_with_keyring(&dir, &server).await;
+    assert_eq!(
+        step_titles(&script.screen),
+        [
+            "Step 1 of 6: Folder",
+            "Step 2 of 6: Where your sign-in is kept",
+            "Step 3 of 6: Apple sign-in",
+            "Step 4 of 6: Approval mode",
+            "Step 5 of 6: Services",
+            "Step 6 of 6: Check",
+        ]
+    );
+    // Kept: the sign-in, storage and approval steps don't run and aren't counted.
+    let script = ready(vec![Ask(""), Ask("")], &dir, &server).await;
+    assert_eq!(
+        step_titles(&script.screen),
+        [
+            "Step 1 of 3: Folder",
+            "Step 2 of 3: Services",
+            "Step 3 of 3: Check"
+        ]
+    );
+    assert!(
+        !script.screen.contains("steps for this folder"),
+        "{}",
+        script.screen
+    );
+    // Signing in again runs every step, and setup says the count changed.
+    let mut answers = vec![Ask(""), Ask("2")];
+    answers.extend(sign_in_answers());
+    answers.push(Ask(""));
+    let script = ready(answers, &dir, &server).await;
+    script.assert_no_secrets();
+    assert_eq!(
+        step_titles(&script.screen),
+        [
+            "Step 1 of 3: Folder",
+            "Step 2 of 6: Where your sign-in is kept",
+            "Step 3 of 6: Apple sign-in",
+            "Step 4 of 6: Approval mode",
+            "Step 5 of 6: Services",
+            "Step 6 of 6: Check",
+        ]
+    );
+    assert!(
+        script
+            .screen
+            .contains("Setup has 6 steps for this folder.\n\nStep 2 of 6"),
+        "{}",
+        script.screen
+    );
+}
+
 /// Apple refused the saved sign-in: setup says so and signs in again in the same folder.
 #[tokio::test]
 async fn a_sign_in_apple_rejected_is_renewed_in_the_same_folder() {
