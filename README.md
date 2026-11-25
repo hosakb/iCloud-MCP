@@ -26,7 +26,7 @@ Edit `crates/icloud-mcp/docs/architecture.html` and re-export `crates/icloud-mcp
 
 The release is a beta for Linux on x86-64 only. On macOS, use Hermes' own Apple skills instead (see "Other apps"). The program is built offline from a tagged commit by the project owner. Nobody has audited it.
 
-1. On the [releases page](https://github.com/hosakb/iCloud-MCP/releases), download the program file and the file of the same name ending in `.sha256`. The names in this guide, such as `icloud-mcp-0.1.0-beta.1-linux-x86_64`, are examples; the names on the release page are the real ones. Keep both in one folder under the names they were downloaded with.
+1. On the [releases page](https://github.com/hosakb/iCloud-MCP/releases), download the program file and the file of the same name ending in `.sha256`. The names in this guide, such as `icloud-mcp-0.1.0-beta.2-linux-x86_64`, are examples; the names on the release page are the real ones. Keep both in one folder under the names they were downloaded with.
 2. In that folder, check the download. Replace `FILE` with the name of the program file:
 
    ```sh
