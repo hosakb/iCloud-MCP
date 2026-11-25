@@ -20,7 +20,6 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
             "drive_name_not_usable_locally_give_local",
             "drive_paused_approve_on_apple_device",
             "drive_write_not_confirmed_run_drive_refresh",
-            "early_alert_account_unavailable_set_one_on_an_apple_device_then_sync",
             "folder_not_in_cache_use_path",
             "invalid_arguments_use_move_for_another_calendar",
             "login_required_or_network_unavailable",
@@ -30,7 +29,6 @@ const NEEDS_NONE: &[(&str, &[&str])] = &[
             "note_body_unavailable_sync_first",
             "quarantine_full_retire_in_terminal",
             "repeating_reminder_complete_with_tick",
-            "state_busy_retry",
         ],
     ),
     (
@@ -457,4 +455,30 @@ fn the_errors_from_issue_91_say_what_to_do_next() {
     }
     let path = line("invalid_path");
     assert!(path.contains("255 bytes"), "{path}");
+}
+
+/// The bare tool errors issue #100 found. Each now names the next step and says icloud-mcp.
+const ISSUE_100: &[(&str, &str)] = &[
+    (
+        "early_alert_account_unavailable_set_one_on_an_apple_device_then_sync",
+        "run sync here, then ask again",
+    ),
+    (
+        "state_busy_retry",
+        "Wait a moment and try the same call again",
+    ),
+];
+
+#[test]
+fn the_errors_from_issue_100_say_what_to_do_next() {
+    let dir = tempfile::tempdir().unwrap();
+    for (code, step) in ISSUE_100 {
+        let text = icloud_mcp::next_step(code, dir.path(), &Value::Null)
+            .unwrap_or_else(|| panic!("give {code} an instructions line"));
+        assert!(text.contains(step), "{code}: {text}");
+        assert!(text.contains("icloud-mcp"), "{code}: {text}");
+        assert!(!text.to_lowercase().contains("skykeep"), "{code}: {text}");
+    }
+    let busy = icloud_mcp::next_step("state_busy_retry", dir.path(), &Value::Null).unwrap();
+    assert!(busy.contains("another icloud-mcp process"), "{busy}");
 }
