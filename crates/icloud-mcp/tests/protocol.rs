@@ -883,7 +883,10 @@ async fn initialize_and_discover_only_notes_and_reminders_tools() {
     let init = server.handle(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})).await.unwrap();
     assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
     assert_eq!(init["result"]["serverInfo"]["name"], "icloud-mcp");
-    assert_eq!(init["result"]["serverInfo"]["version"], "0.1.0-beta.1");
+    assert_eq!(
+        init["result"]["serverInfo"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
     assert!(server
         .handle(json!({"jsonrpc":"2.0","method":"notifications/initialized"}))
         .await

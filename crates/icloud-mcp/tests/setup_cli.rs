@@ -243,7 +243,7 @@ fn version_prints_the_release_version_and_exits_zero() {
         assert_eq!(out.status.code(), Some(0), "{flag}");
         assert_eq!(
             String::from_utf8(out.stdout).unwrap(),
-            "icloud-mcp 0.1.0-beta.1\n"
+            format!("icloud-mcp {}\n", env!("CARGO_PKG_VERSION"))
         );
         assert!(out.stderr.is_empty(), "{flag}");
     }
